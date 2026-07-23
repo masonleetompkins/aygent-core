@@ -366,4 +366,85 @@ mod tests {
         let r = Broker::resolve_within(&root, "link.md", Mode::Read);
         assert_eq!(r, Err(BrokerError::SymlinkEscape));
     }
+
+    // -----------------------------------------------------------------------
+    // GATE TESTS — adversarial, against the REAL atomic open (resolve_and_open).
+    // These prove the atomic O_NOFOLLOW layer survives an active attacker, not
+    // just correct resolution. (Part F tests 8 + 9.)
+    // -----------------------------------------------------------------------
+
+    /// A broker scoped to a root, for exercising resolve_and_open directly.
+    fn broker_with_scope(root: &Path) -> Arc<Broker> {
+        let b = Broker::new();
+        b.set_scope("default", root.to_path_buf(), false);
+        b
+    }
+
+    #[test]
+    fn gate_hardlink_write_refused() {
+        // Rule 7: a hardlink inside root pointing at an OUTSIDE inode must be
+        // refused on write (nlink > 1). Create an outside file, hardlink it in.
+        let root = tmp_root();
+        let outside_dir = tmp_root(); // separate root => "outside"
+        let outside = outside_dir.join("secret");
+        fs::write(&outside, b"top secret").unwrap();
+        let hl = root.join("innocent.md");
+        // hardlink (not symlink): same inode, nlink becomes 2.
+        std::fs::hard_link(&outside, &hl).unwrap();
+
+        let b = broker_with_scope(&root);
+        let r = b.resolve_and_open("default", "innocent.md", Mode::Write);
+        assert!(
+            matches!(r, Err(BrokerError::HardlinkRefused)),
+            "expected HardlinkRefused, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn gate_toctou_symlink_swap() {
+        // Rule 2/3 atomic: race resolve vs an attacker swapping a component for
+        // a symlink to /etc. With O_NOFOLLOW at the final component + the
+        // canonicalized-ancestor check, the broker must NEVER open outside root,
+        // no matter the interleaving. We hammer it in a loop while a thread
+        // flips a name between a real file and a symlink-to-/etc/passwd.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = tmp_root();
+        let name = "racy";
+        let real = root.join("racy_real");
+        fs::write(&real, b"in-scope").unwrap();
+        let target = root.join(name);
+        fs::write(&target, b"in-scope").unwrap();
+
+        let b = broker_with_scope(&root);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Attacker thread: repeatedly swap `racy` between a real file and a
+        // symlink pointing OUT to /etc/passwd.
+        let root2 = root.clone();
+        let stop2 = stop.clone();
+        let attacker = std::thread::spawn(move || {
+            let p = root2.join(name);
+            while !stop2.load(Ordering::Relaxed) {
+                let _ = std::fs::remove_file(&p);
+                let _ = std::os::unix::fs::symlink("/etc/passwd", &p);
+                let _ = std::fs::remove_file(&p);
+                let _ = std::fs::write(&p, b"in-scope");
+            }
+        });
+
+        // Victim loop: open many times; assert we NEVER read /etc/passwd content.
+        for _ in 0..5000 {
+            if let Ok(mut f) = b.resolve_and_open("default", name, Mode::Read) {
+                use std::io::Read;
+                let mut s = String::new();
+                let _ = f.read_to_string(&mut s);
+                assert!(
+                    !s.contains("root:") && !s.contains("/bin/"),
+                    "LEAK: opened /etc/passwd content through TOCTOU race"
+                );
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        attacker.join().unwrap();
+    }
 }
