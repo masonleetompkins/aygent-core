@@ -20,6 +20,12 @@ export function App() {
   const [probe, setProbe] = useState<ProbeResult>(null);
   const [wsRef, setWsRef] = useState<WebSocket | null>(null);
   const [selftest, setSelftest] = useState<string | null>(null);
+  // M0.3 Providers
+  const [apiKey, setApiKey] = useState("");
+  const [keySet, setKeySet] = useState(false);
+  const [prompt, setPrompt] = useState("Say hello in one short sentence.");
+  const [reply, setReply] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     let ws: WebSocket | null = null;
@@ -62,6 +68,23 @@ export function App() {
   function runDaemonSelftest() {
     setSelftest("running…");
     wsRef?.send(JSON.stringify({ type: "selftest" }));
+  }
+  // Check on mount whether an anthropic key is already stored.
+  useEffect(() => { invoke<boolean>("has_provider_key", { provider: "anthropic" }).then(setKeySet).catch(() => {}); }, []);
+  async function saveKey() {
+    if (!apiKey.trim()) return;
+    await invoke("set_provider_key", { provider: "anthropic", key: apiKey.trim() });
+    setApiKey(""); // never keep the secret in JS state
+    setKeySet(true);
+  }
+  async function testAnthropic() {
+    setBusy(true); setReply(null);
+    try {
+      const r = await invoke<string>("anthropic_test", { prompt });
+      setReply(r);
+    } catch (e) {
+      setReply("✗ " + String(e));
+    } finally { setBusy(false); }
   }
 
   const good = status.kind === "connected";
@@ -106,6 +129,32 @@ export function App() {
           </div>
         </section>
       )}
+
+      <section style={S.card}>
+        <div style={S.cardTitle}>Provider — Anthropic</div>
+        {keySet ? (
+          <p style={S.hint}>API key set ✓ <span style={{ color: "#5a6b76" }}>(stored in macOS Keychain — never seen by the UI)</span></p>
+        ) : (
+          <p style={S.hint}>Paste your Anthropic API key. It goes straight to the macOS Keychain; the UI never keeps it.</p>
+        )}
+        <div style={{ display: "flex", gap: "0.5rem" }}>
+          <input style={S.input} type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)}
+            placeholder={keySet ? "replace key…" : "sk-ant-…"} />
+          <button style={S.btn} onClick={saveKey}>{keySet ? "Replace" : "Save key"}</button>
+        </div>
+        {keySet && (
+          <div style={{ marginTop: "0.6rem", borderTop: "1px solid #1b2a35", paddingTop: "0.8rem" }}>
+            <p style={S.hint}>Send a prompt to the model (key fetched Rust-side, never enters JS):</p>
+            <div style={{ display: "flex", gap: "0.5rem" }}>
+              <input style={S.input} value={prompt} onChange={(e) => setPrompt(e.target.value)} />
+              <button style={S.btn} onClick={testAnthropic} disabled={busy}>{busy ? "…" : "Send"}</button>
+            </div>
+            {reply && (
+              <code style={{ ...S.result, marginTop: "0.5rem", color: reply.startsWith("✗") ? "#ef6f6f" : "#2dd4bf", borderColor: reply.startsWith("✗") ? "#5a2b2b" : "#14b8a6", whiteSpace: "pre-wrap" }}>{reply}</code>
+            )}
+          </div>
+        )}
+      </section>
     </main>
   );
 }
