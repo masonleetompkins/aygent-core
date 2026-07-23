@@ -77,6 +77,15 @@ export function App() {
     setApiKey(""); // never keep the secret in JS state
     setKeySet(true);
   }
+  async function runAgent() {
+    setBusy(true); setReply(null);
+    try {
+      const r = await invoke<string>("agent_run", { prompt });
+      setReply(r);
+    } catch (e) {
+      setReply("✗ " + String(e));
+    } finally { setBusy(false); }
+  }
   async function testAnthropic() {
     setBusy(true); setReply(null);
     try {
@@ -149,6 +158,9 @@ export function App() {
               <input style={S.input} value={prompt} onChange={(e) => setPrompt(e.target.value)} />
               <button style={S.btn} onClick={testAnthropic} disabled={busy}>{busy ? "…" : "Send"}</button>
             </div>
+            <p style={{ ...S.hint, marginTop: "0.6rem" }}>Or run the <b>agent</b> — it can use jailed file tools (read/write/list) inside your folder:</p>
+            <button style={S.btn} onClick={runAgent} disabled={busy || !folder}>{busy ? "…" : "Run agent (tool use)"}</button>
+            {!folder && <p style={{ ...S.hint, color: "#5a6b76" }}>Pick an Agent Folder above first.</p>}
             {reply && (
               <code style={{ ...S.result, marginTop: "0.5rem", color: reply.startsWith("✗") ? "#ef6f6f" : "#2dd4bf", borderColor: reply.startsWith("✗") ? "#5a2b2b" : "#14b8a6", whiteSpace: "pre-wrap" }}>{reply}</code>
             )}
