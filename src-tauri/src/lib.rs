@@ -40,28 +40,35 @@ fn daemon_info(state: tauri::State<Arc<DaemonState>>) -> serde_json::Value {
 /// Open the native folder picker, canonicalize the choice, and register it as
 /// the agent's scoped root in the broker (M0.2 (d)). This is how a user chooses
 /// their Agent Folder — from here on the broker jails the agent to it.
-/// Returns the chosen path (for display) or null if cancelled.
+///
+/// ASYNC + non-blocking: `blocking_pick_folder()` on the main thread deadlocks
+/// the UI (the window can't repaint while blocking). We use the async callback
+/// picker and bridge it back with a oneshot channel on a spawned task.
 #[tauri::command]
-fn pick_agent_folder(
+async fn pick_agent_folder(
     app: tauri::AppHandle,
-    broker: tauri::State<Arc<Broker>>,
-) -> Option<String> {
-    // Blocking folder picker (native macOS dialog).
-    let folder = app.dialog().file().blocking_pick_folder();
-    let path = folder?.into_path().ok()?;
+    broker: tauri::State<'_, Arc<Broker>>,
+) -> Result<Option<String>, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.dialog().file().pick_folder(move |chosen| {
+        let _ = tx.send(chosen);
+    });
+    // Wait for the user's choice off the main thread.
+    let chosen = tokio::task::spawn_blocking(move || rx.recv().ok().flatten())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let Some(fp) = chosen else { return Ok(None) };
+    let path = fp.into_path().map_err(|e| e.to_string())?;
 
     // Canonicalize against the data volume (resolves firmlinks/symlinks/case)
     // so the broker's containment checks compare against the real root.
     let canonical = std::fs::canonicalize(&path).unwrap_or(path);
 
-    // Register as the default agent's scope. Multi-agent (M1.4) will key this
-    // per-agent; for M0.2 we use a single "default" agent.
-    // bookmark_stale=false here; the real security-scoped bookmark persistence
-    // + stale handling lands with bookmark storage (still M0.2).
+    // Register as the default agent's scope (multi-agent keying lands M1.4).
     broker.set_scope("default", canonical.clone(), false);
-
     eprintln!("[aygent] agent folder set: {}", canonical.display());
-    Some(canonical.to_string_lossy().to_string())
+    Ok(Some(canonical.to_string_lossy().to_string()))
 }
 
 /// Probe the broker: ask it to resolve a path for the default agent and report
