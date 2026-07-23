@@ -106,6 +106,10 @@ pub fn spawn_daemon(
     };
 
     let mut child = cmd
+        // Set cwd to the daemon dir (which the jail ALLOWS). Otherwise node's
+        // process.cwd() at boot hits EPERM on uv_cwd (the launch cwd, src-tauri/,
+        // is denied by the Seatbelt profile). Fixes: uv_cwd EPERM at boot.
+        .current_dir(&daemon_dir)
         .env("AYGENT_WS_TOKEN", &state.ws_token)
         .env("AYGENT_BROKER_PORT", broker_port.to_string())
         .env("AYGENT_BROKER_TOKEN", broker_token)
