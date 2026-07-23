@@ -91,3 +91,42 @@ pub async fn anthropic_complete(
     }
     Ok(out)
 }
+
+// --- Tool-use aware call (M0.3 agent loop) ---------------------------------
+
+/// One Anthropic Messages turn WITH tools + prior message history. Returns the
+/// raw response JSON so the agent loop can inspect stop_reason / tool_use.
+/// `messages` is the running conversation array; `tools` the tool schemas.
+pub async fn anthropic_turn(
+    api_key: &str,
+    model: &str,
+    system: &str,
+    messages: &serde_json::Value,
+    tools: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let body = json!({
+        "model": model,
+        "max_tokens": 1024,
+        "system": system,
+        "tools": tools,
+        "messages": messages,
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(ANTHROPIC_URL)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", API_VERSION)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("read body failed: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("anthropic {status}: {text}"));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("bad json: {e}"))
+}
