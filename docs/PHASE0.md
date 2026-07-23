@@ -21,8 +21,16 @@ under the real Seatbelt profile. Rushing this defeats the entire product._
          daemon reports `inside=ADMIT · outside=refuse:Forbidden`. The jailed brain can reach
          inside the chosen folder and is structurally refused /etc/passwd. Two-channel trust
          model (UI<->daemon, daemon<->Rust broker) per BROKER-RPC-DECISION.md.
-      REMAINING: real openat/O_NOFOLLOW fd layer; security-scoped bookmark persistence +
-         stale handling; wire real Seatbelt launch + fs-level TOCTOU/hardlink tests.
+      ✅ 2026-07-23 (e): REAL SEATBELT JAIL VERIFIED on Mason's Mac. Daemon launches under
+         sandbox-exec (deny file+exec by default), boots clean (reads its own daemon/ tree
+         incl. node_modules), and runs `[aygent] ws listening` + `daemon up` — while macOS
+         refuses it access to everything else. Fixes en route: execvp node (profile
+         templating w/ real node bin), node runtime boot paths (dyld cache / dev / sockets /
+         iokit), ws EPERM (allow whole daemon/ not just dist/). The broker is now an
+         OS-ENFORCED boundary, not a convention. Tooling: scripts/test-jail.sh.
+      REMAINING: (c) real openat/O_NOFOLLOW fd layer (atomic open behind handles) +
+         security-scoped bookmark persistence + stale handling; then the fs-level TOCTOU/
+         hardlink escape tests run against the daemon UNDER this profile = the Phase 0 GATE.
 - [ ] **M0.2b** MCP transport capability split (`mcp.net` vs `mcp.local-exec`) enforced now.
 - [ ] **M0.3** Anthropic end-to-end: key→Keychain→loop→one handle-based jailed fs tool→stream.
 - [ ] **M0.4** Freeze the four contracts (`ToolDef` + broker RPC + `Capability` enum + folder
