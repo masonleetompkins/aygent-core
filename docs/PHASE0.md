@@ -4,8 +4,10 @@ _The load-bearing gate. Nothing in Phase 1 commits until the escape suite passes
 under the real Seatbelt profile. Rushing this defeats the entire product._
 
 ## Milestones
-- [ ] **M0.1** Tauri shell spawns + supervises the Node daemon; **WS auth from the start**
+- [~] **M0.1** Tauri shell spawns + supervises the Node daemon; **WS auth from the start**
       (per-session token + Origin, or unix socket — Atlas C6); tokens stream to React chat.
+      ✅ 2026-07-23: app compiles + window opens on Mason's Mac (teal AYGENT UI live).
+      REMAINING: actually wire the daemon<->UI WS round-trip (token auth handshake).
 - [ ] **M0.2** Seatbelt profile denies file+exec for the daemon (Atlas C1) + handle-based
       Rust broker (atomic openat/O_NOFOLLOW/component-compare/nlink/firmlink/case/stale —
       Atlas C2) + folder picker + scoped bookmark.
