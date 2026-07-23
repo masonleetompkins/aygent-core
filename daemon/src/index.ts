@@ -55,13 +55,22 @@ async function main() {
       // client is already authenticated (token + Origin checked in ws.ts).
       client.send(JSON.stringify({ type: "hello", from: "daemon", version: "0.0.1" }));
 
-      client.on("message", (raw) => {
+      client.on("message", async (raw) => {
         let msg: any;
         try { msg = JSON.parse(raw); } catch { return; }
         switch (msg?.type) {
           case "ping":
             client.send(JSON.stringify({ type: "pong", t: Date.now() }));
             break;
+          case "selftest": {
+            // Re-run the jail probe from the DAEMON side, on demand (after the
+            // user picks a folder). Proves the daemon→broker channel enforces
+            // the jail live: admit inside, refuse outside.
+            const inside = await broker.resolve("default", "aygent-selftest.txt", "w");
+            const outside = await broker.resolve("default", "/etc/passwd", "r");
+            client.send(JSON.stringify({ type: "selftest:result", inside, outside }));
+            break;
+          }
           // M0.3: case "chat" -> agent loop -> stream tokens back.
           default:
             client.send(JSON.stringify({ type: "ack", echo: msg?.type ?? null }));

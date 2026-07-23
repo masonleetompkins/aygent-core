@@ -18,6 +18,8 @@ export function App() {
   const [folder, setFolder] = useState<string | null>(null);
   const [probePath, setProbePath] = useState("notes/hello.md");
   const [probe, setProbe] = useState<ProbeResult>(null);
+  const [wsRef, setWsRef] = useState<WebSocket | null>(null);
+  const [selftest, setSelftest] = useState<string | null>(null);
 
   useEffect(() => {
     let ws: WebSocket | null = null;
@@ -34,8 +36,13 @@ export function App() {
       ws.onopen = () => ws!.send(JSON.stringify({ type: "auth", token: info.token }));
       ws.onmessage = (ev) => {
         let msg: any; try { msg = JSON.parse(ev.data); } catch { return; }
-        if (msg.type === "auth:ok") { sentAt = Date.now(); ws!.send(JSON.stringify({ type: "ping" })); }
+        if (msg.type === "auth:ok") { sentAt = Date.now(); setWsRef(ws); ws!.send(JSON.stringify({ type: "ping" })); }
         else if (msg.type === "pong") setStatus({ kind: "connected", port: info.port!, latency: Date.now() - sentAt });
+        else if (msg.type === "selftest:result") {
+          const i = msg.inside?.ok ? "ADMIT" : "refuse:" + msg.inside?.error;
+          const o = msg.outside?.ok ? "ADMIT(!!)" : "refuse:" + msg.outside?.error;
+          setSelftest(`inside=${i}  ·  outside=${o}`);
+        }
       };
       ws.onerror = () => setStatus({ kind: "error", msg: "ws error" });
       ws.onclose = () => setStatus((s) => (s.kind === "connected" ? s : { kind: "error", msg: "ws closed (auth rejected?)" }));
@@ -51,6 +58,10 @@ export function App() {
   async function runProbe() {
     const r = await invoke<ProbeResult>("broker_probe", { requested: probePath });
     setProbe(r);
+  }
+  function runDaemonSelftest() {
+    setSelftest("running…");
+    wsRef?.send(JSON.stringify({ type: "selftest" }));
   }
 
   const good = status.kind === "connected";
@@ -88,6 +99,11 @@ export function App() {
               {probe.ok ? `✓ admitted → ${probe.resolved}` : `✗ refused → ${probe.error}`}
             </code>
           )}
+          <div style={{ marginTop: "0.6rem", borderTop: "1px solid #1b2a35", paddingTop: "0.8rem" }}>
+            <p style={S.hint}>Or test the jail from the <b>daemon's</b> side (the jailed brain asking the broker):</p>
+            <button style={S.btn} onClick={runDaemonSelftest} disabled={!wsRef}>Test jail from daemon</button>
+            {selftest && <code style={{ ...S.result, marginTop: "0.5rem", color: "#8fa9b6", borderColor: "#1b2a35" }}>{selftest}</code>}
+          </div>
         </section>
       )}
     </main>
