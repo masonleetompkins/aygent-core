@@ -30,8 +30,19 @@
 
 ;; --- allow ONLY what the Node runtime itself needs to boot ---
 ;; (its own bundled runtime + our app resources — NEVER the agent folder)
+;; NOTE (2026-07-23): the FIRST attempt failed with
+;;   sandbox-exec: execvp() of 'node' failed: No such file or directory
+;; because the profile denied read/exec of the node binary + its dylibs. The
+;; jail must let node LAUNCH (read+exec its own runtime) while still denying the
+;; user's folders. In a bundle we ship node in Resources and allow that subpath;
+;; in dev we allow the system node locations. The AGENT FOLDER is never allowed
+;; here — that access comes only through the Rust broker.
+(allow process-exec (literal "<<NODE_BIN>>"))   ;; templated to the resolved node path
 (allow file-read*
+  (literal "<<NODE_BIN>>")
   (subpath "/usr/lib")
+  (subpath "/usr/local")           ;; homebrew node dylibs (dev)
+  (subpath "/opt/homebrew")        ;; apple-silicon homebrew (dev)
   (subpath "/usr/share")
   (subpath "/System/Library")
   (literal "/dev/null")

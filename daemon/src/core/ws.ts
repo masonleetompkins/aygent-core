@@ -58,8 +58,16 @@ export async function startWsServer(opts: WsOptions) {
     setTimeout(() => { if (!authed) sock.close(1008, "auth timeout"); }, 3000);
   });
 
-  const addr = wss.address();
-  const port = typeof addr === "object" && addr ? addr.port : 0;
+  // BUGFIX (2026-07-23): must wait for the `listening` event before reading
+  // the address — reading synchronously returns port 0 (unbound), which the UI
+  // then can't connect to. Resolve the real ephemeral port here.
+  const port: number = await new Promise((resolve) => {
+    wss.on("listening", () => {
+      const addr = wss.address();
+      resolve(typeof addr === "object" && addr ? addr.port : 0);
+    });
+  });
+
   // Rust reads this line to learn the port to hand the WebView.
   console.error(`[aygent] ws listening 127.0.0.1:${port}`);
   return { wss, port };
