@@ -1,0 +1,53 @@
+;; AYGENT — Folder Mode Seatbelt profile (macOS sandbox-exec)
+;; This is THE jail. The Node daemon runs under this profile so it CANNOT
+;; open user files or spawn processes — it must route everything through the
+;; Rust broker over WS. This converts the broker from a convention into an
+;; OS-enforced boundary (Atlas C1).
+;;
+;; Applied in Phase 0. Pro Mode uses a RELAXED profile (folder-mode-pro.sb)
+;; that permits process-exec + wider fs when the agent holds shell.exec.
+;;
+;; NOTE: sandbox-exec is "deprecated" but fully functional on macOS 14/15 and
+;; is what Chromium et al. still rely on. Test the combination with the app's
+;; hardened-runtime signing early (Atlas N6).
+
+(version 1)
+(deny default)
+
+;; --- allow the daemon to run as a normal process (but NOT spawn children) ---
+(allow process-info-pidinfo)
+(allow sysctl-read)
+(allow mach-lookup)                     ;; needed for basic runtime services
+
+;; --- HARD DENY: no arbitrary execution in Folder Mode (Atlas C3) ---
+(deny process-exec*)
+(deny process-fork)
+
+;; --- HARD DENY: no ambient filesystem access (Atlas C1) ---
+;; The daemon gets NOTHING under the user's disk. All file I/O crosses to the
+;; Rust broker, which is the only opener. No /Users, /tmp, /private, /var.
+(deny file-read* file-write*)
+
+;; --- allow ONLY what the Node runtime itself needs to boot ---
+;; (its own bundled runtime + our app resources — NEVER the agent folder)
+(allow file-read*
+  (subpath "/usr/lib")
+  (subpath "/usr/share")
+  (subpath "/System/Library")
+  (literal "/dev/null")
+  (literal "/dev/random")
+  (literal "/dev/urandom"))
+
+;; app bundle resources (daemon code, bundled node, pinned git binary path is
+;; NOT here — git is invoked by the Rust side, not the daemon)
+;; <<APP_BUNDLE_SUBPATH>> is templated in at launch by the Rust supervisor.
+(allow file-read*
+  (subpath "<<APP_BUNDLE_SUBPATH>>"))
+
+;; --- network: loopback only, for the WS link to the Rust broker/UI ---
+;; Outbound provider/API calls are ALSO made by the daemon (net.http capability)
+;; — kept broad here but the capability layer gates which tools may use net.
+(allow network-outbound)
+(allow network-inbound (local ip "localhost:*"))
+
+;; Everything else: denied by (deny default). The escape suite proves it.
