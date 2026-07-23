@@ -162,7 +162,7 @@ export function App() {
             <button style={S.btn} onClick={runAgent} disabled={busy || !folder}>{busy ? "…" : "Run agent (tool use)"}</button>
             {!folder && <p style={{ ...S.hint, color: "#5a6b76" }}>Pick an Agent Folder above first.</p>}
             {reply && (
-              <code style={{ ...S.result, marginTop: "0.5rem", color: reply.startsWith("✗") ? "#ef6f6f" : "#2dd4bf", borderColor: reply.startsWith("✗") ? "#5a2b2b" : "#14b8a6", whiteSpace: "pre-wrap" }}>{reply}</code>
+              <pre style={{ ...S.transcript, color: reply.startsWith("✗") ? "#ef6f6f" : "#cfe8ef", borderColor: reply.startsWith("✗") ? "#5a2b2b" : "#1b2a35" }}>{reply}</pre>
             )}
           </div>
         )}
@@ -193,4 +193,19 @@ const S: Record<string, React.CSSProperties> = {
   btn: { alignSelf: "flex-start", background: "#14b8a6", color: "#04121a", border: "none", borderRadius: "8px", padding: "0.5rem 1rem", fontWeight: 700, cursor: "pointer" },
   input: { flex: 1, background: "#0a0f14", border: "1px solid #1b2a35", borderRadius: "8px", color: "#e8f4f8", padding: "0.5rem 0.7rem", fontFamily: "monospace", fontSize: "0.85rem" },
   result: { fontSize: "0.8rem", border: "1px solid", borderRadius: "8px", padding: "0.5rem 0.7rem", wordBreak: "break-all" },
+  transcript: {
+    marginTop: "0.6rem",
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    fontSize: "0.78rem",
+    lineHeight: 1.5,
+    background: "#0a0f14",
+    border: "1px solid #1b2a35",
+    borderRadius: "10px",
+    padding: "0.8rem 0.9rem",
+    maxHeight: "340px",
+    overflowY: "auto",
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+    margin: "0.6rem 0 0 0",
+  },
 };
