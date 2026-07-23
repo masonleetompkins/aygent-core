@@ -131,8 +131,12 @@ daemon + React UI. Working dir on his Mac: `~/Documents/aygent`.
   enforced — `daemon/src/core/capabilities.ts`: `grantsFor(mode)`, `gate()`,
   `mcpCapabilityForTransport()` → stdio=mcp.local-exec Pro-only, http/sse=mcp.net Folder-OK),
   **M0.4** (four contracts FROZEN with verified impl-status table in `CONTRACTS.md`).
-  Commits through `0d701bd`. Repo clean.
+  Commits through `b44c1f8`. Repo clean.
+- **VERIFIED on Mason's Mac (2026-07-23 16:37):** after building the latest commits, `cargo
+  test` = 10/10 green AND the agent loop wrote+read `verify.md` cleanly. "Committed" was made
+  "proven" — Mason correctly insisted we build the M0.2b/M0.4 commits, not just push them.
 - The load-bearing security kernel is DONE and PROVEN. **Phase 1 is unblocked.**
+- LESSON reinforced: never call a milestone "complete" on unbuilt commits — verify on the Mac.
 
 ## OPEN / NEXT (Phase 1 buildout)
 - Streaming responses; the delightful **Settings UI (THE WEDGE)**; scheduler (cron+heartbeat);
