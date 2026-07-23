@@ -101,14 +101,33 @@ fn has_provider_key(provider: String) -> bool {
     keychain::has_key(&provider)
 }
 
+/// List the Anthropic models this key can actually use (robust vs guessing IDs;
+/// also feeds the Phase-1 Settings model picker).
+#[tauri::command]
+async fn anthropic_models() -> Result<Vec<String>, String> {
+    let key = keychain::get_key("anthropic")
+        .map_err(|_| "no anthropic key set — add one first".to_string())?;
+    provider::anthropic_list_models(&key).await
+}
+
 /// M0.3 end-to-end proof: fetch the Anthropic key from Keychain (Rust-side
-/// only), call the model, return the text. The key NEVER enters JS/WebView.
+/// only), ask the account which models it can use, call the first one, return
+/// the text (prefixed with which model answered). Key NEVER enters JS/WebView.
 #[tauri::command]
 async fn anthropic_test(prompt: String) -> Result<String, String> {
     let key = keychain::get_key("anthropic")
         .map_err(|_| "no anthropic key set — add one first".to_string())?;
-    // Use a current, stable alias (no dated suffix that can 404 on newer accounts).
-    provider::anthropic_complete(&key, "claude-3-5-haiku-latest", &prompt).await
+    // Ask the account what it can use instead of guessing a model ID.
+    let models = provider::anthropic_list_models(&key).await?;
+    // Prefer a haiku (cheap/fast) if present, else the first available model.
+    let model = models
+        .iter()
+        .find(|m| m.contains("haiku"))
+        .cloned()
+        .or_else(|| models.first().cloned())
+        .ok_or_else(|| "account returned no usable models".to_string())?;
+    let answer = provider::anthropic_complete(&key, &model, &prompt).await?;
+    Ok(format!("[{model}]\n{answer}"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -127,7 +146,7 @@ pub fn run() {
         .manage(state.clone())
         .invoke_handler(tauri::generate_handler![
             daemon_info, pick_agent_folder, broker_probe,
-            set_provider_key, has_provider_key, anthropic_test
+            set_provider_key, has_provider_key, anthropic_test, anthropic_models
         ])
         .setup(move |_app| {
             let broker = broker.clone();

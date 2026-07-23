@@ -7,7 +7,39 @@
 use serde_json::json;
 
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 const API_VERSION: &str = "2023-06-01";
+
+/// Ask the account which models the key can actually use. Robust vs guessing
+/// model IDs (and needed for the Settings UI model picker anyway). Returns the
+/// list of model id strings, newest first (as the API returns them).
+pub async fn anthropic_list_models(api_key: &str) -> Result<Vec<String>, String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(ANTHROPIC_MODELS_URL)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", API_VERSION)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("read body failed: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("anthropic {status}: {text}"));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("bad json: {e}"))?;
+    let ids = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(ids)
+}
 
 /// One-shot Anthropic Messages call. Returns the assistant text, or an error.
 /// `system` may include a note that the agent has a jailed file tool (tool-use
