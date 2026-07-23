@@ -10,6 +10,8 @@ mod supervisor;
 use std::sync::Arc;
 use rand::Rng;
 use supervisor::DaemonState;
+use tauri_plugin_dialog::DialogExt;
+use broker::Broker;
 
 /// Mint a random per-session WS token (Atlas C6). Injected into the daemon via
 /// env and handed to the WebView via the `daemon_info` command — the daemon
@@ -35,6 +37,46 @@ fn daemon_info(state: tauri::State<Arc<DaemonState>>) -> serde_json::Value {
     serde_json::json!({ "port": port, "token": state.ws_token })
 }
 
+/// Open the native folder picker, canonicalize the choice, and register it as
+/// the agent's scoped root in the broker (M0.2 (d)). This is how a user chooses
+/// their Agent Folder — from here on the broker jails the agent to it.
+/// Returns the chosen path (for display) or null if cancelled.
+#[tauri::command]
+fn pick_agent_folder(
+    app: tauri::AppHandle,
+    broker: tauri::State<Arc<Broker>>,
+) -> Option<String> {
+    // Blocking folder picker (native macOS dialog).
+    let folder = app.dialog().file().blocking_pick_folder();
+    let path = folder?.into_path().ok()?;
+
+    // Canonicalize against the data volume (resolves firmlinks/symlinks/case)
+    // so the broker's containment checks compare against the real root.
+    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+
+    // Register as the default agent's scope. Multi-agent (M1.4) will key this
+    // per-agent; for M0.2 we use a single "default" agent.
+    // bookmark_stale=false here; the real security-scoped bookmark persistence
+    // + stale handling lands with bookmark storage (still M0.2).
+    broker.set_scope("default", canonical.clone(), false);
+
+    eprintln!("[aygent] agent folder set: {}", canonical.display());
+    Some(canonical.to_string_lossy().to_string())
+}
+
+/// Probe the broker: ask it to resolve a path for the default agent and report
+/// admit/refuse. Lets the UI demonstrate the jail live (M0.2 visible proof).
+#[tauri::command]
+fn broker_probe(
+    broker: tauri::State<Arc<Broker>>,
+    requested: String,
+) -> serde_json::Value {
+    match broker.resolve("default", &requested, broker::Mode::Read) {
+        Ok(p) => serde_json::json!({ "ok": true, "resolved": p.to_string_lossy() }),
+        Err(e) => serde_json::json!({ "ok": false, "error": format!("{e:?}") }),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let state = Arc::new(DaemonState {
@@ -46,7 +88,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(broker::Broker::new())
         .manage(state.clone())
-        .invoke_handler(tauri::generate_handler![daemon_info])
+        .invoke_handler(tauri::generate_handler![daemon_info, pick_agent_folder, broker_probe])
         .setup(move |_app| {
             // M0.1: launch the daemon so the UI<->daemon WS loop works.
             // jailed=false in dev (build the loop first); the macOS Seatbelt
