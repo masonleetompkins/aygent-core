@@ -111,7 +111,10 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 match broker_ws::start(broker, broker_token.clone()).await {
                     Ok(broker_port) => {
-                        let jailed = false;
+                        // M0.2(e): jail ON by default on macOS (deny file+exec
+                        // Seatbelt). Override with AYGENT_JAILED=0 for dev if a
+                        // Seatbelt issue needs isolating.
+                        let jailed = std::env::var("AYGENT_JAILED").as_deref() != Ok("0");
                         if let Err(e) = supervisor::spawn_daemon(
                             state.clone(), jailed, broker_port, &broker_token,
                         ) {
