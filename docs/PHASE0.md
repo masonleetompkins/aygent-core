@@ -41,9 +41,15 @@ under the real Seatbelt profile. Rushing this defeats the entire product._
 - [x] **M0.3 ✅ DONE (2026-07-23)** Anthropic end-to-end VERIFIED on Mason's Mac: API key in
       macOS Keychain (never enters JS), key fetched Rust-side, account queried for available
       models (robust vs guessing IDs), real completion returned — `[claude-haiku-4-5-20251001]
-      Hello!`. Providers card in UI (save key / send prompt). REMAINING for full M0.3: route
-      through the AGENT LOOP + one jailed fs tool + streaming (current path is a direct
-      one-shot completion). Provider plumbing + Keychain + model discovery all proven.
+      Hello!`. Providers card in UI (save key / send prompt).
+      ✅ AGENT LOOP COMPLETE (2026-07-23): model has jailed read_file/write_file/list_files
+      tools; every call routes through the broker. VERIFIED on Mason's Mac — agent wrote
+      test.md, read it back ("hello world"), and when asked to read /etc/passwd the MODEL WAS
+      REFUSED by the jail and said "I can only access files within the user's chosen folder."
+      Brain + jail FUSED. Clean scrollable transcript UI. (Streaming = Phase-1 nicety;
+      non-streamed act-loop works.) Bugs fixed: 404 model IDs (query account for models);
+      read-back ENOTDIR errno20 (empty-tail join added trailing slash — return canonical
+      ancestor directly).
 - [ ] **M0.4** Freeze the four contracts (`ToolDef` + broker RPC + `Capability` enum + folder
       lock) — see `CONTRACTS.md`.
 - [x] **✅ GATE PASSED (2026-07-23)** — jail proven against an active adversary: 10/10 Rust
