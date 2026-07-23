@@ -16,6 +16,8 @@ import { BrokerClient } from "./broker/client.js";
 // and validates Origin. localhost is NOT access control on its own.
 const WS_TOKEN = process.env.AYGENT_WS_TOKEN;
 const WS_SOCKET = process.env.AYGENT_WS_SOCKET; // prefer a unix socket if provided
+const BROKER_PORT = process.env.AYGENT_BROKER_PORT;   // Rust-hosted broker WS (M0.2b)
+const BROKER_TOKEN = process.env.AYGENT_BROKER_TOKEN;
 
 if (!WS_TOKEN) {
   // Fail closed: without the token the daemon has no legitimate client.
@@ -25,7 +27,26 @@ if (!WS_TOKEN) {
 
 async function main() {
   const broker = new BrokerClient(); // talks to the Rust broker; NO local fs
-  void broker; // wired in M0.2
+
+  // M0.2b: connect to the Rust-hosted broker WS as an authed client, then
+  // self-test the jail from the DAEMON side (admit inside, refuse outside).
+  if (BROKER_PORT && BROKER_TOKEN) {
+    try {
+      const { BrokerWsTransport } = await import("./broker/transport.js");
+      const transport = new BrokerWsTransport(Number(BROKER_PORT), BROKER_TOKEN);
+      broker.attach(transport);
+
+      const inside = await broker.resolve("default", "aygent-selftest.txt", "w");
+      const outside = await broker.resolve("default", "/etc/passwd", "r");
+      const insideStr = inside.ok ? "ADMIT" : "refuse:" + inside.error;
+      const outsideStr = outside.ok ? "ADMIT(!!)" : "refuse:" + outside.error;
+      console.error(`[aygent] broker self-test: inside=${insideStr} outside=${outsideStr}`);
+    } catch (e) {
+      console.error("[aygent] broker connect failed:", e);
+    }
+  } else {
+    console.error("[aygent] no broker WS coords — broker calls will fail (dev without folder).");
+  }
 
   const { port } = await startWsServer({
     token: WS_TOKEN!,

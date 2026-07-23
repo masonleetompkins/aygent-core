@@ -5,6 +5,7 @@
 // per-session WS token (C6) and hands it + the daemon port to the UI.
 
 mod broker;
+mod broker_ws;
 mod supervisor;
 
 use std::sync::Arc;
@@ -90,20 +91,36 @@ pub fn run() {
         ws_token: mint_ws_token(),
         ..Default::default()
     });
+    let broker = broker::Broker::new();
+    // Separate per-session token for the broker WS (jail-boundary channel).
+    let broker_token = mint_ws_token();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(broker::Broker::new())
+        .manage(broker.clone())
         .manage(state.clone())
         .invoke_handler(tauri::generate_handler![daemon_info, pick_agent_folder, broker_probe])
         .setup(move |_app| {
-            // M0.1: launch the daemon so the UI<->daemon WS loop works.
-            // jailed=false in dev (build the loop first); the macOS Seatbelt
-            // jail (jailed=true) is finalized in M0.2.
-            let jailed = false;
-            if let Err(e) = supervisor::spawn_daemon(state.clone(), jailed) {
-                eprintln!("[aygent] daemon spawn failed: {e}");
-            }
+            let broker = broker.clone();
+            let state = state.clone();
+            let broker_token = broker_token.clone();
+            // Start the Rust-hosted broker WS server (M0.2b), then spawn the
+            // daemon, handing it the broker-WS {port, token} so it can connect
+            // as an authed client. jailed=false in dev; Seatbelt (jailed=true)
+            // is finalized later in M0.2.
+            tauri::async_runtime::spawn(async move {
+                match broker_ws::start(broker, broker_token.clone()).await {
+                    Ok(broker_port) => {
+                        let jailed = false;
+                        if let Err(e) = supervisor::spawn_daemon(
+                            state.clone(), jailed, broker_port, &broker_token,
+                        ) {
+                            eprintln!("[aygent] daemon spawn failed: {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("[aygent] broker-ws failed to start: {e}"),
+                }
+            });
             Ok(())
         })
         .run(tauri::generate_context!())

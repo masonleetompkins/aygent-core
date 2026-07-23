@@ -21,7 +21,12 @@ pub struct DaemonState {
 /// Launch the daemon. `jailed` selects Seatbelt (true, macOS Folder Mode) vs a
 /// plain dev launch (false). Captures the `AYGENT_WS_PORT=NNNN` line the daemon
 /// prints and stores it in state.
-pub fn spawn_daemon(state: Arc<DaemonState>, jailed: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub fn spawn_daemon(
+    state: Arc<DaemonState>,
+    jailed: bool,
+    broker_port: u16,
+    broker_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let daemon_entry = std::env::var("AYGENT_DAEMON_ENTRY")
         .unwrap_or_else(|_| "../daemon/dist/index.js".to_string());
 
@@ -41,6 +46,9 @@ pub fn spawn_daemon(state: Arc<DaemonState>, jailed: bool) -> Result<(), Box<dyn
 
     let mut child = cmd
         .env("AYGENT_WS_TOKEN", &state.ws_token)
+        // Broker WS coordinates so the (jailed) daemon can reach the Rust broker.
+        .env("AYGENT_BROKER_PORT", broker_port.to_string())
+        .env("AYGENT_BROKER_TOKEN", broker_token)
         .stderr(Stdio::piped())
         .stdout(Stdio::inherit())
         .spawn()?;
