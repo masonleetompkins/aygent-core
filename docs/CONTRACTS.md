@@ -1,7 +1,19 @@
 # The Four Frozen Contracts (Atlas S2)
 
-_Frozen at the Phase-0 gate (M0.4). These are what we live with; churning them later reworks
-every tool. Do not change without a migration plan._
+_**FROZEN at the Phase-0 gate (M0.4 — 2026-07-23).** These are what we live with; churning them
+later reworks every tool. Do not change without a migration plan._
+
+## M0.4 freeze status (verified against shipped code)
+| Contract | Shape frozen | Impl status (2026-07-23) |
+|---|---|---|
+| 1. `ToolDef` | ✅ | Shape frozen. Agent loop currently registers builtin fs tools inline (Rust); the generic registry that consumes `ToolDef` lands with MCP/connectors in Phase 1. |
+| 2. Broker RPC | ✅ | Resolution FROZEN + LIVE (atomic openat/O_NOFOLLOW, component-compare, nlink, firmlink/tmp, gate-tested). Daemon-facing WS currently returns *content* (proven end-to-end). Opaque `Handle` object API + `acquireLock` + bookmark-stale re-acquire land P1 (checkpoints/multi-agent). |
+| 3. `Capability` enum | ✅ | FROZEN + enforced (M0.2b): `grantsFor(mode)` + gate + MCP transport split. `daemon/src/core/capabilities.ts`. |
+| 4. Folder-lock protocol | ✅ | Design FROZEN. Implementation lands with checkpoints (C4) + shared pools (C5) in Phase 1 — single-writer file ops don't need it yet. |
+
+_Rule for changes: if a change touches a frozen SHAPE (type/enum/RPC signature), it needs a
+migration note here first. Filling in deferred IMPL against the frozen shape is normal Phase-1
+work, not a contract change._
 
 ---
 
