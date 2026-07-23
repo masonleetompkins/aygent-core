@@ -6,6 +6,8 @@
 
 mod broker;
 mod broker_ws;
+mod keychain;
+mod provider;
 mod supervisor;
 
 use std::sync::Arc;
@@ -85,6 +87,29 @@ fn broker_probe(
     }
 }
 
+// --- M0.3: provider key (Keychain) + Anthropic end-to-end -------------------
+
+/// Store a provider API key in the macOS Keychain. Key never returns to JS.
+#[tauri::command]
+fn set_provider_key(provider: String, key: String) -> Result<(), String> {
+    keychain::set_key(&provider, &key)
+}
+
+/// UI-safe check: does a key exist? Returns bool, never the secret.
+#[tauri::command]
+fn has_provider_key(provider: String) -> bool {
+    keychain::has_key(&provider)
+}
+
+/// M0.3 end-to-end proof: fetch the Anthropic key from Keychain (Rust-side
+/// only), call the model, return the text. The key NEVER enters JS/WebView.
+#[tauri::command]
+async fn anthropic_test(prompt: String) -> Result<String, String> {
+    let key = keychain::get_key("anthropic")
+        .map_err(|_| "no anthropic key set — add one first".to_string())?;
+    provider::anthropic_complete(&key, "claude-3-5-haiku-20241022", &prompt).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let state = Arc::new(DaemonState {
@@ -99,7 +124,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(broker.clone())
         .manage(state.clone())
-        .invoke_handler(tauri::generate_handler![daemon_info, pick_agent_folder, broker_probe])
+        .invoke_handler(tauri::generate_handler![
+            daemon_info, pick_agent_folder, broker_probe,
+            set_provider_key, has_provider_key, anthropic_test
+        ])
         .setup(move |_app| {
             let broker = broker.clone();
             let state = state.clone();

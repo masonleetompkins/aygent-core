@@ -23,13 +23,15 @@ rand = "0.8"                       # per-session WS token (Atlas C6)
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros"] }  # async command + broker WS
 tokio-tungstenite = "0.24"         # Rust-hosted broker WS server (M0.2b)
 futures-util = "0.3"
+keyring = { version = "3", features = ["apple-native"] }  # API keys in macOS Keychain (M0.3; never touch JS/WebView)
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }  # Anthropic HTTP (M0.3)
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"                        # atomic openat/O_NOFOLLOW fd layer (M0.2c)
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # scoped-bookmark + security-scoped resource access goes through objc2 bindings;
-# added in M0.2 when we wire the real folder picker + bookmark persistence.
+# added when we wire bookmark persistence (deferred Phase-1 polish).
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
