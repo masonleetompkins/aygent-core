@@ -118,11 +118,22 @@ impl Broker {
             root.join(req)
         };
 
-        // Rule 8: reject forbidden system roots outright (firmlink-aware).
-        let cand_str = candidate.to_string_lossy();
-        for p in FORBIDDEN_PREFIXES {
-            if cand_str == *p || cand_str.starts_with(&format!("{p}/")) {
-                return Err(BrokerError::Forbidden);
+        // Rule 8: reject forbidden system roots — BUT ONLY when the target is
+        // NOT inside the agent's own root. On macOS a legit root often lives
+        // under /var/folders (temp) or similar; a path inside root is fine even
+        // if root sits under a "forbidden" prefix. We only forbid when the
+        // request tries to REACH a system location OUTSIDE root.
+        //
+        // canonicalize root once for the containment tests below.
+        let real_root = std::fs::canonicalize(root).map_err(|_| BrokerError::NoScope)?;
+        if !is_within(&real_root, &candidate) {
+            // target is outside root by lexical path -> apply forbidden check +
+            // it will also fail the ancestor containment test below.
+            let cand_str = candidate.to_string_lossy();
+            for p in FORBIDDEN_PREFIXES {
+                if cand_str == *p || cand_str.starts_with(&format!("{p}/")) {
+                    return Err(BrokerError::Forbidden);
+                }
             }
         }
 
@@ -141,7 +152,7 @@ impl Broker {
 
         // Rule 4/5/6: component-boundary compare against the canonical root
         // (canonicalize resolves firmlinks + case via the filesystem itself).
-        let real_root = std::fs::canonicalize(root).map_err(|_| BrokerError::NoScope)?;
+        // real_root computed above.
         if !is_within(&real_root, &real_ancestor) {
             return Err(BrokerError::SymlinkEscape);
         }
