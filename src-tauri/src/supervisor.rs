@@ -1,14 +1,15 @@
 // AYGENT — daemon supervisor.
 // The ONLY code allowed to launch the Node daemon (Atlas C1). On macOS it
 // launches the daemon UNDER a sandbox-exec profile that denies file+exec, so
-// the daemon physically cannot bypass the Rust path broker. In dev (or before
-// the Seatbelt profile is finalized in M0.2) a plain launch is used so the
-// UI<->daemon WS loop can be built and tested first.
+// the daemon physically cannot bypass the Rust path broker.
 //
-// M0.1: launch the daemon, capture the WS port it prints on stderr, store it
-// in shared state so the `daemon_info` Tauri command can hand it to the UI.
+// M0.2(e): the Seatbelt profile has <<NODE_BIN>> and <<APP_BUNDLE_SUBPATH>>
+// templates. We resolve the real node binary + daemon dir and fill them in,
+// writing the concrete profile to a temp file before launching. This is what
+// prevents the `execvp of node failed` gotcha (the profile must allow reading
+// + exec of the node binary while still denying the user's folders).
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -18,9 +19,59 @@ pub struct DaemonState {
     pub ws_port: Mutex<Option<u16>>,
 }
 
+/// Find the absolute path to `node` (Seatbelt needs the concrete binary path;
+/// `execvp` inside the jail can't do a PATH search once fs is denied).
+fn resolve_node_bin() -> Option<String> {
+    if let Ok(explicit) = std::env::var("AYGENT_NODE_BIN") {
+        return Some(explicit);
+    }
+    // `which node` (run OUTSIDE the jail — this is the privileged supervisor).
+    let out = Command::new("/usr/bin/which").arg("node").output().ok()?;
+    if out.status.success() {
+        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !p.is_empty() {
+            // canonicalize (homebrew symlinks node -> ../Cellar/...) so the
+            // profile allows the REAL binary path.
+            return std::fs::canonicalize(&p).ok().map(|c| c.to_string_lossy().to_string()).or(Some(p));
+        }
+    }
+    None
+}
+
+/// Build a concrete Seatbelt profile from the template, filling in the resolved
+/// node binary + daemon dir, and write it to a temp file. Returns its path.
+fn materialize_profile(node_bin: &str, daemon_dir: &str) -> std::io::Result<std::path::PathBuf> {
+    let template_path = std::env::var("AYGENT_SEATBELT_PROFILE")
+        .unwrap_or_else(|_| "../seatbelt/folder-mode.sb".to_string());
+    let template = std::fs::read_to_string(&template_path)?;
+
+    // node lives in a bin dir; allow reading that dir's tree (dylibs, ICU data).
+    let node_dir = std::path::Path::new(node_bin)
+        .parent()
+        .and_then(|p| p.parent()) // .../bin/node -> allow the install prefix
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "/usr/local".to_string());
+
+    let concrete = template
+        .replace("<<NODE_BIN>>", node_bin)
+        .replace("<<APP_BUNDLE_SUBPATH>>", daemon_dir)
+        // extra: allow the node install prefix so its dylibs/ICU resolve
+        .replace(
+            "(allow process-exec (literal \"<<NODE_BIN>>\"))",
+            &format!(
+                "(allow process-exec (literal \"{node_bin}\"))\n(allow file-read* (subpath \"{node_dir}\"))"
+            ),
+        );
+
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("aygent-folder-mode-{}.sb", std::process::id()));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(concrete.as_bytes())?;
+    Ok(tmp)
+}
+
 /// Launch the daemon. `jailed` selects Seatbelt (true, macOS Folder Mode) vs a
-/// plain dev launch (false). Captures the `AYGENT_WS_PORT=NNNN` line the daemon
-/// prints and stores it in state.
+/// plain dev launch (false). Captures the `AYGENT_WS_PORT=NNNN` line + drains stderr.
 pub fn spawn_daemon(
     state: Arc<DaemonState>,
     jailed: bool,
@@ -29,16 +80,24 @@ pub fn spawn_daemon(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let daemon_entry = std::env::var("AYGENT_DAEMON_ENTRY")
         .unwrap_or_else(|_| "../daemon/dist/index.js".to_string());
+    // daemon dir = the tree the jailed node is allowed to READ (its own code).
+    let daemon_dir = std::fs::canonicalize(
+        std::path::Path::new(&daemon_entry)
+            .parent()
+            .unwrap_or(std::path::Path::new(".")),
+    )
+    .map(|p| p.to_string_lossy().to_string())
+    .unwrap_or_else(|_| "../daemon/dist".to_string());
 
     let mut cmd = if jailed {
-        // macOS Folder Mode: node runs INSIDE the Seatbelt jail (deny file+exec).
-        let profile = std::env::var("AYGENT_SEATBELT_PROFILE")
-            .unwrap_or_else(|_| "../seatbelt/folder-mode.sb".to_string());
+        let node_bin = resolve_node_bin()
+            .ok_or("could not resolve node binary for Seatbelt launch")?;
+        let profile = materialize_profile(&node_bin, &daemon_dir)?;
+        eprintln!("[aygent] jailed launch: node={node_bin} profile={}", profile.display());
         let mut c = Command::new("sandbox-exec");
-        c.arg("-f").arg(&profile).arg("node").arg(&daemon_entry);
+        c.arg("-f").arg(&profile).arg(&node_bin).arg(&daemon_entry);
         c
     } else {
-        // Dev / pre-M0.2: plain launch so we can build the WS loop first.
         let mut c = Command::new("node");
         c.arg(&daemon_entry);
         c
@@ -46,14 +105,12 @@ pub fn spawn_daemon(
 
     let mut child = cmd
         .env("AYGENT_WS_TOKEN", &state.ws_token)
-        // Broker WS coordinates so the (jailed) daemon can reach the Rust broker.
         .env("AYGENT_BROKER_PORT", broker_port.to_string())
         .env("AYGENT_BROKER_TOKEN", broker_token)
         .stderr(Stdio::piped())
         .stdout(Stdio::inherit())
         .spawn()?;
 
-    // Read the daemon's stderr to catch the WS port line, then keep draining.
     if let Some(stderr) = child.stderr.take() {
         let state = state.clone();
         std::thread::spawn(move || {
@@ -71,10 +128,7 @@ pub fn spawn_daemon(
         });
     }
 
-    eprintln!(
-        "[aygent] daemon spawned (jailed={jailed}) entry={daemon_entry}"
-    );
-    // Intentionally not waiting; daemon runs for the app lifetime.
+    eprintln!("[aygent] daemon spawned (jailed={jailed}) entry={daemon_entry}");
     std::mem::forget(child);
     Ok(())
 }
