@@ -7,7 +7,10 @@ set -uo pipefail
 NODE_BIN="$(which node)"
 NODE_BIN="$(readlink -f "$NODE_BIN" 2>/dev/null || echo "$NODE_BIN")"
 NODE_PREFIX="$(dirname "$(dirname "$NODE_BIN")")"
-DAEMON_DIR="$(cd daemon/dist && pwd)"
+# Allow the WHOLE daemon package (dist/ + node_modules/), not just dist/,
+# or node can't load its deps (ws/index.js) -> EPERM at boot.
+DAEMON_DIR="$(cd daemon && pwd)"
+DAEMON_ENTRY="$DAEMON_DIR/dist/index.js"
 PROFILE="/tmp/aygent-jail-test.sb"
 
 echo "==> node: $NODE_BIN"
@@ -28,7 +31,7 @@ echo "-----------------------------------------------------------------"
 AYGENT_WS_TOKEN=diagtoken \
 AYGENT_BROKER_PORT=1 \
 AYGENT_BROKER_TOKEN=diagtoken \
-sandbox-exec -f "$PROFILE" "$NODE_BIN" "$DAEMON_DIR/index.js"
+sandbox-exec -f "$PROFILE" "$NODE_BIN" "$DAEMON_ENTRY"
 
 echo "-----------------------------------------------------------------"
 echo "==> daemon exited with code $?"

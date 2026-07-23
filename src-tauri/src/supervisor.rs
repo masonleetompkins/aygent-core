@@ -81,13 +81,15 @@ pub fn spawn_daemon(
     let daemon_entry = std::env::var("AYGENT_DAEMON_ENTRY")
         .unwrap_or_else(|_| "../daemon/dist/index.js".to_string());
     // daemon dir = the tree the jailed node is allowed to READ (its own code).
-    let daemon_dir = std::fs::canonicalize(
-        std::path::Path::new(&daemon_entry)
-            .parent()
-            .unwrap_or(std::path::Path::new(".")),
-    )
-    .map(|p| p.to_string_lossy().to_string())
-    .unwrap_or_else(|_| "../daemon/dist".to_string());
+    // MUST be the whole daemon/ package (dist/ + node_modules/), NOT just dist/,
+    // or node can't load its own deps (e.g. ws/index.js) -> EPERM at boot.
+    // dist/index.js -> parent=dist -> parent=daemon/  (the package root).
+    let daemon_dir = std::path::Path::new(&daemon_entry)
+        .parent()                       // .../daemon/dist
+        .and_then(|p| p.parent())       // .../daemon
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "../daemon".to_string());
 
     let mut cmd = if jailed {
         let node_bin = resolve_node_bin()
