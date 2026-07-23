@@ -15,9 +15,12 @@
 (deny default)
 
 ;; --- allow the daemon to run as a normal process (but NOT spawn children) ---
-(allow process-info-pidinfo)
+(allow process-info*)
 (allow sysctl-read)
 (allow mach-lookup)                     ;; needed for basic runtime services
+(allow signal (target self))
+(allow system-socket)                   ;; node libuv / loopback sockets
+(allow iokit-open)                      ;; node runtime probes some iokit props
 
 ;; --- HARD DENY: no arbitrary execution in Folder Mode (Atlas C3) ---
 (deny process-exec*)
@@ -45,9 +48,20 @@
   (subpath "/opt/homebrew")        ;; apple-silicon homebrew (dev)
   (subpath "/usr/share")
   (subpath "/System/Library")
+  (subpath "/System/Volumes/Preboot/Cryptexes")  ;; dyld shared cache (macOS 13+)
+  (literal "/")                    ;; stat the root (node startup)
   (literal "/dev/null")
+  (literal "/dev/zero")
   (literal "/dev/random")
-  (literal "/dev/urandom"))
+  (literal "/dev/urandom")
+  (literal "/dev/dtracehelper")
+  (subpath "/dev/fd"))
+;; node/libuv need read+write on some /dev + tty + pipe fds
+(allow file-write*
+  (literal "/dev/null")
+  (literal "/dev/dtracehelper")
+  (subpath "/dev/fd"))
+(allow file-read-metadata)          ;; stat() up ancestor chains during boot
 
 ;; app bundle resources (daemon code, bundled node, pinned git binary path is
 ;; NOT here — git is invoked by the Rust side, not the daemon)
