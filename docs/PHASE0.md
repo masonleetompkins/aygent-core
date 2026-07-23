@@ -38,7 +38,12 @@ under the real Seatbelt profile. Rushing this defeats the entire product._
       REMAINING (minor, deferred): security-scoped bookmark persistence + stale handling
          (folder currently re-picked each launch) — not gate-blocking; a Phase-1 polish item.
 - [ ] **M0.2b** MCP transport capability split (`mcp.net` vs `mcp.local-exec`) enforced now.
-- [ ] **M0.3** Anthropic end-to-end: key→Keychain→loop→one handle-based jailed fs tool→stream.
+- [x] **M0.3 ✅ DONE (2026-07-23)** Anthropic end-to-end VERIFIED on Mason's Mac: API key in
+      macOS Keychain (never enters JS), key fetched Rust-side, account queried for available
+      models (robust vs guessing IDs), real completion returned — `[claude-haiku-4-5-20251001]
+      Hello!`. Providers card in UI (save key / send prompt). REMAINING for full M0.3: route
+      through the AGENT LOOP + one jailed fs tool + streaming (current path is a direct
+      one-shot completion). Provider plumbing + Keychain + model discovery all proven.
 - [ ] **M0.4** Freeze the four contracts (`ToolDef` + broker RPC + `Capability` enum + folder
       lock) — see `CONTRACTS.md`.
 - [x] **✅ GATE PASSED (2026-07-23)** — jail proven against an active adversary: 10/10 Rust
