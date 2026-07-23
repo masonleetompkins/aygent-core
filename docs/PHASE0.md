@@ -17,7 +17,9 @@ under the real Seatbelt profile. Rushing this defeats the entire product._
       ✅ 2026-07-23 (d): native folder picker (async, non-blocking) + broker scope
          registration + live jail-probe UI, working on Mason's Mac (folder chosen).
       ✅ 2026-07-23 (b): Rust-hosted broker WS (privileged server) + daemon authed client
-         + daemon-side jail self-test (admit inside / refuse outside). Two-channel trust
+         + daemon-side jail self-test. VERIFIED END-TO-END on Mason's Mac: after folder pick,
+         daemon reports `inside=ADMIT · outside=refuse:Forbidden`. The jailed brain can reach
+         inside the chosen folder and is structurally refused /etc/passwd. Two-channel trust
          model (UI<->daemon, daemon<->Rust broker) per BROKER-RPC-DECISION.md.
       REMAINING: real openat/O_NOFOLLOW fd layer; security-scoped bookmark persistence +
          stale handling; wire real Seatbelt launch + fs-level TOCTOU/hardlink tests.
