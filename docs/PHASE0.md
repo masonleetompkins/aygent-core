@@ -8,9 +8,15 @@ under the real Seatbelt profile. Rushing this defeats the entire product._
       **WS auth working** (per-session token + Origin — Atlas C6); UI<->daemon handshake live.
       Verified on Mason's Mac: teal pill `● daemon connected ✓ (:61439, 0ms)`. Full three-layer
       stack (Rust shell -> Node daemon -> authenticated WS -> React UI) alive end to end.
-- [ ] **M0.2** Seatbelt profile denies file+exec for the daemon (Atlas C1) + handle-based
+- [~] **M0.2** Seatbelt profile denies file+exec for the daemon (Atlas C1) + handle-based
       Rust broker (atomic openat/O_NOFOLLOW/component-compare/nlink/firmlink/case/stale —
       Atlas C2) + folder picker + scoped bookmark.
+      ✅ 2026-07-23: broker RESOLUTION LOGIC done + 8/8 Rust escape tests PASS on macOS
+         (traversal, absolute, sibling-prefix, symlink mid-path + final, /tmp forbidden,
+         legit existing + new files admitted).
+      REMAINING: (a) RPC bridge Rust<->daemon (handle-based); (b) real openat/O_NOFOLLOW fd
+         layer; (c) folder picker + security-scoped bookmark; (d) wire real Seatbelt launch
+         (node-exec allow already patched); (e) fs-level TOCTOU/hardlink tests under Seatbelt.
 - [ ] **M0.2b** MCP transport capability split (`mcp.net` vs `mcp.local-exec`) enforced now.
 - [ ] **M0.3** Anthropic end-to-end: key→Keychain→loop→one handle-based jailed fs tool→stream.
 - [ ] **M0.4** Freeze the four contracts (`ToolDef` + broker RPC + `Capability` enum + folder
