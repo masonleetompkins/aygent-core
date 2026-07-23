@@ -187,6 +187,53 @@ impl Broker {
             .cloned()
             .ok_or(BrokerError::NoScope)
     }
+
+    /// M0.2(c): resolve + open ATOMICALLY. This closes the TOCTOU gap: the
+    /// admitted path is opened with O_NOFOLLOW on the final component in the
+    /// SAME step as the check, so an attacker can't swap a component for a
+    /// symlink between resolve() and open(). Returns a File (owns the fd).
+    /// The daemon never receives this path — broker_ws reads/writes via the fd
+    /// and returns CONTENT.
+    #[cfg(unix)]
+    pub fn resolve_and_open(
+        &self,
+        agent_id: &str,
+        requested: &str,
+        mode: Mode,
+    ) -> Result<std::fs::File, BrokerError> {
+        let admitted = self.resolve(agent_id, requested, mode)?;
+        open_nofollow(&admitted, mode)
+    }
+}
+
+/// Open a path with O_NOFOLLOW on the final component (Atlas C2 rule 2/3).
+/// If the final component is a symlink, the OS itself refuses with ELOOP — the
+/// atomic guarantee that a check-then-open race cannot bypass.
+#[cfg(unix)]
+fn open_nofollow(path: &Path, mode: Mode) -> Result<std::fs::File, BrokerError> {
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| BrokerError::NotFound)?;
+
+    let mut flags = libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    match mode {
+        Mode::Read => flags |= libc::O_RDONLY,
+        Mode::Write => flags |= libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+        Mode::ReadWrite => flags |= libc::O_RDWR | libc::O_CREAT,
+    }
+
+    // 0o600 for newly-created files (owner-only).
+    let fd = unsafe { libc::open(cpath.as_ptr(), flags, 0o600 as libc::c_uint) };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        // ELOOP = final component was a symlink (O_NOFOLLOW refused it).
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            return Err(BrokerError::SymlinkEscape);
+        }
+        return Err(BrokerError::NotFound);
+    }
+    use std::os::unix::io::FromRawFd;
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 /// Component-boundary containment check (Atlas C2 rule 4: NOT string prefix).

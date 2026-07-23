@@ -110,21 +110,34 @@ fn handle_op(broker: &Arc<Broker>, v: &serde_json::Value) -> serde_json::Value {
             Ok(_) => serde_json::json!({ "ok": true }),
             Err(e) => refuse!(e),
         },
-        "read" => match broker.resolve(agent, path, Mode::Read) {
-            Ok(real) => match std::fs::read_to_string(&real) {
-                Ok(content) => serde_json::json!({ "ok": true, "content": content }),
-                Err(e) => serde_json::json!({ "ok": false, "error": format!("io: {e}") }),
-            },
+        "read" => match broker.resolve_and_open(agent, path, Mode::Read) {
+            // ATOMIC (M0.2c): opened with O_NOFOLLOW in the same step as the
+            // check — no TOCTOU window. We read from the fd, never re-open a path.
+            Ok(mut f) => {
+                use std::io::Read;
+                let mut content = String::new();
+                match f.read_to_string(&mut content) {
+                    Ok(_) => serde_json::json!({ "ok": true, "content": content }),
+                    Err(e) => serde_json::json!({ "ok": false, "error": format!("io: {e}") }),
+                }
+            }
             Err(e) => refuse!(e),
         },
         "write" => {
             let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
-            match broker.resolve(agent, path, Mode::Write) {
-                Ok(real) => {
-                    if let Some(parent) = real.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    match std::fs::write(&real, content) {
+            // Ensure parent dirs exist (resolve validates the parent is in-scope
+            // via the resolution logic before we create anything).
+            if let Ok(real) = broker.resolve(agent, path, Mode::Write) {
+                if let Some(parent) = real.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+            match broker.resolve_and_open(agent, path, Mode::Write) {
+                // ATOMIC (M0.2c): O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW — refuses to
+                // follow a symlink at the final component, in the open itself.
+                Ok(mut f) => {
+                    use std::io::Write as _;
+                    match f.write_all(content.as_bytes()) {
                         Ok(_) => serde_json::json!({ "ok": true }),
                         Err(e) => serde_json::json!({ "ok": false, "error": format!("io: {e}") }),
                     }

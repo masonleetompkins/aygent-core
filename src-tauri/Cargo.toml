@@ -24,6 +24,9 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", 
 tokio-tungstenite = "0.24"         # Rust-hosted broker WS server (M0.2b)
 futures-util = "0.3"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"                        # atomic openat/O_NOFOLLOW fd layer (M0.2c)
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # scoped-bookmark + security-scoped resource access goes through objc2 bindings;
 # added in M0.2 when we wire the real folder picker + bookmark persistence.
