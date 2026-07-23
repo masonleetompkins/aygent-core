@@ -107,7 +107,8 @@ fn has_provider_key(provider: String) -> bool {
 async fn anthropic_test(prompt: String) -> Result<String, String> {
     let key = keychain::get_key("anthropic")
         .map_err(|_| "no anthropic key set — add one first".to_string())?;
-    provider::anthropic_complete(&key, "claude-3-5-haiku-20241022", &prompt).await
+    // Use a current, stable alias (no dated suffix that can 404 on newer accounts).
+    provider::anthropic_complete(&key, "claude-3-5-haiku-latest", &prompt).await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
