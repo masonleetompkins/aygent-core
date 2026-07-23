@@ -1,0 +1,29 @@
+[package]
+name = "aygent"
+version = "0.0.1"
+description = "The AI agent you actually own"
+authors = ["Mason Tompkins"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "aygent_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"          # native folder picker (M0.2)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+rand = "0.8"                       # per-session WS token (Atlas C6)
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# scoped-bookmark + security-scoped resource access goes through objc2 bindings;
+# added in M0.2 when we wire the real folder picker + bookmark persistence.
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

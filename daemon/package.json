@@ -1,0 +1,21 @@
+{
+  "name": "aygent-daemon",
+  "version": "0.0.1",
+  "description": "AYGENT daemon — the brain. Runs under a Seatbelt jail; no ambient fs/exec.",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "lint:no-fs": "node scripts/lint-no-ambient-fs.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.6.0"
+  }
+}
