@@ -175,8 +175,16 @@ impl Broker {
 
         // Rebuild the admitted path rooted at the REAL root (canonical), joining
         // the portion of the request beyond the existing ancestor.
+        // BUGFIX (errno 20 ENOTDIR on read-back): when the file already EXISTS,
+        // existing_ancestor == candidate, so tail is empty and `join("")` would
+        // append a trailing separator -> kernel reads `file/` -> ENOTDIR. In
+        // that case return the canonical ancestor directly.
         let tail = candidate.strip_prefix(&existing_ancestor).unwrap_or(Path::new(""));
-        Ok(real_ancestor.join(tail))
+        if tail.as_os_str().is_empty() {
+            Ok(real_ancestor)
+        } else {
+            Ok(real_ancestor.join(tail))
+        }
     }
 
     fn scope_for(&self, agent_id: &str) -> Result<AgentScope, BrokerError> {
