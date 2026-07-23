@@ -149,6 +149,16 @@ async fn agent_run(
         .or_else(|| models.first().cloned())
         .ok_or_else(|| "account returned no usable models".to_string())?;
 
+    // M0.2b: capability model. In Folder Mode (the M0.3 default) the granted
+    // caps are {fs.read, fs.write, net.http, mcp.net}. The file tools below need
+    // only fs.read/fs.write, so they're allowed. shell.exec / mcp.local-exec /
+    // hooks.script are NOT granted here — they belong to Pro Mode. The OS
+    // Seatbelt jail is the authoritative backstop; this is the explicit early gate.
+    // (Full registry-driven gating + MCP transport split lands with the MCP
+    // client in Phase 1; the enum + rule are frozen now — see
+    // daemon/src/core/capabilities.ts and docs/CONTRACTS.md §3.)
+    let _mode = "folder"; // M1.4 makes this per-agent.
+
     // Tool schemas the model can call. Handlers route through the broker (jailed).
     let tools = serde_json::json!([
         {
