@@ -16,9 +16,11 @@ under the real Seatbelt profile. Rushing this defeats the entire product._
          legit existing + new files admitted).
       ✅ 2026-07-23 (d): native folder picker (async, non-blocking) + broker scope
          registration + live jail-probe UI, working on Mason's Mac (folder chosen).
-      REMAINING: (a) RPC bridge Rust<->daemon (handle-based) so the DAEMON calls the broker;
-         (b) real openat/O_NOFOLLOW fd layer; (c) security-scoped bookmark persistence +
-         stale handling; (e) wire real Seatbelt launch + fs-level TOCTOU/hardlink tests.
+      ✅ 2026-07-23 (b): Rust-hosted broker WS (privileged server) + daemon authed client
+         + daemon-side jail self-test (admit inside / refuse outside). Two-channel trust
+         model (UI<->daemon, daemon<->Rust broker) per BROKER-RPC-DECISION.md.
+      REMAINING: real openat/O_NOFOLLOW fd layer; security-scoped bookmark persistence +
+         stale handling; wire real Seatbelt launch + fs-level TOCTOU/hardlink tests.
 - [ ] **M0.2b** MCP transport capability split (`mcp.net` vs `mcp.local-exec`) enforced now.
 - [ ] **M0.3** Anthropic end-to-end: key→Keychain→loop→one handle-based jailed fs tool→stream.
 - [ ] **M0.4** Freeze the four contracts (`ToolDef` + broker RPC + `Capability` enum + folder
