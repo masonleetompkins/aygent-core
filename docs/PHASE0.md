@@ -37,7 +37,10 @@ under the real Seatbelt profile. Rushing this defeats the entire product._
          paths. This is the reason M0.2 exists.
       REMAINING (minor, deferred): security-scoped bookmark persistence + stale handling
          (folder currently re-picked each launch) — not gate-blocking; a Phase-1 polish item.
-- [ ] **M0.2b** MCP transport capability split (`mcp.net` vs `mcp.local-exec`) enforced now.
+- [x] **M0.2b ✅ DONE (2026-07-23)** Capability model frozen + MCP transport split enforced:
+      `grantsFor(mode)` (Folder = fs.read/fs.write/net.http/mcp.net; Pro adds shell.exec/
+      hooks.script/mcp.local-exec), a `gate()`, and `mcpCapabilityForTransport()` (stdio =
+      mcp.local-exec Pro-only; http/sse = mcp.net Folder-OK). `daemon/src/core/capabilities.ts`.
 - [x] **M0.3 ✅ DONE (2026-07-23)** Anthropic end-to-end VERIFIED on Mason's Mac: API key in
       macOS Keychain (never enters JS), key fetched Rust-side, account queried for available
       models (robust vs guessing IDs), real completion returned — `[claude-haiku-4-5-20251001]
@@ -50,8 +53,12 @@ under the real Seatbelt profile. Rushing this defeats the entire product._
       non-streamed act-loop works.) Bugs fixed: 404 model IDs (query account for models);
       read-back ENOTDIR errno20 (empty-tail join added trailing slash — return canonical
       ancestor directly).
-- [ ] **M0.4** Freeze the four contracts (`ToolDef` + broker RPC + `Capability` enum + folder
-      lock) — see `CONTRACTS.md`.
+- [x] **M0.4 ✅ DONE (2026-07-23)** Four contracts FROZEN with a verified impl-status table in
+      `CONTRACTS.md` (ToolDef shape / Broker RPC resolution live / Capability enum enforced /
+      folder-lock design frozen). Shape changes now need a migration note; filling deferred
+      impl against a frozen shape is normal Phase-1 work.
+
+### 🎁 PHASE 0 COMPLETE (2026-07-23) — every milestone green. Phase 1 is unblocked.
 - [x] **✅ GATE PASSED (2026-07-23)** — jail proven against an active adversary: 10/10 Rust
       escape+gate tests green (traversal, absolute, sibling-prefix, symlink mid/final,
       /tmp forbidden, legit files, hardlink-write refused, TOCTOU race 5000x no-leak) AND
