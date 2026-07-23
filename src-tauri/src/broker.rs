@@ -230,7 +230,13 @@ fn open_nofollow(path: &Path, mode: Mode) -> Result<std::fs::File, BrokerError> 
         if err.raw_os_error() == Some(libc::ELOOP) {
             return Err(BrokerError::SymlinkEscape);
         }
-        return Err(BrokerError::NotFound);
+        // Surface the real errno instead of masking everything as NotFound
+        // (that masked the read-back bug). e.g. ENOENT vs EACCES vs EISDIR.
+        return Err(BrokerError::Io(format!(
+            "open failed (errno {:?}): {}",
+            err.raw_os_error(),
+            err
+        )));
     }
     use std::os::unix::io::FromRawFd;
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
@@ -273,6 +279,7 @@ pub enum BrokerError {
     SymlinkEscape,
     HardlinkRefused,
     NotFound,
+    Io(String),
     NotYetImplemented,
 }
 

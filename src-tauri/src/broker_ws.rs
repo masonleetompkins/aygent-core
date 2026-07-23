@@ -110,6 +110,8 @@ fn handle_op(broker: &Arc<Broker>, v: &serde_json::Value) -> serde_json::Value {
             Ok(_) => serde_json::json!({ "ok": true }),
             Err(e) => refuse!(e),
         },
+        // NOTE: broker_ws still uses resolve() + std::fs for now; the atomic
+        // resolve_and_open path (M0.2c) is exercised by the agent loop in lib.rs.
         "read" => match broker.resolve_and_open(agent, path, Mode::Read) {
             // ATOMIC (M0.2c): opened with O_NOFOLLOW in the same step as the
             // check — no TOCTOU window. We read from the fd, never re-open a path.
