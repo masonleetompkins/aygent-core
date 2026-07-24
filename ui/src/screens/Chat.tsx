@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Button, Input } from "../components/ui";
+import { Markdown } from "../components/Markdown";
 
 type ToolLine = { name: string; path: string; ok?: boolean; detail?: string };
 type Msg =
@@ -102,13 +103,16 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
     try { await invoke("conv_reorder", { folder, updates }); await refreshList(); } catch { /* ignore */ }
   }
 
-  // Persist the current conversation. Title = first user message, trimmed.
-  // Uses convIdRef so it never saves against a stale id.
+  // Persist a conversation snapshot. Reads msgs from the passed array (source of
+  // truth), derives the title from the first user message, uses convIdRef so it
+  // never saves against a stale id. Called both on SEND (so the thread appears
+  // immediately) and after the turn COMPLETES (to store the reply + history).
+  const msgsRef = useRef<Msg[]>([]);
   async function persist(nextMsgs: Msg[]) {
     const id = convIdRef.current;
     if (!folder || !id) return;
     const firstUser = nextMsgs.find((m) => m.role === "user") as { text: string } | undefined;
-    const title = (firstUser?.text ?? "New chat").slice(0, 60);
+    const title = (firstUser?.text?.trim() || "New chat").slice(0, 60);
     try {
       await invoke("conv_save", {
         folder,
@@ -123,8 +127,15 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
     if (!prompt || busy) return;
     setInput(""); setBusy(true);
 
-    setMsgs((m) => [...m, { role: "user", text: prompt },
-      { role: "assistant", text: "", tools: [], streaming: true }]);
+    // Build the next msgs array explicitly (don't rely on async state for the
+    // save). This is the source of truth we persist from.
+    const withUser: Msg[] = [...msgsRef.current, { role: "user", text: prompt }];
+    const nextMsgs: Msg[] = [...withUser, { role: "assistant", text: "", tools: [], streaming: true }];
+    msgsRef.current = nextMsgs;
+    setMsgs(nextMsgs);
+    // Persist IMMEDIATELY so the thread shows up in the sidebar with a real
+    // title the moment you send — even before the reply streams in.
+    void persist(withUser);
 
     const channel = `agent://${Date.now()}`;
 
@@ -172,11 +183,16 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
       mirror();
     } finally {
       unlisten();
-      let finalMsgs: Msg[] = [];
-      setMsgs((m) => { const c = [...m]; const l = c[c.length - 1]; if (l?.role === "assistant") l.streaming = false; finalMsgs = c; return c; });
+      // Build the final msgs array from our ref + the accumulated reply (don't
+      // read it back out of React state — that was the stale-capture save bug).
+      const finalMsgs: Msg[] = [
+        ...withUser,
+        { role: "assistant", text: acc.text, tools: acc.tools, streaming: false },
+      ];
+      msgsRef.current = finalMsgs;
+      setMsgs(finalMsgs);
       setBusy(false);
-      // Persist the completed turn (msgs + updated provider history).
-      void persist(finalMsgs);
+      void persist(finalMsgs); // store the completed turn + updated history
     }
   }
 
@@ -184,17 +200,8 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
 
   return (
     <div style={{ display: "flex", height: "calc(100vh - 130px)", gap: 16 }}>
-      {/* HISTORY SIDEBAR */}
-      {!blocked && (
-        <HistorySidebar
-          convs={convs} activeId={convId} busy={busy} dragId={dragId}
-          onNew={newConv} onOpen={openConv} onDelete={deleteConv}
-          onPin={togglePin} onDragStart={setDragId} onDropOn={onDrop}
-        />
-      )}
-
-      {/* MAIN CHAT COLUMN */}
-      <div style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0, maxWidth: 720 }}>
+      {/* MAIN CHAT COLUMN (stays centered/left; history lives on the RIGHT) */}
+      <div style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0, maxWidth: 720, margin: "0 auto" }}>
         <h2 style={{ fontSize: 22, fontWeight: 800, margin: "0 0 12px" }}>Chat</h2>
 
         {blocked && (
@@ -218,6 +225,15 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
           <Button onClick={send} disabled={blocked || busy}>{busy ? "…" : "Send"}</Button>
         </div>
       </div>
+
+      {/* HISTORY SIDEBAR — right-hand side, so the active chat stays centered */}
+      {!blocked && (
+        <HistorySidebar
+          convs={convs} activeId={convId} busy={busy} dragId={dragId}
+          onNew={newConv} onOpen={openConv} onDelete={deleteConv}
+          onPin={togglePin} onDragStart={setDragId} onDropOn={onDrop}
+        />
+      )}
     </div>
   );
 }
@@ -232,7 +248,7 @@ function HistorySidebar({
   return (
     <div style={{
       width: 230, flexShrink: 0, display: "flex", flexDirection: "column", gap: 8,
-      borderRight: "var(--border-width) solid var(--line)", paddingRight: 14,
+      borderLeft: "var(--border-width) solid var(--line)", paddingLeft: 14,
     }}>
       <Button onClick={onNew} disabled={busy}>+ New chat</Button>
       <div style={{ overflowY: "auto", display: "flex", flexDirection: "column", gap: 4, marginTop: 4 }}>
@@ -314,7 +330,9 @@ function Bubble({ m }: { m: Msg }) {
         display: "flex", flexDirection: "column", gap: 8,
       }}>
         {!isUser && m.role === "assistant" && m.tools.map((t, i) => <ToolCard key={i} t={t} />)}
-        {m.text && <span style={{ whiteSpace: "pre-wrap", lineHeight: 1.55, fontSize: 15 }}>{m.text}</span>}
+        {m.text && (isUser
+          ? <span style={{ whiteSpace: "pre-wrap", lineHeight: 1.55, fontSize: 15 }}>{m.text}</span>
+          : <Markdown text={m.text} />)}
         {!isUser && m.role === "assistant" && m.streaming && !m.text && <Thinking />}
       </div>
     </div>
