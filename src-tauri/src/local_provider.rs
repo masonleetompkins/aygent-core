@@ -173,7 +173,7 @@ fn decode(path: &str, prompt: &str, tx: tokio::sync::mpsc::UnboundedSender<Token
         if model.is_eog_token(token) { break; }
 
         let piece = model
-            .token_to_str(token, llama_cpp_2::model::Special::Tokenize)
+            .token_to_piece(token, false)
             .unwrap_or_default();
         if tx.send(TokenMsg::Text(piece)).is_err() { break; } // UI hung up
 
