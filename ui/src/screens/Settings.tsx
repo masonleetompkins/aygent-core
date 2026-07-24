@@ -337,7 +337,11 @@ function LocalModels({ folder, activePath, onChoose }: {
   }
 
   async function download(q: Quant) {
-    const channel = `dl://${q.filename}`;
+    // Tauri event names must be simple (alphanumeric/-/_/ /:) — a channel built
+    // from the filename (dots, slashes) can make listen() silently no-op, which
+    // looked exactly like a frozen 0%. Use a safe, unique channel instead.
+    const channel = `dl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setErr(null);
     setProgress((p) => ({ ...p, [q.filename]: 0 }));
     const un = await listen<any>(channel, (e) => {
       const { got, total, done } = e.payload || {};
@@ -347,7 +351,7 @@ function LocalModels({ folder, activePath, onChoose }: {
     try {
       await invoke("local_download", { channel, url: q.download_url, filename: q.filename });
       await refreshDownloaded();
-    } catch (e) { setErr(String(e)); }
+    } catch (e) { setErr(`Download failed: ${String(e)}`); }
     finally { un(); setProgress((p) => { const n = { ...p }; delete n[q.filename]; return n; }); }
   }
 
