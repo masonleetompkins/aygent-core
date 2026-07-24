@@ -146,11 +146,25 @@ fn decode(path: &str, prompt: &str, tx: tokio::sync::mpsc::UnboundedSender<Token
         .map_err(|e| format!("create context: {e}"))?;
 
     // Tokenize the prompt.
-    let tokens = model
+    let mut tokens = model
         .str_to_token(prompt, AddBos::Always)
         .map_err(|e| format!("tokenize: {e}"))?;
 
-    let mut batch = LlamaBatch::new(512, 1);
+    // The context holds CTX_TOKENS total; leave room for the reply we're about
+    // to generate. If the conversation has grown past that, keep the MOST RECENT
+    // tokens (drop the oldest) so a long chat degrades gracefully instead of
+    // erroring with "insufficient space" — the bug that surfaced after a few msgs.
+    let max_prompt = (CTX_TOKENS as usize).saturating_sub(MAX_NEW_TOKENS + 8);
+    if tokens.len() > max_prompt {
+        let drop = tokens.len() - max_prompt;
+        tokens.drain(0..drop);
+    }
+
+    // Batch capacity must cover the whole prompt (was hardcoded 512 — too small
+    // once the conversation exceeded ~512 tokens). Single-token decode steps
+    // below reuse this same batch, so sizing it to the prompt length is enough.
+    let cap = tokens.len().max(1);
+    let mut batch = LlamaBatch::new(cap, 1);
     let last = tokens.len() as i32 - 1;
     for (i, tok) in tokens.iter().enumerate() {
         batch.add(*tok, i as i32, &[0], i as i32 == last)
