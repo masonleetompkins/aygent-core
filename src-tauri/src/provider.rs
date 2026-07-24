@@ -130,3 +130,170 @@ pub async fn anthropic_turn(
     }
     serde_json::from_str(&text).map_err(|e| format!("bad json: {e}"))
 }
+
+// --- STREAMING (Phase 1) ---------------------------------------------------
+// Provider-agnostic streaming: a turn emits a sequence of StreamEvents. The
+// agent loop forwards them live over the WS to the UI. Providers that can't
+// stream fall back to a single "turn-based" completion (the UI shows a thinking
+// animation instead of live tokens).
+
+use futures_util::StreamExt;
+
+/// Normalized streaming events — same shape regardless of provider. The Chat UI
+/// only ever knows these, so adding OpenAI/OpenRouter/Ollama = a new parser, not
+/// a new UI.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind")]
+pub enum StreamEvent {
+    /// A chunk of assistant text.
+    TextDelta { text: String },
+    /// The model wants to call a tool (emitted once its input is assembled).
+    ToolUse { id: String, name: String, input: serde_json::Value },
+    /// The turn finished. `stop_reason` = "tool_use" | "end_turn" | ...
+    Done { stop_reason: String },
+    /// A non-fatal note (e.g. fell back to non-streaming).
+    Info { text: String },
+    /// Fatal error for this turn.
+    Error { text: String },
+}
+
+/// Does this provider/model support server-sent streaming? (Phase-1 providers
+/// all do; kept as a hook so a future provider can declare turn-based only.)
+pub fn provider_supports_streaming(provider: &str) -> bool {
+    matches!(provider, "anthropic" | "openai" | "openrouter" | "ollama")
+}
+
+/// Stream one Anthropic turn. Calls `on_event` for each normalized StreamEvent
+/// as it arrives off the wire. Assembles tool_use input deltas into a single
+/// ToolUse event. Returns the assistant `content` array (for history) + stop.
+pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
+    api_key: &str,
+    model: &str,
+    system: &str,
+    messages: &serde_json::Value,
+    tools: &serde_json::Value,
+    mut on_event: F,
+) -> Result<(serde_json::Value, String), String> {
+    let body = json!({
+        "model": model,
+        "max_tokens": 1024,
+        "system": system,
+        "tools": tools,
+        "messages": messages,
+        "stream": true,
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(ANTHROPIC_URL)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", API_VERSION)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("anthropic {status}: {text}"));
+    }
+
+    // Reassemble the assistant content array from the SSE stream so we can put
+    // it back into `messages` for the next turn (tool_result needs it verbatim).
+    let mut blocks: Vec<serde_json::Value> = Vec::new();
+    // per-index scratch for tool_use input JSON being streamed as partial_json
+    let mut tool_json: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    let mut stop_reason = String::from("end_turn");
+
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| format!("stream error: {e}"))?;
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+
+        // SSE frames are separated by blank lines; each has `data: {...}` lines.
+        while let Some(pos) = buf.find("\n\n") {
+            let frame = buf[..pos].to_string();
+            buf.drain(..pos + 2);
+            for line in frame.lines() {
+                let line = line.trim_start();
+                let Some(data) = line.strip_prefix("data:") else { continue };
+                let data = data.trim();
+                if data.is_empty() { continue; }
+                let ev: serde_json::Value = match serde_json::from_str(data) {
+                    Ok(v) => v, Err(_) => continue,
+                };
+                match ev.get("type").and_then(|t| t.as_str()) {
+                    Some("content_block_start") => {
+                        let idx = ev.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                        let block = ev.get("content_block").cloned().unwrap_or(json!({}));
+                        // seed the block; text accumulates via deltas, tool_use via partial_json
+                        while blocks.len() <= idx { blocks.push(json!({})); }
+                        blocks[idx] = block.clone();
+                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            tool_json.insert(idx, String::new());
+                        }
+                    }
+                    Some("content_block_delta") => {
+                        let idx = ev.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                        let delta = ev.get("delta").cloned().unwrap_or(json!({}));
+                        match delta.get("type").and_then(|t| t.as_str()) {
+                            Some("text_delta") => {
+                                if let Some(t) = delta.get("text").and_then(|t| t.as_str()) {
+                                    // accumulate into the block + emit live
+                                    if let Some(b) = blocks.get_mut(idx) {
+                                        let cur = b.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                        b["text"] = json!(format!("{cur}{t}"));
+                                        b["type"] = json!("text");
+                                    }
+                                    on_event(StreamEvent::TextDelta { text: t.to_string() });
+                                }
+                            }
+                            Some("input_json_delta") => {
+                                if let Some(pj) = delta.get("partial_json").and_then(|x| x.as_str()) {
+                                    tool_json.entry(idx).or_default().push_str(pj);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some("content_block_stop") => {
+                        let idx = ev.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                        // finalize a tool_use block: parse its assembled input JSON + emit
+                        if let Some(raw) = tool_json.get(&idx) {
+                            let input: serde_json::Value =
+                                serde_json::from_str(raw).unwrap_or(json!({}));
+                            if let Some(b) = blocks.get_mut(idx) {
+                                b["input"] = input.clone();
+                            }
+                            let (id, name) = blocks.get(idx).map(|b| (
+                                b.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                                b.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                            )).unwrap_or_default();
+                            on_event(StreamEvent::ToolUse { id, name, input });
+                        }
+                    }
+                    Some("message_delta") => {
+                        if let Some(sr) = ev.get("delta").and_then(|d| d.get("stop_reason")).and_then(|s| s.as_str()) {
+                            stop_reason = sr.to_string();
+                        }
+                    }
+                    Some("message_stop") => {
+                        on_event(StreamEvent::Done { stop_reason: stop_reason.clone() });
+                    }
+                    Some("error") => {
+                        let msg = ev.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).unwrap_or("stream error");
+                        on_event(StreamEvent::Error { text: msg.to_string() });
+                        return Err(msg.to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok((serde_json::Value::Array(blocks), stop_reason))
+}

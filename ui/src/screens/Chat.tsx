@@ -1,0 +1,168 @@
+// Chat — the primary agent surface. Streaming-first: tokens render live, tool
+// calls appear as inline cards as they fire, multi-turn history persists.
+// Consumes normalized StreamEvents from the Rust streaming agent loop over a
+// Tauri event channel. Falls back to a thinking animation if no text streams.
+import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { Button, Input } from "../components/ui";
+
+type ToolLine = { name: string; path: string; ok?: boolean; detail?: string };
+type Msg =
+  | { role: "user"; text: string }
+  | { role: "assistant"; text: string; tools: ToolLine[]; streaming?: boolean };
+
+const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
+
+export function Chat({ folder, keySet }: { folder: string | null; keySet: boolean }) {
+  const [msgs, setMsgs] = useState<Msg[]>([]);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const historyRef = useRef<any>([]); // provider-format running history
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => { scrollRef.current?.scrollTo({ top: 1e9, behavior: "smooth" }); }, [msgs]);
+
+  async function send() {
+    const prompt = input.trim();
+    if (!prompt || busy) return;
+    setInput(""); setBusy(true);
+
+    setMsgs((m) => [...m, { role: "user", text: prompt },
+      { role: "assistant", text: "", tools: [], streaming: true }]);
+
+    const channel = `agent://${Date.now()}`;
+    let gotText = false;
+
+    const unlisten = await listen<any>(channel, (e) => {
+      const ev = e.payload;
+      setMsgs((m) => {
+        const copy = [...m];
+        const last = copy[copy.length - 1];
+        if (last?.role !== "assistant") return m;
+        switch (ev.kind) {
+          case "TextDelta":
+            gotText = true;
+            last.text += ev.text;
+            break;
+          case "ToolUse":
+            last.tools = [...last.tools, { name: ev.name, path: ev.input?.path ?? "" }];
+            break;
+          case "ToolResult": {
+            const t = [...last.tools];
+            // match the most recent tool of this name without an outcome yet
+            for (let i = t.length - 1; i >= 0; i--) {
+              if (t[i].name === ev.name && t[i].ok === undefined) { t[i] = { ...t[i], ok: ev.ok, detail: ev.detail }; break; }
+            }
+            last.tools = t;
+            break;
+          }
+          case "Info": break; // model name etc. (could show later)
+          case "Error": last.text += `\n✗ ${ev.text}`; break;
+          case "Done": last.streaming = false; break;
+        }
+        return copy;
+      });
+    });
+
+    try {
+      const updated = await invoke<any>("agent_stream", {
+        channel, prompt, history: historyRef.current,
+      });
+      historyRef.current = updated;
+    } catch (err) {
+      setMsgs((m) => {
+        const copy = [...m]; const last = copy[copy.length - 1];
+        if (last?.role === "assistant") { last.text += `\n✗ ${String(err)}`; last.streaming = false; }
+        return copy;
+      });
+    } finally {
+      unlisten();
+      setMsgs((m) => { const c = [...m]; const l = c[c.length - 1]; if (l?.role === "assistant") l.streaming = false; return c; });
+      setBusy(false);
+      void gotText;
+    }
+  }
+
+  const blocked = !folder || !keySet;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "calc(100vh - 130px)", maxWidth: 720 }}>
+      <h2 style={{ fontSize: 22, fontWeight: 800, margin: "0 0 12px" }}>Chat</h2>
+
+      {blocked && (
+        <p style={{ ...hint, marginBottom: 12 }}>
+          {!folder ? "Pick an Agent Folder in Settings, " : ""}{!keySet ? "add an Anthropic key in Settings" : ""} to start.
+        </p>
+      )}
+
+      <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 14, paddingRight: 6 }}>
+        {msgs.length === 0 && !blocked && (
+          <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
+        )}
+        {msgs.map((m, i) => <Bubble key={i} m={m} />)}
+      </div>
+
+      <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+        <Input value={input} disabled={blocked || busy}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") send(); }}
+          placeholder={blocked ? "Set up folder + key in Settings first…" : "Message your agent…"} />
+        <Button onClick={send} disabled={blocked || busy}>{busy ? "…" : "Send"}</Button>
+      </div>
+    </div>
+  );
+}
+
+function Bubble({ m }: { m: Msg }) {
+  const isUser = m.role === "user";
+  return (
+    <div style={{ display: "flex", justifyContent: isUser ? "flex-end" : "flex-start" }}>
+      <div style={{
+        maxWidth: "82%",
+        background: isUser ? "var(--accent)" : "var(--surface)",
+        color: isUser ? "var(--bg)" : "var(--text)",
+        border: "var(--border-width) solid var(--line)",
+        borderRadius: "var(--radius-card)",
+        boxShadow: "var(--elevation)",
+        padding: "12px 15px",
+        display: "flex", flexDirection: "column", gap: 8,
+      }}>
+        {!isUser && m.role === "assistant" && m.tools.map((t, i) => <ToolCard key={i} t={t} />)}
+        {m.text && <span style={{ whiteSpace: "pre-wrap", lineHeight: 1.55, fontSize: 15 }}>{m.text}</span>}
+        {!isUser && m.role === "assistant" && m.streaming && !m.text && <Thinking />}
+      </div>
+    </div>
+  );
+}
+
+function ToolCard({ t }: { t: ToolLine }) {
+  const pending = t.ok === undefined;
+  const color = pending ? "var(--text-muted)" : t.ok ? "var(--ok)" : "var(--danger)";
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 8,
+      fontFamily: "ui-monospace, monospace", fontSize: 12.5,
+      border: `var(--border-width) solid ${color}`, color,
+      borderRadius: "var(--radius-control)", padding: "6px 10px",
+      background: "var(--bg)",
+    }}>
+      <span>⚙ {t.name}({t.path})</span>
+      <span style={{ marginLeft: "auto" }}>{pending ? "…" : t.ok ? "✓" : `✗ ${t.detail || "refused"}`}</span>
+    </div>
+  );
+}
+
+function Thinking() {
+  return (
+    <span style={{ display: "inline-flex", gap: 4, alignItems: "center", color: "var(--text-muted)" }}>
+      {[0, 1, 2].map((i) => (
+        <span key={i} style={{
+          width: 6, height: 6, borderRadius: 999, background: "currentColor",
+          animation: `aygentPulse 1s ${i * 0.15}s infinite ease-in-out`,
+        }} />
+      ))}
+      <style>{`@keyframes aygentPulse{0%,100%{opacity:.25}50%{opacity:1}}`}</style>
+    </span>
+  );
+}

@@ -10,7 +10,7 @@ export interface NavItem { id: ScreenId; label: string; icon: string; enabled: b
 // Phase-1 order. Only what's built is enabled; the rest show as "soon" so the
 // product shape is visible without pretending features exist.
 export const NAV: NavItem[] = [
-  { id: "chat", label: "Chat", icon: "💬", enabled: false },
+  { id: "chat", label: "Chat", icon: "💬", enabled: true },
   { id: "agents", label: "Agents", icon: "🧠", enabled: false },
   { id: "scheduler", label: "Scheduler", icon: "⏰", enabled: false },
   { id: "connections", label: "Connections", icon: "🔌", enabled: false },

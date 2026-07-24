@@ -4,6 +4,7 @@ import { Pill } from "./components/ui";
 import { Sidebar, type ScreenId } from "./components/Sidebar";
 import { Settings } from "./screens/Settings";
 import { Playground } from "./screens/Playground";
+import { Chat } from "./screens/Chat";
 import { initTheme, saveTheme, type Mode } from "./lib/theme";
 
 // Phase 1: app shell (sidebar nav + content pane) on the design system.
@@ -21,11 +22,13 @@ export function App() {
   const [status, setStatus] = useState<Status>({ kind: "booting" });
   const [ws, setWs] = useState<WebSocket | null>(null);
   const [folder, setFolder] = useState<string | null>(null);
-  const [screen, setScreen] = useState<ScreenId>("settings");
+  const [screen, setScreen] = useState<ScreenId>("chat");
   const [mode, setMode] = useState<Mode>("light");
   const [accent, setAccent] = useState("");
+  const [keySet, setKeySet] = useState(false);
 
   useEffect(() => { const t = initTheme(); setMode(t.mode); setAccent(t.accent); }, []);
+  useEffect(() => { invoke<boolean>("has_provider_key", { provider: "anthropic" }).then(setKeySet).catch(() => {}); }, [screen]);
   function onTheme(m: Mode, a: string) { setMode(m); setAccent(a); saveTheme(m, a); }
 
   useEffect(() => {
@@ -73,6 +76,7 @@ export function App() {
         </div>
 
         <div style={{ padding: "28px 32px" }}>
+          {screen === "chat" && <Chat folder={folder} keySet={keySet} />}
           {screen === "settings" && (
             <Settings mode={mode} accent={accent} onTheme={onTheme} folder={folder} onPickFolder={pickFolder} />
           )}

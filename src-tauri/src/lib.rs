@@ -283,6 +283,150 @@ async fn agent_run(
     Ok(transcript)
 }
 
+// --- STREAMING agent loop (Phase 1) ----------------------------------------
+// Emits normalized StreamEvents to the UI via Tauri events as they arrive.
+// Tool calls still route through the broker (jailed). Falls back to turn-based
+// automatically if the provider can't stream (UI shows a thinking animation).
+
+/// Execute one jailed tool call, returning (result_text, is_error).
+fn exec_tool(
+    broker: &Arc<Broker>,
+    name: &str,
+    input: &serde_json::Value,
+) -> (String, bool) {
+    let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
+    match name {
+        "read_file" => match broker.resolve_and_open("default", path, broker::Mode::Read) {
+            Ok(mut f) => {
+                use std::io::Read;
+                let mut s = String::new();
+                match f.read_to_string(&mut s) {
+                    Ok(_) => (s, false),
+                    Err(e) => (format!("io error: {e}"), true),
+                }
+            }
+            Err(e) => (format!("refused by jail: {e:?}"), true),
+        },
+        "write_file" => {
+            let cnt = input.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            if let Ok(real) = broker.resolve("default", path, broker::Mode::Write) {
+                if let Some(parent) = real.parent() { let _ = std::fs::create_dir_all(parent); }
+            }
+            match broker.resolve_and_open("default", path, broker::Mode::Write) {
+                Ok(mut f) => {
+                    use std::io::Write as _;
+                    match f.write_all(cnt.as_bytes()) {
+                        Ok(_) => (format!("wrote {} bytes to {path}", cnt.len()), false),
+                        Err(e) => (format!("io error: {e}"), true),
+                    }
+                }
+                Err(e) => (format!("refused by jail: {e:?}"), true),
+            }
+        }
+        "list_files" => match broker.resolve("default", path, broker::Mode::Read) {
+            Ok(real) => match std::fs::read_dir(&real) {
+                Ok(rd) => {
+                    let names: Vec<String> = rd.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().to_string()).collect();
+                    (names.join("\n"), false)
+                }
+                Err(e) => (format!("io error: {e}"), true),
+            },
+            Err(e) => (format!("refused by jail: {e:?}"), true),
+        },
+        other => (format!("unknown tool: {other}"), true),
+    }
+}
+
+fn agent_tools() -> serde_json::Value {
+    serde_json::json!([
+        { "name": "read_file", "description": "Read a UTF-8 text file inside the agent folder. Path relative to folder root.",
+          "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } },
+        { "name": "write_file", "description": "Write a UTF-8 text file inside the agent folder. Path relative to folder root.",
+          "input_schema": { "type": "object", "properties": { "path": { "type": "string" }, "content": { "type": "string" } }, "required": ["path", "content"] } },
+        { "name": "list_files", "description": "List entries in a directory inside the agent folder. Path relative to root; '.' for root.",
+          "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } }
+    ])
+}
+
+const AGENT_SYSTEM: &str = "You are AYGENT, an agent that can ONLY touch files inside the user's \
+    chosen folder via your tools. You cannot run shell commands. Use read_file/write_file/list_files \
+    for file work. Be concise and friendly.";
+
+/// STREAMING chat turn. `history` is the running conversation (array of
+/// {role, content}); we append the new user prompt, run the agent loop with
+/// streaming, emit events to the UI, and return the FULL updated history so the
+/// UI can persist multi-turn memory. Events are emitted on channel `agent://<id>`.
+#[tauri::command]
+async fn agent_stream(
+    app: tauri::AppHandle,
+    broker: tauri::State<'_, Arc<Broker>>,
+    channel: String,
+    prompt: String,
+    history: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use tauri::Emitter;
+    let broker = broker.inner().clone();
+    let key = keychain::get_key("anthropic")
+        .map_err(|_| "no anthropic key set — add one in Settings".to_string())?;
+    let models = provider::anthropic_list_models(&key).await?;
+    let model = models.iter().find(|m| m.contains("haiku")).cloned()
+        .or_else(|| models.first().cloned())
+        .ok_or_else(|| "account returned no usable models".to_string())?;
+
+    let tools = agent_tools();
+    let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
+    messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": prompt }));
+
+    let emit = |ev: &provider::StreamEvent| { let _ = app.emit(&channel, ev); };
+    emit(&provider::StreamEvent::Info { text: format!("model: {model}") });
+
+    for _ in 0..8 {
+        let (content, stop) = provider::anthropic_stream_turn(
+            &key, &model, AGENT_SYSTEM, &messages, &tools,
+            |ev| { let _ = app.emit(&channel, &ev); },
+        ).await?;
+
+        messages.as_array_mut().unwrap().push(serde_json::json!({
+            "role": "assistant", "content": content.clone()
+        }));
+
+        // Execute any tool_use blocks through the broker; emit results live.
+        let mut tool_results = Vec::new();
+        if let Some(arr) = content.as_array() {
+            for blk in arr {
+                if blk.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                    let name = blk.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                    let id = blk.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                    let input = blk.get("input").cloned().unwrap_or(serde_json::json!({}));
+                    let (result_text, is_err) = exec_tool(&broker, &name, &input);
+                    let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                    // tell the UI the tool's OUTCOME (the ToolUse start already fired)
+                    let _ = app.emit(&channel, &serde_json::json!({
+                        "kind": "ToolResult", "name": name, "path": path,
+                        "ok": !is_err, "detail": if is_err { result_text.clone() } else { String::new() }
+                    }));
+                    tool_results.push(serde_json::json!({
+                        "type": "tool_result", "tool_use_id": id,
+                        "content": result_text, "is_error": is_err
+                    }));
+                }
+            }
+        }
+
+        if stop == "tool_use" && !tool_results.is_empty() {
+            messages.as_array_mut().unwrap().push(serde_json::json!({
+                "role": "user", "content": tool_results
+            }));
+            continue;
+        }
+        break;
+    }
+
+    emit(&provider::StreamEvent::Done { stop_reason: "end_turn".into() });
+    Ok(messages) // full history back for multi-turn persistence
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let state = Arc::new(DaemonState {
@@ -299,7 +443,8 @@ pub fn run() {
         .manage(state.clone())
         .invoke_handler(tauri::generate_handler![
             daemon_info, pick_agent_folder, broker_probe,
-            set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run
+            set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
+            agent_stream
         ])
         .setup(move |_app| {
             let broker = broker.clone();
