@@ -10,22 +10,52 @@ import { saveTheme, type Mode } from "../lib/theme";
 const ACCENT_SWATCHES = ["", "#2dd4bf", "#6366f1", "#e0533d", "#22c55e", "#eab308", "#ec4899"];
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 
-// Cost + context info per model FAMILY. Anthropic's API doesn't return pricing,
-// so this is a static map keyed by id substring — update when pricing changes.
-// Prices are $ per MILLION tokens (input / output).
+// Cost + context info per model. Anthropic's API doesn't return pricing or
+// context sizes, so this is a static map keyed by model id, sourced from
+// Anthropic's published docs (platform.claude.com, verified 2026-07-24):
+//   - 1M-token context: Opus 5, Opus 4.6/4.7/4.8, Sonnet 5, Sonnet 4.6,
+//     Fable 5, Mythos 5 (1M is the DEFAULT on these — no beta header needed).
+//   - 200k-token context: Sonnet 4.5 and earlier, ALL Haiku, everything else.
+//   - Legacy Claude 2.x: 100k.
+// Pricing is $ per MILLION tokens (input / output).
 type ModelInfo = { label: string; inPrice: number; outPrice: number; context: string; blurb: string };
-// Per-model info keyed by the model id. Context windows:
-//   - Legacy Claude 2.x: 100k
-//   - All Claude 3 / 3.5 / 4 / 4.5 models: 200k
-//   - Sonnet 4/4.5 CAN do 1M tokens, but ONLY with a beta header we do not send
-//     — so in AYGENT they effectively run at 200k. We show 200k to stay honest
-//     about what the app actually gives you (claiming 1M would be misleading).
+
+// Ordered rules: FIRST match wins, so more specific ids come before general
+// family fallbacks. Context values are the real published windows.
 function modelInfo(id: string): ModelInfo {
   const has = (s: string) => id.includes(s);
+
+  // ---- 1M-token context models (from Anthropic docs) ----
+  // Fable 5 / Mythos 5 — top tier.
+  if (has("fable") || has("mythos"))
+    return { label: "Fable", inPrice: 10, outPrice: 50, context: "1M", blurb: "next-gen — most capable, for long-running agents" };
+
+  // Opus: 5 and 4.6/4.7/4.8 are 1M; older Opus (4.5/4.1/4) are 200k.
+  if (has("opus")) {
+    const oneM = has("opus-5") || has("opus-4-6") || has("opus-4-7") || has("opus-4-8");
+    // Opus 5 pricing dropped to $5/$25; older Opus were $15/$75.
+    const price = has("opus-5") ? { i: 5, o: 25 } : { i: 15, o: 75 };
+    return { label: "Opus", inPrice: price.i, outPrice: price.o, context: oneM ? "1M" : "200k", blurb: "deepest reasoning — best for hard problems" };
+  }
+
+  // Sonnet: 5 and 4.6 are 1M; 4.5 and earlier are 200k.
+  if (has("sonnet")) {
+    const oneM = has("sonnet-5") || has("sonnet-4-6");
+    return { label: "Sonnet", inPrice: 3, outPrice: 15, context: oneM ? "1M" : "200k", blurb: "balanced — great default for real work" };
+  }
+
+  // ---- 200k-token context models ----
+  // Haiku is always 200k. 4.5 is $1/$5; older 3.5/3 were cheaper.
+  if (has("haiku")) {
+    const price = has("haiku-4-5") ? { i: 1, o: 5 } : { i: 0.8, o: 4 };
+    return { label: "Haiku", inPrice: price.i, outPrice: price.o, context: "200k", blurb: "fast + cheap — everyday tasks" };
+  }
+
+  // Legacy Claude 2.x — 100k.
   if (has("claude-2")) return { label: id, inPrice: 8, outPrice: 24, context: "100k", blurb: "legacy model" };
-  if (has("opus"))     return { label: "Opus",   inPrice: 15,  outPrice: 75, context: "200k", blurb: "deepest reasoning — best for hard problems" };
-  if (has("sonnet"))   return { label: "Sonnet", inPrice: 3,   outPrice: 15, context: "200k", blurb: "balanced — great default for real work" };
-  if (has("haiku"))    return { label: "Haiku",  inPrice: 0.8, outPrice: 4,  context: "200k", blurb: "fast + cheap — everyday tasks" };
+
+  // Unknown/new id: default to 200k (the conservative, most-common window)
+  // rather than over-claiming 1M.
   return { label: id, inPrice: 0, outPrice: 0, context: "200k", blurb: "" };
 }
 function fmtPrice(n: number) { return n === 0 ? "?" : (n < 1 ? `$${n.toFixed(2)}` : `$${n}`); }
