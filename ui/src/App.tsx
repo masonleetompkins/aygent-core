@@ -29,6 +29,12 @@ export function App() {
   const [keySet, setKeySet] = useState(false);
 
   useEffect(() => { const t = initTheme(); setMode(t.mode); setAccent(t.accent); }, []);
+  // Restore the saved Agent Folder on boot (folder persistence) so the user
+  // never has to re-pick after a restart. The backend re-registers the broker
+  // scope; if the folder vanished it returns null and we prompt a fresh pick.
+  useEffect(() => {
+    invoke<string | null>("restore_agent_folder").then((f) => { if (f) setFolder(f); }).catch(() => {});
+  }, []);
   useEffect(() => { invoke<boolean>("has_provider_key", { provider: "anthropic" }).then(setKeySet).catch(() => {}); }, [screen]);
   function onTheme(m: Mode, a: string) { setMode(m); setAccent(a); saveTheme(m, a); }
 

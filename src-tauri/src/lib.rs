@@ -76,7 +76,63 @@ async fn pick_agent_folder(
 
     // Register as the default agent's scope (multi-agent keying lands M1.4).
     broker.set_scope("default", canonical.clone(), false);
+    // PERSIST the choice so it survives restarts (folder persistence). We save
+    // the canonical PATH — correct for a directly-distributed (non-sandboxed)
+    // Mac app, which is how AYGENT ships today. A security-scoped bookmark blob
+    // slots into the same record later, only needed once App Sandbox is on.
+    if let Err(e) = save_agent_folder(&app, &canonical) {
+        eprintln!("[aygent] warn: could not persist agent folder: {e}");
+    }
     eprintln!("[aygent] agent folder set: {}", canonical.display());
+    Ok(Some(canonical.to_string_lossy().to_string()))
+}
+
+/// Where the persisted agent-folder record lives (app data, not the user's
+/// folder). Shape: { "path": "...", "bookmark": null }. The `bookmark` field is
+/// reserved for the macOS security-scoped bookmark blob we add when we enable
+/// App Sandbox; until then the canonical path is sufficient + correct.
+fn agent_folder_record_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+    let dir = app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir app data: {e}"))?;
+    Ok(dir.join("agent-folder.json"))
+}
+
+fn save_agent_folder(app: &tauri::AppHandle, path: &std::path::Path) -> Result<(), String> {
+    let rec = serde_json::json!({ "path": path.to_string_lossy(), "bookmark": serde_json::Value::Null });
+    let text = serde_json::to_string_pretty(&rec).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(agent_folder_record_path(app)?, text).map_err(|e| format!("write: {e}"))
+}
+
+/// Read the persisted agent folder path (if any). Returns None when unset.
+fn load_agent_folder(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    let p = agent_folder_record_path(app).ok()?;
+    let text = std::fs::read_to_string(&p).ok()?;
+    let rec: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let path = rec.get("path").and_then(|v| v.as_str())?;
+    if path.is_empty() { return None; }
+    Some(std::path::PathBuf::from(path))
+}
+
+/// UI calls this on boot to restore the saved Agent Folder. Re-registers the
+/// broker scope (fail-closed if the folder vanished) and returns the path so the
+/// UI can show it without a re-pick. Returns None if nothing was saved or the
+/// saved folder no longer exists.
+#[tauri::command]
+fn restore_agent_folder(
+    app: tauri::AppHandle,
+    broker: tauri::State<'_, Arc<Broker>>,
+) -> Result<Option<String>, String> {
+    let Some(saved) = load_agent_folder(&app) else { return Ok(None) };
+    // If the folder is gone (moved/deleted/external drive unplugged), don't
+    // register a bogus scope — report None so the UI prompts a fresh pick.
+    if !saved.is_dir() {
+        eprintln!("[aygent] saved agent folder missing: {}", saved.display());
+        return Ok(None);
+    }
+    let canonical = std::fs::canonicalize(&saved).unwrap_or(saved);
+    broker.set_scope("default", canonical.clone(), false);
+    eprintln!("[aygent] agent folder restored: {}", canonical.display());
     Ok(Some(canonical.to_string_lossy().to_string()))
 }
 
@@ -883,7 +939,7 @@ pub fn run() {
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
             agent_stream, reveal_in_finder, get_selected_model, set_selected_model,
             get_selection, set_selection, detect_hardware, local_catalog, local_downloaded,
-            local_download, local_delete,
+            local_download, local_delete, restore_agent_folder,
             checkpoint_snapshot, checkpoint_timeline, checkpoint_rewind,
             checkpoint_undo, checkpoint_redo,
             checkpoint_get_retention, checkpoint_set_retention, checkpoint_purge,
