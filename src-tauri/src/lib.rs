@@ -169,6 +169,27 @@ fn checkpoint_redo(broker: tauri::State<Arc<Broker>>) -> Result<Option<String>, 
     checkpoint::redo(&root)
 }
 
+/// Read the retention window (days, 1..=90).
+#[tauri::command]
+fn checkpoint_get_retention(broker: tauri::State<Arc<Broker>>) -> Result<i64, String> {
+    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+    checkpoint::get_retention(&root)
+}
+
+/// Set the retention window (days) + prune anything older immediately.
+#[tauri::command]
+fn checkpoint_set_retention(broker: tauri::State<Arc<Broker>>, days: i64) -> Result<(), String> {
+    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+    checkpoint::set_retention(&root, days)
+}
+
+/// Purge ALL checkpoint history for the folder (user's files untouched).
+#[tauri::command]
+fn checkpoint_purge(broker: tauri::State<Arc<Broker>>) -> Result<(), String> {
+    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+    checkpoint::purge_all(&root)
+}
+
 // --- M0.3: provider key (Keychain) + Anthropic end-to-end -------------------
 
 /// Store a provider API key in the macOS Keychain. Key never returns to JS.
@@ -528,6 +549,10 @@ async fn agent_stream(
             Ok(None) => {}
             Err(e) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("checkpoint skipped: {e}") }); }
         }
+        // Auto-prune anything past the retention window (best-effort; never blocks).
+        if let Ok(days) = checkpoint::get_retention(&root) {
+            let _ = checkpoint::prune(&root, days);
+        }
     }
 
     emit(&provider::StreamEvent::Done { stop_reason: "end_turn".into() });
@@ -553,7 +578,8 @@ pub fn run() {
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
             agent_stream, reveal_in_finder,
             checkpoint_snapshot, checkpoint_timeline, checkpoint_rewind,
-            checkpoint_undo, checkpoint_redo
+            checkpoint_undo, checkpoint_redo,
+            checkpoint_get_retention, checkpoint_set_retention, checkpoint_purge
         ])
         .setup(move |_app| {
             let broker = broker.clone();

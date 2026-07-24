@@ -18,8 +18,26 @@ export function Settings({
   const [apiKey, setApiKey] = useState("");
   const [keySet, setKeySet] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
+  const [retention, setRetention] = useState(30);
+  const [cpMsg, setCpMsg] = useState<string | null>(null);
+  const [confirmPurge, setConfirmPurge] = useState(false);
 
   useEffect(() => { invoke<boolean>("has_provider_key", { provider: "anthropic" }).then(setKeySet).catch(() => {}); }, []);
+  useEffect(() => {
+    if (!folder) return;
+    invoke<number>("checkpoint_get_retention").then(setRetention).catch(() => {});
+  }, [folder]);
+
+  async function saveRetention(days: number) {
+    setRetention(days); setCpMsg(null);
+    try { await invoke("checkpoint_set_retention", { days }); setCpMsg(`✓ keeping ${days} days`); }
+    catch (e) { setCpMsg("✗ " + String(e)); }
+  }
+  async function purgeAll() {
+    setConfirmPurge(false); setCpMsg(null);
+    try { await invoke("checkpoint_purge"); setCpMsg("✓ all checkpoints purged"); }
+    catch (e) { setCpMsg("✗ " + String(e)); }
+  }
   async function saveKey() {
     if (!apiKey.trim()) return;
     await invoke("set_provider_key", { provider: "anthropic", key: apiKey.trim() });
@@ -76,6 +94,42 @@ export function Settings({
         </div>
         {testResult && <Pill tone={testResult.startsWith("✗") ? "danger" : "ok"}>{testResult}</Pill>}
         <p style={{ ...hint, color: "var(--text-faint)", fontSize: 12 }}>OpenAI · OpenRouter · local Ollama — coming in this build.</p>
+      </Card>
+
+      {/* CHECKPOINTS */}
+      <Card title="Checkpoints">
+        <p style={hint}>Every change your agent makes is snapshotted so you can rewind. Keep history for a window, then it prunes automatically.</p>
+        {!folder ? (
+          <p style={{ ...hint, color: "var(--text-faint)" }}>Pick an Agent Folder below to configure checkpoints.</p>
+        ) : (
+          <>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <span style={{ fontSize: 14, fontWeight: 600, width: 90 }}>Keep for</span>
+              <input
+                type="range" min={1} max={90} value={retention}
+                onChange={(e) => setRetention(Number(e.target.value))}
+                onMouseUp={(e) => saveRetention(Number((e.target as HTMLInputElement).value))}
+                onTouchEnd={(e) => saveRetention(Number((e.target as HTMLInputElement).value))}
+                style={{ flex: 1, accentColor: "var(--accent)" }}
+              />
+              <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 14, fontWeight: 700, width: 64, textAlign: "right" }}>
+                {retention} day{retention === 1 ? "" : "s"}
+              </span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4 }}>
+              {!confirmPurge ? (
+                <Button variant="secondary" onClick={() => setConfirmPurge(true)}>Purge all history…</Button>
+              ) : (
+                <>
+                  <Button onClick={purgeAll}>Confirm purge</Button>
+                  <Button variant="secondary" onClick={() => setConfirmPurge(false)}>Cancel</Button>
+                  <span style={{ ...hint, color: "var(--danger)", fontSize: 13 }}>Deletes all checkpoints (your files are untouched).</span>
+                </>
+              )}
+            </div>
+            {cpMsg && <Pill tone={cpMsg.startsWith("✗") ? "danger" : "ok"}>{cpMsg}</Pill>}
+          </>
+        )}
       </Card>
 
       {/* AGENT FOLDER */}
