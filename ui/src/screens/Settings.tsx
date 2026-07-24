@@ -281,7 +281,24 @@ function speedWords(perf: Perf): string {
     default: return "";
   }
 }
-type CatModel = { family: string; family_label: string; repo: string; name: string; params_billions: number; downloads: number; quants: Quant[] };
+
+// Friendly context-window label: tokens → "~24,000 words of conversation".
+// (1 token ≈ 0.75 words.) Shows the raw "128k" too for people who know it.
+function contextWords(tokens: number): { short: string; long: string } {
+  if (!tokens) return { short: "—", long: "context size unknown" };
+  const k = Math.round(tokens / 1024);
+  const words = Math.round((tokens * 0.75) / 1000);
+  return { short: `${k}k`, long: `can hold about ${words.toLocaleString()},000 words of conversation` };
+}
+
+// Per-quant friendly framing: the SAME model at different compression levels.
+// The tradeoff is QUALITY vs DOWNLOAD SIZE — speed is essentially the same.
+function tierBlurb(tier: string): string {
+  return tier === "Higher quality"
+    ? "sharpest answers · bigger download"
+    : "great quality · smaller download — best for most people";
+}
+type CatModel = { family: string; family_label: string; repo: string; name: string; params_billions: number; context_tokens: number; downloads: number; quants: Quant[] };
 type HW = { summary: string };
 type Downloaded = { filename: string; path: string; size_gb: number };
 
@@ -367,46 +384,57 @@ function LocalModels({ folder, activePath, onChoose }: {
       </div>
       {err && <Pill tone="danger">✗ {err}</Pill>}
 
-      {catalog.map((m) => (
-        <div key={m.repo} style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 6, paddingTop: 10, borderTop: "var(--border-width) solid var(--line)" }}>
-          <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
-            <span style={{ fontWeight: 800, fontSize: 15 }}>{m.family_label}</span>
-            <span style={{ fontSize: 13, color: "var(--text-muted)" }}>{m.name}</span>
-            {m.params_billions >= 1 && (
-              <span style={{ fontSize: 12, color: "var(--text-faint)" }}>{m.params_billions}B params</span>
-            )}
-          </div>
-          {m.quants.map((q) => {
-            const pct = progress[q.filename];
-            const downloading = pct !== undefined;
-            const words = speedWords(q.perf);
-            return (
-              <div key={q.filename} style={{ display: "flex", alignItems: "center", gap: 12, paddingLeft: 4 }}>
-                {/* Friendly tier name is primary; the raw quant code is secondary. */}
-                <span style={{ display: "flex", flexDirection: "column", width: 130, flexShrink: 0 }}>
-                  <span style={{ fontSize: 13, fontWeight: 700 }}>{q.tier}</span>
-                  <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 10, color: "var(--text-faint)" }}>{q.quant} · ~{q.size_gb.toFixed(1)}GB</span>
-                </span>
-                {/* Plain-language speed + the tooltip keeps the technical note. */}
-                <span title={q.perf.note} style={{ fontSize: 13, flex: 1, minWidth: 0 }}>
-                  {q.perf.badge} {q.perf.fits
-                    ? <>{words}{q.perf.tokens_per_sec && <span style={{ color: "var(--text-faint)" }}> ({q.perf.tokens_per_sec})</span>}</>
-                    : "won't fit on your machine"}
-                </span>
-                {isDown(q.filename)
-                  ? <Pill tone="ok">installed ✓</Pill>
-                  : downloading
-                    ? <span style={{ fontSize: 12, fontFamily: "ui-monospace, monospace", width: 90, textAlign: "right" }}>{Math.round(pct * 100)}%</span>
-                    : <Button variant="secondary" onClick={() => download(q)} disabled={!q.perf.fits}>Download</Button>}
+      {catalog.map((m) => {
+        // Speed + context belong to the MODEL (both downloads run at the same
+        // speed — the quant tradeoff is quality vs download size, not speed).
+        const rec = m.quants[0];
+        const perf = rec?.perf;
+        const ctx = contextWords(m.context_tokens);
+        return (
+          <div key={m.repo} style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 6, paddingTop: 12, borderTop: "var(--border-width) solid var(--line)" }}>
+            {/* MODEL HEADER: name + the two facts that matter (speed, memory) */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+              <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+                <span style={{ fontWeight: 800, fontSize: 15 }}>{m.name}</span>
+                <span style={{ fontSize: 12, color: "var(--text-faint)" }}>{m.family_label} · {m.params_billions}B</span>
               </div>
-            );
-          })}
-        </div>
-      ))}
+              <div style={{ display: "flex", gap: 14, flexWrap: "wrap", fontSize: 13 }}>
+                {perf && (
+                  <span title={perf.note}>
+                    {perf.badge} <b>Speed on your Mac:</b>{" "}
+                    {perf.fits ? <>{speedWords(perf)}{perf.tokens_per_sec && <span style={{ color: "var(--text-faint)" }}> ({perf.tokens_per_sec})</span>}</> : "won't fit"}
+                  </span>
+                )}
+                <span title={ctx.long}>
+                  🧠 <b>Memory:</b> {ctx.short === "—" ? "unknown" : <>{ctx.short} tokens <span style={{ color: "var(--text-faint)" }}>(≈ a {m.context_tokens >= 100000 ? "whole book" : m.context_tokens >= 30000 ? "long essay" : "few pages"} of conversation)</span></>}
+                </span>
+              </div>
+            </div>
+            {/* DOWNLOAD CHOICES: same model, different compression. Quality vs size. */}
+            {m.quants.map((q) => {
+              const pct = progress[q.filename];
+              const downloading = pct !== undefined;
+              return (
+                <div key={q.filename} style={{ display: "flex", alignItems: "center", gap: 12, paddingLeft: 4 }}>
+                  <span style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0 }}>
+                    <span style={{ fontSize: 13, fontWeight: 700 }}>{q.tier} <span style={{ fontWeight: 400, color: "var(--text-muted)" }}>— {tierBlurb(q.tier)}</span></span>
+                    <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 10, color: "var(--text-faint)" }}>~{q.size_gb.toFixed(1)}GB download · {q.quant}</span>
+                  </span>
+                  {isDown(q.filename)
+                    ? <Pill tone="ok">installed ✓</Pill>
+                    : downloading
+                      ? <span style={{ fontSize: 12, fontFamily: "ui-monospace, monospace", width: 90, textAlign: "right" }}>{Math.round(pct * 100)}%</span>
+                      : <Button variant="secondary" onClick={() => download(q)} disabled={!q.perf.fits}>Download</Button>}
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
       {catalog.length > 0 && (
         <div style={{ ...hint, fontSize: 12, color: "var(--text-faint)", marginTop: 8, display: "flex", flexDirection: "column", gap: 3 }}>
-          <span><b>Recommended vs Higher quality:</b> both are the same model — “Higher quality” is a larger, sharper version that needs more memory and runs a bit slower.</span>
-          <span><b>What’s “tok/s”?</b> Tokens per second — roughly how fast the AI types its reply. ~15+ feels quick; under ~8 feels sluggish. These are estimates for your machine, not exact benchmarks.</span>
+          <span><b>Which download should I pick?</b> Both are the exact same model at different compression. “Recommended” is nearly identical quality in a smaller file — pick it unless you have plenty of free memory and want the absolute best.</span>
+          <span><b>Speed</b> (“tok/s” = tokens per second) is how fast the AI types. ~15+ feels quick; under ~8 feels sluggish. <b>Memory</b> is how much conversation the model can keep in mind at once. Estimates, not benchmarks.</span>
           <span>Local models run in chat mode; file tools are coming soon.</span>
         </div>
       )}

@@ -338,6 +338,7 @@ async fn local_catalog(per_family: Option<usize>) -> Result<serde_json::Value, S
         serde_json::json!({
             "family": m.family, "family_label": m.family_label, "repo": m.repo,
             "name": m.name, "params_billions": m.params_billions,
+            "context_tokens": m.context_tokens,
             "downloads": m.downloads, "updated": m.updated, "quants": quants,
         })
     }).collect();

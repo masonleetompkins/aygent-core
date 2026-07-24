@@ -52,6 +52,9 @@ pub struct CatalogModel {
     pub repo: String,          // HF repo id
     pub name: String,          // cleaned display name
     pub params_billions: f32,  // parsed from the id (e.g. 7, 8, 32) — best effort
+    /// Context window in tokens (how much conversation the model can hold),
+    /// from known family specs — best effort, 0 = unknown.
+    pub context_tokens: u32,
     pub quants: Vec<QuantOption>,
     pub downloads: u64,
     pub updated: String,
@@ -116,6 +119,7 @@ async fn fetch_family(
             repo: id.to_string(),
             name: clean_name(id),
             params_billions: params,
+            context_tokens: context_window(&lower),
             quants,
             downloads: repo.get("downloads").and_then(|d| d.as_u64()).unwrap_or(0),
             updated: repo.get("lastModified").and_then(|d| d.as_str()).unwrap_or("").to_string(),
@@ -245,6 +249,43 @@ fn parse_params(lower: &str) -> f32 {
         i += 1;
     }
     if best > 0.0 { best } else { 7.0 } // sensible default when unparseable
+}
+
+/// Known context windows by family/version (tokens). Best-effort from each
+/// family's published specs; 0 = unknown (UI shows "—"). Order matters: more
+/// specific patterns first.
+fn context_window(lower: &str) -> u32 {
+    const K: u32 = 1024;
+    let rules: &[(&str, u32)] = &[
+        // Qwen
+        ("qwen3", 32 * K),            // Qwen3 base 32k (128k w/ yarn — be conservative)
+        ("qwen2.5-coder", 32 * K),
+        ("qwen2.5-1m", 1024 * K),
+        ("qwen2.5", 128 * K),
+        ("qwen2", 32 * K),
+        // Mistral
+        ("mistral-7b-instruct-v0.1", 8 * K),
+        ("mistral-7b-instruct-v0.2", 32 * K),
+        ("mistral-7b-instruct-v0.3", 32 * K),
+        ("mistral-small", 32 * K),    // Small 3.x = 32k (128k on 3.1+ but varies; conservative)
+        ("mistral-nemo", 128 * K),
+        ("mixtral", 32 * K),
+        ("mistral", 32 * K),
+        // Kimi
+        ("kimi-k2", 128 * K),
+        ("kimi", 128 * K),
+        // Meta Llama
+        ("llama-3.3", 128 * K),
+        ("llama-3.2", 128 * K),
+        ("llama-3.1", 128 * K),
+        ("llama-3", 8 * K),
+        ("llama-2", 4 * K),
+        ("llama", 8 * K),
+    ];
+    for (pat, ctx) in rules {
+        if lower.contains(pat) { return *ctx; }
+    }
+    0
 }
 
 /// Minimal URL-encoding for the query string (space + a few reserved chars).
