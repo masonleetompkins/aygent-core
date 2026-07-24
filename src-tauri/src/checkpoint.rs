@@ -5,30 +5,35 @@
 // turn writes anything, we snapshot the folder; if the result is wrong, one
 // click restores the exact prior tree.
 //
+// ZERO USER SETUP (the whole product promise): we use **git2 / libgit2**, which
+// is compiled INTO our binary. There is NO dependency on a system `git` install
+// and nothing to bundle separately — the git object model just lives inside the
+// app. A user double-clicks AYGENT and checkpoints work, full stop.
+//
 // DESIGN (per docs/CONTRACTS.md §4 — the frozen Folder-lock protocol picked git):
 //   - Each agent folder gets a SHADOW git repo whose GIT_DIR lives at
 //     `<root>/.aygent/checkpoints.git`, with the work-tree set to `<root>`.
-//     Using a separate GIT_DIR (not `<root>/.git`) means we NEVER touch or
-//     conflict with a user's real git repo if the folder already is one.
-//   - A checkpoint = `git add -A && git commit` of the whole work-tree. The
-//     commit message carries the user prompt that caused the turn.
-//   - Rewind = `git checkout <commit> -- .` + clean untracked → the folder is
-//     restored to that snapshot's exact state.
+//     A separate GIT_DIR (not `<root>/.git`) means we NEVER touch or conflict
+//     with a user's real git repo if the folder already is one.
+//   - A checkpoint = stage-all + commit of the whole work-tree. The commit
+//     message carries the user prompt that caused the turn.
+//   - Rewind = reset the work-tree to that commit's tree (checkout + remove
+//     files the target didn't have), then commit the restore so HEAD tracks it.
 //   - We SNAPSHOT-BEFORE the rewind too, so "undo the undo" is always possible.
 //
-// SECURITY: every git invocation runs with cwd forced to the broker-resolved
-// root (never a daemon-supplied path). The shadow repo is excluded from its own
-// snapshots (`.aygent/` is git-ignored) so checkpoints never recurse.
+// SECURITY: the repo is opened at the broker-resolved root (never a
+// daemon-supplied path). `.aygent/` is git-ignored so checkpoints never recurse
+// into the shadow repo itself.
 
+use git2::{IndexAddOption, Repository, ResetType, Signature};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// One checkpoint entry surfaced to the UI timeline.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Checkpoint {
     pub id: String,        // commit sha (short)
     pub message: String,   // the prompt/label that caused this snapshot
-    pub timestamp: i64,    // unix seconds (author date)
+    pub timestamp: i64,    // unix seconds (commit time)
     pub files: usize,      // files changed vs the previous checkpoint
     pub is_current: bool,  // is this the checkpoint the tree currently matches?
 }
@@ -37,148 +42,182 @@ fn git_dir(root: &Path) -> PathBuf {
     root.join(".aygent").join("checkpoints.git")
 }
 
-/// Build a git Command already pointed at the shadow repo + work-tree, with cwd
-/// pinned to the root. All git operations go through this so no call can drift
-/// off the resolved root.
-fn git(root: &Path) -> Command {
-    let mut c = Command::new("git");
-    c.current_dir(root)
-        .arg("--git-dir")
-        .arg(git_dir(root))
-        .arg("--work-tree")
-        .arg(root);
-    c
+fn sig() -> Result<Signature<'static>, String> {
+    Signature::now("AYGENT Checkpoints", "checkpoints@aygent.local")
+        .map_err(|e| format!("signature: {e}"))
 }
 
-fn run(mut cmd: Command) -> Result<String, String> {
-    let out = cmd.output().map_err(|e| format!("git spawn failed: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// Ensure the shadow repo exists + is configured. Idempotent — safe to call
-/// before every snapshot. Sets a local identity so commits work even if the
-/// user has no global git config, and ignores our own `.aygent/` dir.
-pub fn ensure_repo(root: &Path) -> Result<(), String> {
+/// Open the shadow repo, creating + configuring it if absent. Idempotent — safe
+/// to call before every snapshot. The work-tree is set to `root` so a bare-ish
+/// separate GIT_DIR still commits/checks-out the user's folder.
+fn open_or_init(root: &Path) -> Result<Repository, String> {
     let gd = git_dir(root);
-    if !gd.exists() {
-        std::fs::create_dir_all(&gd).map_err(|e| format!("mkdir .aygent failed: {e}"))?;
-        run({
-            let mut c = git(root);
-            c.args(["init", "--quiet"]);
-            c
-        })?;
-        // Local identity (never touches the user's global git config).
-        run({ let mut c = git(root); c.args(["config", "user.email", "checkpoints@aygent.local"]); c })?;
-        run({ let mut c = git(root); c.args(["config", "user.name", "AYGENT Checkpoints"]); c })?;
-        // Never snapshot our own shadow repo (avoid recursion/bloat).
-        let exclude = gd.join("info").join("exclude");
-        if let Some(parent) = exclude.parent() { let _ = std::fs::create_dir_all(parent); }
-        let _ = std::fs::write(&exclude, ".aygent/\n");
+    if gd.exists() {
+        return Repository::open(&gd).map_err(|e| format!("open repo: {e}"));
     }
-    Ok(())
+    std::fs::create_dir_all(&gd).map_err(|e| format!("mkdir .aygent: {e}"))?;
+
+    // Init a repo whose GIT_DIR is our shadow dir but whose work-tree is `root`.
+    let mut opts = git2::RepositoryInitOptions::new();
+    opts.bare(false);
+    opts.no_reinit(true);
+    opts.workdir_path(root);
+    let repo = Repository::init_opts(&gd, &opts).map_err(|e| format!("init repo: {e}"))?;
+
+    // Never snapshot our own shadow repo (avoid recursion/bloat).
+    let exclude = gd.join("info").join("exclude");
+    if let Some(parent) = exclude.parent() { let _ = std::fs::create_dir_all(parent); }
+    let _ = std::fs::write(&exclude, ".aygent/\n");
+
+    Ok(repo)
+}
+
+/// Stage the entire work-tree into the index and write the tree object. Returns
+/// the tree oid. Honors `.aygent/info/exclude` so the shadow repo is skipped.
+fn stage_all(repo: &Repository) -> Result<git2::Oid, String> {
+    let mut index = repo.index().map_err(|e| format!("index: {e}"))?;
+    index
+        .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+        .map_err(|e| format!("add_all: {e}"))?;
+    // Capture deletions too (add_all handles new/modified; update_all handles rm).
+    index
+        .update_all(["*"].iter(), None)
+        .map_err(|e| format!("update_all: {e}"))?;
+    index.write().map_err(|e| format!("index write: {e}"))?;
+    index.write_tree().map_err(|e| format!("write_tree: {e}"))
 }
 
 /// Take a checkpoint of the whole work-tree. `label` becomes the commit message
 /// (typically the user prompt). Returns the new checkpoint's short sha, or None
 /// if nothing changed since the last checkpoint (no empty commits).
 pub fn snapshot(root: &Path, label: &str) -> Result<Option<String>, String> {
-    ensure_repo(root)?;
-    run({ let mut c = git(root); c.args(["add", "-A"]); c })?;
+    let repo = open_or_init(root)?;
+    let tree_oid = stage_all(&repo)?;
+    let tree = repo.find_tree(tree_oid).map_err(|e| format!("find_tree: {e}"))?;
 
-    // Anything staged? `git diff --cached --quiet` exits 1 when there ARE staged
-    // changes. If clean (exit 0), skip — no empty checkpoints cluttering the timeline.
-    let status = {
-        let mut c = git(root);
-        c.args(["diff", "--cached", "--quiet"]);
-        c.status().map_err(|e| format!("git diff failed: {e}"))?
+    // Current HEAD (if any) becomes the parent.
+    let parent_commit = match repo.head() {
+        Ok(h) => h.peel_to_commit().ok(),
+        Err(_) => None,
     };
-    let has_changes = !status.success();
-    // Special case: the very first commit (no HEAD yet) should always snapshot,
-    // even of an empty tree, so there's an anchor to rewind to.
-    let has_head = run({ let mut c = git(root); c.args(["rev-parse", "--verify", "HEAD"]); c }).is_ok();
-    if !has_changes && has_head {
-        return Ok(None);
+
+    // Skip empty checkpoints (tree identical to parent), but always allow the
+    // very first commit so there's an anchor to rewind to.
+    if let Some(ref parent) = parent_commit {
+        if parent.tree_id() == tree_oid {
+            return Ok(None);
+        }
     }
 
+    let signature = sig()?;
     let msg = if label.trim().is_empty() { "checkpoint" } else { label.trim() };
-    run({
-        let mut c = git(root);
-        c.args(["commit", "--allow-empty", "--quiet", "-m", msg]);
-        c
-    })?;
-    let sha = run({ let mut c = git(root); c.args(["rev-parse", "--short", "HEAD"]); c })?;
-    Ok(Some(sha))
+    let parents: Vec<&git2::Commit> = parent_commit.iter().collect();
+    let oid = repo
+        .commit(Some("HEAD"), &signature, &signature, msg, &tree, &parents)
+        .map_err(|e| format!("commit: {e}"))?;
+
+    Ok(Some(short(&oid)))
 }
 
 /// List checkpoints newest-first. `is_current` marks the commit the work-tree
-/// presently matches (i.e. where a rewind last landed, or the latest snapshot).
+/// presently matches (HEAD — after a rewind we commit the restore so HEAD is
+/// always the "current" pointer).
 pub fn list(root: &Path) -> Result<Vec<Checkpoint>, String> {
-    if !git_dir(root).exists() { return Ok(vec![]); }
-    if run({ let mut c = git(root); c.args(["rev-parse", "--verify", "HEAD"]); c }).is_err() {
+    if !git_dir(root).exists() {
         return Ok(vec![]);
     }
+    let repo = open_or_init(root)?;
+    let head_oid = match repo.head().ok().and_then(|h| h.target()) {
+        Some(o) => o,
+        None => return Ok(vec![]), // no commits yet
+    };
 
-    // The commit the tree currently matches. After a rewind we tag the tree by
-    // committing the restore, so HEAD is always the "current" pointer.
-    let head = run({ let mut c = git(root); c.args(["rev-parse", "--short", "HEAD"]); c }).unwrap_or_default();
-
-    // sha \x1f message \x1f unix-date, one record per line.
-    let log = run({
-        let mut c = git(root);
-        c.args(["log", "--pretty=format:%h\x1f%s\x1f%at"]);
-        c
-    })?;
+    let mut walk = repo.revwalk().map_err(|e| format!("revwalk: {e}"))?;
+    walk.push_head().map_err(|e| format!("push_head: {e}"))?;
+    walk.set_sorting(git2::Sort::TIME).map_err(|e| format!("sort: {e}"))?;
 
     let mut out = Vec::new();
-    for line in log.lines() {
-        let mut parts = line.splitn(3, '\x1f');
-        let id = parts.next().unwrap_or("").to_string();
-        let message = parts.next().unwrap_or("").to_string();
-        let timestamp = parts.next().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-        // files changed vs the parent commit (0 for the root commit).
-        let files = run({
-            let mut c = git(root);
-            c.args(["diff", "--name-only", &format!("{id}~1"), &id]);
-            c
-        })
-        .map(|s| s.lines().filter(|l| !l.is_empty()).count())
-        .unwrap_or(0);
-        let is_current = id == head;
-        out.push(Checkpoint { id, message, timestamp, files, is_current });
+    for oid in walk {
+        let oid = oid.map_err(|e| format!("walk: {e}"))?;
+        let commit = repo.find_commit(oid).map_err(|e| format!("find_commit: {e}"))?;
+        let message = commit.summary().unwrap_or("checkpoint").to_string();
+        let timestamp = commit.time().seconds();
+
+        // files changed vs the (first) parent — 0 for the root commit.
+        let files = if commit.parent_count() > 0 {
+            let parent = commit.parent(0).map_err(|e| format!("parent: {e}"))?;
+            let a = parent.tree().map_err(|e| format!("ptree: {e}"))?;
+            let b = commit.tree().map_err(|e| format!("ctree: {e}"))?;
+            repo.diff_tree_to_tree(Some(&a), Some(&b), None)
+                .map(|d| d.deltas().count())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        out.push(Checkpoint {
+            id: short(&oid),
+            message,
+            timestamp,
+            files,
+            is_current: oid == head_oid,
+        });
     }
     Ok(out)
 }
 
 /// Rewind the folder to a checkpoint. We FIRST snapshot the current state (so
-/// the rewind itself is undoable — "undo the undo"), then restore the target
-/// tree, then commit the restore so HEAD tracks where we are.
+/// the rewind itself is undoable — "undo the undo"), then hard-reset the
+/// work-tree to the target tree, then commit the restore so HEAD tracks it.
 pub fn rewind(root: &Path, target: &str) -> Result<(), String> {
-    ensure_repo(root)?;
-    // Guard: refuse a target that isn't a real commit in OUR repo.
-    run({ let mut c = git(root); c.args(["cat-file", "-e", &format!("{target}^{{commit}}")]); c })
-        .map_err(|_| format!("unknown checkpoint: {target}"))?;
+    let repo = open_or_init(root)?;
 
-    // 1) Safety snapshot of the present state (best-effort; ignore "nothing to commit").
+    // Resolve the target to a real commit in OUR repo (accepts short shas).
+    let obj = repo
+        .revparse_single(target)
+        .map_err(|_| format!("unknown checkpoint: {target}"))?;
+    let target_commit = obj
+        .peel_to_commit()
+        .map_err(|_| format!("not a commit: {target}"))?;
+
+    // 1) Safety snapshot of the present state (best-effort; ignore "no changes").
     let _ = snapshot(root, "before rewind");
 
-    // 2) Restore the target tree into the work-tree, then clean untracked files
-    //    that the target didn't have (so a rewind is a true restore, not a merge).
-    run({ let mut c = git(root); c.args(["checkout", target, "--", "."]); c })?;
-    run({ let mut c = git(root); c.args(["clean", "-fd", "--quiet"]); c })?;
+    // 2) Hard reset the work-tree + index to the target commit's tree. This both
+    //    restores modified files AND removes files the target didn't have — a
+    //    true restore, not a merge. (reset moves HEAD too, which we then advance
+    //    with the restore commit below to keep the timeline linear.)
+    let target_obj = target_commit.as_object();
+    repo.reset(target_obj, ResetType::Hard, None)
+        .map_err(|e| format!("reset: {e}"))?;
 
-    // 3) Commit the restore so HEAD == where we are now (keeps the timeline linear
-    //    and makes `is_current` meaningful).
-    run({ let mut c = git(root); c.args(["add", "-A"]); c })?;
-    let _ = run({
-        let mut c = git(root);
-        c.args(["commit", "--allow-empty", "--quiet", "-m", &format!("rewind to {target}")]);
-        c
-    });
+    // 3) Commit the restore so HEAD == where we are now (makes `is_current`
+    //    meaningful and keeps history append-only/inspectable).
+    let tree_oid = stage_all(&repo)?;
+    let tree = repo.find_tree(tree_oid).map_err(|e| format!("find_tree: {e}"))?;
+    let signature = sig()?;
+    let head_commit = repo
+        .head()
+        .and_then(|h| h.peel_to_commit())
+        .map_err(|e| format!("head: {e}"))?;
+    // Only add a restore commit if the reset actually changed the tree vs HEAD.
+    if head_commit.tree_id() != tree_oid {
+        let parents = [&head_commit];
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            &format!("rewind to {}", short(&target_commit.id())),
+            &tree,
+            &parents,
+        )
+        .map_err(|e| format!("restore commit: {e}"))?;
+    }
     Ok(())
+}
+
+/// Short (7-char) sha, matching what users see in the timeline.
+fn short(oid: &git2::Oid) -> String {
+    let s = oid.to_string();
+    s.chars().take(7).collect()
 }

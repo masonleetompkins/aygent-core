@@ -25,6 +25,7 @@ tokio-tungstenite = "0.24"         # Rust-hosted broker WS server (M0.2b)
 futures-util = "0.3"
 keyring = { version = "3", features = ["apple-native"] }  # API keys in macOS Keychain (M0.3; never touch JS/WebView)
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }  # Anthropic HTTP (M0.3)
+git2 = { version = "0.19", default-features = false }  # checkpoints (C4): git object model compiled IN — no system git, zero user setup
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"                        # atomic openat/O_NOFOLLOW fd layer (M0.2c)
