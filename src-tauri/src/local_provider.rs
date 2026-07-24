@@ -172,8 +172,13 @@ fn decode(path: &str, prompt: &str, tx: tokio::sync::mpsc::UnboundedSender<Token
 
         if model.is_eog_token(token) { break; }
 
+        // NOTE: token_to_str is deprecated in llama-cpp-2 (harmless warning) but
+        // its replacement token_to_piece takes a streaming encoding_rs::Decoder +
+        // lstrip arg that isn't worth the complexity here. Keep the simple call;
+        // revisit if the crate actually removes it.
+        #[allow(deprecated)]
         let piece = model
-            .token_to_piece(token, false)
+            .token_to_str(token, llama_cpp_2::model::Special::Tokenize)
             .unwrap_or_default();
         if tx.send(TokenMsg::Text(piece)).is_err() { break; } // UI hung up
 
