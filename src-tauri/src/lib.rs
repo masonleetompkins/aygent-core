@@ -7,6 +7,7 @@
 mod broker;
 mod broker_ws;
 mod checkpoint;
+mod conversations;
 mod keychain;
 mod provider;
 mod supervisor;
@@ -119,6 +120,44 @@ fn reveal_in_finder(
 
     cmd.spawn().map_err(|e| format!("could not open file manager: {e}"))?;
     Ok(())
+}
+
+// --- Conversation persistence (Phase 1) ------------------------------------
+// Chat history lives in the APP data dir (not the agent folder) so it never
+// pollutes the vault or gets swept into checkpoints. Keyed per agent folder.
+
+use tauri::Manager;
+
+/// Resolve the app data dir (created if missing). All conversation storage hangs
+/// off this. Fails clearly if the platform dir can't be determined.
+fn app_data(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| format!("app_data_dir: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir app_data: {e}"))?;
+    Ok(dir)
+}
+
+/// List conversation metadata for the current agent folder, newest-first.
+#[tauri::command]
+fn conv_list(app: tauri::AppHandle, folder: String) -> Result<Vec<conversations::ConvMeta>, String> {
+    conversations::list(&app_data(&app)?, &folder)
+}
+
+/// Load one full conversation (msgs + provider history).
+#[tauri::command]
+fn conv_load(app: tauri::AppHandle, folder: String, id: String) -> Result<conversations::Conversation, String> {
+    conversations::load(&app_data(&app)?, &folder, &id)
+}
+
+/// Save (create or overwrite) a conversation.
+#[tauri::command]
+fn conv_save(app: tauri::AppHandle, folder: String, conv: conversations::Conversation) -> Result<(), String> {
+    conversations::save(&app_data(&app)?, &folder, conv)
+}
+
+/// Delete a conversation.
+#[tauri::command]
+fn conv_delete(app: tauri::AppHandle, folder: String, id: String) -> Result<(), String> {
+    conversations::delete(&app_data(&app)?, &folder, &id)
 }
 
 // --- Checkpoints (Phase 1, Contract C4) ------------------------------------
@@ -579,7 +618,8 @@ pub fn run() {
             agent_stream, reveal_in_finder,
             checkpoint_snapshot, checkpoint_timeline, checkpoint_rewind,
             checkpoint_undo, checkpoint_redo,
-            checkpoint_get_retention, checkpoint_set_retention, checkpoint_purge
+            checkpoint_get_retention, checkpoint_set_retention, checkpoint_purge,
+            conv_list, conv_load, conv_save, conv_delete
         ])
         .setup(move |_app| {
             let broker = broker.clone();

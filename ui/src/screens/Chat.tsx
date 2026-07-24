@@ -14,14 +14,70 @@ type Msg =
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 
+type ConvMeta = { id: string; title: string; updated: number };
+
 export function Chat({ folder, keySet }: { folder: string | null; keySet: boolean }) {
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [convs, setConvs] = useState<ConvMeta[]>([]);
+  const [convId, setConvId] = useState<string | null>(null);
   const historyRef = useRef<any>([]); // provider-format running history
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => { scrollRef.current?.scrollTo({ top: 1e9, behavior: "smooth" }); }, [msgs]);
+
+  // On folder change: load the conversation list and open the most recent one.
+  useEffect(() => {
+    if (!folder) { setConvs([]); setConvId(null); setMsgs([]); historyRef.current = []; return; }
+    (async () => {
+      try {
+        const list = await invoke<ConvMeta[]>("conv_list", { folder });
+        setConvs(list);
+        if (list.length > 0) await openConv(list[0].id);
+        else newConv();
+      } catch { /* first run / no store yet */ newConv(); }
+    })();
+    // eslint-disable-next-line
+  }, [folder]);
+
+  function newConv() {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setConvId(id); setMsgs([]); historyRef.current = [];
+  }
+
+  async function openConv(id: string) {
+    if (!folder) return;
+    try {
+      const c = await invoke<any>("conv_load", { folder, id });
+      setConvId(c.id);
+      setMsgs(Array.isArray(c.msgs) ? c.msgs : []);
+      historyRef.current = Array.isArray(c.history) ? c.history : [];
+    } catch { newConv(); }
+  }
+
+  async function deleteConv(id: string) {
+    if (!folder) return;
+    try { await invoke("conv_delete", { folder, id }); } catch { /* ignore */ }
+    const list = await invoke<ConvMeta[]>("conv_list", { folder }).catch(() => [] as ConvMeta[]);
+    setConvs(list);
+    if (id === convId) { if (list.length > 0) openConv(list[0].id); else newConv(); }
+  }
+
+  // Persist the current conversation. Title = first user message, trimmed.
+  async function persist(nextMsgs: Msg[]) {
+    if (!folder || !convId) return;
+    const firstUser = nextMsgs.find((m) => m.role === "user") as { text: string } | undefined;
+    const title = (firstUser?.text ?? "New chat").slice(0, 60);
+    try {
+      await invoke("conv_save", {
+        folder,
+        conv: { id: convId, title, updated: 0, msgs: nextMsgs, history: historyRef.current },
+      });
+      const list = await invoke<ConvMeta[]>("conv_list", { folder });
+      setConvs(list);
+    } catch { /* non-fatal: chat still works even if save fails */ }
+  }
 
   async function send() {
     const prompt = input.trim();
@@ -77,8 +133,11 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
       mirror();
     } finally {
       unlisten();
-      setMsgs((m) => { const c = [...m]; const l = c[c.length - 1]; if (l?.role === "assistant") l.streaming = false; return c; });
+      let finalMsgs: Msg[] = [];
+      setMsgs((m) => { const c = [...m]; const l = c[c.length - 1]; if (l?.role === "assistant") l.streaming = false; finalMsgs = c; return c; });
       setBusy(false);
+      // Persist the completed turn (msgs + updated provider history).
+      void persist(finalMsgs);
     }
   }
 
@@ -86,7 +145,35 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "calc(100vh - 130px)", maxWidth: 720 }}>
-      <h2 style={{ fontSize: 22, fontWeight: 800, margin: "0 0 12px" }}>Chat</h2>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "0 0 12px" }}>
+        <h2 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>Chat</h2>
+        {!blocked && (
+          <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+            {convs.length > 0 && (
+              <select
+                value={convId ?? ""}
+                onChange={(e) => openConv(e.target.value)}
+                disabled={busy}
+                style={{
+                  background: "var(--bg)", color: "var(--text)",
+                  border: "var(--border-width) solid var(--line)",
+                  borderRadius: "var(--radius-control)", padding: "7px 10px",
+                  fontSize: 13, maxWidth: 240, boxShadow: "var(--elevation)",
+                }}
+              >
+                {convs.find((c) => c.id === convId) ? null : <option value="">New chat</option>}
+                {convs.map((c) => (
+                  <option key={c.id} value={c.id}>{c.title || "Untitled"}</option>
+                ))}
+              </select>
+            )}
+            <Button variant="secondary" onClick={newConv} disabled={busy}>+ New</Button>
+            {convId && convs.some((c) => c.id === convId) && (
+              <Button variant="secondary" onClick={() => deleteConv(convId)} disabled={busy}>Delete</Button>
+            )}
+          </div>
+        )}
+      </div>
 
       {blocked && (
         <p style={{ ...hint, marginBottom: 12 }}>
