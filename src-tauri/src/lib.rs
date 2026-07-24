@@ -345,6 +345,33 @@ async fn local_catalog(per_family: Option<usize>) -> Result<serde_json::Value, S
     Ok(serde_json::json!({ "hardware": hw, "models": scored }))
 }
 
+/// Choose the context window (tokens) for a local model: the model's real
+/// advertised window, capped to a memory-safe budget for THIS machine. The KV
+/// cache scales ~linearly with context, so we cap by usable accelerator memory.
+/// Heuristic: budget ~ half of usable memory for context, at a rough
+/// ~0.5 MB/token for a small model's KV cache. Clamped to sane bounds. This is
+/// intentionally conservative so it "just works" without OOMing a user's Mac.
+fn local_context_budget(gguf_path: &str) -> u32 {
+    // Model's real window, parsed from its filename via the catalog's rules.
+    let name = std::path::Path::new(gguf_path)
+        .file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+    let model_ctx = catalog::context_window(&name); // 0 if unknown
+
+    // Memory-safe ceiling from detected hardware.
+    let hw = hardware::detect();
+    // Reserve ~40% of usable memory for context; ~0.0005 GB per token is a
+    // conservative small-model KV estimate → tokens = mem*0.4 / 0.0005.
+    let mem_tokens = ((hw.accel_mem_gb as f64) * 0.40 / 0.0005) as u32;
+
+    let chosen = match (model_ctx, mem_tokens) {
+        (0, 0) => 4096,
+        (0, m) => m.min(8192),           // unknown model window: modest default
+        (c, 0) => c.min(8192),
+        (c, m) => c.min(m),              // model window, capped by memory
+    };
+    chosen.clamp(2048, 131072)
+}
+
 /// Directory where downloaded GGUF models live (app data, not the user folder).
 fn models_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     use tauri::Manager;
@@ -719,11 +746,19 @@ async fn agent_stream(
             .ok_or_else(|| "no local model selected — download one in Settings".to_string())?;
         let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
         messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": prompt }));
+
+        // Context window = the MODEL's real capability, capped to what THIS Mac
+        // can hold. A model may advertise 128k tokens, but the KV cache grows
+        // with context and would eat gigabytes of RAM at full size — so we pick
+        // the model's window but never exceed a memory-safe budget. This makes
+        // "context matches the model" true for a non-technical user, while it
+        // still just-works within their hardware.
+        let ctx_tokens = local_context_budget(&path);
         let _ = app.emit(&channel, &provider::StreamEvent::Info {
-            text: "local model · chat mode (file tools coming soon)".into(),
+            text: format!("local model · chat mode · {}k context (file tools coming soon)", ctx_tokens / 1024),
         });
         let (content, _stop) = local_provider::local_stream_turn(
-            &path, AGENT_SYSTEM_LOCAL, &messages,
+            &path, AGENT_SYSTEM_LOCAL, &messages, ctx_tokens,
             |ev| { let _ = app.emit(&channel, &ev); },
         ).await?;
         messages.as_array_mut().unwrap().push(serde_json::json!({

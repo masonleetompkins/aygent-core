@@ -43,7 +43,13 @@ static MODELS: Lazy<Mutex<HashMap<String, Arc<LlamaModel>>>> =
 /// clamps to the model's actual layer count). On CPU-only builds this is simply
 /// ignored by the backend.
 const GPU_LAYERS: u32 = u32::MAX;
-const CTX_TOKENS: u32 = 4096;
+/// Fallback context if the caller doesn't know the model's real window.
+const DEFAULT_CTX_TOKENS: u32 = 4096;
+/// Hard floor/ceiling so a wild value can't underflow or blow up memory. The
+/// caller (agent_stream) already caps to what the machine can hold; this is a
+/// last-resort clamp.
+const MIN_CTX_TOKENS: u32 = 2048;
+const MAX_CTX_TOKENS: u32 = 131072;
 const MAX_NEW_TOKENS: usize = 1024;
 
 fn backend() -> Result<&'static LlamaBackend, String> {
@@ -107,15 +113,18 @@ pub async fn local_stream_turn<F: FnMut(StreamEvent)>(
     model_path: &str,
     system: &str,
     messages: &serde_json::Value,
+    ctx_tokens: u32,
     mut on_event: F,
 ) -> Result<(serde_json::Value, String), String> {
     let prompt = render_prompt(system, messages);
     let path = model_path.to_string();
+    let ctx = if ctx_tokens == 0 { DEFAULT_CTX_TOKENS } else { ctx_tokens }
+        .clamp(MIN_CTX_TOKENS, MAX_CTX_TOKENS);
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TokenMsg>();
 
     // Decode on a blocking thread (llama.cpp is synchronous + heavy).
-    let handle = tokio::task::spawn_blocking(move || decode(&path, &prompt, tx));
+    let handle = tokio::task::spawn_blocking(move || decode(&path, &prompt, ctx, tx));
 
     // Forward tokens live as they arrive.
     let mut full = String::new();
@@ -135,12 +144,12 @@ pub async fn local_stream_turn<F: FnMut(StreamEvent)>(
 enum TokenMsg { Text(String), Err(String) }
 
 /// The synchronous decode loop (runs on a blocking thread).
-fn decode(path: &str, prompt: &str, tx: tokio::sync::mpsc::UnboundedSender<TokenMsg>) -> Result<(), String> {
+fn decode(path: &str, prompt: &str, ctx_tokens: u32, tx: tokio::sync::mpsc::UnboundedSender<TokenMsg>) -> Result<(), String> {
     let be = backend()?;
     let model = load_model(path)?;
 
     let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(std::num::NonZeroU32::new(CTX_TOKENS));
+        .with_n_ctx(std::num::NonZeroU32::new(ctx_tokens));
     let mut ctx = model
         .new_context(be, ctx_params)
         .map_err(|e| format!("create context: {e}"))?;
@@ -154,7 +163,7 @@ fn decode(path: &str, prompt: &str, tx: tokio::sync::mpsc::UnboundedSender<Token
     // to generate. If the conversation has grown past that, keep the MOST RECENT
     // tokens (drop the oldest) so a long chat degrades gracefully instead of
     // erroring with "insufficient space" — the bug that surfaced after a few msgs.
-    let max_prompt = (CTX_TOKENS as usize).saturating_sub(MAX_NEW_TOKENS + 8);
+    let max_prompt = (ctx_tokens as usize).saturating_sub(MAX_NEW_TOKENS + 8);
     if tokens.len() > max_prompt {
         let drop = tokens.len() - max_prompt;
         tokens.drain(0..drop);
