@@ -33,12 +33,10 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
 
     const channel = `agent://${Date.now()}`;
 
-    // StrictMode-safe: accumulate into a REF (immune to React's dev double-
-    // invoke), then mirror it into state. Also dedupe events by a seen-set so a
-    // double-delivered listener can't double-append. The ref is the source of
-    // truth for THIS assistant turn; state is just a render mirror.
+    // Accumulate into a REF (source of truth for THIS turn), then mirror into
+    // state for rendering. With StrictMode removed there is exactly ONE listener
+    // per turn, so no id-dedupe games are needed — every event is appended once.
     const acc = { text: "", tools: [] as ToolLine[] };
-    const seen = new Set<string>();
 
     const mirror = () => setMsgs((m) => {
       const copy = [...m];
@@ -50,19 +48,8 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
       return copy;
     });
 
-    let seq = 0;
     const unlisten = await listen<any>(channel, (e) => {
       const ev = e.payload;
-      // event dedupe key: Tauri may deliver an event id; fall back to a counter
-      // only for non-idempotent kinds. TextDelta must be sequence-guarded.
-      const key = `${e.id ?? ""}:${ev.kind}:${ev.text ?? ""}:${ev.name ?? ""}:${ev.ok ?? ""}:${seq}`;
-      if (e.id !== undefined) {
-        if (seen.has(String(e.id))) return; // exact duplicate delivery
-        seen.add(String(e.id));
-      }
-      seq++;
-      void key;
-
       switch (ev.kind) {
         case "TextDelta": acc.text += ev.text; break;
         case "ToolUse": acc.tools.push({ name: ev.name, path: ev.input?.path ?? "" }); break;
