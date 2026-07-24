@@ -14,7 +14,7 @@ type Msg =
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 
-type ConvMeta = { id: string; title: string; updated: number };
+type ConvMeta = { id: string; title: string; updated: number; pinned: boolean; order: number };
 
 export function Chat({ folder, keySet }: { folder: string | null; keySet: boolean }) {
   const [msgs, setMsgs] = useState<Msg[]>([]);
@@ -23,34 +23,46 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
   const [convs, setConvs] = useState<ConvMeta[]>([]);
   const [convId, setConvId] = useState<string | null>(null);
   const historyRef = useRef<any>([]); // provider-format running history
+  // convId in a REF too: `persist()` runs inside async closures that would
+  // otherwise capture a STALE convId (the save-bug that dropped the first
+  // chat). The ref is always the current thread id.
+  const convIdRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [dragId, setDragId] = useState<string | null>(null);
 
   useEffect(() => { scrollRef.current?.scrollTo({ top: 1e9, behavior: "smooth" }); }, [msgs]);
 
-  // On folder change: load the conversation list and open the most recent one.
+  function setConv(id: string | null) { convIdRef.current = id; setConvId(id); }
+
+  // On folder change: load the list and open the most recent one (or a fresh one).
   useEffect(() => {
-    if (!folder) { setConvs([]); setConvId(null); setMsgs([]); historyRef.current = []; return; }
+    if (!folder) { setConvs([]); setConv(null); setMsgs([]); historyRef.current = []; return; }
     (async () => {
       try {
         const list = await invoke<ConvMeta[]>("conv_list", { folder });
         setConvs(list);
         if (list.length > 0) await openConv(list[0].id);
         else newConv();
-      } catch { /* first run / no store yet */ newConv(); }
+      } catch { newConv(); }
     })();
     // eslint-disable-next-line
   }, [folder]);
 
+  async function refreshList() {
+    if (!folder) return;
+    try { setConvs(await invoke<ConvMeta[]>("conv_list", { folder })); } catch { /* ignore */ }
+  }
+
   function newConv() {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    setConvId(id); setMsgs([]); historyRef.current = [];
+    setConv(id); setMsgs([]); historyRef.current = [];
   }
 
   async function openConv(id: string) {
-    if (!folder) return;
+    if (!folder || busy) return;
     try {
       const c = await invoke<any>("conv_load", { folder, id });
-      setConvId(c.id);
+      setConv(c.id);
       setMsgs(Array.isArray(c.msgs) ? c.msgs : []);
       historyRef.current = Array.isArray(c.history) ? c.history : [];
     } catch { newConv(); }
@@ -61,21 +73,48 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
     try { await invoke("conv_delete", { folder, id }); } catch { /* ignore */ }
     const list = await invoke<ConvMeta[]>("conv_list", { folder }).catch(() => [] as ConvMeta[]);
     setConvs(list);
-    if (id === convId) { if (list.length > 0) openConv(list[0].id); else newConv(); }
+    if (id === convIdRef.current) { if (list.length > 0) openConv(list[0].id); else newConv(); }
+  }
+
+  async function togglePin(id: string) {
+    const c = convs.find((x) => x.id === id);
+    if (!c || !folder) return;
+    try {
+      await invoke("conv_reorder", { folder, updates: [{ id, pinned: !c.pinned, order: c.order }] });
+      await refreshList();
+    } catch { /* ignore */ }
+  }
+
+  // Drag-to-reorder: on drop, recompute a dense order (1..n) for the whole list
+  // in its new visual arrangement and persist it in one batch.
+  async function onDrop(targetId: string) {
+    if (!folder || !dragId || dragId === targetId) { setDragId(null); return; }
+    const ids = convs.map((c) => c.id);
+    const from = ids.indexOf(dragId);
+    const to = ids.indexOf(targetId);
+    if (from < 0 || to < 0) { setDragId(null); return; }
+    const reordered = [...convs];
+    const [moved] = reordered.splice(from, 1);
+    reordered.splice(to, 0, moved);
+    const updates = reordered.map((c, i) => ({ id: c.id, pinned: c.pinned, order: i + 1 }));
+    setConvs(reordered.map((c, i) => ({ ...c, order: i + 1 })));
+    setDragId(null);
+    try { await invoke("conv_reorder", { folder, updates }); await refreshList(); } catch { /* ignore */ }
   }
 
   // Persist the current conversation. Title = first user message, trimmed.
+  // Uses convIdRef so it never saves against a stale id.
   async function persist(nextMsgs: Msg[]) {
-    if (!folder || !convId) return;
+    const id = convIdRef.current;
+    if (!folder || !id) return;
     const firstUser = nextMsgs.find((m) => m.role === "user") as { text: string } | undefined;
     const title = (firstUser?.text ?? "New chat").slice(0, 60);
     try {
       await invoke("conv_save", {
         folder,
-        conv: { id: convId, title, updated: 0, msgs: nextMsgs, history: historyRef.current },
+        conv: { id, title, updated: 0, pinned: false, order: 0, msgs: nextMsgs, history: historyRef.current },
       });
-      const list = await invoke<ConvMeta[]>("conv_list", { folder });
-      setConvs(list);
+      await refreshList();
     } catch { /* non-fatal: chat still works even if save fails */ }
   }
 
@@ -144,57 +183,118 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
   const blocked = !folder || !keySet;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "calc(100vh - 130px)", maxWidth: 720 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "0 0 12px" }}>
-        <h2 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>Chat</h2>
-        {!blocked && (
-          <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
-            {convs.length > 0 && (
-              <select
-                value={convId ?? ""}
-                onChange={(e) => openConv(e.target.value)}
-                disabled={busy}
-                style={{
-                  background: "var(--bg)", color: "var(--text)",
-                  border: "var(--border-width) solid var(--line)",
-                  borderRadius: "var(--radius-control)", padding: "7px 10px",
-                  fontSize: 13, maxWidth: 240, boxShadow: "var(--elevation)",
-                }}
-              >
-                {convs.find((c) => c.id === convId) ? null : <option value="">New chat</option>}
-                {convs.map((c) => (
-                  <option key={c.id} value={c.id}>{c.title || "Untitled"}</option>
-                ))}
-              </select>
-            )}
-            <Button variant="secondary" onClick={newConv} disabled={busy}>+ New</Button>
-            {convId && convs.some((c) => c.id === convId) && (
-              <Button variant="secondary" onClick={() => deleteConv(convId)} disabled={busy}>Delete</Button>
-            )}
-          </div>
-        )}
-      </div>
-
-      {blocked && (
-        <p style={{ ...hint, marginBottom: 12 }}>
-          {!folder ? "Pick an Agent Folder in Settings, " : ""}{!keySet ? "add an Anthropic key in Settings" : ""} to start.
-        </p>
+    <div style={{ display: "flex", height: "calc(100vh - 130px)", gap: 16 }}>
+      {/* HISTORY SIDEBAR */}
+      {!blocked && (
+        <HistorySidebar
+          convs={convs} activeId={convId} busy={busy} dragId={dragId}
+          onNew={newConv} onOpen={openConv} onDelete={deleteConv}
+          onPin={togglePin} onDragStart={setDragId} onDropOn={onDrop}
+        />
       )}
 
-      <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 14, paddingRight: 6 }}>
-        {msgs.length === 0 && !blocked && (
-          <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
-        )}
-        {msgs.map((m, i) => <Bubble key={i} m={m} />)}
-      </div>
+      {/* MAIN CHAT COLUMN */}
+      <div style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0, maxWidth: 720 }}>
+        <h2 style={{ fontSize: 22, fontWeight: 800, margin: "0 0 12px" }}>Chat</h2>
 
-      <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
-        <Input value={input} disabled={blocked || busy}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") send(); }}
-          placeholder={blocked ? "Set up folder + key in Settings first…" : "Message your agent…"} />
-        <Button onClick={send} disabled={blocked || busy}>{busy ? "…" : "Send"}</Button>
+        {blocked && (
+          <p style={{ ...hint, marginBottom: 12 }}>
+            {!folder ? "Pick an Agent Folder in Settings, " : ""}{!keySet ? "add an Anthropic key in Settings" : ""} to start.
+          </p>
+        )}
+
+        <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 14, paddingRight: 6 }}>
+          {msgs.length === 0 && !blocked && (
+            <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
+          )}
+          {msgs.map((m, i) => <Bubble key={i} m={m} />)}
+        </div>
+
+        <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+          <Input value={input} disabled={blocked || busy}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") send(); }}
+            placeholder={blocked ? "Set up folder + key in Settings first…" : "Message your agent…"} />
+          <Button onClick={send} disabled={blocked || busy}>{busy ? "…" : "Send"}</Button>
+        </div>
       </div>
+    </div>
+  );
+}
+
+function HistorySidebar({
+  convs, activeId, busy, dragId, onNew, onOpen, onDelete, onPin, onDragStart, onDropOn,
+}: {
+  convs: ConvMeta[]; activeId: string | null; busy: boolean; dragId: string | null;
+  onNew: () => void; onOpen: (id: string) => void; onDelete: (id: string) => void;
+  onPin: (id: string) => void; onDragStart: (id: string | null) => void; onDropOn: (id: string) => void;
+}) {
+  return (
+    <div style={{
+      width: 230, flexShrink: 0, display: "flex", flexDirection: "column", gap: 8,
+      borderRight: "var(--border-width) solid var(--line)", paddingRight: 14,
+    }}>
+      <Button onClick={onNew} disabled={busy}>+ New chat</Button>
+      <div style={{ overflowY: "auto", display: "flex", flexDirection: "column", gap: 4, marginTop: 4 }}>
+        {convs.length === 0 && (
+          <p style={{ ...hint, fontSize: 13, color: "var(--text-faint)" }}>No chats yet.</p>
+        )}
+        {convs.map((c) => (
+          <HistoryItem
+            key={c.id} c={c} active={c.id === activeId} dragging={dragId === c.id}
+            onOpen={() => onOpen(c.id)} onDelete={() => onDelete(c.id)} onPin={() => onPin(c.id)}
+            onDragStart={() => onDragStart(c.id)} onDragEnd={() => onDragStart(null)}
+            onDrop={() => onDropOn(c.id)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function HistoryItem({
+  c, active, dragging, onOpen, onDelete, onPin, onDragStart, onDragEnd, onDrop,
+}: {
+  c: ConvMeta; active: boolean; dragging: boolean;
+  onOpen: () => void; onDelete: () => void; onPin: () => void;
+  onDragStart: () => void; onDragEnd: () => void; onDrop: () => void;
+}) {
+  const [hover, setHover] = useState(false);
+  return (
+    <div
+      draggable
+      onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={(e) => { e.preventDefault(); onDrop(); }}
+      onClick={onOpen}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      title={c.title || "Untitled"}
+      style={{
+        display: "flex", alignItems: "center", gap: 6, cursor: "pointer",
+        padding: "8px 10px", borderRadius: "var(--radius-control)", fontSize: 13,
+        border: `var(--border-width) solid ${active ? "var(--line)" : "transparent"}`,
+        background: active ? "var(--bg)" : hover ? "var(--surface)" : "transparent",
+        boxShadow: active ? "var(--elevation)" : "none",
+        opacity: dragging ? 0.4 : 1,
+      }}
+    >
+      <button
+        onClick={(e) => { e.stopPropagation(); onPin(); }}
+        title={c.pinned ? "Unpin" : "Pin to top"}
+        style={{ background: "none", border: "none", cursor: "pointer", padding: 0, fontSize: 12, opacity: c.pinned ? 1 : hover ? 0.5 : 0 }}
+      >{c.pinned ? "★" : "☆"}</button>
+      <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", color: "var(--text)" }}>
+        {c.title || "Untitled"}
+      </span>
+      {hover && (
+        <button
+          onClick={(e) => { e.stopPropagation(); onDelete(); }}
+          title="Delete chat"
+          style={{ background: "none", border: "none", cursor: "pointer", padding: 0, fontSize: 13, color: "var(--danger)" }}
+        >✕</button>
+      )}
     </div>
   );
 }

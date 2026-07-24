@@ -160,6 +160,26 @@ fn conv_delete(app: tauri::AppHandle, folder: String, id: String) -> Result<(), 
     conversations::delete(&app_data(&app)?, &folder, &id)
 }
 
+/// Update pin + manual order for a batch of conversations (drag-reorder / pin).
+/// `updates` = [{ id, pinned, order }].
+#[tauri::command]
+fn conv_reorder(
+    app: tauri::AppHandle,
+    folder: String,
+    updates: Vec<serde_json::Value>,
+) -> Result<(), String> {
+    let parsed: Vec<(String, bool, i64)> = updates
+        .into_iter()
+        .filter_map(|u| {
+            let id = u.get("id")?.as_str()?.to_string();
+            let pinned = u.get("pinned").and_then(|p| p.as_bool()).unwrap_or(false);
+            let order = u.get("order").and_then(|o| o.as_i64()).unwrap_or(0);
+            Some((id, pinned, order))
+        })
+        .collect();
+    conversations::reorder(&app_data(&app)?, &folder, parsed)
+}
+
 // --- Checkpoints (Phase 1, Contract C4) ------------------------------------
 
 /// Take a checkpoint of the agent folder. `label` is usually the user prompt.
@@ -619,7 +639,7 @@ pub fn run() {
             checkpoint_snapshot, checkpoint_timeline, checkpoint_rewind,
             checkpoint_undo, checkpoint_redo,
             checkpoint_get_retention, checkpoint_set_retention, checkpoint_purge,
-            conv_list, conv_load, conv_save, conv_delete
+            conv_list, conv_load, conv_save, conv_delete, conv_reorder
         ])
         .setup(move |_app| {
             let broker = broker.clone();
