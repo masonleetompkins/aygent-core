@@ -252,6 +252,27 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
                                     on_event(StreamEvent::TextDelta { text: t.to_string() });
                                 }
                             }
+                            // Thinking-enabled models (Opus 5, etc.) emit thinking_delta
+                            // + signature_delta. We accumulate them so the block isn't
+                            // empty, but they get STRIPPED before replay (see below) —
+                            // Anthropic rejects a replayed thinking block that lacks its
+                            // exact signature, and we don't round-trip that reliably.
+                            Some("thinking_delta") => {
+                                if let Some(t) = delta.get("thinking").and_then(|t| t.as_str()) {
+                                    if let Some(b) = blocks.get_mut(idx) {
+                                        let cur = b.get("thinking").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                        b["thinking"] = json!(format!("{cur}{t}"));
+                                    }
+                                }
+                            }
+                            Some("signature_delta") => {
+                                if let Some(s) = delta.get("signature").and_then(|x| x.as_str()) {
+                                    if let Some(b) = blocks.get_mut(idx) {
+                                        let cur = b.get("signature").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                        b["signature"] = json!(format!("{cur}{s}"));
+                                    }
+                                }
+                            }
                             Some("input_json_delta") => {
                                 if let Some(pj) = delta.get("partial_json").and_then(|x| x.as_str()) {
                                     tool_json.entry(idx).or_default().push_str(pj);
@@ -295,5 +316,20 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
         }
     }
 
-    Ok((serde_json::Value::Array(blocks), stop_reason))
+    // Fix for the "each thinking block must contain thinking" 400 on Opus 5 and
+    // other thinking-enabled models: STRIP thinking/redacted_thinking blocks from
+    // the content we return for replay. On multi-turn tool loops Anthropic
+    // requires a replayed thinking block to carry its exact original signature;
+    // rather than risk an invalid round-trip, we drop them. The user still saw
+    // the final answer stream live — only the internal thinking is omitted from
+    // history. Keeps text + tool_use blocks intact (what the loop actually needs).
+    let cleaned: Vec<serde_json::Value> = blocks
+        .into_iter()
+        .filter(|b| {
+            let t = b.get("type").and_then(|x| x.as_str()).unwrap_or("");
+            t != "thinking" && t != "redacted_thinking"
+        })
+        .collect();
+
+    Ok((serde_json::Value::Array(cleaned), stop_reason))
 }
