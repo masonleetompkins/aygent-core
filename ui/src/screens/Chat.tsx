@@ -35,9 +35,15 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
 
   function setConv(id: string | null) { convIdRef.current = id; setConvId(id); }
 
+  // Set msgs in BOTH the ref (source of truth for send/persist) and state (render).
+  // Keeping these in lockstep is critical: send() builds from msgsRef, so if a
+  // switch/new only cleared state, the next send would append to the OLD thread
+  // (the "previous chat bled into the new one" bug).
+  function setMessages(next: Msg[]) { msgsRef.current = next; setMsgs(next); }
+
   // On folder change: load the list and open the most recent one (or a fresh one).
   useEffect(() => {
-    if (!folder) { setConvs([]); setConv(null); setMsgs([]); historyRef.current = []; return; }
+    if (!folder) { setConvs([]); setConv(null); setMessages([]); historyRef.current = []; return; }
     (async () => {
       try {
         const list = await invoke<ConvMeta[]>("conv_list", { folder });
@@ -56,7 +62,7 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
 
   function newConv() {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    setConv(id); setMsgs([]); historyRef.current = [];
+    setConv(id); setMessages([]); historyRef.current = [];
   }
 
   async function openConv(id: string) {
@@ -64,7 +70,7 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
     try {
       const c = await invoke<any>("conv_load", { folder, id });
       setConv(c.id);
-      setMsgs(Array.isArray(c.msgs) ? c.msgs : []);
+      setMessages(Array.isArray(c.msgs) ? c.msgs : []);
       historyRef.current = Array.isArray(c.history) ? c.history : [];
     } catch { newConv(); }
   }
