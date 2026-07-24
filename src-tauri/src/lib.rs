@@ -442,16 +442,16 @@ async fn agent_stream(
         .or_else(|| models.first().cloned())
         .ok_or_else(|| "account returned no usable models".to_string())?;
 
-    // CHECKPOINT (C4): snapshot the folder BEFORE the turn runs, so whatever the
-    // agent writes this turn is rewindable. Labeled with the user's prompt.
-    // Best-effort: a checkpoint failure must never block chatting (e.g. git not
-    // installed) — we surface it as an Info note and continue.
+    // CHECKPOINT (C4) part 1: ensure a BASELINE snapshot exists before the turn
+    // runs. This captures the folder's pre-turn state (labeled "baseline") ONLY
+    // if there are uncommitted changes / no history yet — so there's always an
+    // anchor to rewind *back before* this turn's edits. It is NOT labeled with
+    // the prompt: the prompt-labeled checkpoint is taken AFTER the turn (below),
+    // so it correctly represents "the state produced by this prompt." This fixes
+    // the bug where a turn's writes were absorbed (mislabeled) into the NEXT
+    // turn's pre-snapshot, or lost entirely if they were the last edit.
     if let Ok(root) = broker.root_for("default") {
-        match checkpoint::snapshot(&root, &prompt) {
-            Ok(Some(sha)) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("checkpoint {sha}") }); }
-            Ok(None) => {}
-            Err(e) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("checkpoint skipped: {e}") }); }
-        }
+        let _ = checkpoint::snapshot(&root, "baseline");
     }
 
     let tools = agent_tools();
@@ -501,6 +501,19 @@ async fn agent_stream(
             continue;
         }
         break;
+    }
+
+    // CHECKPOINT (C4) part 2: snapshot the folder AFTER the turn's writes, labeled
+    // with THIS turn's prompt. Now every turn that changed files gets its own
+    // correctly-labeled checkpoint, and "Rewind here" restores the state produced
+    // by that prompt — which is what a user intuitively expects. Skips silently if
+    // nothing changed (no empty checkpoints). Best-effort: never blocks the reply.
+    if let Ok(root) = broker.root_for("default") {
+        match checkpoint::snapshot(&root, &prompt) {
+            Ok(Some(sha)) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("checkpoint {sha}") }); }
+            Ok(None) => {}
+            Err(e) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("checkpoint skipped: {e}") }); }
+        }
     }
 
     emit(&provider::StreamEvent::Done { stop_reason: "end_turn".into() });
