@@ -9,9 +9,11 @@ mod broker_ws;
 mod catalog;
 mod checkpoint;
 mod conversations;
+mod gguf;
 mod hardware;
 mod keychain;
 mod local_provider;
+mod local_tools;
 mod provider;
 mod settings;
 mod supervisor;
@@ -515,6 +517,14 @@ async fn local_download(app: tauri::AppHandle, channel: String, url: String, fil
     Ok(dest.to_string_lossy().to_string())
 }
 
+/// Report a downloaded model's tool capability (detected from its GGUF chat
+/// template). Used by the UI to tag installed models "works with file tools" vs
+/// "chat only" — honest, per-model, no guessing.
+#[tauri::command]
+fn local_tool_capability(path: String) -> gguf::ToolCapability {
+    gguf::detect_tool_capability(&path)
+}
+
 /// Delete a downloaded local model by filename.
 #[tauri::command]
 fn local_delete(app: tauri::AppHandle, filename: String) -> Result<(), String> {
@@ -769,10 +779,14 @@ const AGENT_SYSTEM: &str = "You are AYGENT, an agent that can ONLY touch files i
     chosen folder via your tools. You cannot run shell commands. Use read_file/write_file/list_files \
     for file work. Be concise and friendly.";
 
-// Local models are CHAT-only for now (tool-use is a fast-follow), so their
-// system prompt doesn't promise file tools it can't yet use.
-const AGENT_SYSTEM_LOCAL: &str = "You are AYGENT, a helpful local AI assistant running privately \
-    on the user's own machine. You are running in chat mode. Be concise and friendly.";
+// Base system prompt for local models. When the model is tool-capable, we
+// APPEND its family-native tool instructions (local_tools::system_prompt_with_tools).
+const AGENT_SYSTEM_LOCAL: &str = "You are AYGENT, a helpful AI assistant running privately \
+    on the user's own machine. Be concise and friendly.";
+
+/// Max tool-calling turns for LOCAL models. Anthropic uses 8; local models are
+/// slower and can loop unproductively, so we cap at 4 (Mason's call).
+const LOCAL_TOOL_TURN_CAP: usize = 4;
 
 /// STREAMING chat turn. `history` is the running conversation (array of
 /// {role, content}); we append the new user prompt, run the agent loop with
@@ -810,16 +824,91 @@ async fn agent_stream(
         // "context matches the model" true for a non-technical user, while it
         // still just-works within their hardware.
         let ctx_tokens = local_context_budget(&path);
+
+        // Detect this model's native tool capability from its GGUF chat template
+        // (detect, don't guess). Tool-capable => run the tool loop; else chat-only.
+        let cap = gguf::detect_tool_capability(&path);
+        let ctx_note = format!("{}k context", ctx_tokens / 1024);
+
+        if !cap.tools_supported {
+            // CHAT-ONLY model: single turn, no tools (honest — its template
+            // never declared tool support).
+            let _ = app.emit(&channel, &provider::StreamEvent::Info {
+                text: format!("local model · chat only · {ctx_note}"),
+            });
+            let (content, _stop) = local_provider::local_stream_turn(
+                &path, AGENT_SYSTEM_LOCAL, &messages, ctx_tokens,
+                |ev| { let _ = app.emit(&channel, &ev); },
+            ).await?;
+            messages.as_array_mut().unwrap().push(serde_json::json!({
+                "role": "assistant", "content": content
+            }));
+            return Ok(messages);
+        }
+
+        // TOOL-CAPABLE model: build the family-native system prompt + run a
+        // bounded tool loop (cap at LOCAL_TOOL_TURN_CAP).
         let _ = app.emit(&channel, &provider::StreamEvent::Info {
-            text: format!("local model · chat mode · {}k context (file tools coming soon)", ctx_tokens / 1024),
+            text: format!("local model · {} tools · {ctx_note}", cap.format),
         });
-        let (content, _stop) = local_provider::local_stream_turn(
-            &path, AGENT_SYSTEM_LOCAL, &messages, ctx_tokens,
-            |ev| { let _ = app.emit(&channel, &ev); },
-        ).await?;
-        messages.as_array_mut().unwrap().push(serde_json::json!({
-            "role": "assistant", "content": content
-        }));
+        // Baseline checkpoint before any tool writes (same as Anthropic path).
+        if let Ok(root) = broker.root_for("default") {
+            let _ = checkpoint::snapshot(&root, "baseline");
+        }
+        let sys = local_tools::system_prompt_with_tools(AGENT_SYSTEM_LOCAL, &cap.format);
+
+        for turn in 0..LOCAL_TOOL_TURN_CAP {
+            let (content, _stop) = local_provider::local_stream_turn(
+                &path, &sys, &messages, ctx_tokens,
+                |ev| { let _ = app.emit(&channel, &ev); },
+            ).await?;
+            // The assistant's raw text (content is [{type:text,text:...}]).
+            let text = content.as_array()
+                .and_then(|a| a.first())
+                .and_then(|b| b.get("text")).and_then(|t| t.as_str())
+                .unwrap_or("").to_string();
+            messages.as_array_mut().unwrap().push(serde_json::json!({
+                "role": "assistant", "content": content
+            }));
+
+            // Parse tool calls in the model's native format.
+            let calls = local_tools::parse_tool_calls(&text, &cap.format);
+            if calls.is_empty() { break; } // no tool wanted → done
+
+            // Execute each call through the SAME jailed broker + emit UI events.
+            let mut results_text = String::new();
+            for c in &calls {
+                let _ = app.emit(&channel, &serde_json::json!({
+                    "kind": "ToolUse", "name": c.name,
+                    "input": c.input,
+                }));
+                let (result, is_err) = exec_tool(&broker, &c.name, &c.input);
+                let path_s = c.input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                let _ = app.emit(&channel, &serde_json::json!({
+                    "kind": "ToolResult", "name": c.name, "path": path_s,
+                    "ok": !is_err, "detail": if is_err { result.clone() } else { String::new() }
+                }));
+                results_text.push_str(&local_tools::format_tool_result(&cap.format, &c.name, &result, is_err));
+                results_text.push('\n');
+            }
+
+            // Feed results back as a user turn and loop.
+            messages.as_array_mut().unwrap().push(serde_json::json!({
+                "role": "user", "content": results_text
+            }));
+
+            if turn == LOCAL_TOOL_TURN_CAP - 1 {
+                let _ = app.emit(&channel, &provider::StreamEvent::Info {
+                    text: format!("stopped after {LOCAL_TOOL_TURN_CAP} tool steps"),
+                });
+            }
+        }
+
+        // Snapshot AFTER the turn's writes, labeled with the prompt (same C4
+        // semantics as the Anthropic path — rewindable local tool edits).
+        if let Ok(root) = broker.root_for("default") {
+            let _ = checkpoint::snapshot(&root, &prompt);
+        }
         return Ok(messages);
     }
 
@@ -939,7 +1028,7 @@ pub fn run() {
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
             agent_stream, reveal_in_finder, get_selected_model, set_selected_model,
             get_selection, set_selection, detect_hardware, local_catalog, local_downloaded,
-            local_download, local_delete, restore_agent_folder,
+            local_download, local_delete, local_tool_capability, restore_agent_folder,
             checkpoint_snapshot, checkpoint_timeline, checkpoint_rewind,
             checkpoint_undo, checkpoint_redo,
             checkpoint_get_retention, checkpoint_set_retention, checkpoint_purge,

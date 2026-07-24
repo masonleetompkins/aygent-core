@@ -353,10 +353,20 @@ function LocalModels({ folder, activePath, onChoose }: {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [progress, setProgress] = useState<Record<string, number>>({}); // filename -> 0..1
+  const [toolCaps, setToolCaps] = useState<Record<string, boolean>>({}); // path -> tools_supported
   const unlistenRef = useRef<null | (() => void)>(null);
 
   async function refreshDownloaded() {
-    try { setDownloaded(await invoke<Downloaded[]>("local_downloaded")); } catch { /* ignore */ }
+    try {
+      const list = await invoke<Downloaded[]>("local_downloaded");
+      setDownloaded(list);
+      // Detect each installed model's tool capability (from its GGUF template).
+      for (const d of list) {
+        invoke<{ tools_supported: boolean }>("local_tool_capability", { path: d.path })
+          .then((c) => setToolCaps((m) => ({ ...m, [d.path]: c.tools_supported })))
+          .catch(() => {});
+      }
+    } catch { /* ignore */ }
   }
 
   useEffect(() => {
@@ -408,19 +418,31 @@ function LocalModels({ folder, activePath, onChoose }: {
       {downloaded.length > 0 && (
         <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
           <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text-muted)" }}>Installed</span>
-          {downloaded.map((d) => (
+          {downloaded.map((d) => {
+            const toolable = toolCaps[d.path];
+            return (
             <div key={d.filename} style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <ModelRow
                 active={activePath === d.path}
                 onClick={() => folder && onChoose(d.path, d.filename.replace(/\.gguf$/i, ""))}
                 title={d.filename.replace(/\.gguf$/i, "")}
-                sub={folder ? "click to use this model" : "pick an Agent Folder to use"}
+                sub={toolable === undefined
+                  ? (folder ? "click to use this model" : "pick an Agent Folder to use")
+                  : (toolable ? "✓ works with file tools" : "chat only — no file tools")}
                 meta={`${d.size_gb.toFixed(1)}GB · local`}
               />
               <Button variant="secondary" onClick={() => del(d)}>Delete</Button>
             </div>
-          ))}
+            );
+          })}
         </div>
+      )}
+      {downloaded.length > 0 && (
+        <p style={{ ...hint, color: "var(--text-faint)", fontSize: 12 }}>
+          Models marked “works with file tools” can read &amp; write files in your Agent Folder. Smaller
+          models are less reliable at it than cloud models — and every change is checkpointed, so you can
+          always rewind.
+        </p>
       )}
 
       {/* Catalog browser */}
