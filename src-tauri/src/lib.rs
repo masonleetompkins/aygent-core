@@ -6,9 +6,12 @@
 
 mod broker;
 mod broker_ws;
+mod catalog;
 mod checkpoint;
 mod conversations;
+mod hardware;
 mod keychain;
+mod local_provider;
 mod provider;
 mod settings;
 mod supervisor;
@@ -290,6 +293,136 @@ fn set_selected_model(app: tauri::AppHandle, folder: String, model: String) -> R
     settings::save(&app_data, &folder, &s)
 }
 
+/// Full per-folder selection (provider + model). Empty provider = anthropic.
+#[tauri::command]
+fn get_selection(app: tauri::AppHandle, folder: String) -> Result<serde_json::Value, String> {
+    use tauri::Manager;
+    let app_data = app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))?;
+    let s = settings::load(&app_data, &folder);
+    Ok(serde_json::json!({ "provider": s.provider, "model": s.model }))
+}
+
+#[tauri::command]
+fn set_selection(app: tauri::AppHandle, folder: String, provider: String, model: String) -> Result<(), String> {
+    use tauri::Manager;
+    let app_data = app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))?;
+    let mut s = settings::load(&app_data, &folder);
+    s.provider = provider;
+    s.model = model;
+    settings::save(&app_data, &folder, &s)
+}
+
+// --- LOCAL MODELS ----------------------------------------------------------
+
+/// Detect the RUNTIME machine (CPU/RAM/GPU/accel) for perf prediction.
+#[tauri::command]
+fn detect_hardware() -> hardware::HardwareInfo {
+    hardware::detect()
+}
+
+/// Live catalog of the latest curated GGUF models (Qwen/Mistral/Kimi/Llama),
+/// each entry already scored for THIS machine's expected performance per quant.
+#[tauri::command]
+async fn local_catalog(per_family: Option<usize>) -> Result<serde_json::Value, String> {
+    let hw = hardware::detect();
+    let models = catalog::fetch(per_family.unwrap_or(4)).await?;
+    // Attach a perf verdict to each quant so the UI can show fit + speed inline.
+    let scored: Vec<serde_json::Value> = models.iter().map(|m| {
+        let quants: Vec<serde_json::Value> = m.quants.iter().map(|q| {
+            let v = hardware::predict(&hw, m.params_billions, q.size_gb);
+            serde_json::json!({
+                "quant": q.quant, "filename": q.filename, "size_gb": q.size_gb,
+                "download_url": q.download_url, "perf": v,
+            })
+        }).collect();
+        serde_json::json!({
+            "family": m.family, "family_label": m.family_label, "repo": m.repo,
+            "name": m.name, "params_billions": m.params_billions,
+            "downloads": m.downloads, "updated": m.updated, "quants": quants,
+        })
+    }).collect();
+    Ok(serde_json::json!({ "hardware": hw, "models": scored }))
+}
+
+/// Directory where downloaded GGUF models live (app data, not the user folder).
+fn models_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+    let dir = app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))?.join("models");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir models: {e}"))?;
+    Ok(dir)
+}
+
+/// List downloaded local models (filename + size + absolute path).
+#[tauri::command]
+fn local_downloaded(app: tauri::AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    let dir = models_dir(&app)?;
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("gguf") {
+                let size_gb = std::fs::metadata(&p).map(|m| (m.len() as f64 / 1_073_741_824.0) as f32).unwrap_or(0.0);
+                out.push(serde_json::json!({
+                    "filename": p.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+                    "path": p.to_string_lossy(), "size_gb": size_gb,
+                }));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Download a GGUF to the models dir, emitting progress events on `channel`.
+/// Returns the absolute local path (which becomes the per-folder model id).
+#[tauri::command]
+async fn local_download(app: tauri::AppHandle, channel: String, url: String, filename: String) -> Result<String, String> {
+    use tauri::Emitter;
+    use futures_util::StreamExt;
+    // Guard the filename (no traversal).
+    if filename.is_empty() || filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return Err("invalid filename".into());
+    }
+    let dir = models_dir(&app)?;
+    let dest = dir.join(&filename);
+    let tmp = dir.join(format!("{filename}.part"));
+
+    let client = reqwest::Client::builder().user_agent("aygent/0.1").build().map_err(|e| format!("http: {e}"))?;
+    let resp = client.get(&url).send().await.map_err(|e| format!("request: {e}"))?;
+    if !resp.status().is_success() { return Err(format!("download {}", resp.status())); }
+    let total = resp.content_length().unwrap_or(0);
+
+    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create file: {e}"))?;
+    let mut got: u64 = 0;
+    let mut last_emit = 0u64;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| format!("stream: {e}"))?;
+        use std::io::Write;
+        file.write_all(&bytes).map_err(|e| format!("write: {e}"))?;
+        got += bytes.len() as u64;
+        // throttle progress events to ~every 8MB
+        if got - last_emit > 8_000_000 {
+            last_emit = got;
+            let _ = app.emit(&channel, &serde_json::json!({ "got": got, "total": total }));
+        }
+    }
+    drop(file);
+    std::fs::rename(&tmp, &dest).map_err(|e| format!("finalize: {e}"))?;
+    let _ = app.emit(&channel, &serde_json::json!({ "got": got, "total": total, "done": true }));
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// Delete a downloaded local model by filename.
+#[tauri::command]
+fn local_delete(app: tauri::AppHandle, filename: String) -> Result<(), String> {
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return Err("invalid filename".into());
+    }
+    let path = models_dir(&app)?.join(&filename);
+    if path.exists() { std::fs::remove_file(&path).map_err(|e| format!("delete: {e}"))?; }
+    Ok(())
+}
+
 /// M0.3 end-to-end proof: fetch the Anthropic key from Keychain (Rust-side
 /// only), ask the account which models it can use, call the first one, return
 /// the text (prefixed with which model answered). Key NEVER enters JS/WebView.
@@ -533,6 +666,11 @@ const AGENT_SYSTEM: &str = "You are AYGENT, an agent that can ONLY touch files i
     chosen folder via your tools. You cannot run shell commands. Use read_file/write_file/list_files \
     for file work. Be concise and friendly.";
 
+// Local models are CHAT-only for now (tool-use is a fast-follow), so their
+// system prompt doesn't promise file tools it can't yet use.
+const AGENT_SYSTEM_LOCAL: &str = "You are AYGENT, a helpful local AI assistant running privately \
+    on the user's own machine. You are running in chat mode. Be concise and friendly.";
+
 /// STREAMING chat turn. `history` is the running conversation (array of
 /// {role, content}); we append the new user prompt, run the agent loop with
 /// streaming, emit events to the UI, and return the FULL updated history so the
@@ -545,9 +683,36 @@ async fn agent_stream(
     prompt: String,
     history: serde_json::Value,
     model: Option<String>,
+    provider: Option<String>,
 ) -> Result<serde_json::Value, String> {
     use tauri::Emitter;
     let broker = broker.inner().clone();
+    let provider_kind = provider.unwrap_or_default();
+
+    // ---- LOCAL MODEL PATH (llama.cpp compiled in) --------------------------
+    // Chat-first (Mason's call): a downloaded GGUF runs entirely in-process. No
+    // key, no network. `model` here is the absolute path to the .gguf file.
+    // Tool-use is a deliberate fast-follow, so the local loop is a SINGLE chat
+    // turn (no agent_tools, no broker file loop yet).
+    if provider_kind == "local" {
+        let path = model.filter(|m| !m.trim().is_empty())
+            .ok_or_else(|| "no local model selected — download one in Settings".to_string())?;
+        let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
+        messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": prompt }));
+        let _ = app.emit(&channel, &provider::StreamEvent::Info {
+            text: "local model · chat mode (file tools coming soon)".into(),
+        });
+        let (content, _stop) = local_provider::local_stream_turn(
+            &path, AGENT_SYSTEM_LOCAL, &messages,
+            |ev| { let _ = app.emit(&channel, &ev); },
+        ).await?;
+        messages.as_array_mut().unwrap().push(serde_json::json!({
+            "role": "assistant", "content": content
+        }));
+        return Ok(messages);
+    }
+
+    // ---- ANTHROPIC PATH (default) ------------------------------------------
     let key = keychain::get_key("anthropic")
         .map_err(|_| "no anthropic key set — add one in Settings".to_string())?;
     // Model choice: explicit (from the per-folder Settings picker) wins; empty/
@@ -662,6 +827,8 @@ pub fn run() {
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
             agent_stream, reveal_in_finder, get_selected_model, set_selected_model,
+            get_selection, set_selection, detect_hardware, local_catalog, local_downloaded,
+            local_download, local_delete,
             checkpoint_snapshot, checkpoint_timeline, checkpoint_rewind,
             checkpoint_undo, checkpoint_redo,
             checkpoint_get_retention, checkpoint_set_retention, checkpoint_purge,

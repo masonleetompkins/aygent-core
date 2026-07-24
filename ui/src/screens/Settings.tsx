@@ -1,8 +1,9 @@
 // Settings — THE WEDGE. Where "no config files, ever" becomes visible and
 // delightful. Appearance (theme lives here now, not a debug bar), Providers
 // (BYO keys -> Keychain), and the Agent Folder scope. Themed via tokens.
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Card, Button, Input, Pill } from "../components/ui";
 import { saveTheme, type Mode } from "../lib/theme";
 
@@ -36,13 +37,15 @@ export function Settings({
   const [confirmPurge, setConfirmPurge] = useState(false);
   const [models, setModels] = useState<string[]>([]);
   const [selModel, setSelModel] = useState(""); // "" = auto (haiku)
+  const [selProvider, setSelProvider] = useState(""); // "" = anthropic, "local"
   const [modelMsg, setModelMsg] = useState<string | null>(null);
 
   useEffect(() => { invoke<boolean>("has_provider_key", { provider: "anthropic" }).then(setKeySet).catch(() => {}); }, []);
   useEffect(() => {
     if (!folder) return;
     invoke<number>("checkpoint_get_retention").then(setRetention).catch(() => {});
-    invoke<string>("get_selected_model", { folder }).then(setSelModel).catch(() => {});
+    invoke<{ provider: string; model: string }>("get_selection", { folder })
+      .then((s) => { setSelProvider(s.provider); setSelModel(s.model); }).catch(() => {});
   }, [folder]);
 
   // Load the live model list once a key is set (real models this key can use).
@@ -53,10 +56,20 @@ export function Settings({
 
   async function chooseModel(model: string) {
     if (!folder) return;
-    setSelModel(model); setModelMsg(null);
+    setSelProvider(""); setSelModel(model); setModelMsg(null);
     try {
-      await invoke("set_selected_model", { folder, model });
+      await invoke("set_selection", { folder, provider: "", model });
       setModelMsg(model === "" ? "✓ auto (Haiku — fast + cheap)" : `✓ using ${modelInfo(model).label}`);
+    } catch (e) { setModelMsg("✗ " + String(e)); }
+  }
+
+  // Choose a downloaded LOCAL model (provider="local", model=absolute gguf path).
+  async function chooseLocalModel(path: string, name: string) {
+    if (!folder) return;
+    setSelProvider("local"); setSelModel(path); setModelMsg(null);
+    try {
+      await invoke("set_selection", { folder, provider: "local", model: path });
+      setModelMsg(`✓ using ${name} (local)`);
     } catch (e) { setModelMsg("✗ " + String(e)); }
   }
 
@@ -167,6 +180,13 @@ export function Settings({
         )}
       </Card>
 
+      {/* LOCAL MODELS — download + run GGUF models entirely in-app, no external tools */}
+      <LocalModels
+        folder={folder}
+        activePath={selProvider === "local" ? selModel : ""}
+        onChoose={chooseLocalModel}
+      />
+
       {/* CHECKPOINTS */}
       <Card title="Checkpoints">
         <p style={hint}>Every change your agent makes is snapshotted so you can rewind. Keep history for a window, then it prunes automatically.</p>
@@ -242,6 +262,131 @@ function ModelRow({ active, onClick, title, sub, meta, mono }: {
       </span>
       <span style={{ fontSize: 12, fontFamily: "ui-monospace, monospace", color: "var(--text-muted)", flexShrink: 0 }}>{meta}</span>
     </button>
+  );
+}
+
+// ---- LOCAL MODELS ---------------------------------------------------------
+// Browse a live, curated GGUF catalog (Qwen/Mistral/Kimi/Llama), see how each
+// will run on THIS machine, download in-app, and pick one to chat with. Fully
+// self-contained: no Ollama, no terminal.
+type Perf = { tier: string; badge: string; tokens_per_sec: string; note: string; fits: boolean };
+type Quant = { quant: string; filename: string; size_gb: number; download_url: string; perf: Perf };
+type CatModel = { family: string; family_label: string; repo: string; name: string; params_billions: number; downloads: number; quants: Quant[] };
+type HW = { summary: string };
+type Downloaded = { filename: string; path: string; size_gb: number };
+
+function LocalModels({ folder, activePath, onChoose }: {
+  folder: string | null; activePath: string; onChoose: (path: string, name: string) => void;
+}) {
+  const [hw, setHw] = useState<HW | null>(null);
+  const [catalog, setCatalog] = useState<CatModel[]>([]);
+  const [downloaded, setDownloaded] = useState<Downloaded[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [progress, setProgress] = useState<Record<string, number>>({}); // filename -> 0..1
+  const unlistenRef = useRef<null | (() => void)>(null);
+
+  async function refreshDownloaded() {
+    try { setDownloaded(await invoke<Downloaded[]>("local_downloaded")); } catch { /* ignore */ }
+  }
+
+  useEffect(() => {
+    invoke<HW>("detect_hardware").then(setHw).catch(() => {});
+    refreshDownloaded();
+  }, []);
+
+  async function loadCatalog() {
+    setLoading(true); setErr(null);
+    try {
+      const res = await invoke<{ hardware: HW; models: CatModel[] }>("local_catalog", { perFamily: 4 });
+      setHw(res.hardware); setCatalog(res.models);
+    } catch (e) { setErr(String(e)); }
+    finally { setLoading(false); }
+  }
+
+  async function download(q: Quant) {
+    const channel = `dl://${q.filename}`;
+    setProgress((p) => ({ ...p, [q.filename]: 0 }));
+    const un = await listen<any>(channel, (e) => {
+      const { got, total, done } = e.payload || {};
+      setProgress((p) => ({ ...p, [q.filename]: done ? 1 : (total ? got / total : 0) }));
+    });
+    unlistenRef.current = un;
+    try {
+      await invoke("local_download", { channel, url: q.download_url, filename: q.filename });
+      await refreshDownloaded();
+    } catch (e) { setErr(String(e)); }
+    finally { un(); setProgress((p) => { const n = { ...p }; delete n[q.filename]; return n; }); }
+  }
+
+  async function del(d: Downloaded) {
+    try { await invoke("local_delete", { filename: d.filename }); await refreshDownloaded(); }
+    catch (e) { setErr(String(e)); }
+  }
+
+  const isDown = (fname: string) => downloaded.some((d) => d.filename === fname);
+
+  return (
+    <Card title="Local Models">
+      <p style={hint}>Download and run open models entirely on your machine — no accounts, no cloud, fully private. Powered by an engine built right into AYGENT.</p>
+      {hw && <Pill tone="muted">🖥 {hw.summary}</Pill>}
+
+      {/* Downloaded models — pick one to chat with */}
+      {downloaded.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text-muted)" }}>Installed</span>
+          {downloaded.map((d) => (
+            <div key={d.filename} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <ModelRow
+                active={activePath === d.path}
+                onClick={() => folder && onChoose(d.path, d.filename.replace(/\.gguf$/i, ""))}
+                title={d.filename.replace(/\.gguf$/i, "")}
+                sub={folder ? "click to use this model" : "pick an Agent Folder to use"}
+                meta={`${d.size_gb.toFixed(1)}GB · local`}
+              />
+              <Button variant="secondary" onClick={() => del(d)}>Delete</Button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Catalog browser */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6 }}>
+        <Button onClick={loadCatalog} disabled={loading}>{loading ? "Loading…" : catalog.length ? "Refresh catalog" : "Browse models"}</Button>
+        <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Latest Qwen · Mistral · Kimi · Llama</span>
+      </div>
+      {err && <Pill tone="danger">✗ {err}</Pill>}
+
+      {catalog.map((m) => (
+        <div key={m.repo} style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6, paddingTop: 8, borderTop: "var(--border-width) solid var(--line)" }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+            <span style={{ fontWeight: 800, fontSize: 15 }}>{m.family_label}</span>
+            <span style={{ fontSize: 13, color: "var(--text-muted)" }}>{m.name}</span>
+          </div>
+          {m.quants.map((q) => {
+            const pct = progress[q.filename];
+            const downloading = pct !== undefined;
+            return (
+              <div key={q.filename} style={{ display: "flex", alignItems: "center", gap: 10, paddingLeft: 4 }}>
+                <span style={{ width: 90, fontFamily: "ui-monospace, monospace", fontSize: 12 }}>{q.quant}</span>
+                <span title={q.perf.note} style={{ fontSize: 13, flex: 1, minWidth: 0 }}>
+                  {q.perf.badge} {q.perf.tokens_per_sec || (q.perf.fits ? "" : "won't fit")}
+                  <span style={{ color: "var(--text-faint)", marginLeft: 6 }}>{q.size_gb.toFixed(1)}GB</span>
+                </span>
+                {isDown(q.filename)
+                  ? <Pill tone="ok">installed ✓</Pill>
+                  : downloading
+                    ? <span style={{ fontSize: 12, fontFamily: "ui-monospace, monospace", width: 90, textAlign: "right" }}>{Math.round(pct * 100)}%</span>
+                    : <Button variant="secondary" onClick={() => download(q)} disabled={!q.perf.fits}>Download</Button>}
+              </div>
+            );
+          })}
+        </div>
+      ))}
+      <p style={{ ...hint, color: "var(--text-faint)", fontSize: 12, marginTop: 4 }}>
+        Performance figures are estimates for your machine, not benchmarks. Local models run in chat mode; file tools are coming soon.
+      </p>
+    </Card>
   );
 }
 

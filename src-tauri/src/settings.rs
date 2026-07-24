@@ -16,8 +16,13 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct FolderSettings {
     /// Selected model id ("" = auto: prefer haiku, else first available).
+    /// For a LOCAL model this is the absolute path to the downloaded .gguf file.
     #[serde(default)]
     pub model: String,
+    /// Provider this model belongs to: "" / "anthropic" (default) or "local".
+    /// (OpenAI/OpenRouter land in a later pass.) Empty = anthropic for back-compat.
+    #[serde(default)]
+    pub provider: String,
 }
 
 /// FNV-1a 64-bit — same stable, dependency-free hash the conversations store

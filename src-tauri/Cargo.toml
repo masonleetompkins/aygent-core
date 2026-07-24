@@ -26,6 +26,11 @@ futures-util = "0.3"
 keyring = { version = "3", features = ["apple-native"] }  # API keys in macOS Keychain (M0.3; never touch JS/WebView)
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }  # Anthropic HTTP (M0.3)
 git2 = { version = "0.19", default-features = false }  # checkpoints (C4): git object model compiled IN — no system git, zero user setup
+llama-cpp-2 = "0.1"                 # LOCAL MODELS: llama.cpp compiled IN — download + run GGUF models in-app, zero user setup (Metal on mac / CUDA on PC via features below)
+num_cpus = "1"                      # thread count for local inference / perf prediction
+sysinfo = "0.32"                    # hardware detection (CPU/RAM) for perf prediction on the RUNTIME machine
+once_cell = "1"                     # process-wide llama.cpp backend + model cache (local models)
+urlencoding = "2"                   # (unused placeholder removed if not needed) — kept minimal
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"                        # atomic openat/O_NOFOLLOW fd layer (M0.2c)
@@ -36,3 +41,13 @@ libc = "0.2"                        # atomic openat/O_NOFOLLOW fd layer (M0.2c)
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+# LOCAL-MODEL GPU acceleration. macOS builds turn on Metal; a CUDA PC build can
+# opt in. Kept as features so a headless/CI build can compile CPU-only.
+metal = ["llama-cpp-2/metal"]
+cuda = ["llama-cpp-2/cuda"]
+
+# On macOS, default to Metal so Mason's `cargo tauri dev` GPU-offloads out of the
+# box (this is where he builds/runs). Other targets stay CPU-only unless opted in.
+[target.'cfg(target_os = "macos")'.dependencies.llama-cpp-2]
+version = "0.1"
+features = ["metal"]
