@@ -85,18 +85,34 @@ export function Settings({
       .then((s) => { setSelProvider(s.provider); setSelModel(s.model); }).catch(() => {});
   }, [folder]);
 
-  // Load the live model list once a key is set (real models this key can use).
+  // Which CLOUD provider the picker is browsing: "anthropic" | "openai" |
+  // "openrouter". Defaults to the folder's saved provider (or anthropic).
+  const [pickerProvider, setPickerProvider] = useState<"anthropic" | "openai" | "openrouter">("anthropic");
+  const [modelsLoading, setModelsLoading] = useState(false);
+
   useEffect(() => {
-    if (!keySet) return;
-    invoke<string[]>("anthropic_models").then(setModels).catch(() => {});
-  }, [keySet]);
+    if (selProvider === "openai" || selProvider === "openrouter") setPickerProvider(selProvider);
+    else if (selProvider === "" || selProvider === "anthropic") setPickerProvider("anthropic");
+  }, [selProvider]);
+
+  // Load the live model list for the selected cloud provider.
+  useEffect(() => {
+    setModels([]); setModelsLoading(true);
+    const call = pickerProvider === "anthropic"
+      ? invoke<string[]>("anthropic_models")
+      : invoke<string[]>("openai_models", { provider: pickerProvider });
+    call.then(setModels).catch(() => setModels([])).finally(() => setModelsLoading(false));
+  }, [pickerProvider]);
 
   async function chooseModel(model: string) {
     if (!folder) return;
-    setSelProvider(""); setSelModel(model); setModelMsg(null);
+    // provider "" means anthropic (back-compat default).
+    const prov = pickerProvider === "anthropic" ? "" : pickerProvider;
+    setSelProvider(prov); setSelModel(model); setModelMsg(null);
     try {
-      await invoke("set_selection", { folder, provider: "", model });
-      setModelMsg(model === "" ? "✓ auto (Haiku — fast + cheap)" : `✓ using ${modelInfo(model).label}`);
+      await invoke("set_selection", { folder, provider: prov, model });
+      const label = model === "" ? "auto (Haiku — fast + cheap)" : (pickerProvider === "anthropic" ? modelInfo(model).label : model);
+      setModelMsg(`✓ using ${label}`);
     } catch (e) { setModelMsg("✗ " + String(e)); }
   }
 
@@ -165,17 +181,9 @@ export function Settings({
       {/* PROVIDERS */}
       <Card title="Providers">
         <p style={hint}>Bring your own keys. They go straight to the macOS Keychain — the UI never keeps them.</p>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <span style={{ fontSize: 14, fontWeight: 700, width: 90 }}>Anthropic</span>
-          {keySet ? <Pill tone="ok">key set ✓</Pill> : <Pill tone="muted">no key</Pill>}
-        </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <Input type="password" mono value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={keySet ? "replace key…" : "sk-ant-…"} />
-          <Button onClick={saveKey}>{keySet ? "Replace" : "Save"}</Button>
-          {keySet && <Button variant="secondary" onClick={testKey}>Test</Button>}
-        </div>
-        {testResult && <Pill tone={testResult.startsWith("✗") ? "danger" : "ok"}>{testResult}</Pill>}
-        <p style={{ ...hint, color: "var(--text-faint)", fontSize: 12 }}>OpenAI · OpenRouter · local Ollama — coming in this build.</p>
+        <ProviderRow provider="anthropic" label="Anthropic" placeholder="sk-ant-…" />
+        <ProviderRow provider="openai" label="OpenAI" placeholder="sk-…" />
+        <ProviderRow provider="openrouter" label="OpenRouter" placeholder="sk-or-…" />
       </Card>
 
       {/* MODEL */}
@@ -183,36 +191,45 @@ export function Settings({
         <p style={hint}>Which brain your agent runs on. Saved per folder — a serious project can run Opus while a scratch folder stays on Haiku.</p>
         {!folder ? (
           <p style={{ ...hint, color: "var(--text-faint)" }}>Pick an Agent Folder below to choose a model.</p>
-        ) : !keySet ? (
-          <p style={{ ...hint, color: "var(--text-faint)" }}>Add an Anthropic key above to load your available models.</p>
-        ) : models.length === 0 ? (
-          <p style={{ ...hint, color: "var(--text-faint)" }}>Loading models…</p>
         ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {/* AUTO option */}
-            <ModelRow
-              active={selModel === ""}
-              onClick={() => chooseModel("")}
-              title="Auto"
-              sub="picks Haiku — fast + cheap — automatically"
-              meta="default"
-            />
-            {models.map((m) => {
-              const info = modelInfo(m);
-              return (
-                <ModelRow
-                  key={m}
-                  active={selModel === m}
-                  onClick={() => chooseModel(m)}
-                  title={info.label}
-                  sub={info.blurb || m}
-                  meta={`${fmtPrice(info.inPrice)} in · ${fmtPrice(info.outPrice)} out / 1M tok · ${info.context} ctx`}
-                  mono={m}
-                />
-              );
-            })}
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {/* PROVIDER SWITCHER */}
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              {(["anthropic", "openai", "openrouter"] as const).map((p) => (
+                <Button key={p} variant={pickerProvider === p ? "primary" : "secondary"} onClick={() => setPickerProvider(p)}>
+                  {p === "anthropic" ? "Anthropic" : p === "openai" ? "OpenAI" : "OpenRouter"}
+                </Button>
+              ))}
+            </div>
+            {modelsLoading ? (
+              <p style={{ ...hint, color: "var(--text-faint)" }}>Loading models…</p>
+            ) : models.length === 0 ? (
+              <p style={{ ...hint, color: "var(--text-faint)" }}>
+                No models — add your {pickerProvider === "anthropic" ? "Anthropic" : pickerProvider === "openai" ? "OpenAI" : "OpenRouter"} key above (then Test), or that key has no available models.
+              </p>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 340, overflowY: "auto" }}>
+                {/* AUTO option — anthropic only (picks haiku) */}
+                {pickerProvider === "anthropic" && (
+                  <ModelRow active={selModel === "" && (selProvider === "" || selProvider === "anthropic")}
+                    onClick={() => chooseModel("")} title="Auto" sub="picks Haiku — fast + cheap — automatically" meta="default" />
+                )}
+                {models.map((m) => {
+                  const info = pickerProvider === "anthropic" ? modelInfo(m) : null;
+                  const prov = pickerProvider === "anthropic" ? "" : pickerProvider;
+                  return (
+                    <ModelRow key={m} active={selModel === m && selProvider === prov}
+                      onClick={() => chooseModel(m)}
+                      title={info ? info.label : m}
+                      sub={info ? (info.blurb || m) : ""}
+                      meta={info ? `${fmtPrice(info.inPrice)} in · ${fmtPrice(info.outPrice)} out / 1M tok · ${info.context} ctx` : ""}
+                      mono={m} />
+                  );
+                })}
+              </div>
+            )}
             {modelMsg && <Pill tone={modelMsg.startsWith("✗") ? "danger" : "ok"}>{modelMsg}</Pill>}
-            <p style={{ ...hint, color: "var(--text-faint)", fontSize: 12 }}>Prices are per million tokens (input · output). Context = how much the model can hold in one conversation.</p>
+            <p style={{ ...hint, color: "var(--text-faint)", fontSize: 12 }}>Pricing/context shown for Anthropic models. OpenAI · OpenRouter lists are live from your account.</p>
           </div>
         )}
       </Card>
@@ -509,6 +526,43 @@ function LocalModels({ folder, activePath, onChoose }: {
         </div>
       )}
     </Card>
+  );
+}
+
+// One provider key row: shows key status, save/replace, and a live Test that
+// hits that provider's /models endpoint. Keys go straight to Keychain.
+function ProviderRow({ provider, label, placeholder }: { provider: string; label: string; placeholder: string }) {
+  const [key, setKey] = useState("");
+  const [set, setSet] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  useEffect(() => { invoke<boolean>("has_provider_key", { provider }).then(setSet).catch(() => {}); }, [provider]);
+  async function save() {
+    if (!key.trim()) return;
+    await invoke("set_provider_key", { provider, key: key.trim() });
+    setKey(""); setSet(true); setMsg(null);
+  }
+  async function test() {
+    setMsg("testing…");
+    try {
+      const models = provider === "anthropic"
+        ? await invoke<string[]>("anthropic_models")
+        : await invoke<string[]>("openai_models", { provider });
+      setMsg(`✓ connected · ${models.length} models`);
+    } catch (e) { setMsg("✗ " + String(e)); }
+  }
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6, paddingTop: 6 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <span style={{ fontSize: 14, fontWeight: 700, width: 100 }}>{label}</span>
+        {set ? <Pill tone="ok">key set ✓</Pill> : <Pill tone="muted">no key</Pill>}
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <Input type="password" mono value={key} onChange={(e) => setKey(e.target.value)} placeholder={set ? "replace key…" : placeholder} />
+        <Button onClick={save}>{set ? "Replace" : "Save"}</Button>
+        {set && <Button variant="secondary" onClick={test}>Test</Button>}
+      </div>
+      {msg && <Pill tone={msg.startsWith("✗") ? "danger" : "ok"}>{msg}</Pill>}
+    </div>
   );
 }
 

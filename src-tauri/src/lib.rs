@@ -14,6 +14,7 @@ mod hardware;
 mod keychain;
 mod local_provider;
 mod local_tools;
+mod openai_provider;
 mod provider;
 mod settings;
 mod supervisor;
@@ -332,6 +333,16 @@ async fn anthropic_models() -> Result<Vec<String>, String> {
     let key = keychain::get_key("anthropic")
         .map_err(|_| "no anthropic key set — add one first".to_string())?;
     provider::anthropic_list_models(&key).await
+}
+
+/// List models for an OpenAI-compatible provider ("openai" | "openrouter") via
+/// its live /models endpoint — no hardcoded list, so new models appear without
+/// an app update.
+#[tauri::command]
+async fn openai_models(provider: String) -> Result<Vec<String>, String> {
+    let key = keychain::get_key(&provider)
+        .map_err(|_| format!("no {provider} key set — add one first"))?;
+    openai_provider::list_models(&provider, &key).await
 }
 
 /// Per-folder selected model. "" = auto (prefer haiku, else first available).
@@ -912,6 +923,73 @@ async fn agent_stream(
         return Ok(messages);
     }
 
+    // ---- OPENAI / OPENROUTER PATH ------------------------------------------
+    // Shared Chat Completions wire format; one impl, two base URLs. Full tool-
+    // use: same jailed exec_tool + broker + checkpoints as every other provider.
+    if provider_kind == "openai" || provider_kind == "openrouter" {
+        let key = keychain::get_key(&provider_kind)
+            .map_err(|_| format!("no {provider_kind} key set — add one in Settings"))?;
+        let model = model.filter(|m| !m.trim().is_empty())
+            .ok_or_else(|| format!("no {provider_kind} model selected — pick one in Settings"))?;
+
+        // Baseline checkpoint before the turn (rewind anchor), same as Anthropic.
+        if let Ok(root) = broker.root_for("default") {
+            let _ = checkpoint::snapshot(&root, "baseline");
+        }
+
+        let tools = agent_tools();
+        let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
+        messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": prompt }));
+        let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("model: {model}") });
+
+        for _ in 0..8 {
+            let (assistant, stop) = openai_provider::openai_stream_turn(
+                &provider_kind, &key, &model, AGENT_SYSTEM, &messages, &tools,
+                |ev| { let _ = app.emit(&channel, &ev); },
+            ).await?;
+
+            // Push the assistant message (OpenAI-native shape, may carry tool_calls).
+            messages.as_array_mut().unwrap().push(assistant.clone());
+
+            // Execute tool_calls (OpenAI shape) through the SAME jailed broker.
+            let mut had_tools = false;
+            if let Some(tcs) = assistant.get("tool_calls").and_then(|t| t.as_array()) {
+                for tc in tcs {
+                    had_tools = true;
+                    let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                    let f = tc.get("function").cloned().unwrap_or(serde_json::json!({}));
+                    let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                    let args_str = f.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
+                    let input: serde_json::Value = serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+                    let (result_text, is_err) = exec_tool(&broker, &name, &input);
+                    let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                    let _ = app.emit(&channel, &serde_json::json!({
+                        "kind": "ToolResult", "name": name, "path": path,
+                        "ok": !is_err, "detail": if is_err { result_text.clone() } else { String::new() }
+                    }));
+                    // OpenAI expects tool results as {role:"tool", tool_call_id, content};
+                    // build_openai_messages translates our tool_result blocks into that.
+                    messages.as_array_mut().unwrap().push(serde_json::json!({
+                        "role": "user",
+                        "content": [{ "type": "tool_result", "tool_use_id": id, "content": result_text, "is_error": is_err }]
+                    }));
+                }
+            }
+
+            if had_tools { continue; }
+            break;
+        }
+
+        // Snapshot AFTER the turn's writes, labeled with the prompt (C4).
+        if let Ok(root) = broker.root_for("default") {
+            match checkpoint::snapshot(&root, &prompt) {
+                Ok(Some(sha)) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("checkpoint {sha}") }); }
+                _ => {}
+            }
+        }
+        return Ok(messages);
+    }
+
     // ---- ANTHROPIC PATH (default) ------------------------------------------
     let key = keychain::get_key("anthropic")
         .map_err(|_| "no anthropic key set — add one in Settings".to_string())?;
@@ -1029,6 +1107,7 @@ pub fn run() {
             agent_stream, reveal_in_finder, get_selected_model, set_selected_model,
             get_selection, set_selection, detect_hardware, local_catalog, local_downloaded,
             local_download, local_delete, local_tool_capability, restore_agent_folder,
+            openai_models,
             checkpoint_snapshot, checkpoint_timeline, checkpoint_rewind,
             checkpoint_undo, checkpoint_redo,
             checkpoint_get_retention, checkpoint_set_retention, checkpoint_purge,
