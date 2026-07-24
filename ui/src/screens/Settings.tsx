@@ -176,7 +176,7 @@ export function Settings({
                   onClick={() => chooseModel(m)}
                   title={info.label}
                   sub={info.blurb || m}
-                  meta={`${fmtPrice(info.inPrice)} in · ${fmtPrice(info.outPrice)} out / 1M · ${info.context} ctx`}
+                  meta={`${fmtPrice(info.inPrice)} in · ${fmtPrice(info.outPrice)} out / 1M tok · ${info.context} ctx`}
                   mono={m}
                 />
               );
