@@ -196,6 +196,17 @@ impl Broker {
             .ok_or(BrokerError::NoScope)
     }
 
+    /// The canonical scoped root for an agent, if set. Checkpoints run git
+    /// against this root (never against a path the daemon supplies). Refuses if
+    /// the bookmark is stale — same fail-closed rule as resolve().
+    pub fn root_for(&self, agent_id: &str) -> Result<PathBuf, BrokerError> {
+        let scope = self.scope_for(agent_id)?;
+        if scope.bookmark_stale {
+            return Err(BrokerError::StaleBookmark);
+        }
+        Ok(scope.root)
+    }
+
     /// M0.2(c): resolve + open ATOMICALLY. This closes the TOCTOU gap: the
     /// admitted path is opened with O_NOFOLLOW on the final component in the
     /// SAME step as the check, so an attacker can't swap a component for a

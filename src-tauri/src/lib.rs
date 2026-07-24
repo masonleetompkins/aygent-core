@@ -6,6 +6,7 @@
 
 mod broker;
 mod broker_ws;
+mod checkpoint;
 mod keychain;
 mod provider;
 mod supervisor;
@@ -118,6 +119,40 @@ fn reveal_in_finder(
 
     cmd.spawn().map_err(|e| format!("could not open file manager: {e}"))?;
     Ok(())
+}
+
+// --- Checkpoints (Phase 1, Contract C4) ------------------------------------
+
+/// Take a checkpoint of the agent folder. `label` is usually the user prompt.
+/// Returns the new checkpoint sha, or null if nothing changed. Root comes from
+/// the broker (never a UI-supplied path) so git only ever runs on the jail root.
+#[tauri::command]
+fn checkpoint_snapshot(
+    broker: tauri::State<Arc<Broker>>,
+    label: String,
+) -> Result<Option<String>, String> {
+    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+    checkpoint::snapshot(&root, &label)
+}
+
+/// List all checkpoints for the agent folder, newest first.
+#[tauri::command]
+fn checkpoint_list(
+    broker: tauri::State<Arc<Broker>>,
+) -> Result<Vec<checkpoint::Checkpoint>, String> {
+    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+    checkpoint::list(&root)
+}
+
+/// Rewind the agent folder to a checkpoint. Snapshots current state first, so
+/// the rewind itself is undoable.
+#[tauri::command]
+fn checkpoint_rewind(
+    broker: tauri::State<Arc<Broker>>,
+    target: String,
+) -> Result<(), String> {
+    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+    checkpoint::rewind(&root, &target)
 }
 
 // --- M0.3: provider key (Keychain) + Anthropic end-to-end -------------------
@@ -407,6 +442,18 @@ async fn agent_stream(
         .or_else(|| models.first().cloned())
         .ok_or_else(|| "account returned no usable models".to_string())?;
 
+    // CHECKPOINT (C4): snapshot the folder BEFORE the turn runs, so whatever the
+    // agent writes this turn is rewindable. Labeled with the user's prompt.
+    // Best-effort: a checkpoint failure must never block chatting (e.g. git not
+    // installed) — we surface it as an Info note and continue.
+    if let Ok(root) = broker.root_for("default") {
+        match checkpoint::snapshot(&root, &prompt) {
+            Ok(Some(sha)) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("checkpoint {sha}") }); }
+            Ok(None) => {}
+            Err(e) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("checkpoint skipped: {e}") }); }
+        }
+    }
+
     let tools = agent_tools();
     let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
     messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": prompt }));
@@ -477,7 +524,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
-            agent_stream, reveal_in_finder
+            agent_stream, reveal_in_finder,
+            checkpoint_snapshot, checkpoint_list, checkpoint_rewind
         ])
         .setup(move |_app| {
             let broker = broker.clone();

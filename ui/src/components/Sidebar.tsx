@@ -14,7 +14,7 @@ export const NAV: NavItem[] = [
   { id: "agents", label: "Agents", icon: "🧠", enabled: false },
   { id: "scheduler", label: "Scheduler", icon: "⏰", enabled: false },
   { id: "connections", label: "Connections", icon: "🔌", enabled: false },
-  { id: "checkpoints", label: "Checkpoints", icon: "↩", enabled: false },
+  { id: "checkpoints", label: "Checkpoints", icon: "↩", enabled: true },
   { id: "settings", label: "Settings", icon: "⚙", enabled: true },
   { id: "playground", label: "Playground", icon: "🧪", enabled: true },
 ];
