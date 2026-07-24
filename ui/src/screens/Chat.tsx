@@ -32,37 +32,52 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
       { role: "assistant", text: "", tools: [], streaming: true }]);
 
     const channel = `agent://${Date.now()}`;
-    let gotText = false;
 
+    // StrictMode-safe: accumulate into a REF (immune to React's dev double-
+    // invoke), then mirror it into state. Also dedupe events by a seen-set so a
+    // double-delivered listener can't double-append. The ref is the source of
+    // truth for THIS assistant turn; state is just a render mirror.
+    const acc = { text: "", tools: [] as ToolLine[] };
+    const seen = new Set<string>();
+
+    const mirror = () => setMsgs((m) => {
+      const copy = [...m];
+      const last = copy[copy.length - 1];
+      if (last?.role === "assistant") {
+        last.text = acc.text;
+        last.tools = acc.tools.map((t) => ({ ...t }));
+      }
+      return copy;
+    });
+
+    let seq = 0;
     const unlisten = await listen<any>(channel, (e) => {
       const ev = e.payload;
-      setMsgs((m) => {
-        const copy = [...m];
-        const last = copy[copy.length - 1];
-        if (last?.role !== "assistant") return m;
-        switch (ev.kind) {
-          case "TextDelta":
-            gotText = true;
-            last.text += ev.text;
-            break;
-          case "ToolUse":
-            last.tools = [...last.tools, { name: ev.name, path: ev.input?.path ?? "" }];
-            break;
-          case "ToolResult": {
-            const t = [...last.tools];
-            // match the most recent tool of this name without an outcome yet
-            for (let i = t.length - 1; i >= 0; i--) {
-              if (t[i].name === ev.name && t[i].ok === undefined) { t[i] = { ...t[i], ok: ev.ok, detail: ev.detail }; break; }
+      // event dedupe key: Tauri may deliver an event id; fall back to a counter
+      // only for non-idempotent kinds. TextDelta must be sequence-guarded.
+      const key = `${e.id ?? ""}:${ev.kind}:${ev.text ?? ""}:${ev.name ?? ""}:${ev.ok ?? ""}:${seq}`;
+      if (e.id !== undefined) {
+        if (seen.has(String(e.id))) return; // exact duplicate delivery
+        seen.add(String(e.id));
+      }
+      seq++;
+      void key;
+
+      switch (ev.kind) {
+        case "TextDelta": acc.text += ev.text; break;
+        case "ToolUse": acc.tools.push({ name: ev.name, path: ev.input?.path ?? "" }); break;
+        case "ToolResult": {
+          for (let i = acc.tools.length - 1; i >= 0; i--) {
+            if (acc.tools[i].name === ev.name && acc.tools[i].ok === undefined) {
+              acc.tools[i] = { ...acc.tools[i], ok: ev.ok, detail: ev.detail }; break;
             }
-            last.tools = t;
-            break;
           }
-          case "Info": break; // model name etc. (could show later)
-          case "Error": last.text += `\n✗ ${ev.text}`; break;
-          case "Done": last.streaming = false; break;
+          break;
         }
-        return copy;
-      });
+        case "Error": acc.text += `\n✗ ${ev.text}`; break;
+        case "Info": case "Done": break;
+      }
+      mirror();
     });
 
     try {
@@ -71,16 +86,12 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
       });
       historyRef.current = updated;
     } catch (err) {
-      setMsgs((m) => {
-        const copy = [...m]; const last = copy[copy.length - 1];
-        if (last?.role === "assistant") { last.text += `\n✗ ${String(err)}`; last.streaming = false; }
-        return copy;
-      });
+      acc.text += `\n✗ ${String(err)}`;
+      mirror();
     } finally {
       unlisten();
       setMsgs((m) => { const c = [...m]; const l = c[c.length - 1]; if (l?.role === "assistant") l.streaming = false; return c; });
       setBusy(false);
-      void gotText;
     }
   }
 
