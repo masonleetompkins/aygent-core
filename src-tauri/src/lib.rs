@@ -87,6 +87,39 @@ fn broker_probe(
     }
 }
 
+/// Reveal a file in the OS file manager (Finder on macOS). The path is resolved
+/// THROUGH THE BROKER (jailed) first — so this can only ever reveal files that
+/// live inside the agent folder. An out-of-scope or traversal path is refused by
+/// the same jail the agent obeys; the reveal action gets no special privilege.
+/// macOS: `open -R <file>` selects the item in Finder. (Windows/Linux branches
+/// kept so my Windows authoring box + future Linux builds behave sanely.)
+#[tauri::command]
+fn reveal_in_finder(
+    broker: tauri::State<Arc<Broker>>,
+    path: String,
+) -> Result<(), String> {
+    // Read-mode resolution is the right check: revealing is a read-ish action,
+    // and it proves the file is inside the jail before we hand it to the OS.
+    let real = broker
+        .resolve("default", &path, broker::Mode::Read)
+        .map_err(|e| format!("refused by jail: {e:?}"))?;
+    let real_os = real.as_os_str();
+
+    #[cfg(target_os = "macos")]
+    let mut cmd = { let mut c = std::process::Command::new("open"); c.arg("-R").arg(real_os); c };
+    #[cfg(target_os = "windows")]
+    let mut cmd = { let mut c = std::process::Command::new("explorer"); c.arg(format!("/select,{}", real.display())); c };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        // No universal "select" on Linux file managers; open the parent dir.
+        let dir = real.parent().unwrap_or(&real);
+        let mut c = std::process::Command::new("xdg-open"); c.arg(dir); c
+    };
+
+    cmd.spawn().map_err(|e| format!("could not open file manager: {e}"))?;
+    Ok(())
+}
+
 // --- M0.3: provider key (Keychain) + Anthropic end-to-end -------------------
 
 /// Store a provider API key in the macOS Keychain. Key never returns to JS.
@@ -444,7 +477,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
-            agent_stream
+            agent_stream, reveal_in_finder
         ])
         .setup(move |_app| {
             let broker = broker.clone();

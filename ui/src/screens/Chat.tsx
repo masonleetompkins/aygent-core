@@ -137,6 +137,15 @@ function Bubble({ m }: { m: Msg }) {
 function ToolCard({ t }: { t: ToolLine }) {
   const pending = t.ok === undefined;
   const color = pending ? "var(--text-muted)" : t.ok ? "var(--ok)" : "var(--danger)";
+  // A path is "revealable" once the call succeeded and points at a real file
+  // (list_files on '.' or a refused call has nothing useful to reveal).
+  const revealable = t.ok === true && !!t.path && t.path !== ".";
+
+  async function reveal() {
+    try { await invoke("reveal_in_finder", { path: t.path }); }
+    catch (err) { console.warn("reveal failed:", err); }
+  }
+
   return (
     <div style={{
       display: "flex", alignItems: "center", gap: 8,
@@ -145,7 +154,21 @@ function ToolCard({ t }: { t: ToolLine }) {
       borderRadius: "var(--radius-control)", padding: "6px 10px",
       background: "var(--bg)",
     }}>
-      <span>⚙ {t.name}({t.path})</span>
+      <span>
+        ⚙ {t.name}(
+        {revealable ? (
+          <button
+            onClick={reveal}
+            title="Reveal in Finder"
+            style={{
+              font: "inherit", color: "inherit", background: "none", border: "none",
+              padding: 0, cursor: "pointer", textDecoration: "underline",
+              textUnderlineOffset: 2,
+            }}
+          >{t.path}</button>
+        ) : t.path}
+        )
+      </span>
       <span style={{ marginLeft: "auto" }}>{pending ? "…" : t.ok ? "✓" : `✗ ${t.detail || "refused"}`}</span>
     </div>
   );
