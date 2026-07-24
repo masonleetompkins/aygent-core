@@ -92,15 +92,30 @@ fn open_or_init(root: &Path) -> Result<Repository, String> {
 }
 
 /// Stage the entire work-tree into the index and write the tree object. Returns
-/// the tree oid. Honors `.aygent/info/exclude` so the shadow repo is skipped.
+/// the tree oid.
+///
+/// CRITICAL: we must NOT try to stage `.aygent/` (our own shadow git dir). A
+/// blanket `"*"` pathspec makes libgit2 hit the nested git dir and error with
+/// `invalid path: '.aygent/checkpoints.git/'` — the `info/exclude` ignore rule
+/// does NOT save us because the pathspec matches before ignore logic applies.
+/// The fix is a path-filter CALLBACK on add_all that skips anything under
+/// `.aygent/`. That's the libgit2-blessed way to exclude a nested dir.
 fn stage_all(repo: &Repository) -> Result<git2::Oid, String> {
     let mut index = repo.index().map_err(|e| format!("index: {e}"))?;
+
+    // Return 0 = add this path, 1 = skip it. Skip our own shadow dir.
+    let mut skip_aygent = |path: &Path, _matched: &[u8]| -> i32 {
+        let p = path.to_string_lossy();
+        if p.starts_with(".aygent/") || p == ".aygent" { 1 } else { 0 }
+    };
+
     index
-        .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+        .add_all(["*"].iter(), IndexAddOption::DEFAULT, Some(&mut skip_aygent))
         .map_err(|e| format!("add_all: {e}"))?;
-    // Capture deletions too (add_all handles new/modified; update_all handles rm).
+    // Capture deletions too (update_all only touches already-tracked entries, so
+    // it can't re-introduce .aygent, but we keep it consistent for safety).
     index
-        .update_all(["*"].iter(), None)
+        .update_all(["*"].iter(), Some(&mut skip_aygent))
         .map_err(|e| format!("update_all: {e}"))?;
     index.write().map_err(|e| format!("index write: {e}"))?;
     index.write_tree().map_err(|e| format!("write_tree: {e}"))
