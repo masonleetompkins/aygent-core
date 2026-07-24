@@ -14,12 +14,19 @@ const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 // so this is a static map keyed by id substring — update when pricing changes.
 // Prices are $ per MILLION tokens (input / output).
 type ModelInfo = { label: string; inPrice: number; outPrice: number; context: string; blurb: string };
+// Per-model info keyed by the model id. Context windows:
+//   - Legacy Claude 2.x: 100k
+//   - All Claude 3 / 3.5 / 4 / 4.5 models: 200k
+//   - Sonnet 4/4.5 CAN do 1M tokens, but ONLY with a beta header we do not send
+//     — so in AYGENT they effectively run at 200k. We show 200k to stay honest
+//     about what the app actually gives you (claiming 1M would be misleading).
 function modelInfo(id: string): ModelInfo {
   const has = (s: string) => id.includes(s);
-  if (has("opus"))   return { label: "Opus",   inPrice: 15,   outPrice: 75,    context: "200k", blurb: "deepest reasoning — best for hard problems" };
-  if (has("sonnet")) return { label: "Sonnet", inPrice: 3,    outPrice: 15,    context: "200k", blurb: "balanced — great default for real work" };
-  if (has("haiku"))  return { label: "Haiku",  inPrice: 0.8,  outPrice: 4,     context: "200k", blurb: "fast + cheap — everyday tasks" };
-  return { label: id, inPrice: 0, outPrice: 0, context: "—", blurb: "" };
+  if (has("claude-2")) return { label: id, inPrice: 8, outPrice: 24, context: "100k", blurb: "legacy model" };
+  if (has("opus"))     return { label: "Opus",   inPrice: 15,  outPrice: 75, context: "200k", blurb: "deepest reasoning — best for hard problems" };
+  if (has("sonnet"))   return { label: "Sonnet", inPrice: 3,   outPrice: 15, context: "200k", blurb: "balanced — great default for real work" };
+  if (has("haiku"))    return { label: "Haiku",  inPrice: 0.8, outPrice: 4,  context: "200k", blurb: "fast + cheap — everyday tasks" };
+  return { label: id, inPrice: 0, outPrice: 0, context: "200k", blurb: "" };
 }
 function fmtPrice(n: number) { return n === 0 ? "?" : (n < 1 ? `$${n.toFixed(2)}` : `$${n}`); }
 
