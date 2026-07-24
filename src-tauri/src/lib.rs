@@ -10,6 +10,7 @@ mod checkpoint;
 mod conversations;
 mod keychain;
 mod provider;
+mod settings;
 mod supervisor;
 
 use std::sync::Arc;
@@ -272,6 +273,23 @@ async fn anthropic_models() -> Result<Vec<String>, String> {
     provider::anthropic_list_models(&key).await
 }
 
+/// Per-folder selected model. "" = auto (prefer haiku, else first available).
+#[tauri::command]
+fn get_selected_model(app: tauri::AppHandle, folder: String) -> Result<String, String> {
+    use tauri::Manager;
+    let app_data = app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))?;
+    Ok(settings::load(&app_data, &folder).model)
+}
+
+#[tauri::command]
+fn set_selected_model(app: tauri::AppHandle, folder: String, model: String) -> Result<(), String> {
+    use tauri::Manager;
+    let app_data = app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))?;
+    let mut s = settings::load(&app_data, &folder);
+    s.model = model;
+    settings::save(&app_data, &folder, &s)
+}
+
 /// M0.3 end-to-end proof: fetch the Anthropic key from Keychain (Rust-side
 /// only), ask the account which models it can use, call the first one, return
 /// the text (prefixed with which model answered). Key NEVER enters JS/WebView.
@@ -526,15 +544,23 @@ async fn agent_stream(
     channel: String,
     prompt: String,
     history: serde_json::Value,
+    model: Option<String>,
 ) -> Result<serde_json::Value, String> {
     use tauri::Emitter;
     let broker = broker.inner().clone();
     let key = keychain::get_key("anthropic")
         .map_err(|_| "no anthropic key set — add one in Settings".to_string())?;
-    let models = provider::anthropic_list_models(&key).await?;
-    let model = models.iter().find(|m| m.contains("haiku")).cloned()
-        .or_else(|| models.first().cloned())
-        .ok_or_else(|| "account returned no usable models".to_string())?;
+    // Model choice: explicit (from the per-folder Settings picker) wins; empty/
+    // missing = auto (prefer haiku — cheap/fast — else first available).
+    let model = match model.filter(|m| !m.trim().is_empty()) {
+        Some(m) => m,
+        None => {
+            let models = provider::anthropic_list_models(&key).await?;
+            models.iter().find(|m| m.contains("haiku")).cloned()
+                .or_else(|| models.first().cloned())
+                .ok_or_else(|| "account returned no usable models".to_string())?
+        }
+    };
 
     // CHECKPOINT (C4) part 1: ensure a BASELINE snapshot exists before the turn
     // runs. This captures the folder's pre-turn state (labeled "baseline") ONLY
@@ -635,7 +661,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
-            agent_stream, reveal_in_finder,
+            agent_stream, reveal_in_finder, get_selected_model, set_selected_model,
             checkpoint_snapshot, checkpoint_timeline, checkpoint_rewind,
             checkpoint_undo, checkpoint_redo,
             checkpoint_get_retention, checkpoint_set_retention, checkpoint_purge,

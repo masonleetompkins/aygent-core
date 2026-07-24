@@ -30,6 +30,9 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
   const convIdRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [dragId, setDragId] = useState<string | null>(null);
+  // Per-folder selected model ("" = auto/haiku). Loaded on folder change and
+  // re-checked on each send so a Settings change applies without a reload.
+  const modelRef = useRef<string>("");
 
   useEffect(() => { scrollRef.current?.scrollTo({ top: 1e9, behavior: "smooth" }); }, [msgs]);
 
@@ -44,6 +47,7 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
   // On folder change: load the list and open the most recent one (or a fresh one).
   useEffect(() => {
     if (!folder) { setConvs([]); setConv(null); setMessages([]); historyRef.current = []; return; }
+    invoke<string>("get_selected_model", { folder }).then((m) => { modelRef.current = m; }).catch(() => {});
     (async () => {
       try {
         const list = await invoke<ConvMeta[]>("conv_list", { folder });
@@ -180,8 +184,14 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
     });
 
     try {
+      // Refresh the folder's model choice right before the call, so changing it
+      // in Settings takes effect on the very next message.
+      if (folder) {
+        try { modelRef.current = await invoke<string>("get_selected_model", { folder }); } catch { /* keep last */ }
+      }
       const updated = await invoke<any>("agent_stream", {
         channel, prompt, history: historyRef.current,
+        model: modelRef.current || null,
       });
       historyRef.current = updated;
     } catch (err) {

@@ -9,6 +9,19 @@ import { saveTheme, type Mode } from "../lib/theme";
 const ACCENT_SWATCHES = ["", "#2dd4bf", "#6366f1", "#e0533d", "#22c55e", "#eab308", "#ec4899"];
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 
+// Cost + context info per model FAMILY. Anthropic's API doesn't return pricing,
+// so this is a static map keyed by id substring — update when pricing changes.
+// Prices are $ per MILLION tokens (input / output).
+type ModelInfo = { label: string; inPrice: number; outPrice: number; context: string; blurb: string };
+function modelInfo(id: string): ModelInfo {
+  const has = (s: string) => id.includes(s);
+  if (has("opus"))   return { label: "Opus",   inPrice: 15,   outPrice: 75,    context: "200k", blurb: "deepest reasoning — best for hard problems" };
+  if (has("sonnet")) return { label: "Sonnet", inPrice: 3,    outPrice: 15,    context: "200k", blurb: "balanced — great default for real work" };
+  if (has("haiku"))  return { label: "Haiku",  inPrice: 0.8,  outPrice: 4,     context: "200k", blurb: "fast + cheap — everyday tasks" };
+  return { label: id, inPrice: 0, outPrice: 0, context: "—", blurb: "" };
+}
+function fmtPrice(n: number) { return n === 0 ? "?" : (n < 1 ? `$${n.toFixed(2)}` : `$${n}`); }
+
 export function Settings({
   mode, accent, onTheme, folder, onPickFolder,
 }: {
@@ -21,12 +34,31 @@ export function Settings({
   const [retention, setRetention] = useState(30);
   const [cpMsg, setCpMsg] = useState<string | null>(null);
   const [confirmPurge, setConfirmPurge] = useState(false);
+  const [models, setModels] = useState<string[]>([]);
+  const [selModel, setSelModel] = useState(""); // "" = auto (haiku)
+  const [modelMsg, setModelMsg] = useState<string | null>(null);
 
   useEffect(() => { invoke<boolean>("has_provider_key", { provider: "anthropic" }).then(setKeySet).catch(() => {}); }, []);
   useEffect(() => {
     if (!folder) return;
     invoke<number>("checkpoint_get_retention").then(setRetention).catch(() => {});
+    invoke<string>("get_selected_model", { folder }).then(setSelModel).catch(() => {});
   }, [folder]);
+
+  // Load the live model list once a key is set (real models this key can use).
+  useEffect(() => {
+    if (!keySet) return;
+    invoke<string[]>("anthropic_models").then(setModels).catch(() => {});
+  }, [keySet]);
+
+  async function chooseModel(model: string) {
+    if (!folder) return;
+    setSelModel(model); setModelMsg(null);
+    try {
+      await invoke("set_selected_model", { folder, model });
+      setModelMsg(model === "" ? "✓ auto (Haiku — fast + cheap)" : `✓ using ${modelInfo(model).label}`);
+    } catch (e) { setModelMsg("✗ " + String(e)); }
+  }
 
   async function saveRetention(days: number) {
     setRetention(days); setCpMsg(null);
@@ -96,6 +128,45 @@ export function Settings({
         <p style={{ ...hint, color: "var(--text-faint)", fontSize: 12 }}>OpenAI · OpenRouter · local Ollama — coming in this build.</p>
       </Card>
 
+      {/* MODEL */}
+      <Card title="Model">
+        <p style={hint}>Which brain your agent runs on. Saved per folder — a serious project can run Opus while a scratch folder stays on Haiku.</p>
+        {!folder ? (
+          <p style={{ ...hint, color: "var(--text-faint)" }}>Pick an Agent Folder below to choose a model.</p>
+        ) : !keySet ? (
+          <p style={{ ...hint, color: "var(--text-faint)" }}>Add an Anthropic key above to load your available models.</p>
+        ) : models.length === 0 ? (
+          <p style={{ ...hint, color: "var(--text-faint)" }}>Loading models…</p>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {/* AUTO option */}
+            <ModelRow
+              active={selModel === ""}
+              onClick={() => chooseModel("")}
+              title="Auto"
+              sub="picks Haiku — fast + cheap — automatically"
+              meta="default"
+            />
+            {models.map((m) => {
+              const info = modelInfo(m);
+              return (
+                <ModelRow
+                  key={m}
+                  active={selModel === m}
+                  onClick={() => chooseModel(m)}
+                  title={info.label}
+                  sub={info.blurb || m}
+                  meta={`${fmtPrice(info.inPrice)} in · ${fmtPrice(info.outPrice)} out / 1M · ${info.context} ctx`}
+                  mono={m}
+                />
+              );
+            })}
+            {modelMsg && <Pill tone={modelMsg.startsWith("✗") ? "danger" : "ok"}>{modelMsg}</Pill>}
+            <p style={{ ...hint, color: "var(--text-faint)", fontSize: 12 }}>Prices are per million tokens (input · output). Context = how much the model can hold in one conversation.</p>
+          </div>
+        )}
+      </Card>
+
       {/* CHECKPOINTS */}
       <Card title="Checkpoints">
         <p style={hint}>Every change your agent makes is snapshotted so you can rewind. Keep history for a window, then it prunes automatically.</p>
@@ -141,6 +212,36 @@ export function Settings({
         <div><Button onClick={onPickFolder}>{folder ? "Change folder…" : "Choose folder…"}</Button></div>
       </Card>
     </div>
+  );
+}
+
+// One selectable model row: radio-style card with name, blurb, cost/context.
+function ModelRow({ active, onClick, title, sub, meta, mono }: {
+  active: boolean; onClick: () => void; title: string; sub: string; meta: string; mono?: string;
+}) {
+  return (
+    <button onClick={onClick} style={{
+      display: "flex", alignItems: "center", gap: 12, textAlign: "left", cursor: "pointer",
+      padding: "10px 12px", borderRadius: "var(--radius-control)",
+      border: `var(--border-width) solid ${active ? "var(--accent, var(--text))" : "var(--line)"}`,
+      background: active ? "var(--bg)" : "transparent",
+      boxShadow: active ? "var(--elevation)" : "none",
+      color: "var(--text)", font: "inherit",
+    }}>
+      <span style={{
+        width: 14, height: 14, borderRadius: 999, flexShrink: 0,
+        border: `2px solid ${active ? "var(--accent, var(--text))" : "var(--line)"}`,
+        background: active ? "var(--accent, var(--text))" : "transparent",
+      }} />
+      <span style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0, flex: 1 }}>
+        <span style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+          <span style={{ fontWeight: 800, fontSize: 15 }}>{title}</span>
+          {mono && <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 11, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{mono}</span>}
+        </span>
+        <span style={{ fontSize: 13, color: "var(--text-muted)" }}>{sub}</span>
+      </span>
+      <span style={{ fontSize: 12, fontFamily: "ui-monospace, monospace", color: "var(--text-muted)", flexShrink: 0 }}>{meta}</span>
+    </button>
   );
 }
 
