@@ -254,7 +254,7 @@ fn parse_params(lower: &str) -> f32 {
 /// Known context windows by family/version (tokens). Best-effort from each
 /// family's published specs; 0 = unknown (UI shows "—"). Order matters: more
 /// specific patterns first.
-fn context_window(lower: &str) -> u32 {
+pub fn context_window(lower: &str) -> u32 {
     const K: u32 = 1024;
     let rules: &[(&str, u32)] = &[
         // Qwen
