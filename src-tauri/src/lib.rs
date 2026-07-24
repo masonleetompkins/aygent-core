@@ -135,17 +135,17 @@ fn checkpoint_snapshot(
     checkpoint::snapshot(&root, &label)
 }
 
-/// List all checkpoints for the agent folder, newest first.
+/// The full checkpoint timeline + undo/redo availability, newest first.
 #[tauri::command]
-fn checkpoint_list(
+fn checkpoint_timeline(
     broker: tauri::State<Arc<Broker>>,
-) -> Result<Vec<checkpoint::Checkpoint>, String> {
+) -> Result<checkpoint::Timeline, String> {
     let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
-    checkpoint::list(&root)
+    checkpoint::timeline(&root)
 }
 
-/// Rewind the agent folder to a checkpoint. Snapshots current state first, so
-/// the rewind itself is undoable.
+/// Rewind (jump) the agent folder to a specific checkpoint. Snapshots current
+/// state first, so the jump never loses uncommitted work.
 #[tauri::command]
 fn checkpoint_rewind(
     broker: tauri::State<Arc<Broker>>,
@@ -153,6 +153,20 @@ fn checkpoint_rewind(
 ) -> Result<(), String> {
     let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
     checkpoint::rewind(&root, &target)
+}
+
+/// Undo: step the cursor one checkpoint back and restore that state.
+#[tauri::command]
+fn checkpoint_undo(broker: tauri::State<Arc<Broker>>) -> Result<Option<String>, String> {
+    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+    checkpoint::undo(&root)
+}
+
+/// Redo: step the cursor one checkpoint forward and restore that state.
+#[tauri::command]
+fn checkpoint_redo(broker: tauri::State<Arc<Broker>>) -> Result<Option<String>, String> {
+    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+    checkpoint::redo(&root)
 }
 
 // --- M0.3: provider key (Keychain) + Anthropic end-to-end -------------------
@@ -538,7 +552,8 @@ pub fn run() {
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
             agent_stream, reveal_in_finder,
-            checkpoint_snapshot, checkpoint_list, checkpoint_rewind
+            checkpoint_snapshot, checkpoint_timeline, checkpoint_rewind,
+            checkpoint_undo, checkpoint_redo
         ])
         .setup(move |_app| {
             let broker = broker.clone();

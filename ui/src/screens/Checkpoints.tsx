@@ -14,11 +14,14 @@ type Checkpoint = {
   files: number;
   is_current: boolean;
 };
+type Timeline = { items: Checkpoint[]; can_undo: boolean; can_redo: boolean };
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 
 export function Checkpoints({ folder }: { folder: string | null }) {
   const [items, setItems] = useState<Checkpoint[]>([]);
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [confirmId, setConfirmId] = useState<string | null>(null);
@@ -26,8 +29,10 @@ export function Checkpoints({ folder }: { folder: string | null }) {
   async function refresh() {
     if (!folder) return;
     setErr(null);
-    try { setItems(await invoke<Checkpoint[]>("checkpoint_list")); }
-    catch (e) { setErr(String(e)); }
+    try {
+      const t = await invoke<Timeline>("checkpoint_timeline");
+      setItems(t.items); setCanUndo(t.can_undo); setCanRedo(t.can_redo);
+    } catch (e) { setErr(String(e)); }
   }
 
   useEffect(() => { refresh(); /* eslint-disable-next-line */ }, [folder]);
@@ -35,6 +40,13 @@ export function Checkpoints({ folder }: { folder: string | null }) {
   async function snapshotNow() {
     setBusy(true); setErr(null);
     try { await invoke("checkpoint_snapshot", { label: "manual checkpoint" }); await refresh(); }
+    catch (e) { setErr(String(e)); }
+    finally { setBusy(false); }
+  }
+
+  async function step(cmd: "checkpoint_undo" | "checkpoint_redo") {
+    setBusy(true); setErr(null);
+    try { await invoke(cmd); await refresh(); }
     catch (e) { setErr(String(e)); }
     finally { setBusy(false); }
   }
@@ -58,6 +70,9 @@ export function Checkpoints({ folder }: { folder: string | null }) {
       {folder && (
         <>
           <div style={{ display: "flex", gap: 8 }}>
+            <Button onClick={() => step("checkpoint_undo")} disabled={busy || !canUndo}>↶ Undo</Button>
+            <Button onClick={() => step("checkpoint_redo")} disabled={busy || !canRedo}>↷ Redo</Button>
+            <div style={{ width: 1, background: "var(--line)", margin: "2px 4px" }} />
             <Button variant="secondary" onClick={snapshotNow} disabled={busy}>{busy ? "…" : "Snapshot now"}</Button>
             <Button variant="secondary" onClick={refresh} disabled={busy}>Refresh</Button>
           </div>

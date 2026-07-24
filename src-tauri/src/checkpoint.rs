@@ -35,8 +35,27 @@ pub struct Checkpoint {
     pub message: String,   // the prompt/label that caused this snapshot
     pub timestamp: i64,    // unix seconds (commit time)
     pub files: usize,      // files changed vs the previous checkpoint
-    pub is_current: bool,  // is this the checkpoint the tree currently matches?
+    pub is_current: bool,  // is this the checkpoint the cursor is on right now?
 }
+
+/// The timeline + where we currently are on it. Drives the Undo/Redo buttons:
+/// undo is possible when the cursor has a parent; redo when a checkpoint sits
+/// AFTER the cursor on the history chain.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Timeline {
+    pub items: Vec<Checkpoint>,
+    pub can_undo: bool,
+    pub can_redo: bool,
+}
+
+// We keep TWO refs, so "future" checkpoints are never orphaned by a rewind:
+//   HISTORY_REF  — the append-only tip of ALL checkpoints ever taken.
+//   CURSOR_REF   — where the user currently is (what the work-tree matches).
+// Undo/redo just walk the cursor along the history chain and checkout its tree.
+// Taking a NEW snapshot commits on top of the cursor and moves BOTH refs to it
+// (typing after an undo discards the redo branch — exactly like a text editor).
+const HISTORY_REF: &str = "refs/aygent/history";
+const CURSOR_REF: &str = "refs/aygent/cursor";
 
 fn git_dir(root: &Path) -> PathBuf {
     root.join(".aygent").join("checkpoints.git")
@@ -87,22 +106,37 @@ fn stage_all(repo: &Repository) -> Result<git2::Oid, String> {
     index.write_tree().map_err(|e| format!("write_tree: {e}"))
 }
 
+/// Read a ref's commit oid, if the ref exists.
+fn ref_oid(repo: &Repository, name: &str) -> Option<git2::Oid> {
+    repo.find_reference(name).ok().and_then(|r| r.target())
+}
+
+/// Point a ref at a commit (create or move it).
+fn set_ref(repo: &Repository, name: &str, oid: git2::Oid, log: &str) -> Result<(), String> {
+    repo.reference(name, oid, true, log)
+        .map(|_| ())
+        .map_err(|e| format!("set ref {name}: {e}"))
+}
+
 /// Take a checkpoint of the whole work-tree. `label` becomes the commit message
 /// (typically the user prompt). Returns the new checkpoint's short sha, or None
 /// if nothing changed since the last checkpoint (no empty commits).
+///
+/// The new commit's PARENT is the current CURSOR (not the history tip). So if
+/// the user undid a few steps and then made a new change, the new checkpoint
+/// branches off where they are — and both refs advance to it, discarding the
+/// now-stale redo future. Exactly a text editor's undo/redo semantics.
 pub fn snapshot(root: &Path, label: &str) -> Result<Option<String>, String> {
     let repo = open_or_init(root)?;
     let tree_oid = stage_all(&repo)?;
     let tree = repo.find_tree(tree_oid).map_err(|e| format!("find_tree: {e}"))?;
 
-    // Current HEAD (if any) becomes the parent.
-    let parent_commit = match repo.head() {
-        Ok(h) => h.peel_to_commit().ok(),
-        Err(_) => None,
-    };
+    // Parent = wherever the cursor currently sits.
+    let parent_oid = ref_oid(&repo, CURSOR_REF);
+    let parent_commit = parent_oid.and_then(|o| repo.find_commit(o).ok());
 
-    // Skip empty checkpoints (tree identical to parent), but always allow the
-    // very first commit so there's an anchor to rewind to.
+    // Skip empty checkpoints (tree identical to the cursor's tree), but always
+    // allow the very first commit so there's an anchor.
     if let Some(ref parent) = parent_commit {
         if parent.tree_id() == tree_oid {
             return Ok(None);
@@ -112,38 +146,45 @@ pub fn snapshot(root: &Path, label: &str) -> Result<Option<String>, String> {
     let signature = sig()?;
     let msg = if label.trim().is_empty() { "checkpoint" } else { label.trim() };
     let parents: Vec<&git2::Commit> = parent_commit.iter().collect();
+    // Commit WITHOUT moving HEAD; we manage our own refs explicitly.
     let oid = repo
-        .commit(Some("HEAD"), &signature, &signature, msg, &tree, &parents)
+        .commit(None, &signature, &signature, msg, &tree, &parents)
         .map_err(|e| format!("commit: {e}"))?;
 
+    // Both the history tip and the cursor advance to the new checkpoint.
+    set_ref(&repo, HISTORY_REF, oid, "snapshot")?;
+    set_ref(&repo, CURSOR_REF, oid, "snapshot")?;
     Ok(Some(short(&oid)))
 }
 
-/// List checkpoints newest-first. `is_current` marks the commit the work-tree
-/// presently matches (HEAD — after a rewind we commit the restore so HEAD is
-/// always the "current" pointer).
-pub fn list(root: &Path) -> Result<Vec<Checkpoint>, String> {
+/// The full timeline (newest-first) + undo/redo availability. We walk from the
+/// HISTORY tip (so "future" checkpoints above the cursor are still shown), and
+/// mark the CURSOR commit as current. Undo is possible when the cursor has a
+/// parent; redo when a checkpoint sits after the cursor on the chain.
+pub fn timeline(root: &Path) -> Result<Timeline, String> {
     if !git_dir(root).exists() {
-        return Ok(vec![]);
+        return Ok(Timeline { items: vec![], can_undo: false, can_redo: false });
     }
     let repo = open_or_init(root)?;
-    let head_oid = match repo.head().ok().and_then(|h| h.target()) {
+    let tip = match ref_oid(&repo, HISTORY_REF) {
         Some(o) => o,
-        None => return Ok(vec![]), // no commits yet
+        None => return Ok(Timeline { items: vec![], can_undo: false, can_redo: false }),
     };
+    let cursor = ref_oid(&repo, CURSOR_REF).unwrap_or(tip);
 
     let mut walk = repo.revwalk().map_err(|e| format!("revwalk: {e}"))?;
-    walk.push_head().map_err(|e| format!("push_head: {e}"))?;
+    walk.push(tip).map_err(|e| format!("push tip: {e}"))?;
     walk.set_sorting(git2::Sort::TIME).map_err(|e| format!("sort: {e}"))?;
 
-    let mut out = Vec::new();
+    let mut items = Vec::new();
+    let mut cursor_has_parent = false;
+    let mut redo_available = false;
     for oid in walk {
         let oid = oid.map_err(|e| format!("walk: {e}"))?;
         let commit = repo.find_commit(oid).map_err(|e| format!("find_commit: {e}"))?;
         let message = commit.summary().unwrap_or("checkpoint").to_string();
         let timestamp = commit.time().seconds();
 
-        // files changed vs the (first) parent — 0 for the root commit.
         let files = if commit.parent_count() > 0 {
             let parent = commit.parent(0).map_err(|e| format!("parent: {e}"))?;
             let a = parent.tree().map_err(|e| format!("ptree: {e}"))?;
@@ -155,65 +196,107 @@ pub fn list(root: &Path) -> Result<Vec<Checkpoint>, String> {
             0
         };
 
-        out.push(Checkpoint {
+        if oid == cursor {
+            cursor_has_parent = commit.parent_count() > 0;
+        } else if !redo_available {
+            // Any commit strictly newer than the cursor on the walk means there's
+            // a forward state to redo into. (Walk is newest-first, so a non-cursor
+            // commit seen BEFORE we hit the cursor is a redo candidate.)
+            redo_available = true;
+        }
+
+        items.push(Checkpoint {
             id: short(&oid),
             message,
             timestamp,
             files,
-            is_current: oid == head_oid,
+            is_current: oid == cursor,
         });
     }
-    Ok(out)
+
+    // redo_available is set if we saw any commit before reaching the cursor; but
+    // if the cursor IS the tip, everything before it doesn't exist, so recompute
+    // cleanly: redo is possible iff cursor != tip.
+    let can_redo = cursor != tip;
+    let _ = redo_available;
+
+    Ok(Timeline { items, can_undo: cursor_has_parent, can_redo })
 }
 
-/// Rewind the folder to a checkpoint. We FIRST snapshot the current state (so
-/// the rewind itself is undoable — "undo the undo"), then hard-reset the
-/// work-tree to the target tree, then commit the restore so HEAD tracks it.
+/// Move the cursor to `oid` and make the work-tree match that commit's tree.
+/// This is the ONE place the folder contents change: a hard-reset of the tree +
+/// index to the target, plus moving CURSOR_REF. HISTORY_REF is left untouched,
+/// so "future" checkpoints above the new cursor stay reachable for redo.
+fn goto(repo: &Repository, oid: git2::Oid) -> Result<(), String> {
+    let commit = repo.find_commit(oid).map_err(|e| format!("find_commit: {e}"))?;
+    let obj = commit.as_object();
+    // Hard-reset restores modified files AND removes files the target lacked —
+    // a true restore, not a merge. It moves HEAD too, but we don't rely on HEAD;
+    // our own CURSOR_REF is the source of truth.
+    repo.reset(obj, ResetType::Hard, None)
+        .map_err(|e| format!("reset: {e}"))?;
+    set_ref(repo, CURSOR_REF, oid, "goto")?;
+    Ok(())
+}
+
+/// Rewind (jump) the folder to an explicit checkpoint. Before moving, we capture
+/// any uncommitted work as a checkpoint so nothing is ever lost. Then we move
+/// the cursor to the target and restore its tree. HISTORY is preserved, so
+/// everything above the target remains redo-reachable.
 pub fn rewind(root: &Path, target: &str) -> Result<(), String> {
     let repo = open_or_init(root)?;
-
-    // Resolve the target to a real commit in OUR repo (accepts short shas).
-    let obj = repo
+    let target_commit = repo
         .revparse_single(target)
+        .and_then(|o| o.peel_to_commit())
         .map_err(|_| format!("unknown checkpoint: {target}"))?;
-    let target_commit = obj
-        .peel_to_commit()
-        .map_err(|_| format!("not a commit: {target}"))?;
 
-    // 1) Safety snapshot of the present state (best-effort; ignore "no changes").
+    // Capture any uncommitted edits first (best-effort) so a jump never drops work.
     let _ = snapshot(root, "before rewind");
+    goto(&repo, target_commit.id())
+}
 
-    // 2) Hard reset the work-tree + index to the target commit's tree. This both
-    //    restores modified files AND removes files the target didn't have — a
-    //    true restore, not a merge. (reset moves HEAD too, which we then advance
-    //    with the restore commit below to keep the timeline linear.)
-    let target_obj = target_commit.as_object();
-    repo.reset(target_obj, ResetType::Hard, None)
-        .map_err(|e| format!("reset: {e}"))?;
-
-    // 3) Commit the restore so HEAD == where we are now (makes `is_current`
-    //    meaningful and keeps history append-only/inspectable).
-    let tree_oid = stage_all(&repo)?;
-    let tree = repo.find_tree(tree_oid).map_err(|e| format!("find_tree: {e}"))?;
-    let signature = sig()?;
-    let head_commit = repo
-        .head()
-        .and_then(|h| h.peel_to_commit())
-        .map_err(|e| format!("head: {e}"))?;
-    // Only add a restore commit if the reset actually changed the tree vs HEAD.
-    if head_commit.tree_id() != tree_oid {
-        let parents = [&head_commit];
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            &format!("rewind to {}", short(&target_commit.id())),
-            &tree,
-            &parents,
-        )
-        .map_err(|e| format!("restore commit: {e}"))?;
+/// UNDO: move the cursor one checkpoint back (to its parent) and restore that
+/// state. No-op error if already at the oldest checkpoint.
+pub fn undo(root: &Path) -> Result<Option<String>, String> {
+    let repo = open_or_init(root)?;
+    // Capture any live edits first, so undo can be redone back to "now".
+    let _ = snapshot(root, "before undo");
+    let cursor = ref_oid(&repo, CURSOR_REF).ok_or("no checkpoints yet")?;
+    let commit = repo.find_commit(cursor).map_err(|e| format!("find_commit: {e}"))?;
+    if commit.parent_count() == 0 {
+        return Ok(None); // already at the oldest
     }
-    Ok(())
+    let parent = commit.parent(0).map_err(|e| format!("parent: {e}"))?;
+    goto(&repo, parent.id())?;
+    Ok(Some(short(&parent.id())))
+}
+
+/// REDO: move the cursor one checkpoint FORWARD along the history chain (to the
+/// child whose ancestor is the current cursor) and restore that state. No-op if
+/// the cursor is already at the tip.
+pub fn redo(root: &Path) -> Result<Option<String>, String> {
+    let repo = open_or_init(root)?;
+    let tip = ref_oid(&repo, HISTORY_REF).ok_or("no checkpoints yet")?;
+    let cursor = ref_oid(&repo, CURSOR_REF).unwrap_or(tip);
+    if cursor == tip {
+        return Ok(None); // nothing to redo
+    }
+    // Walk back from the tip to find the commit whose parent is the cursor —
+    // that's the immediate "next" state to redo into.
+    let mut walk = repo.revwalk().map_err(|e| format!("revwalk: {e}"))?;
+    walk.push(tip).map_err(|e| format!("push tip: {e}"))?;
+    for oid in walk {
+        let oid = oid.map_err(|e| format!("walk: {e}"))?;
+        let commit = repo.find_commit(oid).map_err(|e| format!("find_commit: {e}"))?;
+        if commit.parent_count() > 0 {
+            let p = commit.parent(0).map_err(|e| format!("parent: {e}"))?;
+            if p.id() == cursor {
+                goto(&repo, oid)?;
+                return Ok(Some(short(&oid)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Short (7-char) sha, matching what users see in the timeline.
