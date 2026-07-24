@@ -1,0 +1,78 @@
+/* AYGENT theme tokens — the single source of truth for the lighting system.
+   DESIGN.md is the spec; this is its implementation. Components NEVER hardcode
+   a hex or a shadow — they use Tailwind classes backed by these variables.
+
+   The core idea: shape is constant; theme controls the LIGHTING.
+   light = soft drop shadow · dark = glow · accent = tints outline + lighting. */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* ---- shape (constant across themes) ---- */
+  --radius-card: 14px;
+  --radius-control: 8px;
+  --radius-pill: 999px;
+  --border-width: 1.5px;
+
+  /* ---- LIGHT MODE (default) ---- */
+  --bg: #ffffff;
+  --surface: #ffffff;
+  --text: #0a0a0a;
+  --text-muted: #5c5c5c;
+  --text-faint: #9a9a9a;
+  --line: #0a0a0a;
+  --accent: #0a0a0a;
+  --accent-rgb: 10, 10, 10;
+
+  --elevation: 0 2px 8px rgba(0, 0, 0, 0.06), 0 8px 24px rgba(0, 0, 0, 0.1);
+  --elevation-hover: 0 4px 12px rgba(0, 0, 0, 0.1), 0 12px 32px rgba(0, 0, 0, 0.14);
+
+  --ok: #1f9d55;
+  --danger: #d64545;
+  --warn: #c77d1a;
+}
+
+/* ---- DARK MODE: shadow -> glow ---- */
+:root[data-theme="dark"] {
+  --bg: #000000;
+  --surface: #0b0b0b;
+  --text: #ffffff;
+  --text-muted: #a6a6a6;
+  --text-faint: #666666;
+  --line: #ffffff;
+  --accent: #ffffff;
+  --accent-rgb: 255, 255, 255;
+
+  --elevation: 0 0 10px rgba(255, 255, 255, 0.1), 0 0 28px rgba(255, 255, 255, 0.06);
+  --elevation-hover: 0 0 14px rgba(255, 255, 255, 0.16), 0 0 36px rgba(255, 255, 255, 0.1);
+
+  --ok: #34d17e;
+  --danger: #ff6b6b;
+  --warn: #e0a53f;
+}
+
+/* ---- ACCENT ON: retint outline + lighting to the user's color ----
+   JS sets --accent + --accent-rgb from the picker and toggles data-accent. */
+:root[data-accent="on"] {
+  --line: var(--accent);
+  --elevation: 0 2px 10px rgba(var(--accent-rgb), 0.2), 0 10px 30px rgba(var(--accent-rgb), 0.16);
+  --elevation-hover: 0 4px 14px rgba(var(--accent-rgb), 0.28), 0 14px 38px rgba(var(--accent-rgb), 0.22);
+}
+:root[data-theme="dark"][data-accent="on"] {
+  --line: var(--accent);
+  --elevation: 0 0 12px rgba(var(--accent-rgb), 0.35), 0 0 34px rgba(var(--accent-rgb), 0.2);
+  --elevation-hover: 0 0 16px rgba(var(--accent-rgb), 0.5), 0 0 44px rgba(var(--accent-rgb), 0.3);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "SF Pro Text", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  transition: background 150ms ease, color 150ms ease;
+}
