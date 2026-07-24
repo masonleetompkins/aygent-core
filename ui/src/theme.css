@@ -37,7 +37,7 @@
 /* ---- DARK MODE: shadow -> glow ---- */
 :root[data-theme="dark"] {
   --bg: #000000;
-  --surface: #0b0b0b;
+  --surface: #101012;   /* lifted off pure black so cards separate + glow reads */
   --text: #ffffff;
   --text-muted: #a6a6a6;
   --text-faint: #666666;
@@ -45,8 +45,10 @@
   --accent: #ffffff;
   --accent-rgb: 255, 255, 255;
 
-  --elevation: 0 0 10px rgba(255, 255, 255, 0.1), 0 0 28px rgba(255, 255, 255, 0.06);
-  --elevation-hover: 0 0 14px rgba(255, 255, 255, 0.16), 0 0 36px rgba(255, 255, 255, 0.1);
+  /* Stronger + tighter default white glow so it's actually visible on black.
+     (10% white blur on pure black read as nearly nothing.) */
+  --elevation: 0 0 0 1px rgba(255, 255, 255, 0.04), 0 0 16px rgba(255, 255, 255, 0.22), 0 0 40px rgba(255, 255, 255, 0.12);
+  --elevation-hover: 0 0 0 1px rgba(255, 255, 255, 0.08), 0 0 22px rgba(255, 255, 255, 0.34), 0 0 52px rgba(255, 255, 255, 0.18);
 
   --ok: #34d17e;
   --danger: #ff6b6b;
