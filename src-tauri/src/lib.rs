@@ -387,10 +387,28 @@ async fn local_download(app: tauri::AppHandle, channel: String, url: String, fil
     let dest = dir.join(&filename);
     let tmp = dir.join(format!("{filename}.part"));
 
-    let client = reqwest::Client::builder().user_agent("aygent/0.1").build().map_err(|e| format!("http: {e}"))?;
-    let resp = client.get(&url).send().await.map_err(|e| format!("request: {e}"))?;
-    if !resp.status().is_success() { return Err(format!("download {}", resp.status())); }
+    // HF serves GGUF files via a 302 redirect to a CDN (cdn-lfs/Cloudflare).
+    // Follow redirects explicitly and send an Accept header so the CDN handoff
+    // doesn't 401. (Public GGUF repos need no auth token.)
+    let client = reqwest::Client::builder()
+        .user_agent("aygent/0.1")
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| format!("http: {e}"))?;
+    let resp = client
+        .get(&url)
+        .header("Accept", "*/*")
+        .send()
+        .await
+        .map_err(|e| format!("request: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("download failed: HTTP {} (the model file may have moved — try Refresh catalog)", resp.status()));
+    }
     let total = resp.content_length().unwrap_or(0);
+
+    // Emit an immediate "starting" event (0 of total) so the UI shows a live bar
+    // right away instead of a frozen 0% during the first chunk.
+    let _ = app.emit(&channel, &serde_json::json!({ "got": 0u64, "total": total }));
 
     let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create file: {e}"))?;
     let mut got: u64 = 0;
@@ -401,8 +419,9 @@ async fn local_download(app: tauri::AppHandle, channel: String, url: String, fil
         use std::io::Write;
         file.write_all(&bytes).map_err(|e| format!("write: {e}"))?;
         got += bytes.len() as u64;
-        // throttle progress events to ~every 8MB
-        if got - last_emit > 8_000_000 {
+        // Throttle progress events to ~every 2MB so the bar moves smoothly from
+        // the very first chunk (was 8MB — which looked frozen at 0% for ages).
+        if got - last_emit > 2_000_000 {
             last_emit = got;
             let _ = app.emit(&channel, &serde_json::json!({ "got": got, "total": total }));
         }
