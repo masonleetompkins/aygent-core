@@ -270,7 +270,17 @@ function ModelRow({ active, onClick, title, sub, meta, mono }: {
 // will run on THIS machine, download in-app, and pick one to chat with. Fully
 // self-contained: no Ollama, no terminal.
 type Perf = { tier: string; badge: string; tokens_per_sec: string; note: string; fits: boolean };
-type Quant = { quant: string; filename: string; size_gb: number; download_url: string; perf: Perf };
+type Quant = { tier: string; quant: string; filename: string; size_gb: number; download_url: string; perf: Perf };
+
+// Turn a raw tok/s range into plain language for an inexperienced user.
+function speedWords(perf: Perf): string {
+  switch (perf.tier) {
+    case "great": return "fast";
+    case "usable": return "okay speed";
+    case "slow": return "slow";
+    default: return "";
+  }
+}
 type CatModel = { family: string; family_label: string; repo: string; name: string; params_billions: number; downloads: number; quants: Quant[] };
 type HW = { summary: string };
 type Downloaded = { filename: string; path: string; size_gb: number };
@@ -358,20 +368,30 @@ function LocalModels({ folder, activePath, onChoose }: {
       {err && <Pill tone="danger">✗ {err}</Pill>}
 
       {catalog.map((m) => (
-        <div key={m.repo} style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6, paddingTop: 8, borderTop: "var(--border-width) solid var(--line)" }}>
-          <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+        <div key={m.repo} style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 6, paddingTop: 10, borderTop: "var(--border-width) solid var(--line)" }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
             <span style={{ fontWeight: 800, fontSize: 15 }}>{m.family_label}</span>
             <span style={{ fontSize: 13, color: "var(--text-muted)" }}>{m.name}</span>
+            {m.params_billions >= 1 && (
+              <span style={{ fontSize: 12, color: "var(--text-faint)" }}>{m.params_billions}B params</span>
+            )}
           </div>
           {m.quants.map((q) => {
             const pct = progress[q.filename];
             const downloading = pct !== undefined;
+            const words = speedWords(q.perf);
             return (
-              <div key={q.filename} style={{ display: "flex", alignItems: "center", gap: 10, paddingLeft: 4 }}>
-                <span style={{ width: 90, fontFamily: "ui-monospace, monospace", fontSize: 12 }}>{q.quant}</span>
+              <div key={q.filename} style={{ display: "flex", alignItems: "center", gap: 12, paddingLeft: 4 }}>
+                {/* Friendly tier name is primary; the raw quant code is secondary. */}
+                <span style={{ display: "flex", flexDirection: "column", width: 130, flexShrink: 0 }}>
+                  <span style={{ fontSize: 13, fontWeight: 700 }}>{q.tier}</span>
+                  <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 10, color: "var(--text-faint)" }}>{q.quant} · ~{q.size_gb.toFixed(1)}GB</span>
+                </span>
+                {/* Plain-language speed + the tooltip keeps the technical note. */}
                 <span title={q.perf.note} style={{ fontSize: 13, flex: 1, minWidth: 0 }}>
-                  {q.perf.badge} {q.perf.tokens_per_sec || (q.perf.fits ? "" : "won't fit")}
-                  <span style={{ color: "var(--text-faint)", marginLeft: 6 }}>{q.size_gb.toFixed(1)}GB</span>
+                  {q.perf.badge} {q.perf.fits
+                    ? <>{words}{q.perf.tokens_per_sec && <span style={{ color: "var(--text-faint)" }}> ({q.perf.tokens_per_sec})</span>}</>
+                    : "won't fit on your machine"}
                 </span>
                 {isDown(q.filename)
                   ? <Pill tone="ok">installed ✓</Pill>
@@ -383,9 +403,13 @@ function LocalModels({ folder, activePath, onChoose }: {
           })}
         </div>
       ))}
-      <p style={{ ...hint, color: "var(--text-faint)", fontSize: 12, marginTop: 4 }}>
-        Performance figures are estimates for your machine, not benchmarks. Local models run in chat mode; file tools are coming soon.
-      </p>
+      {catalog.length > 0 && (
+        <div style={{ ...hint, fontSize: 12, color: "var(--text-faint)", marginTop: 8, display: "flex", flexDirection: "column", gap: 3 }}>
+          <span><b>Recommended vs Higher quality:</b> both are the same model — “Higher quality” is a larger, sharper version that needs more memory and runs a bit slower.</span>
+          <span><b>What’s “tok/s”?</b> Tokens per second — roughly how fast the AI types its reply. ~15+ feels quick; under ~8 feels sluggish. These are estimates for your machine, not exact benchmarks.</span>
+          <span>Local models run in chat mode; file tools are coming soon.</span>
+        </div>
+      )}
     </Card>
   );
 }
