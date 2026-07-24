@@ -293,10 +293,15 @@ function contextWords(tokens: number): { short: string; long: string } {
 
 // Per-quant friendly framing: the SAME model at different compression levels.
 // The tradeoff is QUALITY vs DOWNLOAD SIZE — speed is essentially the same.
-function tierBlurb(tier: string): string {
-  return tier === "Higher quality"
-    ? "sharpest answers · bigger download"
-    : "great quality · smaller download — best for most people";
+// Match on the RAW quant code, not the tier label, so the two rows always read
+// distinctly even if tier strings ever collide.
+function quantBlurb(quant: string): { title: string; sub: string } {
+  // Higher-precision quants (more bits per weight = sharper, bigger file).
+  const higher = ["Q5_K_M", "Q6_K", "Q8_0"];
+  if (higher.includes(quant)) {
+    return { title: "Higher quality", sub: "sharper answers · larger file · needs more memory" };
+  }
+  return { title: "Recommended", sub: "nearly identical quality · smaller file · best for most people" };
 }
 type CatModel = { family: string; family_label: string; repo: string; name: string; params_billions: number; context_tokens: number; downloads: number; quants: Quant[] };
 type HW = { summary: string };
@@ -416,10 +421,12 @@ function LocalModels({ folder, activePath, onChoose }: {
               const downloading = pct !== undefined;
               return (
                 <div key={q.filename} style={{ display: "flex", alignItems: "center", gap: 12, paddingLeft: 4 }}>
+                  {(() => { const b = quantBlurb(q.quant); return (
                   <span style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0 }}>
-                    <span style={{ fontSize: 13, fontWeight: 700 }}>{q.tier} <span style={{ fontWeight: 400, color: "var(--text-muted)" }}>— {tierBlurb(q.tier)}</span></span>
+                    <span style={{ fontSize: 13, fontWeight: 700 }}>{b.title} <span style={{ fontWeight: 400, color: "var(--text-muted)" }}>— {b.sub}</span></span>
                     <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 10, color: "var(--text-faint)" }}>~{q.size_gb.toFixed(1)}GB download · {q.quant}</span>
                   </span>
+                  ); })()}
                   {isDown(q.filename)
                     ? <Pill tone="ok">installed ✓</Pill>
                     : downloading
