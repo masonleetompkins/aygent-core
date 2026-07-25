@@ -209,6 +209,11 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
 
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
+    // Whether we saw a terminal message_stop. If the stream closes WITHOUT one
+    // (final frame lacked a trailing "\n\n", so it was never parsed), we drain
+    // the remainder below and synthesize Done — otherwise the UI spinner hangs
+    // forever waiting for a Done event that never comes.
+    let mut saw_done = false;
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| format!("stream error: {e}"))?;
@@ -304,6 +309,7 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
                     }
                     Some("message_stop") => {
                         on_event(StreamEvent::Done { stop_reason: stop_reason.clone() });
+                        saw_done = true;
                     }
                     Some("error") => {
                         let msg = ev.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).unwrap_or("stream error");
@@ -314,6 +320,44 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
                 }
             }
         }
+    }
+
+    // HANG FIX: the stream can close with a final frame (often message_stop) that
+    // lacks a trailing "\n\n", so it never matched the delimiter loop above and
+    // sits unparsed in `buf`. Parse whatever remains, using "\n" boundaries so a
+    // dangling frame is still handled.
+    if !buf.trim().is_empty() {
+        for line in buf.lines() {
+            let line = line.trim_start();
+            let Some(data) = line.strip_prefix("data:") else { continue };
+            let data = data.trim();
+            if data.is_empty() { continue; }
+            let ev: serde_json::Value = match serde_json::from_str(data) { Ok(v) => v, Err(_) => continue };
+            match ev.get("type").and_then(|t| t.as_str()) {
+                Some("message_delta") => {
+                    if let Some(sr) = ev.get("delta").and_then(|d| d.get("stop_reason")).and_then(|s| s.as_str()) {
+                        stop_reason = sr.to_string();
+                    }
+                }
+                Some("message_stop") => {
+                    on_event(StreamEvent::Done { stop_reason: stop_reason.clone() });
+                    saw_done = true;
+                }
+                Some("error") => {
+                    let msg = ev.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).unwrap_or("stream error");
+                    on_event(StreamEvent::Error { text: msg.to_string() });
+                    return Err(msg.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // FINAL SAFETY NET: if the stream ended and we STILL never emitted Done (no
+    // message_stop at all — abrupt close, proxy cut, etc.), synthesize one so the
+    // UI spinner is always resolved. The turn's content is intact either way.
+    if !saw_done {
+        on_event(StreamEvent::Done { stop_reason: stop_reason.clone() });
     }
 
     // Fix for the "each thinking block must contain thinking" 400 on Opus 5 and
