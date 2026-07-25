@@ -43,7 +43,11 @@ pub fn generate(title: &str, content: &str, dest: &std::path::Path, config: &Val
     if page_a4 { doc.set_paper_size(genpdf::PaperSize::A4); }
 
     let text_style = style::Style::new().with_color(text_color);
-    let heading_style = style::Style::new().bold().with_color(heading_color);
+    // Build each heading style FRESH (color + bold + size together). Chaining
+    // .with_font_size() onto a cloned base style was dropping the color in
+    // genpdf 0.2 — which is why heading color didn't show. A helper guarantees
+    // color + bold + size are all set in one Style.
+    let heading = |size: u8| style::Style::new().bold().with_color(heading_color).with_font_size(size);
 
     // Render the title as a heading — UNLESS the content already leads with the
     // same title as a markdown H1 (a very common case, and it was producing a
@@ -57,7 +61,7 @@ pub fn generate(title: &str, content: &str, dest: &std::path::Path, config: &Val
         .unwrap_or(false);
 
     if !title.trim().is_empty() && !content_leads_with_title {
-        doc.push(elements::Paragraph::new(title).styled(heading_style.clone().with_font_size(base_size + 9)));
+        doc.push(elements::Paragraph::new(title).styled(heading(base_size + 9)));
         doc.push(elements::Break::new(1));
     }
 
@@ -67,11 +71,11 @@ pub fn generate(title: &str, content: &str, dest: &std::path::Path, config: &Val
         if line.trim().is_empty() { doc.push(elements::Break::new(1)); continue; }
 
         if let Some(rest) = line.strip_prefix("### ") {
-            doc.push(elements::Paragraph::new(strip_inline(rest)).styled(heading_style.clone().with_font_size(base_size + 2)));
+            doc.push(elements::Paragraph::new(strip_inline(rest)).styled(heading(base_size + 2)));
         } else if let Some(rest) = line.strip_prefix("## ") {
-            doc.push(elements::Paragraph::new(strip_inline(rest)).styled(heading_style.clone().with_font_size(base_size + 4)));
+            doc.push(elements::Paragraph::new(strip_inline(rest)).styled(heading(base_size + 4)));
         } else if let Some(rest) = line.strip_prefix("# ") {
-            doc.push(elements::Paragraph::new(strip_inline(rest)).styled(heading_style.clone().with_font_size(base_size + 7)));
+            doc.push(elements::Paragraph::new(strip_inline(rest)).styled(heading(base_size + 7)));
         } else if let Some(rest) = line.trim_start().strip_prefix("- ").or_else(|| line.trim_start().strip_prefix("* ")) {
             doc.push(elements::Paragraph::new(format!("\u{2022} {}", strip_inline(rest))).styled(text_style.clone()));
         } else {
