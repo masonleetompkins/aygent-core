@@ -539,11 +539,7 @@ fn local_tool_capability(path: String) -> gguf::ToolCapability {
 }
 
 // --- TOOLS registry (extensible agent capabilities) ------------------------
-
-fn app_data(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
-    use tauri::Manager;
-    app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))
-}
+// (uses the existing `app_data` helper defined earlier)
 
 /// Full registry (builtins + user tools) with each tool's enabled-state for a
 /// folder folded in.
@@ -934,6 +930,7 @@ async fn agent_stream(
     history: serde_json::Value,
     model: Option<String>,
     provider: Option<String>,
+    folder: Option<String>,
 ) -> Result<serde_json::Value, String> {
     use tauri::Emitter;
     let broker = broker.inner().clone();

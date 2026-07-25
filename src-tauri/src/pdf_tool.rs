@@ -7,6 +7,7 @@
 // caller, so a PDF can only ever be written inside the agent folder.
 
 use genpdf::{elements, style, Document, SimplePageDecorator};
+use genpdf::Element; // brings the `.styled()` extension method into scope
 
 /// Render `content` (markdown-ish) to a PDF at the already-jail-resolved
 /// absolute `dest` path. `title` is the document title / first heading.
