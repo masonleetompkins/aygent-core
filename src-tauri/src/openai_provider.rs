@@ -40,10 +40,16 @@ fn apply_extra_headers(req: reqwest::RequestBuilder, provider: &str) -> reqwest:
 /// new models appear without an app update). OpenRouter returns hundreds; the
 /// caller can filter/sort. Returns model id strings.
 pub async fn list_models(provider: &str, api_key: &str) -> Result<Vec<String>, String> {
-    let client = reqwest::Client::new();
+    // No-redirect client: reqwest STRIPS the Authorization header across a
+    // redirect (a security default), which is what caused OpenRouter's
+    // "Missing Authentication header" 401 — its endpoint 30x-normalizes and the
+    // bearer token was dropped on the follow. Disabling redirects keeps auth on.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build().map_err(|e| format!("http: {e}"))?;
     let req = client
         .get(format!("{}/models", base_url(provider)))
-        .header("Authorization", format!("Bearer {api_key}"));
+        .bearer_auth(api_key);
     let resp = apply_extra_headers(req, provider)
         .send().await.map_err(|e| format!("request failed: {e}"))?;
     let status = resp.status();
@@ -163,10 +169,14 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
         "stream": true,
     });
 
-    let client = reqwest::Client::new();
+    // No-redirect client (see list_models): keeps the bearer token attached so
+    // OpenRouter doesn't 401 with "Missing Authentication header" on a redirect.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build().map_err(|e| format!("http: {e}"))?;
     let req = client
         .post(format!("{}/chat/completions", base_url(provider)))
-        .header("Authorization", format!("Bearer {api_key}"))
+        .bearer_auth(api_key)
         .header("content-type", "application/json")
         .json(&body);
     let resp = apply_extra_headers(req, provider)
