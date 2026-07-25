@@ -4,6 +4,7 @@
 // Seatbelt profile that denies file+exec — Atlas C1). Also mints the
 // per-session WS token (C6) and hands it + the daemon port to the UI.
 
+mod agents;
 mod broker;
 mod broker_ws;
 mod catalog;
@@ -138,6 +139,12 @@ fn restore_agent_folder(
     let canonical = std::fs::canonicalize(&saved).unwrap_or(saved);
     broker.set_scope("default", canonical.clone(), false);
     eprintln!("[aygent] agent folder restored: {}", canonical.display());
+    // BACK-COMPAT: if this user predates multi-agent (has a saved folder but no
+    // agent profiles yet), synthesize "My Agent" pointing at it so the switcher
+    // has something to show and existing per-folder state stays reachable.
+    if let Ok(ad) = app_data(&app) {
+        let _ = agents::ensure_migrated(&ad, Some(&canonical.to_string_lossy()));
+    }
     Ok(Some(canonical.to_string_lossy().to_string()))
 }
 
@@ -381,6 +388,83 @@ fn set_selection(app: tauri::AppHandle, folder: String, provider: String, model:
     s.provider = provider;
     s.model = model;
     settings::save(&app_data, &folder, &s)
+}
+
+// --- AGENTS (multi-agent profiles) -----------------------------------------
+
+/// List all agent profiles + the active id. UI renders the switcher from this.
+#[tauri::command]
+fn agents_list(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let ad = app_data(&app)?;
+    let idx = agents::load_index(&ad);
+    Ok(serde_json::json!({ "agents": idx.agents, "activeId": idx.active_id }))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+fn agents_create(
+    app: tauri::AppHandle,
+    name: String,
+    icon: Option<String>,
+    color: Option<String>,
+    folder_path: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    context_mode: Option<String>,
+    system_prompt: Option<String>,
+) -> Result<agents::AgentProfile, String> {
+    let ad = app_data(&app)?;
+    agents::create(
+        &ad, &name,
+        &icon.unwrap_or_default(),
+        &color.unwrap_or_default(),
+        &folder_path.unwrap_or_default(),
+        &model.unwrap_or_default(),
+        &provider.unwrap_or_default(),
+        &context_mode.unwrap_or_default(),
+        &system_prompt.unwrap_or_default(),
+    )
+}
+
+#[tauri::command]
+fn agents_update(app: tauri::AppHandle, profile: agents::AgentProfile) -> Result<(), String> {
+    let ad = app_data(&app)?;
+    agents::update(&ad, profile)
+}
+
+#[tauri::command]
+fn agents_delete(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let ad = app_data(&app)?;
+    agents::delete(&ad, &id)
+}
+
+/// Set the active agent AND re-point the broker jail at that agent's folder, so
+/// switching agents switches the security scope in one atomic step.
+#[tauri::command]
+fn agents_set_active(
+    app: tauri::AppHandle,
+    broker: tauri::State<'_, Arc<Broker>>,
+    id: String,
+) -> Result<Option<agents::AgentProfile>, String> {
+    let ad = app_data(&app)?;
+    agents::set_active(&ad, &id)?;
+    let profile = agents::get(&ad, &id);
+    if let Some(p) = &profile {
+        if !p.folder_path.is_empty() {
+            let path = std::path::PathBuf::from(&p.folder_path);
+            if path.is_dir() {
+                let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+                broker.set_scope("default", canonical, false);
+            }
+        }
+    }
+    Ok(profile)
+}
+
+#[tauri::command]
+fn agents_get_active(app: tauri::AppHandle) -> Result<Option<agents::AgentProfile>, String> {
+    let ad = app_data(&app)?;
+    Ok(agents::get_active(&ad))
 }
 
 // --- LOCAL MODELS ----------------------------------------------------------
@@ -1303,7 +1387,9 @@ pub fn run() {
             checkpoint_snapshot, checkpoint_timeline, checkpoint_rewind,
             checkpoint_undo, checkpoint_redo,
             checkpoint_get_retention, checkpoint_set_retention, checkpoint_purge,
-            conv_list, conv_load, conv_save, conv_delete, conv_reorder
+            conv_list, conv_load, conv_save, conv_delete, conv_reorder,
+            agents_list, agents_create, agents_update, agents_delete,
+            agents_set_active, agents_get_active
         ])
         .setup(move |_app| {
             let broker = broker.clone();
