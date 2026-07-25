@@ -15,9 +15,13 @@ pub fn set_key(provider: &str, key: &str) -> Result<(), String> {
 }
 
 /// Fetch a stored key (Rust-side only — used to make provider calls).
+/// Surfaces the RAW keyring error (NoEntry vs access/decrypt denied) so callers
+/// can distinguish "genuinely absent" from "present but this app identity can't
+/// read it" (a macOS Keychain ACL / code-signing-identity mismatch — common in
+/// unsigned `cargo tauri dev` builds).
 pub fn get_key(provider: &str) -> Result<String, String> {
-    let entry = Entry::new(SERVICE, provider).map_err(|e| e.to_string())?;
-    entry.get_password().map_err(|e| e.to_string())
+    let entry = Entry::new(SERVICE, provider).map_err(|e| format!("keychain entry: {e}"))?;
+    entry.get_password().map_err(|e| format!("keychain get [{SERVICE}/{provider}]: {e}"))
 }
 
 /// Whether a key exists (safe for the UI — returns bool, never the secret).
