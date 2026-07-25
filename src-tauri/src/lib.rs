@@ -1222,11 +1222,21 @@ async fn agent_stream(
             }
         }
 
-        if stop == "tool_use" && !tool_results.is_empty() {
+        // CRITICAL Anthropic invariant: EVERY tool_use block MUST be followed
+        // immediately by a message containing its matching tool_result. So the
+        // decision to send results is driven by "did we produce any tool_use
+        // blocks?" (i.e. tool_results is non-empty) — NOT by the stop_reason.
+        // The old guard keyed on `stop == "tool_use"`; if the model both spoke
+        // and called a tool (stop can arrive as end_turn) we'd push the
+        // assistant message with the dangling tool_use, skip the results, and
+        // break — leaving history malformed and 400-ing the NEXT request.
+        if !tool_results.is_empty() {
             messages.as_array_mut().unwrap().push(serde_json::json!({
                 "role": "user", "content": tool_results
             }));
-            continue;
+            // Only keep looping if the model actually wants to continue the
+            // tool cycle; otherwise send results once and finish this turn.
+            if stop == "tool_use" { continue; }
         }
         break;
     }
