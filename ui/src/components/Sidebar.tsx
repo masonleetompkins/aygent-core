@@ -11,7 +11,7 @@ export interface NavItem { id: ScreenId; label: string; icon: string; enabled: b
 // product shape is visible without pretending features exist.
 export const NAV: NavItem[] = [
   { id: "chat", label: "Chat", icon: "💬", enabled: true },
-  { id: "agents", label: "Agents", icon: "🧠", enabled: false },
+  { id: "agents", label: "Agents", icon: "🧠", enabled: true },
   { id: "tools", label: "Tools", icon: "🧰", enabled: true },
   { id: "scheduler", label: "Scheduler", icon: "⏰", enabled: false },
   { id: "connections", label: "Connections", icon: "🔌", enabled: false },

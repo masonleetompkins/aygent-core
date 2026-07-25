@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Pill } from "./components/ui";
 import { Sidebar, type ScreenId } from "./components/Sidebar";
+import { AgentSwitcher, type AgentProfile } from "./components/AgentSwitcher";
+import { Agents } from "./screens/Agents";
 import { Settings } from "./screens/Settings";
 import { Playground } from "./screens/Playground";
 import { Chat } from "./screens/Chat";
@@ -24,6 +26,7 @@ export function App() {
   const [status, setStatus] = useState<Status>({ kind: "booting" });
   const [ws, setWs] = useState<WebSocket | null>(null);
   const [folder, setFolder] = useState<string | null>(null);
+  const [activeAgent, setActiveAgent] = useState<AgentProfile | null>(null);
   const [screen, setScreen] = useState<ScreenId>("chat");
   const [mode, setMode] = useState<Mode>("light");
   const [accent, setAccent] = useState("");
@@ -34,8 +37,21 @@ export function App() {
   // never has to re-pick after a restart. The backend re-registers the broker
   // scope; if the folder vanished it returns null and we prompt a fresh pick.
   useEffect(() => {
-    invoke<string | null>("restore_agent_folder").then((f) => { if (f) setFolder(f); }).catch(() => {});
+    invoke<string | null>("restore_agent_folder").then((f) => {
+      if (f) setFolder(f);
+      // After the (possible) back-compat migration runs inside restore, load the
+      // active agent so the switcher + context are correct on boot.
+      invoke<AgentProfile | null>("agents_get_active").then((a) => {
+        if (a) { setActiveAgent(a); if (a.folder_path) setFolder(a.folder_path); }
+      }).catch(() => {});
+    }).catch(() => {});
   }, []);
+
+  // When the active agent changes (switcher), its folder becomes the scope.
+  function onActiveChange(a: AgentProfile) {
+    setActiveAgent(a);
+    if (a.folder_path) setFolder(a.folder_path);
+  }
   useEffect(() => { invoke<boolean>("has_provider_key", { provider: "anthropic" }).then(setKeySet).catch(() => {}); }, [screen]);
   function onTheme(m: Mode, a: string) { setMode(m); setAccent(a); saveTheme(m, a); }
 
@@ -85,6 +101,14 @@ export function App() {
 
         <div style={{ padding: "28px 32px" }}>
           {screen === "chat" && <Chat folder={folder} keySet={keySet} />}
+          {screen === "agents" && (
+            <Agents
+              activeId={activeAgent?.id ?? null}
+              onActiveChange={onActiveChange}
+              onPickFolder={pickFolder}
+              pendingFolder={folder}
+            />
+          )}
           {screen === "settings" && (
             <Settings mode={mode} accent={accent} onTheme={onTheme} folder={folder} onPickFolder={pickFolder} />
           )}
