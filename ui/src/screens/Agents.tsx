@@ -11,6 +11,38 @@ const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 const ICONS = ["🤖", "🧠", "📓", "🔬", "💼", "🎨", "📈", "🗂️", "⚙️", "🌱"];
 const COLORS = ["#5b8cff", "#22c55e", "#f59e0b", "#ec4899", "#8b5cf6", "#14b8a6", "#ef4444", "#64748b"];
 
+// Rank a model id most-powerful-first. Higher score = more capable = higher in
+// the dropdown. Family tier dominates; version bumps break ties (opus-5 > opus-4-8).
+// Provider-agnostic heuristic; unknown ids fall to the bottom but stay listed.
+function modelRank(id: string): number {
+  const s = id.toLowerCase();
+  let base = 0;
+  if (s.includes("fable") || s.includes("mythos")) base = 900;      // next-gen top tier
+  else if (s.includes("opus")) base = 800;
+  else if (s.includes("gpt-5") || s.includes("o3") || s.includes("o1")) base = 780; // OpenAI reasoning/top
+  else if (s.includes("sonnet")) base = 700;
+  else if (s.includes("gpt-4")) base = 680;
+  else if (s.includes("haiku")) base = 500;
+  else if (s.includes("mini") || s.includes("small")) base = 400;
+  else base = 300;
+  // version nudge: pull a trailing version like "-5", "-4-8", "4.6" out of the id.
+  const m = s.match(/(\d+)(?:[.-](\d+))?/g);
+  let ver = 0;
+  if (m) { const last = m[m.length - 1].replace(/[.-]/g, "."); const parts = last.split("."); ver = (parseInt(parts[0] || "0") * 10) + parseInt(parts[1] || "0"); }
+  return base + ver;
+}
+
+// A short, human label for a model id (family + version), so the dropdown reads
+// nicely instead of showing raw ids.
+function modelLabel(id: string): string {
+  const s = id.toLowerCase();
+  const fam =
+    s.includes("fable") ? "Fable" : s.includes("mythos") ? "Mythos" :
+    s.includes("opus") ? "Opus" : s.includes("sonnet") ? "Sonnet" : s.includes("haiku") ? "Haiku" :
+    null;
+  return fam ? `${fam} — ${id}` : id;
+}
+
 export function Agents({
   activeId,
   onActiveChange,
@@ -121,8 +153,34 @@ function AgentForm({
   const [systemPrompt, setSystemPrompt] = useState(initial?.system_prompt ?? "");
   const [saving, setSaving] = useState(false);
 
+  // Live model list for the chosen provider, most-powerful-first.
+  const [models, setModels] = useState<string[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsErr, setModelsErr] = useState<string | null>(null);
+
   // If the user picks a folder via the native picker, adopt it here.
   useEffect(() => { if (pendingFolder && !initial) setFolder(pendingFolder); }, [pendingFolder, initial]);
+
+  // Fetch this provider's models whenever the provider changes. Anthropic uses
+  // its own command; openai/openrouter share one. Local models are file paths
+  // (handled elsewhere) so we skip the live fetch and let the user keep "auto".
+  useEffect(() => {
+    let cancelled = false;
+    if (provider === "local") { setModels([]); setModelsErr(null); return; }
+    setModelsLoading(true); setModelsErr(null);
+    const call = provider === "anthropic"
+      ? invoke<string[]>("anthropic_models")
+      : invoke<string[]>("openai_models", { provider });
+    call
+      .then((list) => {
+        if (cancelled) return;
+        const sorted = [...(list || [])].sort((a, b) => modelRank(b) - modelRank(a));
+        setModels(sorted);
+      })
+      .catch((e) => { if (!cancelled) { setModels([]); setModelsErr(String(e)); } })
+      .finally(() => { if (!cancelled) setModelsLoading(false); });
+    return () => { cancelled = true; };
+  }, [provider]);
 
   async function save() {
     if (!name.trim()) return;
@@ -189,7 +247,7 @@ function AgentForm({
 
         <div style={{ display: "flex", gap: 12 }}>
           <label style={fieldLabel}>Provider
-            <select value={provider} onChange={(e) => setProvider(e.target.value)} style={selectStyle}>
+            <select value={provider} onChange={(e) => { setProvider(e.target.value); setModel(""); }} style={selectStyle}>
               <option value="anthropic">Anthropic</option>
               <option value="openai">OpenAI</option>
               <option value="openrouter">OpenRouter</option>
@@ -197,7 +255,20 @@ function AgentForm({
             </select>
           </label>
           <label style={fieldLabel}>Model
-            <Input value={model} onChange={(e) => setModel(e.target.value)} mono placeholder="auto" />
+            {provider === "local" ? (
+              <Input value={model} onChange={(e) => setModel(e.target.value)} mono placeholder="path to .gguf" />
+            ) : (
+              <select value={model} onChange={(e) => setModel(e.target.value)} style={selectStyle} disabled={modelsLoading}>
+                <option value="">{modelsLoading ? "loading models…" : "Auto (recommended)"}</option>
+                {models.map((m) => <option key={m} value={m}>{modelLabel(m)}</option>)}
+                {/* keep a saved model visible even if the live list didn't return it */}
+                {model && !models.includes(model) && <option value={model}>{modelLabel(model)}</option>}
+              </select>
+            )}
+            {modelsErr && <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Add your {provider} key in Settings to load models. Using “Auto” for now.</span>}
+            {!modelsErr && !modelsLoading && provider !== "local" && models.length > 0 && (
+              <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Most capable first.</span>
+            )}
           </label>
         </div>
 
