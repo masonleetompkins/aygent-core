@@ -30,6 +30,7 @@ llama-cpp-2 = "0.1"                 # LOCAL MODELS: llama.cpp compiled IN — do
 num_cpus = "1"                      # thread count for local inference / perf prediction
 sysinfo = "0.32"                    # hardware detection (CPU/RAM) for perf prediction on the RUNTIME machine
 genpdf = "0.2"                      # TOOLS: pure-Rust markdown/text -> PDF (compiled in, zero user setup)
+pulldown-cmark = { version = "0.12", default-features = false }  # real CommonMark parser -> proper inline styles, code blocks, blockquotes, HR, nested lists, tables
 once_cell = "1"                     # process-wide llama.cpp backend + model cache (local models)
 urlencoding = "2"                   # (unused placeholder removed if not needed) — kept minimal
 
