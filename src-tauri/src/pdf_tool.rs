@@ -148,7 +148,8 @@ fn render_markdown(doc: &mut Document, content: &str, t: &Theme) {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
-    let parser = Parser::new_ext(&content.replace('\r', ""), opts);
+    let normalized = content.replace('\r', "");
+    let parser = Parser::new_ext(&normalized, opts);
 
     let mut inline = Inline::default();
     let mut run = RunBuf::new();
@@ -277,7 +278,7 @@ fn render_markdown(doc: &mut Document, content: &str, t: &Theme) {
 
 /// Flush the accumulated inline runs as a paragraph. Blockquotes get indented
 /// and tinted so they read as quotes.
-fn flush_block(doc: &mut Document, run: &mut RunBuf, t: &Theme, quote_depth: u32) {
+fn flush_block(doc: &mut Document, run: &mut RunBuf, _t: &Theme, quote_depth: u32) {
     if run.is_empty() { return; }
     let parts = run.take();
     if quote_depth > 0 {
