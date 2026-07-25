@@ -161,26 +161,39 @@ function AgentForm({
   // If the user picks a folder via the native picker, adopt it here.
   useEffect(() => { if (pendingFolder && !initial) setFolder(pendingFolder); }, [pendingFolder, initial]);
 
-  // Fetch this provider's models whenever the provider changes. Anthropic uses
-  // its own command; openai/openrouter share one. Local models are file paths
-  // (handled elsewhere) so we skip the live fetch and let the user keep "auto".
-  useEffect(() => {
-    let cancelled = false;
-    if (provider === "local") { setModels([]); setModelsErr(null); return; }
+  // Fetch this provider's models. Anthropic uses its own command; openai/
+  // openrouter share one. Local models are file paths (handled elsewhere) so we
+  // skip the live fetch. RESILIENT: the create form can mount before the daemon/
+  // keychain handshake settles, so the first call may throw "no key" spuriously.
+  // We retry a few times with backoff, and also expose a manual refetch that the
+  // dropdown fires on focus — so it can never come up permanently empty.
+  async function loadModels(prov: string): Promise<void> {
+    if (prov === "local") { setModels([]); setModelsErr(null); return; }
     setModelsLoading(true); setModelsErr(null);
-    const call = provider === "anthropic"
-      ? invoke<string[]>("anthropic_models")
-      : invoke<string[]>("openai_models", { provider });
-    call
-      .then((list) => {
-        if (cancelled) return;
+    const attempt = () =>
+      prov === "anthropic"
+        ? invoke<string[]>("anthropic_models")
+        : invoke<string[]>("openai_models", { provider: prov });
+    let lastErr: unknown = null;
+    for (let i = 0; i < 4; i++) {
+      try {
+        const list = await attempt();
         const sorted = [...(list || [])].sort((a, b) => modelRank(b) - modelRank(a));
         setModels(sorted);
-      })
-      .catch((e) => { if (!cancelled) { setModels([]); setModelsErr(String(e)); } })
-      .finally(() => { if (!cancelled) setModelsLoading(false); });
-    return () => { cancelled = true; };
-  }, [provider]);
+        setModelsErr(null);
+        setModelsLoading(false);
+        return;
+      } catch (e) {
+        lastErr = e;
+        await new Promise((r) => setTimeout(r, 350 * (i + 1)));
+      }
+    }
+    setModels([]);
+    setModelsErr(String(lastErr));
+    setModelsLoading(false);
+  }
+
+  useEffect(() => { void loadModels(provider); /* eslint-disable-next-line */ }, [provider]);
 
   async function save() {
     if (!name.trim()) return;
@@ -258,14 +271,19 @@ function AgentForm({
             {provider === "local" ? (
               <Input value={model} onChange={(e) => setModel(e.target.value)} mono placeholder="path to .gguf" />
             ) : (
-              <select value={model} onChange={(e) => setModel(e.target.value)} style={selectStyle} disabled={modelsLoading}>
+              <select
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                onMouseDown={() => { if (!modelsLoading && models.length === 0) void loadModels(provider); }}
+                style={selectStyle}
+              >
                 <option value="">{modelsLoading ? "loading models…" : "Auto (recommended)"}</option>
                 {models.map((m) => <option key={m} value={m}>{modelLabel(m)}</option>)}
                 {/* keep a saved model visible even if the live list didn't return it */}
                 {model && !models.includes(model) && <option value={model}>{modelLabel(model)}</option>}
               </select>
             )}
-            {modelsErr && <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Add your {provider} key in Settings to load models. Using “Auto” for now.</span>}
+            {modelsErr && <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Couldn’t load {provider} models: {modelsErr}. Using “Auto” — click the menu to retry.</span>}
             {!modelsErr && !modelsLoading && provider !== "local" && models.length > 0 && (
               <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Most capable first.</span>
             )}
