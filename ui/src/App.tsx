@@ -6,6 +6,7 @@ import { Settings } from "./screens/Settings";
 import { Playground } from "./screens/Playground";
 import { Chat } from "./screens/Chat";
 import { Checkpoints } from "./screens/Checkpoints";
+import { Tools } from "./screens/Tools";
 import { initTheme, saveTheme, type Mode } from "./lib/theme";
 
 // Phase 1: app shell (sidebar nav + content pane) on the design system.
@@ -88,6 +89,7 @@ export function App() {
             <Settings mode={mode} accent={accent} onTheme={onTheme} folder={folder} onPickFolder={pickFolder} />
           )}
           {screen === "checkpoints" && <Checkpoints folder={folder} />}
+          {screen === "tools" && <Tools folder={folder} />}
           {screen === "playground" && <Playground folder={folder} ws={ws} />}
         </div>
       </div>

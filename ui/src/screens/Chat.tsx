@@ -199,6 +199,7 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
         channel, prompt, history: historyRef.current,
         model: modelRef.current || null,
         provider: providerRef.current || null,
+        folder: folder || null,
       });
       historyRef.current = updated;
     } catch (err) {

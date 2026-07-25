@@ -15,9 +15,11 @@ mod keychain;
 mod local_provider;
 mod local_tools;
 mod openai_provider;
+mod pdf_tool;
 mod provider;
 mod settings;
 mod supervisor;
+mod tools_registry;
 
 use std::sync::Arc;
 use rand::Rng;
@@ -536,6 +538,48 @@ fn local_tool_capability(path: String) -> gguf::ToolCapability {
     gguf::detect_tool_capability(&path)
 }
 
+// --- TOOLS registry (extensible agent capabilities) ------------------------
+
+fn app_data(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+    app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))
+}
+
+/// Full registry (builtins + user tools) with each tool's enabled-state for a
+/// folder folded in.
+#[tauri::command]
+fn tools_list(app: tauri::AppHandle, folder: Option<String>) -> Result<serde_json::Value, String> {
+    let ad = app_data(&app)?;
+    let all = tools_registry::load_registry(&ad);
+    let enabled = folder.as_ref().map(|f| tools_registry::load_enabled(&ad, f)).unwrap_or_default();
+    let out: Vec<serde_json::Value> = all.iter().map(|t| {
+        let on = match enabled.get(&t.id) { Some(v) => *v, None => t.builtin };
+        serde_json::json!({
+            "id": t.id, "name": t.name, "display_name": t.display_name,
+            "description": t.description, "kind": t.kind, "builtin": t.builtin,
+            "instructions": t.instructions, "allowed_tools": t.allowed_tools,
+            "enabled": on,
+        })
+    }).collect();
+    Ok(serde_json::json!(out))
+}
+
+/// Create/update a composed (user) tool.
+#[tauri::command]
+fn tools_upsert(app: tauri::AppHandle, tool: tools_registry::ToolDef) -> Result<(), String> {
+    tools_registry::upsert_tool(&app_data(&app)?, tool)
+}
+
+#[tauri::command]
+fn tools_delete(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    tools_registry::delete_tool(&app_data(&app)?, &id)
+}
+
+#[tauri::command]
+fn tools_set_enabled(app: tauri::AppHandle, folder: String, id: String, on: bool) -> Result<(), String> {
+    tools_registry::set_enabled(&app_data(&app)?, &folder, &id, on)
+}
+
 /// Delete a downloaded local model by filename.
 #[tauri::command]
 fn local_delete(app: tauri::AppHandle, filename: String) -> Result<(), String> {
@@ -771,19 +815,97 @@ fn exec_tool(
             },
             Err(e) => (format!("refused by jail: {e:?}"), true),
         },
+        // TOOLS registry: PDF generator (first built-in tool). Output path is
+        // resolved THROUGH THE BROKER — a PDF can only land inside the folder.
+        "generate_pdf" => {
+            let title = input.get("title").and_then(|t| t.as_str()).unwrap_or("Document");
+            let content = input.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            let out_path = input.get("output_path").and_then(|p| p.as_str())
+                .or_else(|| input.get("path").and_then(|p| p.as_str()))
+                .unwrap_or("document.pdf");
+            match broker.resolve("default", out_path, broker::Mode::Write) {
+                Ok(real) => {
+                    if let Some(parent) = real.parent() { let _ = std::fs::create_dir_all(parent); }
+                    match pdf_tool::generate(title, content, &real) {
+                        Ok(_) => (format!("wrote PDF to {out_path}"), false),
+                        Err(e) => (format!("pdf error: {e}"), true),
+                    }
+                }
+                Err(e) => (format!("refused by jail: {e:?}"), true),
+            }
+        }
         other => (format!("unknown tool: {other}"), true),
     }
 }
 
+/// Base file tools, always available. The Tools registry adds MORE on top.
+fn base_tools() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({ "name": "read_file", "description": "Read a UTF-8 text file inside the agent folder. Path relative to folder root.",
+          "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } }),
+        serde_json::json!({ "name": "write_file", "description": "Write a UTF-8 text file inside the agent folder. Path relative to folder root.",
+          "input_schema": { "type": "object", "properties": { "path": { "type": "string" }, "content": { "type": "string" } }, "required": ["path", "content"] } }),
+        serde_json::json!({ "name": "list_files", "description": "List entries in a directory inside the agent folder. Path relative to root; '.' for root.",
+          "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } }),
+    ]
+}
+
+/// The JSON schema for a built-in tool by its agent-facing name.
+fn builtin_tool_schema(name: &str) -> Option<serde_json::Value> {
+    match name {
+        "generate_pdf" => Some(serde_json::json!({
+            "name": "generate_pdf",
+            "description": "Create a PDF document from markdown/text content, saved into the agent folder.",
+            "input_schema": { "type": "object", "properties": {
+                "title": { "type": "string" },
+                "content": { "type": "string", "description": "markdown or plain text body" },
+                "output_path": { "type": "string", "description": "e.g. report.pdf" }
+            }, "required": ["title", "content", "output_path"] }
+        })),
+        _ => None,
+    }
+}
+
+/// Assemble the tool list for a turn: base file tools + any ENABLED registry
+/// tools for this folder. Also returns composed-tool instructions to append to
+/// the system prompt. `app` provides the app-data dir for the registry.
+fn agent_tools_for(app: &tauri::AppHandle, folder: Option<&str>) -> (serde_json::Value, String) {
+    let mut tools = base_tools();
+    let mut extra_instructions = String::new();
+
+    if let (Ok(ad), Some(f)) = (app_data(app), folder) {
+        for t in tools_registry::enabled_tools(&ad, f) {
+            match t.kind.as_str() {
+                "builtin" => {
+                    if let Some(schema) = builtin_tool_schema(&t.name) { tools.push(schema); }
+                }
+                "composed" => {
+                    // A composed tool is exposed as a named tool the model can
+                    // "invoke" by following its saved instructions using the base
+                    // tools it's allowed. We surface it as a no-arg-ish tool plus
+                    // an instruction block so the model knows what it does.
+                    tools.push(serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": { "type": "object", "properties": {
+                            "request": { "type": "string", "description": "what the user wants this tool to do" }
+                        } }
+                    }));
+                    extra_instructions.push_str(&format!(
+                        "\n\nTool \"{}\": {}\nWhen using it, follow these instructions: {}\nYou may use these base tools to carry it out: {}.",
+                        t.name, t.description, t.instructions, t.allowed_tools.join(", ")
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    (serde_json::json!(tools), extra_instructions)
+}
+
+/// Back-compat: the base-only tool set (used where no folder/app context).
 fn agent_tools() -> serde_json::Value {
-    serde_json::json!([
-        { "name": "read_file", "description": "Read a UTF-8 text file inside the agent folder. Path relative to folder root.",
-          "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } },
-        { "name": "write_file", "description": "Write a UTF-8 text file inside the agent folder. Path relative to folder root.",
-          "input_schema": { "type": "object", "properties": { "path": { "type": "string" }, "content": { "type": "string" } }, "required": ["path", "content"] } },
-        { "name": "list_files", "description": "List entries in a directory inside the agent folder. Path relative to root; '.' for root.",
-          "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } }
-    ])
+    serde_json::json!(base_tools())
 }
 
 const AGENT_SYSTEM: &str = "You are AYGENT, an agent that can ONLY touch files inside the user's \
@@ -866,7 +988,11 @@ async fn agent_stream(
         if let Ok(root) = broker.root_for("default") {
             let _ = checkpoint::snapshot(&root, "baseline");
         }
-        let sys = local_tools::system_prompt_with_tools(AGENT_SYSTEM_LOCAL, &cap.format);
+        // Enabled registry tools (e.g. PDF) contribute extra instructions the
+        // local model should know about, appended to its native tool prompt.
+        let (_reg_tools, reg_instr) = agent_tools_for(&app, folder.as_deref());
+        let base_sys = if reg_instr.is_empty() { AGENT_SYSTEM_LOCAL.to_string() } else { format!("{AGENT_SYSTEM_LOCAL}{reg_instr}") };
+        let sys = local_tools::system_prompt_with_tools(&base_sys, &cap.format);
 
         for turn in 0..LOCAL_TOOL_TURN_CAP {
             let (content, _stop) = local_provider::local_stream_turn(
@@ -937,14 +1063,15 @@ async fn agent_stream(
             let _ = checkpoint::snapshot(&root, "baseline");
         }
 
-        let tools = agent_tools();
+        let (tools, reg_instr) = agent_tools_for(&app, folder.as_deref());
+        let sys = if reg_instr.is_empty() { AGENT_SYSTEM.to_string() } else { format!("{AGENT_SYSTEM}{reg_instr}") };
         let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
         messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": prompt }));
         let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("model: {model}") });
 
         for _ in 0..8 {
             let (assistant, stop) = openai_provider::openai_stream_turn(
-                &provider_kind, &key, &model, AGENT_SYSTEM, &messages, &tools,
+                &provider_kind, &key, &model, &sys, &messages, &tools,
                 |ev| { let _ = app.emit(&channel, &ev); },
             ).await?;
 
@@ -1017,7 +1144,8 @@ async fn agent_stream(
         let _ = checkpoint::snapshot(&root, "baseline");
     }
 
-    let tools = agent_tools();
+    let (tools, reg_instr) = agent_tools_for(&app, folder.as_deref());
+    let anthropic_sys = if reg_instr.is_empty() { AGENT_SYSTEM.to_string() } else { format!("{AGENT_SYSTEM}{reg_instr}") };
     let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
     messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": prompt }));
 
@@ -1026,7 +1154,7 @@ async fn agent_stream(
 
     for _ in 0..8 {
         let (content, stop) = provider::anthropic_stream_turn(
-            &key, &model, AGENT_SYSTEM, &messages, &tools,
+            &key, &model, &anthropic_sys, &messages, &tools,
             |ev| { let _ = app.emit(&channel, &ev); },
         ).await?;
 
@@ -1107,7 +1235,7 @@ pub fn run() {
             agent_stream, reveal_in_finder, get_selected_model, set_selected_model,
             get_selection, set_selection, detect_hardware, local_catalog, local_downloaded,
             local_download, local_delete, local_tool_capability, restore_agent_folder,
-            openai_models,
+            openai_models, tools_list, tools_upsert, tools_delete, tools_set_enabled,
             checkpoint_snapshot, checkpoint_timeline, checkpoint_rewind,
             checkpoint_undo, checkpoint_redo,
             checkpoint_get_retention, checkpoint_set_retention, checkpoint_purge,

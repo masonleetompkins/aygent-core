@@ -29,6 +29,7 @@ git2 = { version = "0.19", default-features = false }  # checkpoints (C4): git o
 llama-cpp-2 = "0.1"                 # LOCAL MODELS: llama.cpp compiled IN — download + run GGUF models in-app, zero user setup (Metal on mac / CUDA on PC via features below)
 num_cpus = "1"                      # thread count for local inference / perf prediction
 sysinfo = "0.32"                    # hardware detection (CPU/RAM) for perf prediction on the RUNTIME machine
+genpdf = "0.2"                      # TOOLS: pure-Rust markdown/text -> PDF (compiled in, zero user setup)
 once_cell = "1"                     # process-wide llama.cpp backend + model cache (local models)
 urlencoding = "2"                   # (unused placeholder removed if not needed) — kept minimal
 
