@@ -83,15 +83,16 @@ struct Theme {
     base_size: u8,
 }
 
-/// A heading style built FRESH in one expression (color + bold + size together).
-/// Chaining `.with_font_size()` onto a cloned style was dropping the color in
-/// genpdf 0.2 — so we always construct the full style at once.
+/// A heading style built FRESH in one expression. IMPORTANT genpdf-0.2 quirk:
+/// `.with_font_size()` can clobber a previously-set color, so we set SIZE FIRST
+/// and apply the color LAST — that's why the old renderer's headings kept color
+/// and my first rewrite (size last) rendered black. Order matters here.
 fn heading_style(t: &Theme, size: u8) -> style::Style {
-    style::Style::new().bold().with_color(t.heading_color).with_font_size(size)
+    style::Style::new().with_font_size(size).bold().with_color(t.heading_color)
 }
 
 fn body_style(t: &Theme) -> style::Style {
-    style::Style::new().with_color(t.text_color).with_font_size(t.base_size)
+    style::Style::new().with_font_size(t.base_size).with_color(t.text_color)
 }
 
 /// Inline styling state as we walk the parser events. Tracks nesting of bold /
@@ -105,12 +106,14 @@ struct Inline {
 }
 impl Inline {
     fn style(&self, t: &Theme) -> style::Style {
+        // Size + bold/italic FIRST; color LAST (genpdf 0.2 `.with_font_size()`
+        // can clobber a color set before it — see heading_style note).
         let mut s = style::Style::new().with_font_size(t.base_size);
         if self.bold > 0 { s = s.bold(); }
         if self.italic > 0 { s = s.italic(); }
-        // Inline code: a distinct near-gray so it reads as code even though the
-        // bundled family isn't monospaced. (True monospace would need a second
-        // embedded font family; color contrast is the zero-setup compromise.)
+        // Inline code: a distinct near-magenta so it reads as code even though
+        // the bundled family isn't monospaced. (True monospace would need a
+        // second embedded font family; color contrast is the zero-setup path.)
         if self.code > 0 {
             s = s.with_color(style::Color::Rgb(140, 30, 90));
         } else {
@@ -362,7 +365,7 @@ fn push_table(doc: &mut Document, acc: TableAcc, t: &Theme) {
     let mut table = elements::TableLayout::new(vec![1; cols]);
     table.set_cell_decorator(elements::FrameCellDecorator::new(true, true, false));
 
-    let header_style = style::Style::new().bold().with_color(t.heading_color).with_font_size(t.base_size);
+    let header_style = style::Style::new().with_font_size(t.base_size).bold().with_color(t.heading_color);
     let cell_style = body_style(t);
 
     for (ri, row) in acc.rows.iter().enumerate() {
