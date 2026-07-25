@@ -64,8 +64,7 @@ pub fn generate(title: &str, content: &str, dest: &std::path::Path, config: &Val
         .unwrap_or(false);
 
     if !title.trim().is_empty() && !content_leads_with_title {
-        doc.push(elements::Paragraph::new(title)
-            .styled(heading_style(&theme, base_size + 9)));
+        doc.push(heading_paragraph(title, &theme, base_size + 9));
         doc.push(elements::Break::new(1));
     }
 
@@ -93,6 +92,20 @@ fn heading_style(t: &Theme, size: u8) -> style::Style {
 
 fn body_style(t: &Theme) -> style::Style {
     style::Style::new().with_font_size(t.base_size).with_color(t.text_color)
+}
+
+/// Build a heading Paragraph with the color set ON THE STRING (push_styled),
+/// not via a wrapping `.styled()`. genpdf's Paragraph::apply_style merges the
+/// parent/document style UNDER each string's style; a plain `Paragraph::new(s)`
+/// carries an empty (color:None) string style, so relying on `.styled()` to
+/// supply the color proved unreliable across the doc's default-style threading.
+/// Putting the color directly on the StyledString (exactly how genpdf's own
+/// docs example colors text) makes the color authoritative. THIS is the real
+/// fix for black headings.
+fn heading_paragraph(text: &str, t: &Theme, size: u8) -> elements::Paragraph {
+    let mut p = elements::Paragraph::default();
+    p.push_styled(text.to_string(), heading_style(t, size));
+    p
 }
 
 /// Inline styling state as we walk the parser events. Tracks nesting of bold /
@@ -216,7 +229,7 @@ fn render_markdown(doc: &mut Document, content: &str, t: &Theme) {
                         let parts = run.take();
                         // Headings use the heading color/bold regardless of inline runs.
                         let text: String = parts.iter().map(|p| p.s.clone()).collect();
-                        doc.push(elements::Paragraph::new(text).styled(heading_style(t, size)));
+                        doc.push(heading_paragraph(&text, t, size));
                         doc.push(elements::Break::new(0.4));
                     }
                 }
@@ -373,10 +386,9 @@ fn push_table(doc: &mut Document, acc: TableAcc, t: &Theme) {
         for ci in 0..cols {
             let text = row.get(ci).cloned().unwrap_or_default();
             let st = if ri == 0 { header_style.clone() } else { cell_style.clone() };
-            let cell = elements::PaddedElement::new(
-                elements::Paragraph::new(text.trim()).styled(st),
-                genpdf::Margins::all(2.0),
-            );
+            let mut cell_para = elements::Paragraph::default();
+            cell_para.push_styled(text.trim().to_string(), st);
+            let cell = elements::PaddedElement::new(cell_para, genpdf::Margins::all(2.0));
             tr.push_element(cell);
         }
         // `push()` finalizes the row; ignore the "not enough cells" error path by
