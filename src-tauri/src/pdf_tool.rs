@@ -35,7 +35,18 @@ pub fn generate(title: &str, content: &str, dest: &std::path::Path) -> Result<()
     deco.set_margins(18);
     doc.set_page_decorator(deco);
 
-    if !title.trim().is_empty() {
+    // Render the title as a heading — UNLESS the content already leads with the
+    // same title as a markdown H1 (a very common case, and it was producing a
+    // DUPLICATE title). We compare the title to the content's first non-empty
+    // line stripped of a leading "# "; if they match, we let the content's own
+    // heading carry it instead of adding our own.
+    let first_line = content.replace('\r', "")
+        .lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("").to_string();
+    let content_leads_with_title = first_line.strip_prefix("# ")
+        .map(|h| h.trim().eq_ignore_ascii_case(title.trim()))
+        .unwrap_or(false);
+
+    if !title.trim().is_empty() && !content_leads_with_title {
         doc.push(elements::Paragraph::new(title).styled(style::Style::new().bold().with_font_size(20)));
         doc.push(elements::Break::new(1));
     }
