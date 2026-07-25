@@ -1207,7 +1207,23 @@ async fn agent_stream(
                     let name = blk.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                     let id = blk.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
                     let input = blk.get("input").cloned().unwrap_or(serde_json::json!({}));
-                    let (result_text, is_err) = exec_tool(&broker, &name, &input);
+                    // Run the tool inside catch_unwind so a PANIC (e.g. deep in
+                    // genpdf table/render) becomes a VISIBLE tool error the model
+                    // gets back — instead of aborting the turn task silently and
+                    // leaving the UI dead. This is the safety net that turns
+                    // "silently fails" into a diagnosable message.
+                    let (result_text, is_err) = {
+                        let b = &broker; let n = &name; let inp = &input;
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exec_tool(b, n, inp))) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
+                                    .or_else(|| e.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "tool panicked (unknown)".to_string());
+                                (format!("tool '{name}' panicked: {msg}"), true)
+                            }
+                        }
+                    };
                     let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
                     // tell the UI the tool's OUTCOME (the ToolUse start already fired)
                     let _ = app.emit(&channel, &serde_json::json!({
