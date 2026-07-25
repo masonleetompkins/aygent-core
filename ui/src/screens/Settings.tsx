@@ -18,47 +18,9 @@ const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 //   - 200k-token context: Sonnet 4.5 and earlier, ALL Haiku, everything else.
 //   - Legacy Claude 2.x: 100k.
 // Pricing is $ per MILLION tokens (input / output).
-type ModelInfo = { label: string; inPrice: number; outPrice: number; context: string; blurb: string };
-
-// Ordered rules: FIRST match wins, so more specific ids come before general
-// family fallbacks. Context values are the real published windows.
-function modelInfo(id: string): ModelInfo {
-  const has = (s: string) => id.includes(s);
-
-  // ---- 1M-token context models (from Anthropic docs) ----
-  // Fable 5 / Mythos 5 — top tier.
-  if (has("fable") || has("mythos"))
-    return { label: "Fable", inPrice: 10, outPrice: 50, context: "1M", blurb: "next-gen — most capable, for long-running agents" };
-
-  // Opus: 5 and 4.6/4.7/4.8 are 1M; older Opus (4.5/4.1/4) are 200k.
-  if (has("opus")) {
-    const oneM = has("opus-5") || has("opus-4-6") || has("opus-4-7") || has("opus-4-8");
-    // Opus 5 pricing dropped to $5/$25; older Opus were $15/$75.
-    const price = has("opus-5") ? { i: 5, o: 25 } : { i: 15, o: 75 };
-    return { label: "Opus", inPrice: price.i, outPrice: price.o, context: oneM ? "1M" : "200k", blurb: "deepest reasoning — best for hard problems" };
-  }
-
-  // Sonnet: 5 and 4.6 are 1M; 4.5 and earlier are 200k.
-  if (has("sonnet")) {
-    const oneM = has("sonnet-5") || has("sonnet-4-6");
-    return { label: "Sonnet", inPrice: 3, outPrice: 15, context: oneM ? "1M" : "200k", blurb: "balanced — great default for real work" };
-  }
-
-  // ---- 200k-token context models ----
-  // Haiku is always 200k. 4.5 is $1/$5; older 3.5/3 were cheaper.
-  if (has("haiku")) {
-    const price = has("haiku-4-5") ? { i: 1, o: 5 } : { i: 0.8, o: 4 };
-    return { label: "Haiku", inPrice: price.i, outPrice: price.o, context: "200k", blurb: "fast + cheap — everyday tasks" };
-  }
-
-  // Legacy Claude 2.x — 100k.
-  if (has("claude-2")) return { label: id, inPrice: 8, outPrice: 24, context: "100k", blurb: "legacy model" };
-
-  // Unknown/new id: default to 200k (the conservative, most-common window)
-  // rather than over-claiming 1M.
-  return { label: id, inPrice: 0, outPrice: 0, context: "200k", blurb: "" };
-}
-function fmtPrice(n: number) { return n === 0 ? "?" : (n < 1 ? `$${n.toFixed(2)}` : `$${n}`); }
+// NOTE: model classification/pricing (modelInfo/fmtPrice) moved OUT of Settings
+// when the model picker moved to the Agents screen. The Agents form owns model
+// ranking + labels now (see screens/Agents.tsx: modelRank/modelLabel).
 
 export function Settings({
   mode, accent, onTheme, folder, onPickFolder,
@@ -72,9 +34,12 @@ export function Settings({
   const [retention, setRetention] = useState(30);
   const [cpMsg, setCpMsg] = useState<string | null>(null);
   const [confirmPurge, setConfirmPurge] = useState(false);
-  const [models, setModels] = useState<string[]>([]);
-  const [selModel, setSelModel] = useState(""); // "" = auto (haiku)
-  const [selProvider, setSelProvider] = useState(""); // "" = anthropic, "local"
+  // Model SELECTION moved to the Agents screen. Settings keeps only the LOCAL
+  // model manager (download/manage) + the active local selection so a chosen
+  // local model still shows as active here. selProvider/selModel reflect the
+  // folder's saved selection purely so LocalModels can highlight the active one.
+  const [selModel, setSelModel] = useState("");
+  const [selProvider, setSelProvider] = useState("");
   const [modelMsg, setModelMsg] = useState<string | null>(null);
 
   useEffect(() => { invoke<boolean>("has_provider_key", { provider: "anthropic" }).then(setKeySet).catch(() => {}); }, []);
@@ -84,37 +49,6 @@ export function Settings({
     invoke<{ provider: string; model: string }>("get_selection", { folder })
       .then((s) => { setSelProvider(s.provider); setSelModel(s.model); }).catch(() => {});
   }, [folder]);
-
-  // Which CLOUD provider the picker is browsing: "anthropic" | "openai" |
-  // "openrouter". Defaults to the folder's saved provider (or anthropic).
-  const [pickerProvider, setPickerProvider] = useState<"anthropic" | "openai" | "openrouter">("anthropic");
-  const [modelsLoading, setModelsLoading] = useState(false);
-
-  useEffect(() => {
-    if (selProvider === "openai" || selProvider === "openrouter") setPickerProvider(selProvider);
-    else if (selProvider === "" || selProvider === "anthropic") setPickerProvider("anthropic");
-  }, [selProvider]);
-
-  // Load the live model list for the selected cloud provider.
-  useEffect(() => {
-    setModels([]); setModelsLoading(true);
-    const call = pickerProvider === "anthropic"
-      ? invoke<string[]>("anthropic_models")
-      : invoke<string[]>("openai_models", { provider: pickerProvider });
-    call.then(setModels).catch(() => setModels([])).finally(() => setModelsLoading(false));
-  }, [pickerProvider]);
-
-  async function chooseModel(model: string) {
-    if (!folder) return;
-    // provider "" means anthropic (back-compat default).
-    const prov = pickerProvider === "anthropic" ? "" : pickerProvider;
-    setSelProvider(prov); setSelModel(model); setModelMsg(null);
-    try {
-      await invoke("set_selection", { folder, provider: prov, model });
-      const label = model === "" ? "auto (Haiku — fast + cheap)" : (pickerProvider === "anthropic" ? modelInfo(model).label : model);
-      setModelMsg(`✓ using ${label}`);
-    } catch (e) { setModelMsg("✗ " + String(e)); }
-  }
 
   // Choose a downloaded LOCAL model (provider="local", model=absolute gguf path).
   async function chooseLocalModel(path: string, name: string) {
@@ -186,55 +120,19 @@ export function Settings({
         <ProviderRow provider="openrouter" label="OpenRouter" placeholder="sk-or-…" />
       </Card>
 
-      {/* MODEL */}
+      {/* MODEL selection moved to the Agents screen (per-agent, not per-folder).
+          Settings keeps only Providers/keys, appearance, checkpoints, folder. */}
       <Card title="Model">
-        <p style={hint}>Which brain your agent runs on. Saved per folder — a serious project can run Opus while a scratch folder stays on Haiku.</p>
-        {!folder ? (
-          <p style={{ ...hint, color: "var(--text-faint)" }}>Pick an Agent Folder below to choose a model.</p>
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {/* PROVIDER SWITCHER */}
-            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-              {(["anthropic", "openai", "openrouter"] as const).map((p) => (
-                <Button key={p} variant={pickerProvider === p ? "primary" : "secondary"} onClick={() => setPickerProvider(p)}>
-                  {p === "anthropic" ? "Anthropic" : p === "openai" ? "OpenAI" : "OpenRouter"}
-                </Button>
-              ))}
-            </div>
-            {modelsLoading ? (
-              <p style={{ ...hint, color: "var(--text-faint)" }}>Loading models…</p>
-            ) : models.length === 0 ? (
-              <p style={{ ...hint, color: "var(--text-faint)" }}>
-                No models — add your {pickerProvider === "anthropic" ? "Anthropic" : pickerProvider === "openai" ? "OpenAI" : "OpenRouter"} key above (then Test), or that key has no available models.
-              </p>
-            ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 340, overflowY: "auto" }}>
-                {/* AUTO option — anthropic only (picks haiku) */}
-                {pickerProvider === "anthropic" && (
-                  <ModelRow active={selModel === "" && (selProvider === "" || selProvider === "anthropic")}
-                    onClick={() => chooseModel("")} title="Auto" sub="picks Haiku — fast + cheap — automatically" meta="default" />
-                )}
-                {models.map((m) => {
-                  const info = pickerProvider === "anthropic" ? modelInfo(m) : null;
-                  const prov = pickerProvider === "anthropic" ? "" : pickerProvider;
-                  return (
-                    <ModelRow key={m} active={selModel === m && selProvider === prov}
-                      onClick={() => chooseModel(m)}
-                      title={info ? info.label : m}
-                      sub={info ? (info.blurb || m) : ""}
-                      meta={info ? `${fmtPrice(info.inPrice)} in · ${fmtPrice(info.outPrice)} out / 1M tok · ${info.context} ctx` : ""}
-                      mono={m} />
-                  );
-                })}
-              </div>
-            )}
-            {modelMsg && <Pill tone={modelMsg.startsWith("✗") ? "danger" : "ok"}>{modelMsg}</Pill>}
-            <p style={{ ...hint, color: "var(--text-faint)", fontSize: 12 }}>Pricing/context shown for Anthropic models. OpenAI · OpenRouter lists are live from your account.</p>
-          </div>
-        )}
+        <p style={hint}>
+          Model choice now lives with each agent — open the <b>Agents</b> tab to pick a provider
+          and model per agent. Add your API keys above; the agent screen lists each provider's
+          models, most-capable first.
+        </p>
       </Card>
 
-      {/* LOCAL MODELS — download + run GGUF models entirely in-app, no external tools */}
+      {/* LOCAL MODELS — download + run GGUF models entirely in-app, no external tools.
+          Downloading/managing lives here; SELECTING a downloaded model is done per-agent
+          in the Agents tab (provider = "local"). */}
       <LocalModels
         folder={folder}
         activePath={selProvider === "local" ? selModel : ""}
