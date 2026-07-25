@@ -576,6 +576,23 @@ fn tools_set_enabled(app: tauri::AppHandle, folder: String, id: String, on: bool
     tools_registry::set_enabled(&app_data(&app)?, &folder, &id, on)
 }
 
+/// A tool's config SCHEMA (what settings it exposes) + the folder's saved VALUES.
+#[tauri::command]
+fn tools_config(app: tauri::AppHandle, folder: String, id: String) -> Result<serde_json::Value, String> {
+    let ad = app_data(&app)?;
+    Ok(serde_json::json!({
+        "schema": tools_registry::config_schema(&id),
+        "values": tools_registry::tool_config(&ad, &folder, &id),
+        "fonts": pdf_tool::system_fonts(),
+    }))
+}
+
+/// Save a tool's config values for a folder.
+#[tauri::command]
+fn tools_set_config(app: tauri::AppHandle, folder: String, id: String, values: serde_json::Value) -> Result<(), String> {
+    tools_registry::set_tool_config(&app_data(&app)?, &folder, &id, values)
+}
+
 /// Delete a downloaded local model by filename.
 #[tauri::command]
 fn local_delete(app: tauri::AppHandle, filename: String) -> Result<(), String> {
@@ -771,6 +788,17 @@ fn exec_tool(
     name: &str,
     input: &serde_json::Value,
 ) -> (String, bool) {
+    exec_tool_cfg(broker, name, input, &serde_json::json!({}))
+}
+
+/// Same as exec_tool, but with the PDF tool's per-folder config (font/colors/
+/// page-size/margins). `pdf_config` is {} when unavailable.
+fn exec_tool_cfg(
+    broker: &Arc<Broker>,
+    name: &str,
+    input: &serde_json::Value,
+    pdf_config: &serde_json::Value,
+) -> (String, bool) {
     let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
     match name {
         "read_file" => match broker.resolve_and_open("default", path, broker::Mode::Read) {
@@ -822,7 +850,7 @@ fn exec_tool(
             match broker.resolve("default", out_path, broker::Mode::Write) {
                 Ok(real) => {
                     if let Some(parent) = real.parent() { let _ = std::fs::create_dir_all(parent); }
-                    match pdf_tool::generate(title, content, &real) {
+                    match pdf_tool::generate(title, content, &real, pdf_config) {
                         Ok(_) => (format!("wrote PDF to {out_path}"), false),
                         Err(e) => (format!("pdf error: {e}"), true),
                     }
@@ -902,6 +930,16 @@ fn agent_tools_for(app: &tauri::AppHandle, folder: Option<&str>) -> (serde_json:
 /// Back-compat: the base-only tool set (used where no folder/app context).
 fn agent_tools() -> serde_json::Value {
     serde_json::json!(base_tools())
+}
+
+/// The PDF tool's per-folder config ({} if unavailable). Passed into exec so the
+/// agent's generate_pdf calls honor the user's font/color/page settings.
+fn pdf_config_for(app: &tauri::AppHandle, folder: Option<&str>) -> serde_json::Value {
+    if let (Ok(ad), Some(f)) = (app_data(app), folder) {
+        tools_registry::tool_config(&ad, f, "builtin.pdf")
+    } else {
+        serde_json::json!({})
+    }
 }
 
 const AGENT_SYSTEM: &str = "You are AYGENT, an agent that can ONLY touch files inside the user's \
@@ -988,6 +1026,7 @@ async fn agent_stream(
         // Enabled registry tools (e.g. PDF) contribute extra instructions the
         // local model should know about, appended to its native tool prompt.
         let (_reg_tools, reg_instr) = agent_tools_for(&app, folder.as_deref());
+        let pdf_cfg = pdf_config_for(&app, folder.as_deref());
         let base_sys = if reg_instr.is_empty() { AGENT_SYSTEM_LOCAL.to_string() } else { format!("{AGENT_SYSTEM_LOCAL}{reg_instr}") };
         let sys = local_tools::system_prompt_with_tools(&base_sys, &cap.format);
 
@@ -1016,7 +1055,7 @@ async fn agent_stream(
                     "kind": "ToolUse", "name": c.name,
                     "input": c.input,
                 }));
-                let (result, is_err) = exec_tool(&broker, &c.name, &c.input);
+                let (result, is_err) = exec_tool_cfg(&broker, &c.name, &c.input, &pdf_cfg);
                 let path_s = c.input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
                 let _ = app.emit(&channel, &serde_json::json!({
                     "kind": "ToolResult", "name": c.name, "path": path_s,
@@ -1061,6 +1100,7 @@ async fn agent_stream(
         }
 
         let (tools, reg_instr) = agent_tools_for(&app, folder.as_deref());
+        let pdf_cfg = pdf_config_for(&app, folder.as_deref());
         let sys = if reg_instr.is_empty() { AGENT_SYSTEM.to_string() } else { format!("{AGENT_SYSTEM}{reg_instr}") };
         let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
         messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": prompt }));
@@ -1085,7 +1125,7 @@ async fn agent_stream(
                     let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                     let args_str = f.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
                     let input: serde_json::Value = serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
-                    let (result_text, is_err) = exec_tool(&broker, &name, &input);
+                    let (result_text, is_err) = exec_tool_cfg(&broker, &name, &input, &pdf_cfg);
                     let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
                     let _ = app.emit(&channel, &serde_json::json!({
                         "kind": "ToolResult", "name": name, "path": path,
@@ -1233,6 +1273,7 @@ pub fn run() {
             get_selection, set_selection, detect_hardware, local_catalog, local_downloaded,
             local_download, local_delete, local_tool_capability, restore_agent_folder,
             openai_models, tools_list, tools_upsert, tools_delete, tools_set_enabled,
+            tools_config, tools_set_config,
             checkpoint_snapshot, checkpoint_timeline, checkpoint_rewind,
             checkpoint_undo, checkpoint_redo,
             checkpoint_get_retention, checkpoint_set_retention, checkpoint_purge,

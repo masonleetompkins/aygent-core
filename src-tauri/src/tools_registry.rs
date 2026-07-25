@@ -55,6 +55,34 @@ fn enabled_path(app_data: &Path, folder: &str) -> Result<PathBuf, String> {
     fs::create_dir_all(&d).map_err(|e| format!("mkdir enabled: {e}"))?;
     Ok(d.join(format!("{}.json", folder_key(folder))))
 }
+/// Per-folder config VALUES for tools: { "<tool_id>": { "<key>": <value>, ... } }
+fn config_path(app_data: &Path, folder: &str) -> Result<PathBuf, String> {
+    let d = tools_dir(app_data)?.join("config");
+    fs::create_dir_all(&d).map_err(|e| format!("mkdir config: {e}"))?;
+    Ok(d.join(format!("{}.json", folder_key(folder))))
+}
+
+/// Load all tool config values for a folder (tool_id -> {key: value}).
+pub fn load_config(app_data: &Path, folder: &str) -> serde_json::Value {
+    fs::read_to_string(config_path(app_data, folder).unwrap_or_default())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// Config values for ONE tool in a folder ({} if unset).
+pub fn tool_config(app_data: &Path, folder: &str, tool_id: &str) -> serde_json::Value {
+    load_config(app_data, folder).get(tool_id).cloned().unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// Save config values for one tool (merges into the folder's config file).
+pub fn set_tool_config(app_data: &Path, folder: &str, tool_id: &str, values: serde_json::Value) -> Result<(), String> {
+    let mut all = load_config(app_data, folder);
+    if !all.is_object() { all = serde_json::json!({}); }
+    all[tool_id] = values;
+    let text = serde_json::to_string_pretty(&all).map_err(|e| format!("serialize config: {e}"))?;
+    fs::write(config_path(app_data, folder)?, text).map_err(|e| format!("write config: {e}"))
+}
 
 /// The built-in tools that always exist in the registry (seeded on first read).
 fn builtins() -> Vec<ToolDef> {
@@ -69,6 +97,25 @@ fn builtins() -> Vec<ToolDef> {
         instructions: String::new(),
         allowed_tools: vec![],
     }]
+}
+
+/// Config SCHEMA for a tool (what settings it exposes). The UI renders controls
+/// from this; the executor reads the saved values. Only built-ins declare a
+/// schema for now. Returns [] for tools with no config.
+pub fn config_schema(tool_id: &str) -> serde_json::Value {
+    match tool_id {
+        "builtin.pdf" => serde_json::json!([
+            { "key": "font", "label": "Font", "type": "font", "default": "bundled",
+              "help": "Bundled always works; system fonts fall back to bundled if they fail to load." },
+            { "key": "text_color", "label": "Text color", "type": "color", "default": "#111111" },
+            { "key": "heading_color", "label": "Heading color", "type": "color", "default": "#111111" },
+            { "key": "page_size", "label": "Page size", "type": "select", "default": "Letter",
+              "options": ["Letter", "A4"] },
+            { "key": "font_size", "label": "Base font size", "type": "number", "default": 11, "min": 8, "max": 18 },
+            { "key": "margin", "label": "Margin (mm)", "type": "number", "default": 18, "min": 8, "max": 40 }
+        ]),
+        _ => serde_json::json!([]),
+    }
 }
 
 /// Load the full registry, seeding built-ins + merging any saved tools. Built-in

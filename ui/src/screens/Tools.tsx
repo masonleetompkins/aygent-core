@@ -18,6 +18,7 @@ type Tool = {
 export function Tools({ folder }: { folder: string | null }) {
   const [tools, setTools] = useState<Tool[]>([]);
   const [editing, setEditing] = useState<Tool | null>(null);
+  const [configuring, setConfiguring] = useState<Tool | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
 
   async function refresh() {
@@ -71,12 +72,17 @@ export function Tools({ folder }: { folder: string | null }) {
               <Button variant={t.enabled ? "primary" : "secondary"} onClick={() => toggle(t)}>
                 {t.enabled ? "Enabled ✓" : "Enable"}
               </Button>
+              <Button variant="secondary" onClick={() => setConfiguring(t)}>Configure</Button>
               {!t.builtin && <Button variant="secondary" onClick={() => setEditing(t)}>Edit</Button>}
               {!t.builtin && <Button variant="secondary" onClick={() => del(t)}>Delete</Button>}
             </div>
           </div>
         ))}
       </div>
+
+      {configuring && (
+        <ToolConfig tool={configuring} folder={folder} onClose={() => setConfiguring(null)} />
+      )}
 
       {editing && (
         <ToolEditor
@@ -88,6 +94,85 @@ export function Tools({ folder }: { folder: string | null }) {
     </div>
   );
 }
+
+// Per-tool config panel. Renders controls from the tool's config SCHEMA (the
+// backend declares it; the UI is generic). Values save per folder. This is the
+// reusable pattern every future tool inherits.
+type ConfigField = { key: string; label: string; type: string; default: any; help?: string; options?: string[]; min?: number; max?: number };
+function ToolConfig({ tool, folder, onClose }: { tool: Tool; folder: string | null; onClose: () => void }) {
+  const [schema, setSchema] = useState<ConfigField[]>([]);
+  const [values, setValues] = useState<Record<string, any>>({});
+  const [fonts, setFonts] = useState<string[]>([]);
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    if (!folder) return;
+    invoke<{ schema: ConfigField[]; values: Record<string, any>; fonts: string[] }>("tools_config", { folder, id: tool.id })
+      .then((r) => {
+        setSchema(r.schema || []);
+        setFonts(r.fonts || []);
+        // seed values with defaults where unset
+        const v: Record<string, any> = { ...(r.values || {}) };
+        for (const f of r.schema || []) { if (v[f.key] === undefined) v[f.key] = f.default; }
+        setValues(v);
+      }).catch(() => {});
+  }, [tool.id, folder]);
+
+  async function save() {
+    if (!folder) return;
+    try { await invoke("tools_set_config", { folder, id: tool.id, values }); setSaved(true); setTimeout(() => setSaved(false), 1500); }
+    catch { /* ignore */ }
+  }
+  function set(k: string, v: any) { setValues((x) => ({ ...x, [k]: v })); }
+
+  if (!folder) return <Card title={`Configure ${tool.display_name}`}><p style={hint}>Pick an Agent Folder first.</p><Button variant="secondary" onClick={onClose}>Close</Button></Card>;
+  if (schema.length === 0) return <Card title={`Configure ${tool.display_name}`}><p style={hint}>This tool has no settings.</p><Button variant="secondary" onClick={onClose}>Close</Button></Card>;
+
+  return (
+    <Card title={`Configure ${tool.display_name}`}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        {schema.map((f) => (
+          <label key={f.key} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <span style={{ fontSize: 13, fontWeight: 600 }}>{f.label}</span>
+            {f.type === "font" ? (
+              <select value={values[f.key] ?? "bundled"} onChange={(e) => set(f.key, e.target.value)} style={selectStyle}>
+                {fonts.map((fn) => <option key={fn} value={fn}>{fn === "bundled" ? "Bundled (DejaVu Sans) — always works" : fn}</option>)}
+              </select>
+            ) : f.type === "select" ? (
+              <select value={values[f.key] ?? f.default} onChange={(e) => set(f.key, e.target.value)} style={selectStyle}>
+                {(f.options || []).map((o) => <option key={o} value={o}>{o}</option>)}
+              </select>
+            ) : f.type === "color" ? (
+              <input type="color" value={values[f.key] ?? f.default} onChange={(e) => set(f.key, e.target.value)}
+                style={{ width: 52, height: 32, padding: 0, border: "var(--border-width) solid var(--line)", borderRadius: 8, background: "none", cursor: "pointer" }} />
+            ) : f.type === "number" ? (
+              <input type="number" value={values[f.key] ?? f.default} min={f.min} max={f.max}
+                onChange={(e) => set(f.key, Number(e.target.value))}
+                style={{ width: 100, ...numStyle }} />
+            ) : (
+              <Input value={values[f.key] ?? ""} onChange={(e) => set(f.key, e.target.value)} />
+            )}
+            {f.help && <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>{f.help}</span>}
+          </label>
+        ))}
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <Button onClick={save}>Save settings</Button>
+          <Button variant="secondary" onClick={onClose}>Close</Button>
+          {saved && <Pill tone="ok">saved ✓</Pill>}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+const selectStyle: React.CSSProperties = {
+  fontSize: 14, padding: "8px 10px", borderRadius: "var(--radius-control)",
+  border: "var(--border-width) solid var(--line)", background: "var(--bg)", color: "var(--text)", maxWidth: 320,
+};
+const numStyle: React.CSSProperties = {
+  fontSize: 14, padding: "8px 10px", borderRadius: "var(--radius-control)",
+  border: "var(--border-width) solid var(--line)", background: "var(--bg)", color: "var(--text)",
+};
 
 // Editor + Pro Mode: define a composed tool, and optionally ask the agent to
 // draft its fields for you (Pro Mode) using the currently selected model.
