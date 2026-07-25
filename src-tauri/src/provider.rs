@@ -176,7 +176,13 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
 ) -> Result<(serde_json::Value, String), String> {
     let body = json!({
         "model": model,
-        "max_tokens": 1024,
+        // 1024 was FAR too low: the model streams a preamble, then must emit a
+        // tool_use block whose `content` arg can be a whole markdown document.
+        // Hitting the cap mid-tool-block truncates the tool_use — the input JSON
+        // never closes, content_block_stop never finalizes it, so NO ToolUse is
+        // emitted, tool_results stays empty, and the loop breaks: a silent death
+        // exactly at "generation". 8192 gives tool calls real room.
+        "max_tokens": 8192,
         "system": system,
         "tools": tools,
         "messages": messages,
