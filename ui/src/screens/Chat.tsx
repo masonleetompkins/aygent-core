@@ -29,13 +29,17 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
   // chat). The ref is always the current thread id.
   const convIdRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // POINTER-BASED reorder. Native HTML5 draggable is broken in Tauri's macOS
+  // WebKit webview (the row grays out on drag-start but `drop`/`dragend` never
+  // fire, so the item stays stuck grey and nothing persists). We implement drag
+  // with pointer events instead — works identically in every webview. `dragId`
+  // = the row being dragged (for the grayed-out style); `overId` = the row the
+  // pointer is currently over (drop target). A small move threshold keeps a
+  // plain click from starting a drag.
   const [dragId, setDragId] = useState<string | null>(null);
-  // WebKit (Tauri's macOS webview) can fire `dragend` before/around `drop`,
-  // which would null out dragId and make onDrop bail before persisting. Keep
-  // the source id in a ref that only the drop handler clears, so the reorder
-  // survives the drag-lifecycle race regardless of event ordering.
-  const dragIdRef = useRef<string | null>(null);
-  const setDrag = (id: string | null) => { dragIdRef.current = id; setDragId(id); };
+  const [overId, setOverId] = useState<string | null>(null);
+  const dragRef = useRef<{ id: string; startY: number; active: boolean } | null>(null);
+  const listElRef = useRef<HTMLDivElement>(null);
   // Per-folder selection (provider + model). "" model = auto/haiku; provider
   // "local" routes to the in-app llama.cpp engine. Loaded on folder change and
   // re-checked on each send so a Settings change applies without a reload.
@@ -105,24 +109,65 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
     } catch { /* ignore */ }
   }
 
-  // Drag-to-reorder: on drop, recompute a dense order (1..n) for the whole list
-  // in its new visual arrangement and persist it in one batch.
-  async function onDrop(targetId: string) {
-    // Read the source id from the ref (survives the dragend/drop race), not the
-    // state, which may already be cleared.
-    const src = dragIdRef.current;
-    if (!folder || !src || src === targetId) { setDrag(null); return; }
+  // Persist a drop: move `srcId` to `targetId`'s slot, recompute a dense order
+  // (1..n) for the whole list, and save it in one batch.
+  async function commitReorder(srcId: string, targetId: string) {
+    if (!folder || srcId === targetId) return;
     const ids = convs.map((c) => c.id);
-    const from = ids.indexOf(src);
+    const from = ids.indexOf(srcId);
     const to = ids.indexOf(targetId);
-    if (from < 0 || to < 0) { setDrag(null); return; }
+    if (from < 0 || to < 0) return;
     const reordered = [...convs];
     const [moved] = reordered.splice(from, 1);
     reordered.splice(to, 0, moved);
     const updates = reordered.map((c, i) => ({ id: c.id, pinned: c.pinned, order: i + 1 }));
     setConvs(reordered.map((c, i) => ({ ...c, order: i + 1 })));
-    setDrag(null);
     try { await invoke("conv_reorder", { folder, updates }); await refreshList(); } catch { /* ignore */ }
+  }
+
+  // Hit-test: which row id is under this Y coordinate? Uses the row DOM nodes
+  // (each tagged with data-conv-id) inside the scrollable list.
+  function rowIdAtY(y: number): string | null {
+    const container = listElRef.current;
+    if (!container) return null;
+    const rows = container.querySelectorAll<HTMLElement>("[data-conv-id]");
+    for (const row of Array.from(rows)) {
+      const r = row.getBoundingClientRect();
+      if (y >= r.top && y <= r.bottom) return row.dataset.convId || null;
+    }
+    return null;
+  }
+
+  // Pointer drag lifecycle (replaces native DnD). Bound at the row level via
+  // onPointerDown; move/up are tracked on window so the drag survives leaving
+  // the row. A ~5px threshold distinguishes a drag from a click.
+  function startPointerDrag(id: string, e: React.PointerEvent) {
+    dragRef.current = { id, startY: e.clientY, active: false };
+    const onMove = (ev: PointerEvent) => {
+      const d = dragRef.current;
+      if (!d) return;
+      if (!d.active && Math.abs(ev.clientY - d.startY) > 5) {
+        d.active = true;
+        setDragId(d.id);
+      }
+      if (d.active) {
+        setOverId(rowIdAtY(ev.clientY));
+      }
+    };
+    const onUp = (ev: PointerEvent) => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      const d = dragRef.current;
+      dragRef.current = null;
+      setDragId(null);
+      setOverId(null);
+      if (d && d.active) {
+        const target = rowIdAtY(ev.clientY);
+        if (target) void commitReorder(d.id, target);
+      }
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
   }
 
   // Persist a conversation snapshot. Reads msgs from the passed array (source of
@@ -262,9 +307,10 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
       {/* HISTORY SIDEBAR — right-hand side, so the active chat stays centered */}
       {!blocked && (
         <HistorySidebar
-          convs={convs} activeId={convId} busy={busy} dragId={dragId}
+          convs={convs} activeId={convId} busy={busy} dragId={dragId} overId={overId}
+          listElRef={listElRef}
           onNew={newConv} onOpen={openConv} onDelete={deleteConv}
-          onPin={togglePin} onDragStart={setDrag} onDropOn={onDrop}
+          onPin={togglePin} onPointerDragStart={startPointerDrag}
         />
       )}
     </div>
@@ -272,11 +318,14 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
 }
 
 function HistorySidebar({
-  convs, activeId, busy, dragId, onNew, onOpen, onDelete, onPin, onDragStart, onDropOn,
+  convs, activeId, busy, dragId, overId, listElRef, onNew, onOpen, onDelete, onPin, onPointerDragStart,
 }: {
-  convs: ConvMeta[]; activeId: string | null; busy: boolean; dragId: string | null;
+  convs: ConvMeta[]; activeId: string | null; busy: boolean;
+  dragId: string | null; overId: string | null;
+  listElRef: React.RefObject<HTMLDivElement>;
   onNew: () => void; onOpen: (id: string) => void; onDelete: (id: string) => void;
-  onPin: (id: string) => void; onDragStart: (id: string | null) => void; onDropOn: (id: string) => void;
+  onPin: (id: string) => void;
+  onPointerDragStart: (id: string, e: React.PointerEvent) => void;
 }) {
   return (
     <div style={{
@@ -284,16 +333,16 @@ function HistorySidebar({
       borderLeft: "var(--border-width) solid var(--line)", paddingLeft: 14,
     }}>
       <Button onClick={onNew} disabled={busy}>+ New chat</Button>
-      <div style={{ overflowY: "auto", display: "flex", flexDirection: "column", gap: 4, marginTop: 4 }}>
+      <div ref={listElRef} style={{ overflowY: "auto", display: "flex", flexDirection: "column", gap: 4, marginTop: 4 }}>
         {convs.length === 0 && (
           <p style={{ ...hint, fontSize: 13, color: "var(--text-faint)" }}>No chats yet.</p>
         )}
         {convs.map((c) => (
           <HistoryItem
-            key={c.id} c={c} active={c.id === activeId} dragging={dragId === c.id}
+            key={c.id} c={c} active={c.id === activeId}
+            dragging={dragId === c.id} isOver={overId === c.id && dragId !== null && dragId !== c.id}
             onOpen={() => onOpen(c.id)} onDelete={() => onDelete(c.id)} onPin={() => onPin(c.id)}
-            onDragStart={() => onDragStart(c.id)} onDragEnd={() => { /* drop handler clears the drag id; clearing here would race the drop in WebKit */ }}
-            onDrop={() => onDropOn(c.id)}
+            onPointerDown={(e) => onPointerDragStart(c.id, e)}
           />
         ))}
       </div>
@@ -302,20 +351,17 @@ function HistorySidebar({
 }
 
 function HistoryItem({
-  c, active, dragging, onOpen, onDelete, onPin, onDragStart, onDragEnd, onDrop,
+  c, active, dragging, isOver, onOpen, onDelete, onPin, onPointerDown,
 }: {
-  c: ConvMeta; active: boolean; dragging: boolean;
+  c: ConvMeta; active: boolean; dragging: boolean; isOver: boolean;
   onOpen: () => void; onDelete: () => void; onPin: () => void;
-  onDragStart: () => void; onDragEnd: () => void; onDrop: () => void;
+  onPointerDown: (e: React.PointerEvent) => void;
 }) {
   const [hover, setHover] = useState(false);
   return (
     <div
-      draggable
-      onDragStart={onDragStart}
-      onDragEnd={onDragEnd}
-      onDragOver={(e) => e.preventDefault()}
-      onDrop={(e) => { e.preventDefault(); onDrop(); }}
+      data-conv-id={c.id}
+      onPointerDown={onPointerDown}
       onClick={onOpen}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
@@ -323,7 +369,8 @@ function HistoryItem({
       style={{
         display: "flex", alignItems: "center", gap: 6, cursor: "pointer",
         padding: "8px 10px", borderRadius: "var(--radius-control)", fontSize: 13,
-        border: `var(--border-width) solid ${active ? "var(--line)" : "transparent"}`,
+        userSelect: "none", touchAction: "none",
+        border: `var(--border-width) solid ${isOver ? "var(--accent)" : active ? "var(--line)" : "transparent"}`,
         background: active ? "var(--bg)" : hover ? "var(--surface)" : "transparent",
         boxShadow: active ? "var(--elevation)" : "none",
         opacity: dragging ? 0.4 : 1,
