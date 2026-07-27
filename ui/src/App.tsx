@@ -100,7 +100,7 @@ export function App() {
         </div>
 
         <div style={{ padding: "28px 32px" }}>
-          {screen === "chat" && <Chat folder={folder} keySet={keySet} />}
+          {screen === "chat" && <Chat folder={folder} keySet={keySet} agentId={activeAgent?.id ?? null} />}
           {screen === "agents" && (
             <Agents
               activeId={activeAgent?.id ?? null}

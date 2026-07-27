@@ -17,7 +17,7 @@ const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 
 type ConvMeta = { id: string; title: string; updated: number; pinned: boolean; order: number };
 
-export function Chat({ folder, keySet }: { folder: string | null; keySet: boolean }) {
+export function Chat({ folder, keySet, agentId }: { folder: string | null; keySet: boolean; agentId: string | null }) {
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -254,6 +254,8 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
         model: modelRef.current || null,
         provider: providerRef.current || null,
         folder: folder || null,
+        agentId: agentId || null,
+        sessionId: convIdRef.current || channel,
       });
       historyRef.current = updated;
     } catch (err) {

@@ -1256,6 +1256,7 @@ async fn agent_stream(
     app: tauri::AppHandle,
     broker: tauri::State<'_, Arc<Broker>>,
     lanes: tauri::State<'_, lanes::Lanes>,
+    db: tauri::State<'_, writer::Db>,
     channel: String,
     prompt: String,
     history: serde_json::Value,
@@ -1263,6 +1264,7 @@ async fn agent_stream(
     provider: Option<String>,
     folder: Option<String>,
     session_id: Option<String>,
+    agent_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     use tauri::Emitter;
     let broker = broker.inner().clone();
