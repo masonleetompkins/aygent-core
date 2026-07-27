@@ -264,7 +264,7 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
         <HistorySidebar
           convs={convs} activeId={convId} busy={busy} dragId={dragId}
           onNew={newConv} onOpen={openConv} onDelete={deleteConv}
-          onPin={togglePin} onDragStart={setDragId} onDropOn={onDrop}
+          onPin={togglePin} onDragStart={setDrag} onDropOn={onDrop}
         />
       )}
     </div>
@@ -292,7 +292,7 @@ function HistorySidebar({
           <HistoryItem
             key={c.id} c={c} active={c.id === activeId} dragging={dragId === c.id}
             onOpen={() => onOpen(c.id)} onDelete={() => onDelete(c.id)} onPin={() => onPin(c.id)}
-            onDragStart={() => onDragStart(c.id)} onDragEnd={() => onDragStart(null)}
+            onDragStart={() => onDragStart(c.id)} onDragEnd={() => { /* drop handler clears the drag id; clearing here would race the drop in WebKit */ }}
             onDrop={() => onDropOn(c.id)}
           />
         ))}
