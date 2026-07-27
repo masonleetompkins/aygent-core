@@ -218,8 +218,18 @@ function AgentForm({
     finally { setLocalLoading(false); }
   }
 
-  // If the user picks a folder via the native picker, adopt it here.
-  useEffect(() => { if (pendingFolder && !initial) setFolder(pendingFolder); }, [pendingFolder, initial]);
+  // When the user picks a folder via the native picker, adopt it — whether
+  // CREATING or EDITING an agent. The old `!initial` guard meant edits never
+  // picked up the new path (the form kept showing the stale folder). We only
+  // adopt a pick that ARRIVES while this form is open (pickSeq), so re-mounting
+  // an edit form doesn't overwrite the agent's saved folder with a stale
+  // app-wide value.
+  const mountedRef = useRef(false);
+  useEffect(() => {
+    // Skip the very first run (initial mount) so we don't clobber initial.folder_path.
+    if (!mountedRef.current) { mountedRef.current = true; return; }
+    if (pendingFolder) setFolder(pendingFolder);
+  }, [pendingFolder]);
 
   // Fetch this provider's models. Anthropic uses its own command; openai/
   // openrouter share one. Local models are file paths (handled elsewhere) so we
