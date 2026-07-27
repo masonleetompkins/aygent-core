@@ -188,7 +188,10 @@ function AgentForm({
         ? invoke<string[]>("anthropic_models")
         : invoke<string[]>("openai_models", { provider: prov });
     let lastErr: unknown = null;
-    for (let i = 0; i < 4; i++) {
+    // Cold-mount: the daemon/keychain handshake can lag a beat, so the first few
+    // calls may throw spuriously. Retry with a longer, wider backoff before we
+    // surface an error (this was failing on initial Anthropic load).
+    for (let i = 0; i < 6; i++) {
       try {
         const list = await attempt();
         const sorted = [...(list || [])].sort((a, b) => modelRank(b) - modelRank(a));
@@ -198,7 +201,7 @@ function AgentForm({
         return;
       } catch (e) {
         lastErr = e;
-        await new Promise((r) => setTimeout(r, 350 * (i + 1)));
+        await new Promise((r) => setTimeout(r, 400 * (i + 1)));
       }
     }
     setModels([]);
@@ -241,26 +244,36 @@ function AgentForm({
           <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Work, Journal, Research…" />
         </label>
 
-        <div style={{ display: "flex", gap: 24 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
           <label style={{ ...fieldLabel, flex: 0 }}>Icon
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", maxWidth: 240 }}>
-              {ICONS.map((i) => (
-                <button key={i} onClick={() => setIcon(i)} style={{
-                  width: 34, height: 34, borderRadius: 9, fontSize: 18, cursor: "pointer",
-                  border: icon === i ? "2px solid var(--accent)" : "2px solid var(--line)",
-                  background: "var(--bg)",
-                }}>{i}</button>
-              ))}
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {ICONS.map((i) => {
+                const sel = icon === i;
+                return (
+                  <button key={i} onClick={() => setIcon(i)} style={{
+                    width: 36, height: 36, borderRadius: 9, fontSize: 18, cursor: "pointer",
+                    border: sel ? "2px solid var(--accent)" : "2px solid var(--line)",
+                    background: sel ? "color-mix(in srgb, var(--accent) 14%, var(--bg))" : "var(--bg)",
+                    boxShadow: sel ? "0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent)" : "none",
+                    transition: "border-color .12s, box-shadow .12s, background .12s",
+                  }}>{i}</button>
+                );
+              })}
             </div>
           </label>
           <label style={{ ...fieldLabel, flex: 0 }}>Color
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", maxWidth: 200 }}>
-              {COLORS.map((c) => (
-                <button key={c} onClick={() => setColor(c)} title={c} style={{
-                  width: 30, height: 30, borderRadius: 8, background: c, cursor: "pointer",
-                  border: color === c ? "3px solid var(--text)" : "3px solid transparent",
-                }} />
-              ))}
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {COLORS.map((c) => {
+                const sel = color === c;
+                return (
+                  <button key={c} onClick={() => setColor(c)} title={c} style={{
+                    width: 32, height: 32, borderRadius: 8, background: c, cursor: "pointer",
+                    border: sel ? "2px solid var(--text)" : "2px solid transparent",
+                    boxShadow: sel ? "0 0 0 2px color-mix(in srgb, var(--text) 30%, transparent)" : "none",
+                    transition: "box-shadow .12s",
+                  }} />
+                );
+              })}
             </div>
           </label>
         </div>
@@ -353,4 +366,6 @@ const fieldLabel = { display: "flex", flexDirection: "column", gap: 6, fontSize:
 const selectStyle = {
   padding: "9px 12px", borderRadius: "var(--radius-control)",
   border: "var(--border-width) solid var(--line)", background: "var(--bg)", color: "var(--text)",
+  width: "100%", maxWidth: "100%", boxSizing: "border-box",
+  textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap",
 } as const;
