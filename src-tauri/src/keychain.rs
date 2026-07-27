@@ -19,41 +19,20 @@ pub fn set_key(provider: &str, key: &str) -> Result<(), String> {
 /// can distinguish "genuinely absent" from "present but this app identity can't
 /// read it" (a macOS Keychain ACL / code-signing-identity mismatch — common in
 /// unsigned `cargo tauri dev` builds).
+/// NOTE (2026-07-27): the intermittent "Attribute user is invalid: cannot be
+/// empty" + login-password prompt on `cargo tauri dev` is a macOS Keychain
+/// PARTITION-LIST issue, NOT our code. macOS pins each item to the creating
+/// binary's cdhash; every `cargo build` produces a fresh ad-hoc cdhash, so the
+/// partition check fails and the OS prompts. "Always Allow" only updates the
+/// application ACL, not the partition list, so it re-prompts next rebuild.
+/// Self-signing + set-generic-password-partition-list are dead ends (macOS
+/// rewrites the partition list on each authorization). The real fix is a real
+/// Apple Developer ID cert with a Team ID (needed for notarization anyway).
+/// Until then: click "Always Allow"/enter password once per rebuild. A retry
+/// loop here does NOT help (a partition-denied read just fails repeatedly).
 pub fn get_key(provider: &str) -> Result<String, String> {
-    read_password_warm(provider)
-}
-
-/// The FIRST macOS Keychain access in a fresh process can fail spuriously with
-/// "Attribute user is invalid: cannot be empty" until the security session is
-/// warmed — the entry is stored perfectly (verified via `security` CLI), it's
-/// the session that isn't ready. Empirically, a subsequent read succeeds. So we
-/// rebuild the Entry and retry a few times with a short blocking sleep before
-/// giving up. This is why switching provider (a second keychain touch) "fixed"
-/// Anthropic in the UI — the retry now lives here instead of racing in JS.
-fn read_password_warm(provider: &str) -> Result<String, String> {
-    let mut last: String = String::new();
-    for i in 0..6 {
-        let entry = match Entry::new(SERVICE, provider) {
-            Ok(e) => e,
-            Err(e) => {
-                last = format!("keychain entry: {e}");
-                std::thread::sleep(std::time::Duration::from_millis(120 * (i + 1)));
-                continue;
-            }
-        };
-        match entry.get_password() {
-            Ok(pw) => return Ok(pw),
-            // NoEntry = genuinely absent: don't waste retries, fail fast.
-            Err(keyring::Error::NoEntry) => {
-                return Err(format!("keychain get [{SERVICE}/{provider}]: no entry"));
-            }
-            Err(e) => {
-                last = format!("keychain get [{SERVICE}/{provider}]: {e}");
-                std::thread::sleep(std::time::Duration::from_millis(120 * (i + 1)));
-            }
-        }
-    }
-    Err(last)
+    let entry = Entry::new(SERVICE, provider).map_err(|e| format!("keychain entry: {e}"))?;
+    entry.get_password().map_err(|e| format!("keychain get [{SERVICE}/{provider}]: {e}"))
 }
 
 /// Whether a key exists (safe for the UI — returns bool, never the secret).
