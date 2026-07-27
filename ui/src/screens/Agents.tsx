@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Input, Pill } from "../components/ui";
 import type { AgentProfile } from "../components/AgentSwitcher";
