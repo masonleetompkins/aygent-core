@@ -158,6 +158,19 @@ function AgentForm({
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsErr, setModelsErr] = useState<string | null>(null);
 
+  // Locally-downloaded GGUF models (for provider === "local"): show a dropdown
+  // of what's already on disk instead of forcing the user to type a path.
+  const [localModels, setLocalModels] = useState<Array<{ filename: string; path: string; size_gb: number }>>([]);
+  const [localLoading, setLocalLoading] = useState(false);
+  async function loadLocalModels(): Promise<void> {
+    setLocalLoading(true);
+    try {
+      const list = await invoke<Array<{ filename: string; path: string; size_gb: number }>>("local_downloaded");
+      setLocalModels(list || []);
+    } catch { setLocalModels([]); }
+    finally { setLocalLoading(false); }
+  }
+
   // If the user picks a folder via the native picker, adopt it here.
   useEffect(() => { if (pendingFolder && !initial) setFolder(pendingFolder); }, [pendingFolder, initial]);
 
@@ -193,7 +206,11 @@ function AgentForm({
     setModelsLoading(false);
   }
 
-  useEffect(() => { void loadModels(provider); /* eslint-disable-next-line */ }, [provider]);
+  useEffect(() => {
+    if (provider === "local") void loadLocalModels();
+    else void loadModels(provider);
+    /* eslint-disable-next-line */
+  }, [provider]);
 
   async function save() {
     if (!name.trim()) return;
@@ -269,7 +286,24 @@ function AgentForm({
           </label>
           <label style={fieldLabel}>Model
             {provider === "local" ? (
-              <Input value={model} onChange={(e) => setModel(e.target.value)} mono placeholder="path to .gguf" />
+              localModels.length > 0 ? (
+                <select
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  onMouseDown={() => { if (!localLoading) void loadLocalModels(); }}
+                  style={selectStyle}
+                >
+                  <option value="">{localLoading ? "scanning…" : "Select a downloaded model"}</option>
+                  {localModels.map((m) => (
+                    <option key={m.path} value={m.path}>{m.filename} ({m.size_gb.toFixed(1)} GB)</option>
+                  ))}
+                  {/* keep a manually-set path visible even if it's not in the folder */}
+                  {model && !localModels.some((m) => m.path === model) && <option value={model}>{model}</option>}
+                </select>
+              ) : (
+                <Input value={model} onChange={(e) => setModel(e.target.value)} mono
+                  placeholder={localLoading ? "scanning…" : "path to .gguf (none downloaded yet)"} />
+              )
             ) : (
               <select
                 value={model}
@@ -286,6 +320,12 @@ function AgentForm({
             {modelsErr && <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Couldn’t load {provider} models: {modelsErr}. Using “Auto” — click the menu to retry.</span>}
             {!modelsErr && !modelsLoading && provider !== "local" && models.length > 0 && (
               <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Most capable first.</span>
+            )}
+            {provider === "local" && !localLoading && localModels.length === 0 && (
+              <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>No downloaded models found — grab one in Settings, or paste a .gguf path.</span>
+            )}
+            {provider === "local" && localModels.length > 0 && (
+              <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Downloaded models on this Mac.</span>
             )}
           </label>
         </div>
