@@ -30,6 +30,12 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
   const convIdRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [dragId, setDragId] = useState<string | null>(null);
+  // WebKit (Tauri's macOS webview) can fire `dragend` before/around `drop`,
+  // which would null out dragId and make onDrop bail before persisting. Keep
+  // the source id in a ref that only the drop handler clears, so the reorder
+  // survives the drag-lifecycle race regardless of event ordering.
+  const dragIdRef = useRef<string | null>(null);
+  const setDrag = (id: string | null) => { dragIdRef.current = id; setDragId(id); };
   // Per-folder selection (provider + model). "" model = auto/haiku; provider
   // "local" routes to the in-app llama.cpp engine. Loaded on folder change and
   // re-checked on each send so a Settings change applies without a reload.
@@ -102,17 +108,20 @@ export function Chat({ folder, keySet }: { folder: string | null; keySet: boolea
   // Drag-to-reorder: on drop, recompute a dense order (1..n) for the whole list
   // in its new visual arrangement and persist it in one batch.
   async function onDrop(targetId: string) {
-    if (!folder || !dragId || dragId === targetId) { setDragId(null); return; }
+    // Read the source id from the ref (survives the dragend/drop race), not the
+    // state, which may already be cleared.
+    const src = dragIdRef.current;
+    if (!folder || !src || src === targetId) { setDrag(null); return; }
     const ids = convs.map((c) => c.id);
-    const from = ids.indexOf(dragId);
+    const from = ids.indexOf(src);
     const to = ids.indexOf(targetId);
-    if (from < 0 || to < 0) { setDragId(null); return; }
+    if (from < 0 || to < 0) { setDrag(null); return; }
     const reordered = [...convs];
     const [moved] = reordered.splice(from, 1);
     reordered.splice(to, 0, moved);
     const updates = reordered.map((c, i) => ({ id: c.id, pinned: c.pinned, order: i + 1 }));
     setConvs(reordered.map((c, i) => ({ ...c, order: i + 1 })));
-    setDragId(null);
+    setDrag(null);
     try { await invoke("conv_reorder", { folder, updates }); await refreshList(); } catch { /* ignore */ }
   }
 
