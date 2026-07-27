@@ -10,6 +10,11 @@ mod broker_ws;
 mod catalog;
 mod checkpoint;
 mod conversations;
+mod db;
+mod lanes;
+mod migrate_json;
+mod repo;
+mod writer;
 mod gguf;
 mod hardware;
 mod keychain;
@@ -208,36 +213,60 @@ fn app_data(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(dir)
 }
 
+/// Resolve the UI's `folder` arg to an agent_id. The frontend still keys chat
+/// by folder path (its contract is unchanged); the SQLite spine keys by agent.
+/// We map folder→agent via the agent that owns that folder_path, falling back
+/// to the active agent. This keeps the UI stable while state moves to SQLite.
+fn agent_for_folder(db: &writer::Db, folder: &str) -> Result<String, String> {
+    if !folder.is_empty() {
+        for a in repo::list_agents(db)? {
+            if a.folder_path == folder { return Ok(a.id); }
+        }
+    }
+    // Fall back to the active agent (single-folder users, or a not-yet-mapped
+    // folder). Empty string is tolerated downstream (no conversations found).
+    repo::active_id(db)
+}
+
 /// List conversation metadata for the current agent folder, newest-first.
+/// M1.1: resolves folder→agent, then reads from SQLite (WAL concurrent read).
 #[tauri::command]
-fn conv_list(app: tauri::AppHandle, folder: String) -> Result<Vec<conversations::ConvMeta>, String> {
-    conversations::list(&app_data(&app)?, &folder)
+fn conv_list(db: tauri::State<writer::Db>, folder: String) -> Result<Vec<repo::ConvMeta>, String> {
+    let agent_id = agent_for_folder(&db, &folder)?;
+    repo::list_conversations(&db, &agent_id)
 }
 
-/// Load one full conversation (msgs + provider history).
+/// Load one full conversation (msgs + provider history). `folder` is accepted
+/// (unchanged UI contract) but unused — a conversation id is globally unique.
 #[tauri::command]
-fn conv_load(app: tauri::AppHandle, folder: String, id: String) -> Result<conversations::Conversation, String> {
-    conversations::load(&app_data(&app)?, &folder, &id)
+fn conv_load(db: tauri::State<writer::Db>, folder: Option<String>, id: String) -> Result<repo::Conversation, String> {
+    let _ = folder;
+    repo::load_conversation(&db, &id)
 }
 
-/// Save (create or overwrite) a conversation.
+/// Save (create or overwrite) a conversation. The conversation is attached to
+/// the agent that owns `folder` (resolved here) so multi-agent stays correct.
 #[tauri::command]
-fn conv_save(app: tauri::AppHandle, folder: String, conv: conversations::Conversation) -> Result<(), String> {
-    conversations::save(&app_data(&app)?, &folder, conv)
+fn conv_save(db: tauri::State<writer::Db>, folder: String, conv: repo::Conversation) -> Result<(), String> {
+    let agent_id = agent_for_folder(&db, &folder)?;
+    let mut conv = conv;
+    if conv.agent_id.is_empty() { conv.agent_id = agent_id; }
+    repo::save_conversation(&db, conv)
 }
 
-/// Delete a conversation.
+/// Delete a conversation (and forget its execution lane).
 #[tauri::command]
-fn conv_delete(app: tauri::AppHandle, folder: String, id: String) -> Result<(), String> {
-    conversations::delete(&app_data(&app)?, &folder, &id)
+fn conv_delete(db: tauri::State<writer::Db>, lanes: tauri::State<lanes::Lanes>, id: String) -> Result<(), String> {
+    repo::delete_conversation(&db, &id)?;
+    lanes.forget(&id);
+    Ok(())
 }
 
 /// Update pin + manual order for a batch of conversations (drag-reorder / pin).
 /// `updates` = [{ id, pinned, order }].
 #[tauri::command]
 fn conv_reorder(
-    app: tauri::AppHandle,
-    folder: String,
+    db: tauri::State<writer::Db>,
     updates: Vec<serde_json::Value>,
 ) -> Result<(), String> {
     let parsed: Vec<(String, bool, i64)> = updates
@@ -249,7 +278,7 @@ fn conv_reorder(
             Some((id, pinned, order))
         })
         .collect();
-    conversations::reorder(&app_data(&app)?, &folder, parsed)
+    repo::reorder_conversations(&db, parsed)
 }
 
 // --- Checkpoints (Phase 1, Contract C4) ------------------------------------
@@ -355,56 +384,55 @@ async fn openai_models(provider: String) -> Result<Vec<String>, String> {
     openai_provider::list_models(&provider, &key).await
 }
 
-/// Per-folder selected model. "" = auto (prefer haiku, else first available).
+/// Per-agent selected model. "" = auto (prefer haiku, else first available).
+/// M1.1: folder→agent then read from SQLite agent_settings.
 #[tauri::command]
-fn get_selected_model(app: tauri::AppHandle, folder: String) -> Result<String, String> {
-    use tauri::Manager;
-    let app_data = app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))?;
-    Ok(settings::load(&app_data, &folder).model)
+fn get_selected_model(db: tauri::State<writer::Db>, folder: String) -> Result<String, String> {
+    let agent_id = agent_for_folder(&db, &folder)?;
+    Ok(repo::load_settings(&db, &agent_id)?.model)
 }
 
 #[tauri::command]
-fn set_selected_model(app: tauri::AppHandle, folder: String, model: String) -> Result<(), String> {
-    use tauri::Manager;
-    let app_data = app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))?;
-    let mut s = settings::load(&app_data, &folder);
+fn set_selected_model(db: tauri::State<writer::Db>, folder: String, model: String) -> Result<(), String> {
+    let agent_id = agent_for_folder(&db, &folder)?;
+    let mut s = repo::load_settings(&db, &agent_id)?;
     s.model = model;
-    settings::save(&app_data, &folder, &s)
+    repo::save_settings(&db, &agent_id, s)
 }
 
-/// Full per-folder selection (provider + model). Empty provider = anthropic.
+/// Full per-agent selection (provider + model). Empty provider = anthropic.
 #[tauri::command]
-fn get_selection(app: tauri::AppHandle, folder: String) -> Result<serde_json::Value, String> {
-    use tauri::Manager;
-    let app_data = app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))?;
-    let s = settings::load(&app_data, &folder);
+fn get_selection(db: tauri::State<writer::Db>, folder: String) -> Result<serde_json::Value, String> {
+    let agent_id = agent_for_folder(&db, &folder)?;
+    let s = repo::load_settings(&db, &agent_id)?;
     Ok(serde_json::json!({ "provider": s.provider, "model": s.model }))
 }
 
 #[tauri::command]
-fn set_selection(app: tauri::AppHandle, folder: String, provider: String, model: String) -> Result<(), String> {
-    use tauri::Manager;
-    let app_data = app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))?;
-    let mut s = settings::load(&app_data, &folder);
+fn set_selection(db: tauri::State<writer::Db>, folder: String, provider: String, model: String) -> Result<(), String> {
+    let agent_id = agent_for_folder(&db, &folder)?;
+    let mut s = repo::load_settings(&db, &agent_id)?;
     s.provider = provider;
     s.model = model;
-    settings::save(&app_data, &folder, &s)
+    repo::save_settings(&db, &agent_id, s)
 }
 
 // --- AGENTS (multi-agent profiles) -----------------------------------------
 
 /// List all agent profiles + the active id. UI renders the switcher from this.
+/// M1.1: reads from the SQLite spine (single-writer actor for writes, WAL
+/// concurrent reads) instead of agents/index.json.
 #[tauri::command]
-fn agents_list(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    let ad = app_data(&app)?;
-    let idx = agents::load_index(&ad);
-    Ok(serde_json::json!({ "agents": idx.agents, "activeId": idx.active_id }))
+fn agents_list(db: tauri::State<writer::Db>) -> Result<serde_json::Value, String> {
+    let agents = repo::list_agents(&db)?;
+    let active = repo::active_id(&db)?;
+    Ok(serde_json::json!({ "agents": agents, "activeId": active }))
 }
 
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 fn agents_create(
-    app: tauri::AppHandle,
+    db: tauri::State<writer::Db>,
     name: String,
     icon: Option<String>,
     color: Option<String>,
@@ -413,10 +441,9 @@ fn agents_create(
     provider: Option<String>,
     context_mode: Option<String>,
     system_prompt: Option<String>,
-) -> Result<agents::AgentProfile, String> {
-    let ad = app_data(&app)?;
-    agents::create(
-        &ad, &name,
+) -> Result<repo::AgentProfile, String> {
+    repo::create_agent(
+        &db, &name,
         &icon.unwrap_or_default(),
         &color.unwrap_or_default(),
         &folder_path.unwrap_or_default(),
@@ -428,28 +455,28 @@ fn agents_create(
 }
 
 #[tauri::command]
-fn agents_update(app: tauri::AppHandle, profile: agents::AgentProfile) -> Result<(), String> {
-    let ad = app_data(&app)?;
-    agents::update(&ad, profile)
+fn agents_update(db: tauri::State<writer::Db>, profile: repo::AgentProfile) -> Result<(), String> {
+    repo::update_agent(&db, profile)
 }
 
 #[tauri::command]
-fn agents_delete(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    let ad = app_data(&app)?;
-    agents::delete(&ad, &id)
+fn agents_delete(db: tauri::State<writer::Db>, lanes: tauri::State<lanes::Lanes>, id: String) -> Result<(), String> {
+    // Drop any conversation lanes the UI won't reference again is handled per
+    // conversation on delete; agent delete cascades conversations in SQL.
+    let _ = &lanes;
+    repo::delete_agent(&db, &id)
 }
 
 /// Set the active agent AND re-point the broker jail at that agent's folder, so
 /// switching agents switches the security scope in one atomic step.
 #[tauri::command]
 fn agents_set_active(
-    app: tauri::AppHandle,
+    db: tauri::State<writer::Db>,
     broker: tauri::State<'_, Arc<Broker>>,
     id: String,
-) -> Result<Option<agents::AgentProfile>, String> {
-    let ad = app_data(&app)?;
-    agents::set_active(&ad, &id)?;
-    let profile = agents::get(&ad, &id);
+) -> Result<Option<repo::AgentProfile>, String> {
+    repo::set_active(&db, &id)?;
+    let profile = repo::get_agent(&db, &id)?;
     if let Some(p) = &profile {
         if !p.folder_path.is_empty() {
             let path = std::path::PathBuf::from(&p.folder_path);
@@ -463,9 +490,8 @@ fn agents_set_active(
 }
 
 #[tauri::command]
-fn agents_get_active(app: tauri::AppHandle) -> Result<Option<agents::AgentProfile>, String> {
-    let ad = app_data(&app)?;
-    Ok(agents::get_active(&ad))
+fn agents_get_active(db: tauri::State<writer::Db>) -> Result<Option<repo::AgentProfile>, String> {
+    repo::get_active_agent(&db)
 }
 
 // --- LOCAL MODELS ----------------------------------------------------------
@@ -1048,16 +1074,28 @@ const LOCAL_TOOL_TURN_CAP: usize = 4;
 async fn agent_stream(
     app: tauri::AppHandle,
     broker: tauri::State<'_, Arc<Broker>>,
+    lanes: tauri::State<'_, lanes::Lanes>,
     channel: String,
     prompt: String,
     history: serde_json::Value,
     model: Option<String>,
     provider: Option<String>,
     folder: Option<String>,
+    session_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     use tauri::Emitter;
     let broker = broker.inner().clone();
     let provider_kind = provider.unwrap_or_default();
+
+    // ---- PER-SESSION LANE (M1.1) -------------------------------------------
+    // Serialize turns for THIS session: if another turn is already running on
+    // it, we wait here until it finishes. One turn at a time per session kills
+    // tool/session races (double writes, torn streams, double checkpoints) at
+    // the source. The lane key is the session id when the UI supplies one, else
+    // the per-conversation event channel (also unique per conversation). The
+    // guard is held for the whole turn — dropped automatically on return.
+    let lane_key = session_id.clone().unwrap_or_else(|| channel.clone());
+    let _lane = lanes.acquire(&lane_key).await;
 
     // ---- LOCAL MODEL PATH (llama.cpp compiled in) --------------------------
     // Chat-first (Mason's call): a downloaded GGUF runs entirely in-process. No
@@ -1373,10 +1411,15 @@ pub fn run() {
     // Separate per-session token for the broker WS (jail-boundary channel).
     let broker_token = mint_ws_token();
 
+    // Per-session lanes (M1.1): serialize turn execution one-at-a-time per
+    // session. Created here, managed as Tauri state, acquired in agent_stream.
+    let lanes = lanes::Lanes::new();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(broker.clone())
         .manage(state.clone())
+        .manage(lanes)
         .invoke_handler(tauri::generate_handler![
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
@@ -1393,6 +1436,24 @@ pub fn run() {
             agents_set_active, agents_get_active
         ])
         .setup(move |_app| {
+            // M1.1: bring up the SQLite state spine + single-writer actor, then
+            // run the one-time JSON→SQLite import. Do this synchronously in
+            // setup so every command that follows sees a ready DB. A failure
+            // here is fatal — the app has no state without it.
+            {
+                use tauri::Manager;
+                let app_data = _app.handle().path().app_data_dir()
+                    .map_err(|e| format!("app_data_dir: {e}"))?;
+                let db = writer::Db::start(app_data.clone())
+                    .map_err(|e| format!("db init: {e}"))?;
+                if let Err(e) = migrate_json::run(&db, &app_data) {
+                    // Non-fatal: a bad legacy file shouldn't brick startup. Log
+                    // and continue with whatever imported cleanly.
+                    eprintln!("[aygent] JSON→SQLite migration warning: {e}");
+                }
+                _app.manage(db);
+            }
+
             let broker = broker.clone();
             let state = state.clone();
             let broker_token = broker_token.clone();
