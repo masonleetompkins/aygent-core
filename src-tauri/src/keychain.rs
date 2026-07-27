@@ -20,8 +20,40 @@ pub fn set_key(provider: &str, key: &str) -> Result<(), String> {
 /// read it" (a macOS Keychain ACL / code-signing-identity mismatch — common in
 /// unsigned `cargo tauri dev` builds).
 pub fn get_key(provider: &str) -> Result<String, String> {
-    let entry = Entry::new(SERVICE, provider).map_err(|e| format!("keychain entry: {e}"))?;
-    entry.get_password().map_err(|e| format!("keychain get [{SERVICE}/{provider}]: {e}"))
+    read_password_warm(provider)
+}
+
+/// The FIRST macOS Keychain access in a fresh process can fail spuriously with
+/// "Attribute user is invalid: cannot be empty" until the security session is
+/// warmed — the entry is stored perfectly (verified via `security` CLI), it's
+/// the session that isn't ready. Empirically, a subsequent read succeeds. So we
+/// rebuild the Entry and retry a few times with a short blocking sleep before
+/// giving up. This is why switching provider (a second keychain touch) "fixed"
+/// Anthropic in the UI — the retry now lives here instead of racing in JS.
+fn read_password_warm(provider: &str) -> Result<String, String> {
+    let mut last: String = String::new();
+    for i in 0..6 {
+        let entry = match Entry::new(SERVICE, provider) {
+            Ok(e) => e,
+            Err(e) => {
+                last = format!("keychain entry: {e}");
+                std::thread::sleep(std::time::Duration::from_millis(120 * (i + 1)));
+                continue;
+            }
+        };
+        match entry.get_password() {
+            Ok(pw) => return Ok(pw),
+            // NoEntry = genuinely absent: don't waste retries, fail fast.
+            Err(keyring::Error::NoEntry) => {
+                return Err(format!("keychain get [{SERVICE}/{provider}]: no entry"));
+            }
+            Err(e) => {
+                last = format!("keychain get [{SERVICE}/{provider}]: {e}");
+                std::thread::sleep(std::time::Duration::from_millis(120 * (i + 1)));
+            }
+        }
+    }
+    Err(last)
 }
 
 /// Whether a key exists (safe for the UI — returns bool, never the secret).
