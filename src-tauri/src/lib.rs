@@ -9,9 +9,11 @@ mod broker;
 mod broker_ws;
 mod catalog;
 mod checkpoint;
+mod context_docs;
 mod conversations;
 mod db;
 mod lanes;
+mod mailbox;
 mod migrate_json;
 mod repo;
 mod writer;
@@ -133,8 +135,14 @@ fn load_agent_folder(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
 fn restore_agent_folder(
     app: tauri::AppHandle,
     broker: tauri::State<'_, Arc<Broker>>,
+    db: tauri::State<'_, writer::Db>,
 ) -> Result<Option<String>, String> {
-    let Some(saved) = load_agent_folder(&app) else { return Ok(None) };
+    let Some(saved) = load_agent_folder(&app) else {
+        // Even with no legacy single-folder record, agents created directly may
+        // have folders — register their scopes so they're live on boot.
+        register_all_agent_scopes(&db, &broker);
+        return Ok(None);
+    };
     // If the folder is gone (moved/deleted/external drive unplugged), don't
     // register a bogus scope — report None so the UI prompts a fresh pick.
     if !saved.is_dir() {
@@ -142,6 +150,7 @@ fn restore_agent_folder(
         return Ok(None);
     }
     let canonical = std::fs::canonicalize(&saved).unwrap_or(saved);
+    // Keep "default" as a back-compat scope (legacy single-folder callers).
     broker.set_scope("default", canonical.clone(), false);
     eprintln!("[aygent] agent folder restored: {}", canonical.display());
     // BACK-COMPAT: if this user predates multi-agent (has a saved folder but no
@@ -150,7 +159,28 @@ fn restore_agent_folder(
     if let Ok(ad) = app_data(&app) {
         let _ = agents::ensure_migrated(&ad, Some(&canonical.to_string_lossy()));
     }
+    // M1.4: register EVERY agent's folder as its own broker scope, keyed by the
+    // real agentId (not just "default"). This is what enables TRUE CONCURRENT
+    // runs — a scheduled Work agent can touch its folder while the user chats
+    // with Personal, each jailed to its own root simultaneously. The security
+    // kernel is unchanged: still path-scoped, still fail-closed per scope.
+    register_all_agent_scopes(&db, &broker);
     Ok(Some(canonical.to_string_lossy().to_string()))
+}
+
+/// M1.4: register a broker scope for every agent that has a folder, keyed by its
+/// real agentId. Called on boot (and after agent create/update) so all agents'
+/// jails are live simultaneously — the foundation for concurrent runs. A missing
+/// or vanished folder is skipped (fail-closed: no scope = the broker refuses).
+fn register_all_agent_scopes(db: &writer::Db, broker: &Arc<Broker>) {
+    let agents = match repo::list_agents(db) { Ok(a) => a, Err(_) => return };
+    for a in agents {
+        if a.archived || a.folder_path.is_empty() { continue; }
+        let path = std::path::PathBuf::from(&a.folder_path);
+        if !path.is_dir() { continue; }
+        let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+        broker.set_scope(&a.id, canonical, false);
+    }
 }
 
 /// Probe the broker: ask it to resolve a path for the default agent and report
@@ -433,6 +463,7 @@ fn agents_list(db: tauri::State<writer::Db>) -> Result<serde_json::Value, String
 #[tauri::command]
 fn agents_create(
     db: tauri::State<writer::Db>,
+    broker: tauri::State<'_, Arc<Broker>>,
     name: String,
     icon: Option<String>,
     color: Option<String>,
@@ -442,7 +473,7 @@ fn agents_create(
     context_mode: Option<String>,
     system_prompt: Option<String>,
 ) -> Result<repo::AgentProfile, String> {
-    repo::create_agent(
+    let created = repo::create_agent(
         &db, &name,
         &icon.unwrap_or_default(),
         &color.unwrap_or_default(),
@@ -451,12 +482,19 @@ fn agents_create(
         &provider.unwrap_or_default(),
         &context_mode.unwrap_or_default(),
         &system_prompt.unwrap_or_default(),
-    )
+    )?;
+    // M1.4: register the new agent's scope immediately so it's runnable this
+    // session (concurrent with every other agent) — no restart needed.
+    register_all_agent_scopes(&db, &broker);
+    Ok(created)
 }
 
 #[tauri::command]
-fn agents_update(db: tauri::State<writer::Db>, profile: repo::AgentProfile) -> Result<(), String> {
-    repo::update_agent(&db, profile)
+fn agents_update(db: tauri::State<writer::Db>, broker: tauri::State<'_, Arc<Broker>>, profile: repo::AgentProfile) -> Result<(), String> {
+    repo::update_agent(&db, profile)?;
+    // Folder may have changed — re-register all scopes so the jail tracks it.
+    register_all_agent_scopes(&db, &broker);
+    Ok(())
 }
 
 #[tauri::command]
@@ -492,6 +530,121 @@ fn agents_set_active(
 #[tauri::command]
 fn agents_get_active(db: tauri::State<writer::Db>) -> Result<Option<repo::AgentProfile>, String> {
     repo::get_active_agent(&db)
+}
+
+/// M1.4 (#2): the other non-archived agents sharing `folder_path` with `agent_id`
+/// (pass "" as agent_id to include all). Agents on the SAME folder share
+/// checkpoint history + the folder write-lock (CONTRACTS §4). The UI uses this
+/// to show a plain "shares history with X, Y" line so the user understands what
+/// pointing two agents at one folder means.
+#[tauri::command]
+fn agents_sharing_folder(
+    db: tauri::State<writer::Db>,
+    folder_path: String,
+    agent_id: Option<String>,
+) -> Result<Vec<repo::AgentProfile>, String> {
+    repo::agents_sharing_folder(&db, &folder_path, &agent_id.unwrap_or_default())
+}
+
+// --- CONTEXT DOCUMENTS (M1.4 #4) -------------------------------------------
+// Per-agent reference docs stored app-data-side (out of the jail), chunked into
+// mem_chunk for M1.7 retrieval, prepended (capped) into the agent's prompt now.
+
+/// Upload a context doc for an agent. `bytes` is base64 from the UI (file read).
+#[tauri::command]
+fn agent_context_add(
+    app: tauri::AppHandle,
+    db: tauri::State<writer::Db>,
+    agent_id: String,
+    filename: String,
+    bytes_b64: String,
+) -> Result<context_docs::ContextDoc, String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(bytes_b64.as_bytes())
+        .map_err(|e| format!("decode upload: {e}"))?;
+    let ad = app_data(&app)?;
+    context_docs::add(&db, &ad, &agent_id, &filename, &bytes)
+}
+
+#[tauri::command]
+fn agent_context_list(db: tauri::State<writer::Db>, agent_id: String) -> Result<Vec<context_docs::ContextDoc>, String> {
+    context_docs::list(&db, &agent_id)
+}
+
+#[tauri::command]
+fn agent_context_remove(app: tauri::AppHandle, db: tauri::State<writer::Db>, agent_id: String, id: i64) -> Result<(), String> {
+    let ad = app_data(&app)?;
+    context_docs::remove(&db, &ad, &agent_id, id)
+}
+
+/// M1.4 #7: pending inbound inter-agent message counts per agent (switcher badge).
+#[tauri::command]
+fn mailbox_pending_counts(db: tauri::State<writer::Db>) -> Result<Vec<(String, i64)>, String> {
+    mailbox::pending_counts(&db)
+}
+
+/// M1.4 #7: the roster of OTHER agents a given agent can message.
+#[tauri::command]
+fn mailbox_roster(db: tauri::State<writer::Db>, agent_id: String) -> Result<Vec<(String, String)>, String> {
+    mailbox::roster(&db, &agent_id)
+}
+
+/// M1.4 #7: DELIVERY DRAIN. Pull the next pending inter-agent message for an
+/// agent and return it (marks delivered + charges the tree budget). The UI/
+/// caller then runs it as a turn on that agent's session via agent_stream. This
+/// is the async, non-blocking delivery Atlas specified — the recipient processes
+/// on its own lane; user turns always preempt (see Lanes::acquire_low). Returns
+/// null when the agent's inbox is empty.
+#[tauri::command]
+fn mailbox_take_next(db: tauri::State<writer::Db>, agent_id: String) -> Result<Option<mailbox::Message>, String> {
+    mailbox::take_next_for(&db, &agent_id)
+}
+
+/// M1.4 #5: GENERATE A SOUL.md for an agent — the model authors its own
+/// personality/values doc from a short brief, and we save it as the agent's
+/// system_prompt (its "soul"). Uses the agent's own provider/model. Returns the
+/// generated text so the UI can show + let the user edit before it sticks.
+#[tauri::command]
+async fn agent_generate_soul(
+    db: tauri::State<'_, writer::Db>,
+    agent_id: String,
+    brief: String,
+) -> Result<String, String> {
+    let agent = repo::get_agent(&db, &agent_id)?.ok_or("agent not found")?;
+    let name = if agent.name.trim().is_empty() { "this agent".to_string() } else { agent.name.clone() };
+    let meta = format!(
+        "Write a SOUL.md for an AI agent named \"{name}\". {}\n\nThe SOUL.md defines WHO this agent \
+         is: its personality, voice, values, and how it should behave. Write it in the SECOND person \
+         (\"You are...\") as durable instructions the agent will live by. Be vivid and specific, not \
+         generic. Include: a one-line identity, 3-5 core values, tone/voice, and what it cares about. \
+         Output ONLY the markdown, no preamble.",
+        if brief.trim().is_empty() { "Infer a fitting personality from the name.".to_string() } else { format!("The user's brief: {}", brief.trim()) }
+    );
+
+    // Route to the agent's own provider/model (fallback: anthropic auto/haiku).
+    let provider = if agent.provider.is_empty() { "anthropic".to_string() } else { agent.provider.clone() };
+    let soul = match provider.as_str() {
+        "anthropic" => {
+            let key = keychain::get_key("anthropic").map_err(|_| "no anthropic key set".to_string())?;
+            let model = if agent.model.trim().is_empty() {
+                let models = provider::anthropic_list_models(&key).await?;
+                models.iter().find(|m| m.contains("sonnet")).cloned()
+                    .or_else(|| models.first().cloned())
+                    .ok_or("no usable model")?
+            } else { agent.model.clone() };
+            provider::anthropic_complete(&key, &model, &meta).await?
+        }
+        "openai" | "openrouter" => {
+            let key = keychain::get_key(&provider).map_err(|_| format!("no {provider} key set"))?;
+            let model = agent.model.clone();
+            if model.trim().is_empty() { return Err("pick a model for this agent first".into()); }
+            openai_provider::complete(&provider, &key, &model, &meta).await?
+        }
+        _ => return Err("Soul generation needs a cloud provider (Anthropic/OpenAI/OpenRouter) \
+                         — set one for this agent.".into()),
+    };
+    Ok(soul)
 }
 
 // --- LOCAL MODELS ----------------------------------------------------------
@@ -893,26 +1046,31 @@ async fn agent_run(
 // Tool calls still route through the broker (jailed). Falls back to turn-based
 // automatically if the provider can't stream (UI shows a thinking animation).
 
-/// Execute one jailed tool call, returning (result_text, is_error).
+/// Execute one jailed tool call, returning (result_text, is_error). `agent_id`
+/// selects WHICH agent's broker scope (jail) the file op runs against — M1.4:
+/// every tool call is jailed to the calling agent's own folder, not a shared
+/// "default" scope, so concurrent agents can't reach into each other's folders.
 fn exec_tool(
     broker: &Arc<Broker>,
+    agent_id: &str,
     name: &str,
     input: &serde_json::Value,
 ) -> (String, bool) {
-    exec_tool_cfg(broker, name, input, &serde_json::json!({}))
+    exec_tool_cfg(broker, agent_id, name, input, &serde_json::json!({}))
 }
 
 /// Same as exec_tool, but with the PDF tool's per-folder config (font/colors/
 /// page-size/margins). `pdf_config` is {} when unavailable.
 fn exec_tool_cfg(
     broker: &Arc<Broker>,
+    agent_id: &str,
     name: &str,
     input: &serde_json::Value,
     pdf_config: &serde_json::Value,
 ) -> (String, bool) {
     let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
     match name {
-        "read_file" => match broker.resolve_and_open("default", path, broker::Mode::Read) {
+        "read_file" => match broker.resolve_and_open(agent_id, path, broker::Mode::Read) {
             Ok(mut f) => {
                 use std::io::Read;
                 let mut s = String::new();
@@ -974,6 +1132,8 @@ fn exec_tool_cfg(
 }
 
 /// Base file tools, always available. The Tools registry adds MORE on top.
+/// M1.4: `send_message` is included when the agent has peers (roster non-empty)
+/// — see base_tools_with_peers. This bare version is the file-only fallback.
 fn base_tools() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({ "name": "read_file", "description": "Read a UTF-8 text file inside the agent folder. Path relative to folder root.",
@@ -983,6 +1143,20 @@ fn base_tools() -> Vec<serde_json::Value> {
         serde_json::json!({ "name": "list_files", "description": "List entries in a directory inside the agent folder. Path relative to root; '.' for root.",
           "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } }),
     ]
+}
+
+/// The inter-agent messaging tool schema (M1.4 #7). Added to an agent's tools
+/// only when it has peers. Delivery is ASYNC — the recipient replies on its own
+/// lane; the sender does NOT block waiting.
+fn send_message_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "send_message",
+        "description": "Send a message to ANOTHER agent (by its id from your peer list). Delivery is asynchronous — they'll process it on their own time and may reply back to you. Use this to ask a peer for help, share information, or coordinate. You do NOT wait for a reply in this turn.",
+        "input_schema": { "type": "object", "properties": {
+            "to_agent": { "type": "string", "description": "the recipient agent's id (from your peer list)" },
+            "message": { "type": "string", "description": "what to say to them" }
+        }, "required": ["to_agent", "message"] }
+    })
 }
 
 /// The JSON schema for a built-in tool by its agent-facing name.
@@ -1005,7 +1179,14 @@ fn builtin_tool_schema(name: &str) -> Option<serde_json::Value> {
 /// tools for this folder. Also returns composed-tool instructions to append to
 /// the system prompt. `app` provides the app-data dir for the registry.
 fn agent_tools_for(app: &tauri::AppHandle, folder: Option<&str>) -> (serde_json::Value, String) {
+    agent_tools_for_ex(app, folder, false)
+}
+
+/// M1.4: like agent_tools_for but adds the inter-agent `send_message` tool when
+/// `has_peers` is true (the agent has at least one other agent to talk to).
+fn agent_tools_for_ex(app: &tauri::AppHandle, folder: Option<&str>, has_peers: bool) -> (serde_json::Value, String) {
     let mut tools = base_tools();
+    if has_peers { tools.push(send_message_tool()); }
     let mut extra_instructions = String::new();
 
     if let (Ok(ad), Some(f)) = (app_data(app), folder) {
@@ -1097,6 +1278,54 @@ async fn agent_stream(
     let lane_key = session_id.clone().unwrap_or_else(|| channel.clone());
     let _lane = lanes.acquire(&lane_key).await;
 
+    // ---- WHICH AGENT IS THIS? (M1.4) ---------------------------------------
+    // Resolve the acting agent's real id. Every file op + checkpoint below jails
+    // to THIS agent's own broker scope (not a shared "default"), so concurrent
+    // agents stay confined to their own folders. Precedence: explicit agent_id
+    // from the UI → the agent that owns `folder` → the active agent → "default"
+    // (legacy fallback so a pre-M1.4 caller still works).
+    let scope_id: String = {
+        if let Some(id) = agent_id.clone().filter(|s| !s.trim().is_empty()) {
+            id
+        } else if let Some(f) = folder.clone().filter(|s| !s.is_empty()) {
+            agent_for_folder(&db, &f).unwrap_or_else(|_| "default".to_string())
+        } else {
+            repo::active_id(&db).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "default".to_string())
+        }
+    };
+    // If the agent has a folder but its scope isn't registered yet (e.g. created
+    // this session), register it now so the jail is live for this turn.
+    if let Ok(Some(fp)) = repo::folder_for(&db, &scope_id) {
+        let p = std::path::PathBuf::from(&fp);
+        if p.is_dir() {
+            let canonical = std::fs::canonicalize(&p).unwrap_or(p);
+            broker.set_scope(&scope_id, canonical, false);
+        }
+    }
+    // The agent's own system prompt (personality/values) — prepended to the base
+    // AYGENT instructions below. This is what makes agents feel DISTINCT.
+    let agent_persona: String = repo::get_agent(&db, &scope_id)
+        .ok().flatten().map(|a| a.system_prompt).unwrap_or_default();
+    // M1.4 #4: the agent's uploaded context documents, as a capped prepend block
+    // ("" if none). Bridge until M1.7 embedding retrieval (chunks already stored).
+    let context_block: String = context_docs::prepend_block(&db, &scope_id).unwrap_or_default();
+    // M1.4 #7: the roster of OTHER agents this agent can message, so its
+    // send_message tool knows valid recipients and it's AWARE of its peers.
+    let roster: Vec<(String, String)> = mailbox::roster(&db, &scope_id).unwrap_or_default();
+    let roster_block: String = if roster.is_empty() { String::new() } else {
+        let list = roster.iter().map(|(id, name)| format!("- {name} (id: {id})")).collect::<Vec<_>>().join("\n");
+        format!("\n\nOTHER AGENTS you can message with the send_message tool (async — they reply on their own time):\n{list}")
+    };
+    // The full extra system block appended to AGENT_SYSTEM: persona + peers +
+    // context docs. Assembled once, used by all three provider paths.
+    let extra_block: String = {
+        let mut s = String::new();
+        if !agent_persona.trim().is_empty() { s.push_str("\n\n"); s.push_str(agent_persona.trim()); }
+        s.push_str(&roster_block);
+        s.push_str(&context_block);
+        s
+    };
+
     // ---- LOCAL MODEL PATH (llama.cpp compiled in) --------------------------
     // Chat-first (Mason's call): a downloaded GGUF runs entirely in-process. No
     // key, no network. `model` here is the absolute path to the .gguf file.
@@ -1143,14 +1372,14 @@ async fn agent_stream(
             text: format!("local model · {} tools · {ctx_note}", cap.format),
         });
         // Baseline checkpoint before any tool writes (same as Anthropic path).
-        if let Ok(root) = broker.root_for("default") {
+        if let Ok(root) = broker.root_for(&scope_id) {
             let _ = checkpoint::snapshot(&root, "baseline");
         }
         // Enabled registry tools (e.g. PDF) contribute extra instructions the
         // local model should know about, appended to its native tool prompt.
         let (_reg_tools, reg_instr) = agent_tools_for(&app, folder.as_deref());
         let pdf_cfg = pdf_config_for(&app, folder.as_deref());
-        let base_sys = if reg_instr.is_empty() { AGENT_SYSTEM_LOCAL.to_string() } else { format!("{AGENT_SYSTEM_LOCAL}{reg_instr}") };
+        let base_sys = format!("{AGENT_SYSTEM_LOCAL}{extra_block}{reg_instr}");
         let sys = local_tools::system_prompt_with_tools(&base_sys, &cap.format);
 
         for turn in 0..LOCAL_TOOL_TURN_CAP {
@@ -1178,7 +1407,7 @@ async fn agent_stream(
                     "kind": "ToolUse", "name": c.name,
                     "input": c.input,
                 }));
-                let (result, is_err) = exec_tool_cfg(&broker, &c.name, &c.input, &pdf_cfg);
+                let (result, is_err) = exec_tool_cfg(&broker, &scope_id, &c.name, &c.input, &pdf_cfg);
                 let path_s = c.input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
                 let _ = app.emit(&channel, &serde_json::json!({
                     "kind": "ToolResult", "name": c.name, "path": path_s,
@@ -1202,7 +1431,7 @@ async fn agent_stream(
 
         // Snapshot AFTER the turn's writes, labeled with the prompt (same C4
         // semantics as the Anthropic path — rewindable local tool edits).
-        if let Ok(root) = broker.root_for("default") {
+        if let Ok(root) = broker.root_for(&scope_id) {
             let _ = checkpoint::snapshot(&root, &prompt);
         }
         return Ok(messages);
@@ -1218,13 +1447,13 @@ async fn agent_stream(
             .ok_or_else(|| format!("no {provider_kind} model selected — pick one in Settings"))?;
 
         // Baseline checkpoint before the turn (rewind anchor), same as Anthropic.
-        if let Ok(root) = broker.root_for("default") {
+        if let Ok(root) = broker.root_for(&scope_id) {
             let _ = checkpoint::snapshot(&root, "baseline");
         }
 
-        let (tools, reg_instr) = agent_tools_for(&app, folder.as_deref());
+        let (tools, reg_instr) = agent_tools_for_ex(&app, folder.as_deref(), !roster.is_empty());
         let pdf_cfg = pdf_config_for(&app, folder.as_deref());
-        let sys = if reg_instr.is_empty() { AGENT_SYSTEM.to_string() } else { format!("{AGENT_SYSTEM}{reg_instr}") };
+        let sys = format!("{AGENT_SYSTEM}{extra_block}{reg_instr}");
         let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
         messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": prompt }));
         let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("model: {model}") });
@@ -1248,7 +1477,18 @@ async fn agent_stream(
                     let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                     let args_str = f.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
                     let input: serde_json::Value = serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
-                    let (result_text, is_err) = exec_tool_cfg(&broker, &name, &input, &pdf_cfg);
+                    // M1.4 #7: inter-agent send_message routes through the mailbox.
+                    let (result_text, is_err) = if name == "send_message" {
+                        let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
+                        let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                        match mailbox::send(&db, &scope_id, to, body, 0) {
+                            Ok(mailbox::SendResult::Queued { .. }) => (format!("message delivered to {to}"), false),
+                            Ok(mailbox::SendResult::Refused { reason }) => (format!("not sent: {reason}"), true),
+                            Err(e) => (format!("send failed: {e}"), true),
+                        }
+                    } else {
+                        exec_tool_cfg(&broker, &scope_id, &name, &input, &pdf_cfg)
+                    };
                     let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
                     let _ = app.emit(&channel, &serde_json::json!({
                         "kind": "ToolResult", "name": name, "path": path,
@@ -1268,7 +1508,7 @@ async fn agent_stream(
         }
 
         // Snapshot AFTER the turn's writes, labeled with the prompt (C4).
-        if let Ok(root) = broker.root_for("default") {
+        if let Ok(root) = broker.root_for(&scope_id) {
             match checkpoint::snapshot(&root, &prompt) {
                 Ok(Some(sha)) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("checkpoint {sha}") }); }
                 _ => {}
@@ -1304,8 +1544,8 @@ async fn agent_stream(
         let _ = checkpoint::snapshot(&root, "baseline");
     }
 
-    let (tools, reg_instr) = agent_tools_for(&app, folder.as_deref());
-    let anthropic_sys = if reg_instr.is_empty() { AGENT_SYSTEM.to_string() } else { format!("{AGENT_SYSTEM}{reg_instr}") };
+    let (tools, reg_instr) = agent_tools_for_ex(&app, folder.as_deref(), !roster.is_empty());
+    let anthropic_sys = format!("{AGENT_SYSTEM}{extra_block}{reg_instr}");
     let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
     messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": prompt }));
 
@@ -1330,14 +1570,25 @@ async fn agent_stream(
                     let name = blk.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                     let id = blk.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
                     let input = blk.get("input").cloned().unwrap_or(serde_json::json!({}));
+                    // M1.4 #7: send_message is an inter-agent tool — it enqueues on
+                    // the mailbox (needs db, not the broker), delivered ASYNC on
+                    // the recipient's lane. Handle it here before the file-tool path.
+                    let (result_text, is_err) = if name == "send_message" {
+                        let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
+                        let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                        match mailbox::send(&db, &scope_id, to, body, 0) {
+                            Ok(mailbox::SendResult::Queued { .. }) => (format!("message delivered to {to} (they'll reply on their own time)"), false),
+                            Ok(mailbox::SendResult::Refused { reason }) => (format!("not sent: {reason}"), true),
+                            Err(e) => (format!("send failed: {e}"), true),
+                        }
+                    } else {
                     // Run the tool inside catch_unwind so a PANIC (e.g. deep in
                     // genpdf table/render) becomes a VISIBLE tool error the model
                     // gets back — instead of aborting the turn task silently and
                     // leaving the UI dead. This is the safety net that turns
                     // "silently fails" into a diagnosable message.
-                    let (result_text, is_err) = {
-                        let b = &broker; let n = &name; let inp = &input;
-                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exec_tool(b, n, inp))) {
+                        let b = &broker; let n = &name; let inp = &input; let sid = &scope_id;
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exec_tool(b, sid, n, inp))) {
                             Ok(r) => r,
                             Err(e) => {
                                 let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
@@ -1385,7 +1636,7 @@ async fn agent_stream(
     // correctly-labeled checkpoint, and "Rewind here" restores the state produced
     // by that prompt — which is what a user intuitively expects. Skips silently if
     // nothing changed (no empty checkpoints). Best-effort: never blocks the reply.
-    if let Ok(root) = broker.root_for("default") {
+    if let Ok(root) = broker.root_for(&scope_id) {
         match checkpoint::snapshot(&root, &prompt) {
             Ok(Some(sha)) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("checkpoint {sha}") }); }
             Ok(None) => {}
@@ -1433,7 +1684,10 @@ pub fn run() {
             checkpoint_get_retention, checkpoint_set_retention, checkpoint_purge,
             conv_list, conv_load, conv_save, conv_delete, conv_reorder,
             agents_list, agents_create, agents_update, agents_delete,
-            agents_set_active, agents_get_active
+            agents_set_active, agents_get_active, agents_sharing_folder,
+            agent_context_add, agent_context_list, agent_context_remove,
+            agent_generate_soul,
+            mailbox_pending_counts, mailbox_take_next, mailbox_roster
         ])
         .setup(move |_app| {
             // M1.1: bring up the SQLite state spine + single-writer actor, then

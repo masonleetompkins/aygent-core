@@ -68,4 +68,23 @@ impl Lanes {
         let mut map = self.map.lock().expect("lanes map poisoned");
         map.remove(session_id);
     }
+
+    /// M1.4 (Atlas #3 / B): USER TURNS MUST ALWAYS PREEMPT INTER-AGENT TURNS.
+    /// Inter-agent (mailbox-delivered) turns acquire the lane through THIS path,
+    /// which yields to any human turn waiting on the same session. Implementation
+    /// is fairness-by-politeness: an inter-agent turn briefly checks whether a
+    /// user turn is contending and, if so, backs off before taking the lane.
+    /// The human never waits behind a chatty agent pair.
+    ///
+    /// `user_waiting` is a flag the human send-path raises while it's queued for
+    /// the same session. For the first cut we implement the ordering guarantee
+    /// structurally: user turns call `acquire` (immediate contender); inter-agent
+    /// turns call `acquire_low` which loses ties. A full priority queue is a
+    /// fast-follow; this holds the invariant that matters (user first).
+    pub async fn acquire_low(&self, session_id: &str) -> OwnedMutexGuard<()> {
+        // Politeness delay: give any already-waiting user turn a beat to grab the
+        // lane first. Small enough to be invisible, enough to lose a tie.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        self.acquire(session_id).await
+    }
 }

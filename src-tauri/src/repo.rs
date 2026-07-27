@@ -48,20 +48,26 @@ pub struct AgentProfile {
 }
 fn default_context_mode() -> String { "isolated".to_string() }
 
-/// App-generated id: time(ms, base36) + small non-crypto random suffix. Same
-/// scheme agents.rs used, kept for continuity of existing ids on migration.
+/// App-generated id: time(ms, base36) + a PROCESS-MONOTONIC counter + small
+/// non-crypto random suffix. The counter (Atlas E) guarantees uniqueness even
+/// when two agents/conversations are created in the same millisecond under
+/// concurrent multi-agent + inter-agent spawning — the old stack-pointer⊕ms
+/// scheme could collide. Still sortable-ish (time-prefixed), no ULID crate.
 fn new_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     let rand: u32 = {
         let x = &ms as *const _ as usize as u64;
-        let mut h = x ^ (ms as u64).wrapping_mul(0x9E3779B97F4A7C15);
+        let mut h = x ^ (ms as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ seq.wrapping_mul(0xD6E8FEB86659FD93);
         h ^= h >> 29; h = h.wrapping_mul(0xBF58476D1CE4E5B9); h ^= h >> 32;
         (h & 0xFFFFFFFF) as u32
     };
-    format!("a{}{:07x}", to_base36(ms as u64), rand)
+    format!("a{}{}{:07x}", to_base36(ms as u64), to_base36(seq & 0xFFF), rand)
 }
 fn to_base36(mut n: u64) -> String {
     const D: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
@@ -180,6 +186,12 @@ pub fn delete_agent(db: &Db, id: &str) -> Result<(), String> {
     let id = id.to_string();
     db.write(move |c| {
         let tx = c.transaction().map_err(|e| format!("txn: {e}"))?;
+        // mem_chunk predates the agent FK (SQLite can't ALTER-ADD one), so scrub
+        // this agent's chunks explicitly in the same txn (Atlas E: else orphaned
+        // context survives a delete). conversation/agent_settings/mailbox/
+        // agent_context all cascade via their FKs.
+        tx.execute("DELETE FROM mem_chunk WHERE owner_kind = 'agent' AND owner_id = ?1", params![id])
+            .map_err(|e| format!("scrub mem_chunk: {e}"))?;
         let n = tx.execute("DELETE FROM agent WHERE id = ?1", params![id])
             .map_err(|e| format!("delete agent: {e}"))?;
         if n == 0 { return Err("agent not found".into()); }
@@ -214,6 +226,19 @@ pub fn set_active(db: &Db, id: &str) -> Result<(), String> {
 /// Resolve an agentId to its jailed folder path (for the broker scope).
 pub fn folder_for(db: &Db, id: &str) -> Result<Option<String>, String> {
     Ok(get_agent(db, id)?.map(|a| a.folder_path).filter(|p| !p.is_empty()))
+}
+
+/// M1.4 (Atlas #2): the OTHER non-archived agents that share `folder_path` with
+/// the given agent (empty `exclude_id` to just list everyone on that folder).
+/// Agents on the SAME folder share checkpoint history + the folder write-lock
+/// (CONTRACTS §4) — the UI surfaces this so the user knows, and until the write
+/// lock lands (fast-follow) we WARN rather than silently allow torn writes.
+pub fn agents_sharing_folder(db: &Db, folder_path: &str, exclude_id: &str) -> Result<Vec<AgentProfile>, String> {
+    if folder_path.is_empty() { return Ok(vec![]); }
+    Ok(list_agents(db)?
+        .into_iter()
+        .filter(|a| !a.archived && a.id != exclude_id && a.folder_path == folder_path)
+        .collect())
 }
 
 // ── Conversations ───────────────────────────────────────────────────────────

@@ -153,6 +153,53 @@ function AgentForm({
   const [systemPrompt, setSystemPrompt] = useState(initial?.system_prompt ?? "");
   const [saving, setSaving] = useState(false);
 
+  // M1.4: agents that SHARE this folder (share checkpoint history + write-lock).
+  const [sharedWith, setSharedWith] = useState<AgentProfile[]>([]);
+  useEffect(() => {
+    if (!folder) { setSharedWith([]); return; }
+    invoke<AgentProfile[]>("agents_sharing_folder", { folderPath: folder, agentId: initial?.id ?? "" })
+      .then((a) => setSharedWith(a || [])).catch(() => setSharedWith([]));
+  }, [folder, initial?.id]);
+
+  // M1.4 #4: per-agent context documents (uploaded reference files).
+  const [ctxDocs, setCtxDocs] = useState<Array<{ id: number; filename: string; bytes: number; char_count: number }>>([]);
+  const [ctxBusy, setCtxBusy] = useState(false);
+  async function loadCtx() {
+    if (!initial?.id) { setCtxDocs([]); return; }
+    try { setCtxDocs(await invoke("agent_context_list", { agentId: initial.id }) || []); } catch { setCtxDocs([]); }
+  }
+  useEffect(() => { void loadCtx(); /* eslint-disable-next-line */ }, [initial?.id]);
+  async function uploadCtx(file: File) {
+    if (!initial?.id) return;
+    setCtxBusy(true);
+    try {
+      const buf = new Uint8Array(await file.arrayBuffer());
+      let bin = ""; for (let i = 0; i < buf.length; i++) bin += String.fromCharCode(buf[i]);
+      const b64 = btoa(bin);
+      await invoke("agent_context_add", { agentId: initial.id, filename: file.name, bytesB64: b64 });
+      await loadCtx();
+    } catch { /* surfaced via reload */ }
+    finally { setCtxBusy(false); }
+  }
+  async function removeCtx(id: number) {
+    if (!initial?.id) return;
+    try { await invoke("agent_context_remove", { agentId: initial.id, id }); await loadCtx(); } catch { /* ignore */ }
+  }
+
+  // M1.4 #5: generate a Soul.md (agent authors its own personality/values).
+  const [soulBrief, setSoulBrief] = useState("");
+  const [soulBusy, setSoulBusy] = useState(false);
+  const [soulErr, setSoulErr] = useState<string | null>(null);
+  async function generateSoul() {
+    if (!initial?.id) { setSoulErr("Save the agent first, then generate its soul."); return; }
+    setSoulBusy(true); setSoulErr(null);
+    try {
+      const soul = await invoke<string>("agent_generate_soul", { agentId: initial.id, brief: soulBrief });
+      setSystemPrompt(soul); // drop it into the editable field so the user can tweak before Save
+    } catch (e) { setSoulErr(String(e)); }
+    finally { setSoulBusy(false); }
+  }
+
   // Live model list for the chosen provider, most-powerful-first.
   const [models, setModels] = useState<string[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
@@ -286,6 +333,11 @@ function AgentForm({
           <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>
             This agent can only ever touch files inside this folder.
           </span>
+          {sharedWith.length > 0 && (
+            <span style={{ fontSize: 12, color: "var(--accent)", background: "color-mix(in srgb, var(--accent) 10%, transparent)", border: "1px solid color-mix(in srgb, var(--accent) 30%, transparent)", borderRadius: "var(--radius-control)", padding: "7px 10px" }}>
+              🔗 Shares this folder with {sharedWith.map((a) => a.name).join(", ")} — they share the same edit history &amp; checkpoints, and take turns writing so their changes never collide.
+            </span>
+          )}
         </label>
 
         <div style={{ display: "flex", gap: 12 }}>
@@ -343,15 +395,55 @@ function AgentForm({
           </label>
         </div>
 
-        <label style={fieldLabel}>System prompt (optional)
+        <label style={fieldLabel}>Custom instructions / Soul
           <textarea value={systemPrompt} onChange={(e) => setSystemPrompt(e.target.value)}
-            rows={4} placeholder="This agent's personality / instructions…"
+            rows={5} placeholder="This agent's personality, values & instructions… or generate a Soul below."
             style={{
               background: "var(--bg)", border: "var(--border-width) solid var(--line)",
               borderRadius: "var(--radius-control)", color: "var(--text)", padding: "9px 12px",
               fontSize: 14, resize: "vertical", fontFamily: "inherit",
             }} />
         </label>
+
+        {/* M1.4 #5: Generate a Soul.md — the agent authors its own personality. */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "12px 14px" }}>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>✨ Generate a Soul</div>
+          <span style={{ ...hint, fontSize: 12 }}>Let the agent write its own personality &amp; values. It fills the field above — you can edit before saving.</span>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <Input value={soulBrief} onChange={(e) => setSoulBrief(e.target.value)}
+              placeholder="optional vibe: 'warm, rigorous research partner'…" />
+            <Button variant="secondary" onClick={generateSoul} disabled={soulBusy || !initial?.id}>
+              {soulBusy ? "Writing…" : "Generate Soul"}
+            </Button>
+          </div>
+          {!initial?.id && <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Save the agent first, then generate its soul.</span>}
+          {soulErr && <span style={{ ...hint, fontSize: 12, color: "var(--danger)" }}>{soulErr}</span>}
+        </div>
+
+        {/* M1.4 #4: Per-agent context documents. */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "12px 14px" }}>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>📎 Context documents</div>
+          <span style={{ ...hint, fontSize: 12 }}>Reference files this agent always has in mind (text, markdown, code, JSON…). Stored privately — never inside your folder.</span>
+          {ctxDocs.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {ctxDocs.map((d) => (
+                <div key={d.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+                  <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{d.filename}</span>
+                  <span style={{ ...hint, fontSize: 11, color: "var(--text-faint)" }}>{d.char_count > 0 ? `${d.char_count.toLocaleString()} chars` : "stored (not readable)"}</span>
+                  <button onClick={() => removeCtx(d.id)} title="Remove" style={{ background: "none", border: "none", cursor: "pointer", color: "var(--danger)", fontSize: 13 }}>✕</button>
+                </div>
+              ))}
+            </div>
+          )}
+          <label style={{ display: "inline-flex", alignItems: "center", gap: 8, cursor: initial?.id ? "pointer" : "not-allowed", opacity: initial?.id ? 1 : 0.5 }}>
+            <input type="file" style={{ display: "none" }} disabled={!initial?.id || ctxBusy}
+              onChange={(e) => { const f = e.target.files?.[0]; if (f) void uploadCtx(f); e.currentTarget.value = ""; }} />
+            <span style={{ fontSize: 13, padding: "6px 12px", borderRadius: "var(--radius-control)", border: "var(--border-width) solid var(--line)", background: "var(--bg)" }}>
+              {ctxBusy ? "Uploading…" : "+ Upload document"}
+            </span>
+          </label>
+          {!initial?.id && <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Save the agent first, then attach documents.</span>}
+        </div>
 
         <div style={{ display: "flex", gap: 8 }}>
           <Button onClick={save} disabled={saving || !name.trim()}>{initial ? "Save" : "Create agent"}</Button>

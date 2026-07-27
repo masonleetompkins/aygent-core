@@ -153,6 +153,23 @@ fn flatten_text(content: &serde_json::Value) -> String {
 /// Stream one OpenAI/OpenRouter turn. Emits TextDelta live + ToolUse events.
 /// Returns (assistant_message, stop_reason) where assistant_message is the
 /// OpenAI-native assistant object (with tool_calls if any) to push into history.
+/// M1.4: a NON-streaming completion (used by Soul.md generation). Collects the
+/// streamed text into one string via openai_stream_turn with no tools.
+pub async fn complete(provider: &str, api_key: &str, model: &str, user_msg: &str) -> Result<String, String> {
+    let messages = json!([{ "role": "user", "content": user_msg }]);
+    let no_tools = json!([]);
+    let mut text = String::new();
+    let (assistant, _stop) = openai_stream_turn(
+        provider, api_key, model, "", &messages, &no_tools,
+        |ev| {
+            if let StreamEvent::TextDelta { text: t } = &ev { text.push_str(t); }
+        },
+    ).await?;
+    // Prefer accumulated stream text; fall back to the assistant message content.
+    if !text.trim().is_empty() { return Ok(text); }
+    Ok(assistant.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string())
+}
+
 pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
     provider: &str,
     api_key: &str,

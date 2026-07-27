@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 /// Current schema version. Bump when adding a migration step below.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// The DB file name under <app_data>.
 pub const DB_FILE: &str = "aygent.db";
@@ -91,7 +91,18 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         v = 1;
     }
 
-    // Future: `if v < 2 { ... set_version(conn, 2)?; }`
+    if v < 2 {
+        // M1.4: mailbox (agent-to-agent messaging) + agent_context (uploaded
+        // context docs index). mem_chunk gains no FK retroactively (SQLite can't
+        // ALTER-ADD a FK), so we enforce mem_chunk cleanup in delete_agent's txn
+        // instead (see repo::delete_agent). Both new tables are created fresh
+        // WITH the agent FK + ON DELETE CASCADE.
+        conn.execute_batch(SCHEMA_V2)
+            .map_err(|e| format!("migrate v2: {e}"))?;
+        set_version(conn, 2)?;
+        v = 2;
+    }
+
     let _ = v;
     Ok(())
 }
@@ -172,4 +183,56 @@ CREATE TABLE IF NOT EXISTS mem_chunk (
   updated_at    INTEGER NOT NULL DEFAULT 0,
   UNIQUE(owner_kind, owner_id, source_path, chunk_ordinal)
 );
+"#;
+
+/// SCHEMA v2 (M1.4) — inter-agent mailbox + per-agent context-document index.
+/// Both carry an agent FK with ON DELETE CASCADE so deleting an agent cleans up
+/// its messages + context rows (the orphan risk Atlas flagged). mem_chunk itself
+/// predates the FK; delete_agent scrubs its rows in the same txn.
+const SCHEMA_V2: &str = r#"
+-- Inter-agent messages (Atlas B). A durable, ordered, inspectable mailbox.
+-- Delivery = a NEW async turn on the recipient's lane (never synchronous).
+-- depth = hop-count TTL (dropped at 0) to kill infinite ping-pong; root_id +
+-- the tree budget row cap runaway cost; ancestry = cycle guard.
+CREATE TABLE IF NOT EXISTS mailbox (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_agent    TEXT NOT NULL,
+  to_agent      TEXT NOT NULL,
+  body          TEXT NOT NULL DEFAULT '',
+  root_id       INTEGER NOT NULL DEFAULT 0,   -- conversation-tree root (cost budget key)
+  depth         INTEGER NOT NULL DEFAULT 0,   -- hops remaining (TTL)
+  ancestry      TEXT NOT NULL DEFAULT '',     -- comma list of agent ids in this chain (cycle guard)
+  status        TEXT NOT NULL DEFAULT 'pending', -- pending|delivered|dropped|dead
+  created_at    INTEGER NOT NULL DEFAULT 0,
+  delivered_at  INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY (to_agent) REFERENCES agent(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_mailbox_to ON mailbox(to_agent, status);
+CREATE INDEX IF NOT EXISTS idx_mailbox_root ON mailbox(root_id);
+
+-- Per-conversation-tree cost budget (Atlas B: the runaway-cost backstop).
+-- One row per message tree; turns increments until it hits the cap, then
+-- delivery is refused. Cheap, durable, inspectable.
+CREATE TABLE IF NOT EXISTS mailbox_budget (
+  root_id     INTEGER PRIMARY KEY,
+  turns       INTEGER NOT NULL DEFAULT 0,
+  cap         INTEGER NOT NULL DEFAULT 12,
+  created_at  INTEGER NOT NULL DEFAULT 0
+);
+
+-- Per-agent uploaded context documents (Atlas C). Stored Rust-side in app-data
+-- (OUT of the jail so they never pollute the folder's checkpoint stream). This
+-- is the human-facing index; the extracted text lives chunked in mem_chunk
+-- (owner_kind='agent') for M1.7 retrieval. `stored_path` is app-data-relative.
+CREATE TABLE IF NOT EXISTS agent_context (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id     TEXT NOT NULL,
+  filename     TEXT NOT NULL,
+  stored_path  TEXT NOT NULL,
+  bytes        INTEGER NOT NULL DEFAULT 0,
+  char_count   INTEGER NOT NULL DEFAULT 0,
+  added_at     INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY (agent_id) REFERENCES agent(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_agent_context_agent ON agent_context(agent_id);
 "#;
