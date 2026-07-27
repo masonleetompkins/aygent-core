@@ -339,8 +339,10 @@ fn has_provider_key(provider: String) -> bool {
 /// also feeds the Phase-1 Settings model picker).
 #[tauri::command]
 async fn anthropic_models() -> Result<Vec<String>, String> {
-    let key = keychain::get_key("anthropic")
-        .map_err(|_| "no anthropic key set — add one first".to_string())?;
+    // Surface the RAW keyring error (see keychain::get_key) instead of a
+    // hardcoded "no key set" — otherwise a present-but-unreadable Keychain
+    // entry looks identical to a genuinely-absent one in the UI.
+    let key = keychain::get_key("anthropic")?;
     provider::anthropic_list_models(&key).await
 }
 
@@ -349,8 +351,7 @@ async fn anthropic_models() -> Result<Vec<String>, String> {
 /// an app update.
 #[tauri::command]
 async fn openai_models(provider: String) -> Result<Vec<String>, String> {
-    let key = keychain::get_key(&provider)
-        .map_err(|_| format!("no {provider} key set — add one first"))?;
+    let key = keychain::get_key(&provider)?;
     openai_provider::list_models(&provider, &key).await
 }
 
