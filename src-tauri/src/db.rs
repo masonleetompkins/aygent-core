@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 /// Current schema version. Bump when adding a migration step below.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// The DB file name under <app_data>.
 pub const DB_FILE: &str = "aygent.db";
@@ -124,6 +124,16 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("migrate v4: {e}"))?;
         set_version(conn, 4)?;
         v = 4;
+    }
+
+    if v < 5 {
+        // M1.8 Slice 4: global scheduler kill switch. One bool on the app_state
+        // singleton (no new table for a single flag). ALTER ADD is fine here —
+        // no FK/constraint change. Existing row keeps default 0 (not paused).
+        conn.execute_batch(SCHEMA_V5)
+            .map_err(|e| format!("migrate v5: {e}"))?;
+        set_version(conn, 5)?;
+        v = 5;
     }
 
     let _ = v;
@@ -376,4 +386,12 @@ CREATE TABLE IF NOT EXISTS schedule_run (
   FOREIGN KEY (schedule_id) REFERENCES schedule(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_run_by_schedule ON schedule_run (schedule_id, fired_at DESC);
+"#;
+
+/// SCHEMA v5 (M1.8 Slice 4) — global scheduler pause (kill switch). A single
+/// bool on the app_state singleton; the ticker checks it every tick and fires
+/// nothing while set. Durable so a pause survives relaunch (schedules never
+/// silently resume). ALTER ADD COLUMN is forward-only + safe (no constraint).
+const SCHEMA_V5: &str = r#"
+ALTER TABLE app_state ADD COLUMN scheduler_paused INTEGER NOT NULL DEFAULT 0;
 "#;

@@ -124,6 +124,20 @@ pub fn compute_next(spec: &ScheduleSpec, after_ms: i64) -> i64 {
     compute_next_tz(spec, after_ms, "local")
 }
 
+/// The LOCAL calendar day as an integer YYYYMMDD, used as the daily-counter
+/// reset key. "Local" here means the schedule's tz (so the day rolls at the
+/// user's midnight, not UTC's).
+fn local_yyyymmdd(at_ms: i64, tz: &str) -> i64 {
+    use chrono::{Datelike, TimeZone, Utc};
+    let zone = resolve_tz(tz);
+    let dt = Utc
+        .timestamp_millis_opt(at_ms)
+        .single()
+        .unwrap_or_else(Utc::now)
+        .with_timezone(&zone);
+    (dt.year() as i64) * 10_000 + (dt.month() as i64) * 100 + (dt.day() as i64)
+}
+
 /// Resolve an IANA tz name to a chrono_tz::Tz. "local" (or unknown) falls back
 /// to the system local zone's current fixed offset wrapped as UTC-equivalent.
 /// chrono-tz has no "local" entry, so we approximate: if the caller stored a
@@ -218,22 +232,72 @@ fn fire_one(db: &Db, due: &Due, now: i64) -> Result<bool, String> {
     let next = compute_next_tz(&due.spec, now, &due.tz);
     let id = due.id;
     let agent_id = due.agent_id.clone();
-    // Only AgentTurn enqueues to the drainer in Slice 1; SystemJob is Slice 5.
+    // Only AgentTurn enqueues to the drainer; SystemJob is Slice 5.
     let turn_body: Option<String> = match &due.action {
         ScheduleAction::AgentTurn { prompt_template, .. } => Some(prompt_template.clone()),
         ScheduleAction::SystemJob { .. } => None,
     };
     let body = turn_body.clone().unwrap_or_default();
     let recipient = agent_id.clone(); // the fired turn is addressed to this agent
+    let today = local_yyyymmdd(now, &due.tz);
 
     db.write(move |c| {
         let tx = c.transaction().map_err(|e| format!("txn: {e}"))?;
-        // Advance timing + count. daily counter logic is Slice 4; Slice 1 just
-        // bumps last_fired + next_fire so the ticker doesn't re-fire instantly.
+
+        // ---- GUARDRAILS (Slice 4) ----------------------------------------
+        // Read the current counters + caps. Reset the daily counters if the
+        // local day rolled since count_reset_day.
+        let (mut fires, mut cost, cap_fires, cap_cost, reset_day): (i64, i64, i64, Option<i64>, i64) =
+            tx.query_row(
+                "SELECT daily_fire_count, cost_units_today, max_fires_per_day, max_cost_units_per_day, count_reset_day
+                 FROM schedule WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            ).map_err(|e| format!("read counters: {e}"))?;
+        if reset_day != today {
+            fires = 0;
+            cost = 0;
+        }
+
+        // ALWAYS advance next_fire_at + last_fired (so a rate-limited schedule
+        // doesn't re-fire in a tight loop) and persist the (possibly reset)
+        // counters + reset day.
         tx.execute(
-            "UPDATE schedule SET last_fired_at = ?2, next_fire_at = ?3, updated_at = ?2 WHERE id = ?1",
-            params![id, now, next],
+            "UPDATE schedule SET last_fired_at = ?2, next_fire_at = ?3, updated_at = ?2,
+                daily_fire_count = ?4, cost_units_today = ?5, count_reset_day = ?6 WHERE id = ?1",
+            params![id, now, next, fires, cost, today],
         ).map_err(|e| format!("advance schedule: {e}"))?;
+
+        // Fire-count cap: refuse if we've already hit today's limit.
+        if cap_fires > 0 && fires >= cap_fires {
+            tx.execute(
+                "INSERT INTO schedule_run (schedule_id, agent_id, fired_at, state, skip_reason) VALUES (?1,?2,?3,'skipped','rate_limited')",
+                params![id, agent_id, now],
+            ).map_err(|e| format!("log skip: {e}"))?;
+            tx.commit().map_err(|e| format!("commit: {e}"))?;
+            return Ok(false);
+        }
+        // Cost ceiling: if today's accrued cost is at/over the ceiling, AUTO-PAUSE
+        // the schedule for the day (Atlas's non-negotiable guardrail) + log why.
+        if let Some(ceiling) = cap_cost {
+            if ceiling > 0 && cost >= ceiling {
+                tx.execute("UPDATE schedule SET enabled = 0 WHERE id = ?1", params![id])
+                    .map_err(|e| format!("auto-pause: {e}"))?;
+                tx.execute(
+                    "INSERT INTO schedule_run (schedule_id, agent_id, fired_at, state, skip_reason, result_snippet)
+                     VALUES (?1,?2,?3,'skipped','cost_ceiling',?4)",
+                    params![id, agent_id, now, format!("auto-paused: hit daily cost ceiling ({ceiling})")],
+                ).map_err(|e| format!("log ceiling: {e}"))?;
+                tx.commit().map_err(|e| format!("commit: {e}"))?;
+                return Ok(false);
+            }
+        }
+
+        // Passed the gate — count this fire.
+        tx.execute(
+            "UPDATE schedule SET daily_fire_count = daily_fire_count + 1 WHERE id = ?1",
+            params![id],
+        ).map_err(|e| format!("bump fire count: {e}"))?;
 
         // Durable run row.
         let state = if turn_body.is_some() { "queued" } else { "ok" };
@@ -296,6 +360,7 @@ pub fn create(
     tz: &str,
     action: &ScheduleAction,
     max_fires_per_day: i64,
+    max_cost_units_per_day: Option<i64>,
 ) -> Result<i64, String> {
     let now = now_ms();
     let next = compute_next_tz(spec, now, tz);
@@ -304,15 +369,13 @@ pub fn create(
     let (agent_id, name, kind, tz) = (agent_id.to_string(), name.to_string(), kind.to_string(), tz.to_string());
     db.write(move |c| {
         c.execute(
-            "INSERT INTO schedule (agent_id,name,kind,spec_json,tz,action_json,enabled,max_fires_per_day,next_fire_at,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,1,?7,?8,?9,?9)",
-            params![agent_id, name, kind, spec_json, action_json_holder(&action_json), tz, max_fires_per_day, next, now],
+            "INSERT INTO schedule (agent_id,name,kind,spec_json,tz,action_json,enabled,max_fires_per_day,max_cost_units_per_day,next_fire_at,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,1,?7,?8,?9,?10,?10)",
+            params![agent_id, name, kind, spec_json, action_json, tz, max_fires_per_day, max_cost_units_per_day, next, now],
         ).map_err(|e| format!("insert schedule: {e}"))?;
         Ok(c.last_insert_rowid())
     })
 }
-// tiny helper so the closure captures a &str cleanly without a move-order snag
-fn action_json_holder(s: &str) -> String { s.to_string() }
 
 /// Enable/disable a schedule (pause a single one).
 pub fn set_enabled(db: &Db, id: i64, enabled: bool) -> Result<(), String> {
@@ -322,6 +385,37 @@ pub fn set_enabled(db: &Db, id: i64, enabled: bool) -> Result<(), String> {
             "UPDATE schedule SET enabled = ?2, updated_at = ?3 WHERE id = ?1",
             params![id, if enabled { 1 } else { 0 }, now],
         ).map_err(|e| format!("set enabled: {e}"))?;
+        Ok(())
+    })
+}
+
+/// Global kill switch: is the whole scheduler paused? (Durable on app_state.)
+fn is_globally_paused(db: &Db) -> bool {
+    db.reader()
+        .ok()
+        .and_then(|c| {
+            c.query_row("SELECT scheduler_paused FROM app_state WHERE id = 0", [], |r| r.get::<_, i64>(0))
+                .optional()
+                .ok()
+                .flatten()
+        })
+        .map(|v| v != 0)
+        .unwrap_or(false)
+}
+
+/// Read the global pause flag (for the UI toggle state).
+pub fn get_paused(db: &Db) -> bool {
+    is_globally_paused(db)
+}
+
+/// Flip the global pause. Durable (survives relaunch — schedules never silently
+/// resume). The caller nudges the ticker so it takes effect immediately.
+pub fn set_paused(db: &Db, paused: bool) -> Result<(), String> {
+    db.write(move |c| {
+        c.execute(
+            "UPDATE app_state SET scheduler_paused = ?1 WHERE id = 0",
+            params![if paused { 1 } else { 0 }],
+        ).map_err(|e| format!("set paused: {e}"))?;
         Ok(())
     })
 }
@@ -363,7 +457,10 @@ pub fn spawn(app: AppHandle, db: Db, _broker: Arc<Broker>, _lanes: Lanes, sig: S
                 _ = sig.notified() => { continue; } // hot edit — recompute
             }
 
-            // 2) Fire everything due.
+            // 2) Fire everything due — UNLESS globally paused (kill switch).
+            if is_globally_paused(&db) {
+                continue; // wake_at still recomputed each loop; fire nothing
+            }
             let now = now_ms();
             let due = due_now(&db, now);
             let mut enqueued_any = false;

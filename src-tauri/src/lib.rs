@@ -472,6 +472,7 @@ fn scheduler_create(
     action: serde_json::Value,
     tz: Option<String>,
     max_fires_per_day: Option<i64>,
+    max_cost_units_per_day: Option<i64>,
 ) -> Result<i64, String> {
     // Parse the UI's JSON into the typed enums (tolerant of the UI's field names).
     let spec: scheduler::ScheduleSpec = serde_json::from_value(when)
@@ -489,6 +490,7 @@ fn scheduler_create(
         &db, &agent_id, &name, kind, &spec,
         tz.as_deref().unwrap_or("local"), &act,
         max_fires_per_day.unwrap_or(2),
+        max_cost_units_per_day,
     )?;
     sched.nudge(); // hot: ticker recomputes wake_at immediately
     Ok(id)
@@ -517,6 +519,26 @@ fn scheduler_delete(
     scheduler::delete(&db, id)?;
     sched.nudge();
     Ok(())
+}
+
+/// Global pause-all kill switch (Slice 4). Durable + hot. `paused=true` stops
+/// ALL scheduled fires instantly (survives relaunch — schedules never silently
+/// resume). Returns the new state.
+#[tauri::command]
+fn scheduler_set_paused(
+    db: tauri::State<writer::Db>,
+    sched: tauri::State<scheduler::SchedSignal>,
+    paused: bool,
+) -> Result<bool, String> {
+    scheduler::set_paused(&db, paused)?;
+    sched.nudge();
+    Ok(paused)
+}
+
+/// Read the global pause state (for the UI toggle).
+#[tauri::command]
+fn scheduler_get_paused(db: tauri::State<writer::Db>) -> Result<bool, String> {
+    Ok(scheduler::get_paused(&db))
 }
 
 // ---- M1.8 Scheduler: read-only inspection (Slice 1 observability) --------
@@ -2297,7 +2319,8 @@ pub fn run() {
             memory_ingest, memory_retrieve, memory_stats, pick_vault_folder,
             memory_append_daily, memory_gate_check, memory_remember,
             memory_auto_capture, scheduler_list, scheduler_runs,
-            scheduler_create, scheduler_set_enabled, scheduler_delete
+            scheduler_create, scheduler_set_enabled, scheduler_delete,
+            scheduler_set_paused, scheduler_get_paused
         ])
         .setup(move |_app| {
             // M1.1: bring up the SQLite state spine + single-writer actor, then
