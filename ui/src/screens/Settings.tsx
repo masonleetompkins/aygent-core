@@ -23,11 +23,21 @@ const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 // ranking + labels now (see screens/Agents.tsx: modelRank/modelLabel).
 
 export function Settings({
-  mode, accent, onTheme, folder, onPickFolder,
+  mode, accent, onTheme, folder, onPickFolder, agentId,
 }: {
   mode: Mode; accent: string; onTheme: (m: Mode, a: string) => void;
-  folder: string | null; onPickFolder: () => void;
+  folder: string | null; onPickFolder: () => void; agentId: string | null;
 }) {
+  // M1.7: per-agent auto-remember toggle (surface the setting we built).
+  const [autoRemember, setAutoRemember] = useState(true);
+  useEffect(() => {
+    if (!agentId) return;
+    invoke<boolean>("memory_get_auto_remember", { agentId }).then(setAutoRemember).catch(() => {});
+  }, [agentId]);
+  async function toggleAutoRemember(on: boolean) {
+    setAutoRemember(on);
+    if (agentId) { try { await invoke("memory_set_auto_remember", { agentId, enabled: on }); } catch { /* ignore */ } }
+  }
   const [apiKey, setApiKey] = useState("");
   const [keySet, setKeySet] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
@@ -178,6 +188,23 @@ export function Settings({
         activePath={selProvider === "local" ? selModel : ""}
         onChoose={chooseLocalModel}
       />
+
+      {/* MEMORY (M1.7) */}
+      <Card title="Memory">
+        <p style={hint}>
+          When on, this agent quietly remembers durable facts you mention in conversation
+          (preferences, decisions, people) into its vault — salience-gated and de-duplicated, so it
+          never clutters. Off = it only remembers when you explicitly ask.
+        </p>
+        {!agentId ? (
+          <p style={{ ...hint, color: "var(--text-faint)" }}>Pick an agent in the rail to configure its memory.</p>
+        ) : (
+          <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 14, fontWeight: 600 }}>
+            <input type="checkbox" checked={autoRemember} onChange={(e) => toggleAutoRemember(e.target.checked)} />
+            Auto-remember from conversation
+          </label>
+        )}
+      </Card>
 
       {/* CHECKPOINTS */}
       <Card title="Checkpoints">

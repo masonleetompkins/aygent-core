@@ -133,7 +133,7 @@ export function App() {
             />
           )}
           {screen === "settings" && (
-            <Settings mode={mode} accent={accent} onTheme={onTheme} folder={folder} onPickFolder={pickFolder} />
+            <Settings mode={mode} accent={accent} onTheme={onTheme} folder={folder} onPickFolder={pickFolder} agentId={activeAgent?.id ?? null} />
           )}
           {screen === "checkpoints" && <Checkpoints folder={folder} />}
           {screen === "scheduler" && <Scheduler agentId={activeAgent?.id ?? null} />}
