@@ -10,7 +10,7 @@ import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, get
 
 type ToolLine = { name: string; path: string; ok?: boolean; detail?: string };
 type Msg =
-  | { role: "user"; text: string }
+  | { role: "user"; text: string; memory?: string }
   | { role: "assistant"; text: string; tools: ToolLine[]; streaming?: boolean };
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
@@ -306,8 +306,15 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
       historyRef.current = updated;
       // Compose the final saved msgs from the store's completed live slice.
       const done = getAgentTurnSnapshot(myAgent);
+      // Attach the 🧠 auto-capture note to the USER message that triggered it, so
+      // it renders as a small badge under that bubble AND persists (the live
+      // turn.memory is discarded on finalize otherwise). Mason 07-28.
+      const withUserMem: Msg[] = withUser.map((mm, idx) =>
+        idx === withUser.length - 1 && mm.role === "user" && done.memory
+          ? { ...mm, memory: done.memory } : mm
+      );
       const finalMsgs: Msg[] = [
-        ...withUser,
+        ...withUserMem,
         { role: "assistant", text: done.liveText || "(done)", tools: done.liveTools as ToolLine[], streaming: false },
       ];
       // Only overwrite the visible pane if we're STILL viewing this agent+conv.
@@ -518,6 +525,13 @@ function Bubble({ m }: { m: Msg }) {
           : <Markdown text={m.text} />)}
         {!isUser && m.role === "assistant" && m.streaming && !m.text && <Thinking />}
       </div>
+      {isUser && m.role === "user" && m.memory && (
+        <span style={{
+          alignSelf: "flex-end", marginTop: 4, fontSize: 12, color: "var(--text-muted)",
+          background: "var(--surface)", border: "var(--border-width) solid var(--line)",
+          borderRadius: "var(--radius-pill)", padding: "2px 10px",
+        }}>{m.memory}</span>
+      )}
     </div>
   );
 }

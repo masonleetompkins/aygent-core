@@ -30,6 +30,7 @@ export type TurnState = {
   liveText: string;          // accumulated streamed tokens for the in-flight assistant msg
   liveTools: ToolCard[];     // tool cards for the in-flight turn
   info?: string;             // latest info line (model, checkpoint…)
+  memory?: string;           // 🧠 auto-capture note for THIS turn (shown under the user msg)
   error?: string;
 };
 
@@ -178,6 +179,7 @@ export async function runTurn(a: RunArgs): Promise<unknown[]> {
     const text = m.text ?? m.TextDelta?.text ?? m.Info?.text ?? "";
     if (kind === "TextDelta") { cur.turn = { ...cur.turn, liveText: cur.turn.liveText + text }; emit(); }
     else if (kind === "Info") { cur.turn = { ...cur.turn, info: text }; emit(); }
+    else if (kind === "MemoryCaptured") { cur.turn = { ...cur.turn, memory: m.text }; emit(); }
     else if (kind === "ToolUse") {
       cur.turn = { ...cur.turn, liveTools: [...cur.turn.liveTools, { name: m.name, path: m.input?.path, running: true }] }; emit();
     } else if (kind === "ToolResult") {

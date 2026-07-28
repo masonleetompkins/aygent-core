@@ -2255,7 +2255,13 @@ async fn run_auto_capture(
                     (0, rf) => format!("\u{1F9E0} already knew that ({rf} reinforced)"),
                     (c, rf) => format!("\u{1F9E0} remembered {c} new, reinforced {rf}"),
                 };
-                let _ = app.emit(channel, &provider::StreamEvent::Info { text });
+                // Emit a DEDICATED event (not a transient Info line, which the UI
+                // dropped on finalize). The chat renders this as a small badge
+                // under the USER's message that triggered it. (Mason 07-28.)
+                let _ = app.emit(channel, &serde_json::json!({
+                    "kind": "MemoryCaptured", "text": text,
+                    "created": r.created, "reinforced": r.reinforced,
+                }));
             }
         }
         Err(e) => eprintln!("[aygent][mem] auto-capture failed: {e}"),
