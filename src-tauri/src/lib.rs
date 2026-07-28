@@ -2248,9 +2248,14 @@ async fn run_auto_capture(
         Ok(r) => {
             eprintln!("[aygent][mem] auto-capture: {} candidate(s) → {} created, {} reinforced", r.candidates, r.created, r.reinforced);
             if r.created + r.reinforced > 0 {
-                let _ = app.emit(channel, &provider::StreamEvent::Info {
-                    text: format!("\u{1F9E0} remembered {} new, reinforced {}", r.created, r.reinforced),
-                });
+                // Word it naturally for each case (reinforce-only was silent
+                // before — Mason 07-28: '0 created, 2 reinforced' showed nothing).
+                let text = match (r.created, r.reinforced) {
+                    (c, 0) => format!("\u{1F9E0} remembered {c} new"),
+                    (0, rf) => format!("\u{1F9E0} already knew that ({rf} reinforced)"),
+                    (c, rf) => format!("\u{1F9E0} remembered {c} new, reinforced {rf}"),
+                };
+                let _ = app.emit(channel, &provider::StreamEvent::Info { text });
             }
         }
         Err(e) => eprintln!("[aygent][mem] auto-capture failed: {e}"),
