@@ -10,6 +10,7 @@ import { Playground } from "./screens/Playground";
 import { Chat } from "./screens/Chat";
 import { Checkpoints } from "./screens/Checkpoints";
 import { Tools } from "./screens/Tools";
+import { Scheduler } from "./screens/Scheduler";
 import { initTheme, saveTheme, type Mode } from "./lib/theme";
 import { startHeadlessWatcher } from "./lib/turns";
 
@@ -134,6 +135,7 @@ export function App() {
             <Settings mode={mode} accent={accent} onTheme={onTheme} folder={folder} onPickFolder={pickFolder} />
           )}
           {screen === "checkpoints" && <Checkpoints folder={folder} />}
+          {screen === "scheduler" && <Scheduler agentId={activeAgent?.id ?? null} />}
           {screen === "tools" && <Tools folder={folder} />}
           {screen === "playground" && <Playground folder={folder} ws={ws} agentId={activeAgent?.id ?? null} />}
         </div>

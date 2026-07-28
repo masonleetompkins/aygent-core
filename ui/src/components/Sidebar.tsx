@@ -13,7 +13,7 @@ export const NAV: NavItem[] = [
   { id: "chat", label: "Chat", icon: "💬", enabled: true },
   { id: "agents", label: "Agents", icon: "🧠", enabled: true },
   { id: "tools", label: "Tools", icon: "🧰", enabled: true },
-  { id: "scheduler", label: "Scheduler", icon: "⏰", enabled: false },
+  { id: "scheduler", label: "Scheduler", icon: "⏰", enabled: true },
   { id: "connections", label: "Connections", icon: "🔌", enabled: false },
   { id: "checkpoints", label: "Checkpoints", icon: "↩", enabled: true },
   { id: "settings", label: "Settings", icon: "⚙", enabled: true },
