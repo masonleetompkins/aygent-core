@@ -10,6 +10,7 @@ mod agents;
 mod broker;
 mod broker_ws;
 mod catalog;
+mod connections;
 mod checkpoint;
 mod context_docs;
 mod conversations;
@@ -452,6 +453,42 @@ async fn memory_auto_capture(
         "",
         &embed_model, "",
     ).await
+}
+
+// ---- M1.9 Connections: GitHub (Slice 1) ----------------------------------
+// A Connection = keychain-backed bearer credential + non-secret metadata,
+// exposed to an agent as Rust-side token-attached tools (connections.rs).
+
+/// Connect GitHub via a fine-grained/classic PAT. Validates GET /user, stores
+/// the token in the keychain, upserts the connection row. Returns the login.
+#[tauri::command]
+async fn github_connect(db: tauri::State<'_, writer::Db>, token: String) -> Result<serde_json::Value, String> {
+    let (id, login) = connections::connect_github_pat(&db, &token).await?;
+    Ok(serde_json::json!({ "id": id, "login": login }))
+}
+
+/// List all connections (non-secret metadata) for the Connections catalog.
+#[tauri::command]
+fn connections_list(db: tauri::State<writer::Db>) -> Result<Vec<connections::ConnectionRow>, String> {
+    connections::list(&db)
+}
+
+/// Disconnect (delete the row + wipe keychain slots).
+#[tauri::command]
+fn connection_disconnect(db: tauri::State<writer::Db>, id: i64) -> Result<(), String> {
+    connections::disconnect(&db, id)
+}
+
+/// Enable/disable a connection for a specific agent (per-agent toggle).
+#[tauri::command]
+fn connection_set_agent_enabled(db: tauri::State<writer::Db>, agent_id: String, connection_id: i64, enabled: bool) -> Result<(), String> {
+    connections::set_agent_enabled(&db, &agent_id, connection_id, enabled)
+}
+
+/// Which connection ids are enabled for an agent (per-agent UI state).
+#[tauri::command]
+fn connection_enabled_for_agent(db: tauri::State<writer::Db>, agent_id: String) -> Result<Vec<i64>, String> {
+    connections::enabled_ids_for_agent(&db, &agent_id)
 }
 
 // ---- M1.8 Scheduler: CRUD (Slice 2) --------------------------------------
@@ -1635,9 +1672,34 @@ fn agent_tools_for(app: &tauri::AppHandle, folder: Option<&str>) -> (serde_json:
 /// M1.4: like agent_tools_for but adds the inter-agent `send_message` tool when
 /// `has_peers` is true (the agent has at least one other agent to talk to).
 fn agent_tools_for_ex(app: &tauri::AppHandle, folder: Option<&str>, has_peers: bool) -> (serde_json::Value, String) {
+    agent_tools_for_full(app, folder, has_peers, None)
+}
+
+/// Full assembler that ALSO adds connection tools (e.g. GitHub) when the agent
+/// has that connection enabled. `db`/`agent_id` are threaded so we can check
+/// per-agent enablement; None keeps the old behavior (no connection tools).
+fn agent_tools_for_full(
+    app: &tauri::AppHandle,
+    folder: Option<&str>,
+    has_peers: bool,
+    conn_ctx: Option<(&writer::Db, &str)>,
+) -> (serde_json::Value, String) {
     let mut tools = base_tools();
     if has_peers { tools.push(send_message_tool()); }
     let mut extra_instructions = String::new();
+
+    // CONNECTION TOOLS (M1.9): if GitHub is connected + enabled for this agent,
+    // surface its read tools. Token is attached Rust-side at call time.
+    if let Some((db, agent_id)) = conn_ctx {
+        if connections::provider_enabled_for_agent(db, agent_id, "github") {
+            tools.push(serde_json::json!({
+                "name": "github_list_prs",
+                "description": "List YOUR open GitHub pull requests (authored by you across all repos). Use when the user asks about their PRs / what they're working on. No arguments.",
+                "input_schema": { "type": "object", "properties": {} }
+            }));
+            extra_instructions.push_str("\n\nYou have GitHub connected: use github_list_prs to read the user's open pull requests.");
+        }
+    }
 
     if let (Ok(ad), Some(f)) = (app_data(app), folder) {
         for t in tools_registry::enabled_tools(&ad, f) {
@@ -1905,7 +1967,7 @@ async fn agent_stream(
             let _ = checkpoint::snapshot(&root, "baseline");
         }
 
-        let (tools, reg_instr) = agent_tools_for_ex(&app, folder.as_deref(), !roster.is_empty());
+        let (tools, reg_instr) = agent_tools_for_full(&app, folder.as_deref(), !roster.is_empty(), Some((&db, &scope_id)));
         let pdf_cfg = pdf_config_for(&app, folder.as_deref());
         let sys = format!("{AGENT_SYSTEM}{extra_block}{reg_instr}");
         let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
@@ -1998,7 +2060,7 @@ async fn agent_stream(
         let _ = checkpoint::snapshot(&root, "baseline");
     }
 
-    let (tools, reg_instr) = agent_tools_for_ex(&app, folder.as_deref(), !roster.is_empty());
+    let (tools, reg_instr) = agent_tools_for_full(&app, folder.as_deref(), !roster.is_empty(), Some((&db, &scope_id)));
     let anthropic_sys = format!("{AGENT_SYSTEM}{extra_block}{reg_instr}");
     let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
     messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": prompt }));
@@ -2036,6 +2098,10 @@ async fn agent_stream(
                             Err(e) => (format!("send failed: {e}"), true),
                         };
                         r
+                    } else if name == "github_list_prs" {
+                        // Connection tool: token attached Rust-side. Async GitHub
+                        // call, so run it directly (we're already in async here).
+                        connections::github_list_prs(&db, &scope_id).await
                     } else {
                     // Run the tool inside catch_unwind so a PANIC (e.g. deep in
                     // genpdf table/render) becomes a VISIBLE tool error the model
@@ -2421,7 +2487,9 @@ pub fn run() {
             memory_auto_capture, scheduler_list, scheduler_runs,
             scheduler_create, scheduler_set_enabled, scheduler_delete,
             scheduler_set_paused, scheduler_get_paused, scheduler_run_now,
-            scheduler_debug_row, scheduler_reset_counters
+            scheduler_debug_row, scheduler_reset_counters,
+            github_connect, connections_list, connection_disconnect,
+            connection_set_agent_enabled, connection_enabled_for_agent
         ])
         .setup(move |_app| {
             // M1.1: bring up the SQLite state spine + single-writer actor, then

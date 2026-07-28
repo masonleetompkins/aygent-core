@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 /// Current schema version. Bump when adding a migration step below.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// The DB file name under <app_data>.
 pub const DB_FILE: &str = "aygent.db";
@@ -134,6 +134,17 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("migrate v5: {e}"))?;
         set_version(conn, 5)?;
         v = 5;
+    }
+
+    if v < 6 {
+        // M1.9 CONNECTIONS (Atlas CONNECTIONS-ARCH §B). connection = a keychain-
+        // backed bearer credential + NON-secret metadata; agent_connection =
+        // per-agent enablement (the connection is the unit). Tokens live ONLY in
+        // the keychain (key_ref is a POINTER, never the secret). Forward-only.
+        conn.execute_batch(SCHEMA_V6)
+            .map_err(|e| format!("migrate v6: {e}"))?;
+        set_version(conn, 6)?;
+        v = 6;
     }
 
     let _ = v;
@@ -394,4 +405,36 @@ CREATE INDEX IF NOT EXISTS idx_run_by_schedule ON schedule_run (schedule_id, fir
 /// silently resume). ALTER ADD COLUMN is forward-only + safe (no constraint).
 const SCHEMA_V5: &str = r#"
 ALTER TABLE app_state ADD COLUMN scheduler_paused INTEGER NOT NULL DEFAULT 0;
+"#;
+
+/// SCHEMA v6 (M1.9 CONNECTIONS — Atlas CONNECTIONS-ARCH §B). A `connection` is a
+/// keychain-backed bearer credential + NON-secret metadata; `agent_connection`
+/// is per-agent enablement (the connection is the unit for v1). Tokens live
+/// ONLY in the OS keychain — `key_ref` is a POINTER, never the secret.
+const SCHEMA_V6: &str = r#"
+CREATE TABLE IF NOT EXISTS connection (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  provider      TEXT NOT NULL,               -- 'github' | 'google_calendar' (later 'mcp','custom')
+  kind          TEXT NOT NULL DEFAULT 'api', -- 'api' | 'mcp'
+  auth_kind     TEXT NOT NULL,               -- 'pat' | 'oauth_pkce' (drives the adapter)
+  label         TEXT NOT NULL,               -- "GitHub (@mason)"
+  account       TEXT,                        -- '@mason' / 'mason@gmail.com'
+  scopes        TEXT,                        -- granted scopes (non-secret)
+  config_json   TEXT NOT NULL DEFAULT '{}',  -- non-secret metadata only
+  key_ref       TEXT NOT NULL,               -- keychain pointer base (NOT the token)
+  status        TEXT NOT NULL DEFAULT 'connected', -- connected|needs_reauth|error
+  created_at    INTEGER NOT NULL DEFAULT 0,
+  updated_at    INTEGER NOT NULL DEFAULT 0
+);
+
+-- Per-agent enablement: the connection is the unit (enable 'GitHub' for the
+-- Work agent = all its read tools). No polymorphic FK column.
+CREATE TABLE IF NOT EXISTS agent_connection (
+  agent_id      TEXT NOT NULL,
+  connection_id INTEGER NOT NULL,
+  enabled       INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (agent_id, connection_id),
+  FOREIGN KEY (agent_id) REFERENCES agent(id) ON DELETE CASCADE,
+  FOREIGN KEY (connection_id) REFERENCES connection(id) ON DELETE CASCADE
+);
 "#;
