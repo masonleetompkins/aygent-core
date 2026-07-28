@@ -148,7 +148,7 @@ export function Settings({
         )}
       </Card>
 
-      {/* SAVE POINTS (renamed from Checkpoints 2026-07-28 — full rename). */}
+      {/* SAVE POINTS (renamed from SAVE POINTs 2026-07-28 — full rename). */}
       <Card title="Save Points">
         <p style={hint}>Every change your agent makes is a Save Point so you can rewind. Keep history for a window, then it prunes automatically.</p>
         {!folder ? (

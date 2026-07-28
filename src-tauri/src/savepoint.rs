@@ -5,12 +5,10 @@
 // turn writes anything, we snapshot the folder; if the result is wrong, one
 // click restores the exact prior tree.
 //
-// NAMING: user-facing + code term is "Save Point" (renamed from "Checkpoint"
-// 2026-07-28). The ONE thing that intentionally keeps the old name is the
-// ON-DISK artifact `.aygent/checkpoints.git` + the git config key
-// `aygent.retentiondays` — renaming those would ORPHAN every existing user's
-// save-point history + retention setting on upgrade. That's a migration
-// boundary, not debt; it's commented at each site.
+// NAMING: user-facing + code term is "Save Point" (renamed from "SAVE POINT"
+// 2026-07-28). FULL rename — including the on-disk artifact + config key. Mason
+// is the only user, pre-launch, and will delete + regenerate all generated
+// files, so there is no history to preserve: nothing keeps the old name.
 //
 // ZERO USER SETUP (the whole product promise): we use **git2 / libgit2**, which
 // is compiled INTO our binary. There is NO dependency on a system `git` install
@@ -19,9 +17,9 @@
 //
 // DESIGN (per docs/CONTRACTS.md §4 — the frozen Folder-lock protocol picked git):
 //   - Each agent folder gets a SHADOW git repo whose GIT_DIR lives at
-//     `<root>/.aygent/checkpoints.git` (on-disk name kept — see NAMING above),
-//     with the work-tree set to `<root>`. A separate GIT_DIR (not `<root>/.git`)
-//     means we NEVER touch or conflict with a user's real git repo.
+//     `<root>/.aygent/savepoints.git`, with the work-tree set to `<root>`. A
+//     separate GIT_DIR (not `<root>/.git`) means we NEVER touch or conflict
+//     with a user's real git repo.
 //   - A save point = stage-all + commit of the whole work-tree. The commit
 //     message carries the user prompt that caused the turn.
 //   - Rewind = reset the work-tree to that commit's tree (checkout + remove
@@ -65,9 +63,9 @@ const HISTORY_REF: &str = "refs/aygent/history";
 const CURSOR_REF: &str = "refs/aygent/cursor";
 
 fn git_dir(root: &Path) -> PathBuf {
-    // On-disk name kept as `checkpoints.git` ON PURPOSE (migration boundary —
-    // renaming would orphan every existing user's save-point history).
-    root.join(".aygent").join("checkpoints.git")
+    // The shadow-repo dir (full rename — was SAVE POINTs.git; single user,
+    // pre-launch, generated files regenerated, so no migration to protect).
+    root.join(".aygent").join("savepoints.git")
 }
 
 fn sig() -> Result<Signature<'static>, String> {
@@ -105,7 +103,7 @@ fn open_or_init(root: &Path) -> Result<Repository, String> {
 ///
 /// CRITICAL: we must NOT try to stage `.aygent/` (our own shadow git dir). A
 /// blanket `"*"` pathspec makes libgit2 hit the nested git dir and error with
-/// `invalid path: '.aygent/checkpoints.git/'` — the `info/exclude` ignore rule
+/// `invalid path: '.aygent/savepoints.git/'` — the `info/exclude` ignore rule
 /// does NOT save us because the pathspec matches before ignore logic applies.
 /// The fix is a path-filter CALLBACK on add_all that skips anything under
 /// `.aygent/`. That's the libgit2-blessed way to exclude a nested dir.
@@ -331,7 +329,7 @@ pub fn redo(root: &Path) -> Result<Option<String>, String> {
 // rewrites the history chain to drop old commits while KEEPING the cursor's
 // state reachable, then runs gc so disk is actually reclaimed.
 
-const RETENTION_KEY: &str = "aygent.retentiondays";
+const RETENTION_KEY: &str = "aygent.savepointretentiondays";
 pub const RETENTION_DEFAULT: i64 = 30;
 
 /// Read the retention window (days). Defaults to 30 if unset/out of range.

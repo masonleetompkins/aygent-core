@@ -1,29 +1,14 @@
-refactor(savepoints): rename Checkpoints -> Save Points EVERYWHERE (no half-rename debt)
+refactor(savepoints): finish the rename — on-disk artifact + config key + all comments
 
-Per Mason: a term that means one thing in UI and another in code is debt
-before launch. Full rename, all layers:
+Mason: single user, pre-launch, will delete + regenerate all generated files,
+so there is NO migration to protect. Rename the last holdouts too:
+- shadow-repo dir `.aygent/checkpoints.git` -> `.aygent/savepoints.git`
+- git config key `aygent.retentiondays` -> `aygent.savepointretentiondays`
+- swept every remaining comment across lib.rs/db.rs/savepoint.rs/Settings.tsx
 
-CODE
-- src/checkpoint.rs -> src/savepoint.rs (git mv); mod checkpoint -> mod savepoint
-- struct Checkpoint -> SavePoint; all checkpoint:: calls -> savepoint::
-- Tauri cmds checkpoint_* -> savepoint_* (snapshot/timeline/rewind/undo/redo/
-  get_retention/set_retention/purge) + handler registration + all UI invoke()
-  strings (SavePoints.tsx, Settings.tsx) kept in exact sync
-- active_checkpoint_root -> active_savepoint_root
-- signature "AYGENT Checkpoints" -> "AYGENT Save Points"
+VERIFIED: grep for "checkpoint" (case-insensitive) across all of src-tauri/src
+and ui/src now returns ZERO matches. The rename is 100% complete.
 
-UI
-- ui/screens/Checkpoints.tsx -> SavePoints.tsx (git mv); component/types renamed
-  (Checkpoints->SavePoints, Checkpoint->SavePoint, CheckpointRow->SavePointRow)
-- App.tsx import + screen id "checkpoints" -> "savepoints"; Sidebar label/id
-- all user-facing copy + comments swept across agents/broker/context_docs/
-  conversations/lanes/repo/settings/writer/turns
-
-INTENTIONALLY KEPT (migration boundary, commented at each site):
-- on-disk `.aygent/checkpoints.git` shadow-repo path
-- git config key `aygent.retentiondays`
-Renaming these would ORPHAN every existing user's save-point history +
-retention on upgrade. Code is fully renamed AROUND them.
-
-First compile after a cross-cutting rename (module file move + screen-id type
-change + 9 cmd renames both sides) — flag if cargo/tsc throws.
+NOTE: existing `.aygent/checkpoints.git` folders + old retention config on
+Mason's machine are now orphaned by design — he deletes + regenerates. Fresh
+installs create `savepoints.git` from the start.

@@ -239,7 +239,7 @@ fn reveal_in_finder(
 
 // --- Conversation persistence (Phase 1) ------------------------------------
 // Chat history lives in the APP data dir (not the agent folder) so it never
-// pollutes the vault or gets swept into checkpoints. Keyed per agent folder.
+// pollutes the vault or gets swept into SAVE POINTs. Keyed per agent folder.
 
 use tauri::Manager;
 
@@ -788,10 +788,10 @@ fn conv_reorder(
     repo::reorder_conversations(&db, parsed)
 }
 
-// --- Checkpoints (Phase 1, Contract C4) ------------------------------------
+// --- SAVE POINTs (Phase 1, Contract C4) ------------------------------------
 
-/// Take a checkpoint of the agent folder. `label` is usually the user prompt.
-/// Returns the new checkpoint sha, or null if nothing changed. Root comes from
+/// Take a SAVE POINT of the agent folder. `label` is usually the user prompt.
+/// Returns the new SAVE POINT sha, or null if nothing changed. Root comes from
 /// the broker (never a UI-supplied path) so git only ever runs on the jail root.
 #[tauri::command]
 fn savepoint_snapshot(
@@ -1024,7 +1024,7 @@ fn agents_get_active(db: tauri::State<writer::Db>) -> Result<Option<repo::AgentP
 
 /// M1.4 (#2): the other non-archived agents sharing `folder_path` with `agent_id`
 /// (pass "" as agent_id to include all). Agents on the SAME folder share
-/// checkpoint history + the folder write-lock (CONTRACTS §4). The UI uses this
+/// SAVE POINT history + the folder write-lock (CONTRACTS §4). The UI uses this
 /// to show a plain "shares history with X, Y" line so the user understands what
 /// pointing two agents at one folder means.
 #[tauri::command]
@@ -1834,7 +1834,7 @@ async fn agent_stream(
     // ---- PER-SESSION LANE (M1.1) -------------------------------------------
     // Serialize turns for THIS session: if another turn is already running on
     // it, we wait here until it finishes. One turn at a time per session kills
-    // tool/session races (double writes, torn streams, double checkpoints) at
+    // tool/session races (double writes, torn streams, double SAVE POINTs) at
     // the source. The lane key is the session id when the UI supplies one, else
     // the per-conversation event channel (also unique per conversation). The
     // guard is held for the whole turn — dropped automatically on return.
@@ -1842,7 +1842,7 @@ async fn agent_stream(
     let _lane = lanes.acquire(&lane_key).await;
 
     // ---- WHICH AGENT IS THIS? (M1.4) ---------------------------------------
-    // Resolve the acting agent's real id. Every file op + checkpoint below jails
+    // Resolve the acting agent's real id. Every file op + SAVE POINT below jails
     // to THIS agent's own broker scope (not a shared "default"), so concurrent
     // agents stay confined to their own folders. Precedence: explicit agent_id
     // from the UI → the agent that owns `folder` → the active agent → "default"
@@ -1934,7 +1934,7 @@ async fn agent_stream(
         let _ = app.emit(&channel, &provider::StreamEvent::Info {
             text: format!("local model · {} tools · {ctx_note}", cap.format),
         });
-        // Baseline checkpoint before any tool writes (same as Anthropic path).
+        // Baseline SAVE POINT before any tool writes (same as Anthropic path).
         if let Ok(root) = broker.root_for(&scope_id) {
             let _ = savepoint::snapshot(&root, "baseline");
         }
@@ -2003,14 +2003,14 @@ async fn agent_stream(
 
     // ---- OPENAI / OPENROUTER PATH ------------------------------------------
     // Shared Chat Completions wire format; one impl, two base URLs. Full tool-
-    // use: same jailed exec_tool + broker + checkpoints as every other provider.
+    // use: same jailed exec_tool + broker + SAVE POINTs as every other provider.
     if provider_kind == "openai" || provider_kind == "openrouter" {
         let key = keychain::get_key(&provider_kind)
             .map_err(|_| format!("no {provider_kind} key set — add one in Settings"))?;
         let model = model.filter(|m| !m.trim().is_empty())
             .ok_or_else(|| format!("no {provider_kind} model selected — pick one in Settings"))?;
 
-        // Baseline checkpoint before the turn (rewind anchor), same as Anthropic.
+        // Baseline SAVE POINT before the turn (rewind anchor), same as Anthropic.
         if let Ok(root) = broker.root_for(&scope_id) {
             let _ = savepoint::snapshot(&root, "baseline");
         }
@@ -2074,7 +2074,7 @@ async fn agent_stream(
         // Snapshot AFTER the turn's writes, labeled with the prompt (C4).
         if let Ok(root) = broker.root_for(&scope_id) {
             match savepoint::snapshot(&root, &prompt) {
-                Ok(Some(sha)) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("checkpoint {sha}") }); }
+                Ok(Some(sha)) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("SAVE POINT {sha}") }); }
                 _ => {}
             }
         }
@@ -2097,11 +2097,11 @@ async fn agent_stream(
         }
     };
 
-    // CHECKPOINT (C4) part 1: ensure a BASELINE snapshot exists before the turn
+    // SAVE POINT (C4) part 1: ensure a BASELINE snapshot exists before the turn
     // runs. This captures the folder's pre-turn state (labeled "baseline") ONLY
     // if there are uncommitted changes / no history yet — so there's always an
     // anchor to rewind *back before* this turn's edits. It is NOT labeled with
-    // the prompt: the prompt-labeled checkpoint is taken AFTER the turn (below),
+    // the prompt: the prompt-labeled SAVE POINT is taken AFTER the turn (below),
     // so it correctly represents "the state produced by this prompt." This fixes
     // the bug where a turn's writes were absorbed (mislabeled) into the NEXT
     // turn's pre-snapshot, or lost entirely if they were the last edit.
@@ -2201,11 +2201,11 @@ async fn agent_stream(
         break;
     }
 
-    // CHECKPOINT (C4) part 2: snapshot the folder AFTER the turn's writes, labeled
+    // SAVE POINT (C4) part 2: snapshot the folder AFTER the turn's writes, labeled
     // with THIS turn's prompt. Now every turn that changed files gets its own
-    // correctly-labeled checkpoint, and "Rewind here" restores the state produced
+    // correctly-labeled SAVE POINT, and "Rewind here" restores the state produced
     // by that prompt — which is what a user intuitively expects. Skips silently if
-    // nothing changed (no empty checkpoints). Best-effort: never blocks the reply.
+    // nothing changed (no empty SAVE POINTs). Best-effort: never blocks the reply.
     if let Ok(root) = broker.root_for(&scope_id) {
         match savepoint::snapshot(&root, &prompt) {
             Ok(Some(sha)) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("save point {sha}") }); }
@@ -2397,7 +2397,7 @@ pub async fn run_headless_turn(
     // Resolve provider/model (recipient's own; fallback anthropic auto/haiku).
     let provider_kind = if agent.provider.is_empty() { "anthropic".to_string() } else { agent.provider.clone() };
 
-    // Baseline checkpoint before any writes.
+    // Baseline SAVE POINT before any writes.
     if let Ok(root) = broker.root_for(agent_id) { let _ = savepoint::snapshot(&root, "baseline"); }
 
     let mut messages = serde_json::json!([{ "role": "user", "content": framed }]);

@@ -163,8 +163,8 @@ fn migrate(conn: &Connection) -> Result<(), String> {
 
 /// SCHEMA v1 — the Phase-1 spine. Adapted from BUILD-SPEC Part B to the state
 /// surface actually in use today (agents, conversations/messages, per-agent
-/// settings). Checkpoints stay in git2 keyed by folder (NOT here) — the spec's
-/// `checkpoint` index table is deferred until the timeline UI (M1.5) needs it.
+/// settings). SAVE POINTs stay in git2 keyed by folder (NOT here) — the spec's
+/// `SAVE POINT` index table is deferred until the timeline UI (M1.5) needs it.
 ///
 /// PRIVACY BOUNDARY (Atlas C5): memory/session ownership uses (owner_kind,
 /// owner_id), never one overloaded nullable column, so isolated-agent data can
@@ -281,7 +281,7 @@ CREATE TABLE IF NOT EXISTS mailbox_budget (
 );
 
 -- Per-agent uploaded context documents (Atlas C). Stored Rust-side in app-data
--- (OUT of the jail so they never pollute the folder's checkpoint stream). This
+-- (OUT of the jail so they never pollute the folder's SAVE POINT stream). This
 -- is the human-facing index; the extracted text lives chunked in mem_chunk
 -- (owner_kind='agent') for M1.7 retrieval. `stored_path` is app-data-relative.
 CREATE TABLE IF NOT EXISTS agent_context (
