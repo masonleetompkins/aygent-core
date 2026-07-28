@@ -1720,10 +1720,39 @@ pub async fn run_headless_turn(
         msg.from_agent, msg.body, msg.from_agent
     );
 
-    // Broadcast: this agent is now WORKING (rail shows a spinner).
+    // The per-agent stream channel the UI subscribes to (SAME id the human path
+    // uses for this agent's inbox conversation) so the turn streams LIVE into
+    // whichever pane is viewing the recipient — you WATCH the work happen.
+    let stream_channel = format!("inbox-{agent_id}");
+
+    // 1) DISPATCH-TIME VISIBILITY: show the inbound message in the recipient's
+    //    inbox thread IMMEDIATELY (before any work), so "📨 from Atlas: …" appears
+    //    the instant it's sent. We persist it now + emit a stream event so an
+    //    open pane renders it live.
+    {
+        let conv_id = format!("inbox-{agent_id}");
+        let existing = repo::load_conversation(db, &conv_id).ok();
+        let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
+        ui_msgs.push(serde_json::json!({ "role": "user", "from": from_name, "text": format!("\u{1F4E8} from {from_name}: {}", msg.body) }));
+        let conv = repo::Conversation {
+            id: conv_id, agent_id: agent_id.to_string(),
+            title: "Inter-agent inbox".into(), updated: 0, pinned: true, order: 1,
+            msgs: serde_json::json!(ui_msgs),
+            history: existing.map(|c| c.history).unwrap_or(serde_json::json!([])),
+        };
+        let _ = repo::save_conversation(db, conv);
+        // Live: an inbound-message event the pane renders as a user bubble now.
+        let _ = app.emit(&stream_channel, &serde_json::json!({
+            "kind": "InboundMessage", "from": msg.from_agent, "fromName": from_name, "text": msg.body,
+        }));
+    }
+
+    // Broadcast: this agent is now WORKING (rail shows a spinner) + the pane's
+    // turn store flips to running so it shows a thinking indicator + live stream.
     let _ = app.emit("agent-activity", &serde_json::json!({
         "agentId": agent_id, "kind": "turn_start", "from": msg.from_agent, "fromName": from_name,
     }));
+    let _ = app.emit(&stream_channel, &provider::StreamEvent::Info { text: format!("working on {from_name}’s request…") });
 
     // Build the recipient's system prompt: soul + peers + context docs (same as
     // the human path, minus streaming).
@@ -1760,8 +1789,12 @@ pub async fn run_headless_turn(
         } else { agent.model.clone() };
 
         for _ in 0..6 {
+            // STREAM LIVE to the recipient's inbox channel — same event shape the
+            // human path emits — so an open pane WATCHES the work happen (tokens +
+            // tool cards), not just a rail spinner.
             let (content, stop) = provider::anthropic_stream_turn(
-                &key, &model, &system, &messages, &tools, |_ev| {},
+                &key, &model, &system, &messages, &tools,
+                |ev| { let _ = app.emit(&stream_channel, &ev); },
             ).await?;
             messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": content.clone() }));
             let mut tool_results = Vec::new();
@@ -1778,7 +1811,12 @@ pub async fn run_headless_turn(
                                 let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
                                 // Reply carries the parent id so budget + chain track (msg.id).
                                 match mailbox::send(db, agent_id, to, body, msg.id) {
-                                    Ok(mailbox::SendResult::Queued { .. }) => (format!("message delivered to {to}"), false),
+                                    Ok(mailbox::SendResult::Queued { .. }) => {
+                                        // WAKE the drainer so the reply is delivered to the
+                                        // recipient near-instantly (loops the conversation).
+                                        drain.nudge();
+                                        (format!("message delivered to {to}"), false)
+                                    }
                                     Ok(mailbox::SendResult::Refused { reason }) => (format!("not sent: {reason}"), true),
                                     Err(e) => (format!("send failed: {e}"), true),
                                 }
@@ -1800,9 +1838,12 @@ pub async fn run_headless_turn(
     } else if provider_kind == "openai" || provider_kind == "openrouter" {
         let key = keychain::get_key(&provider_kind).map_err(|_| format!("recipient has no {provider_kind} key"))?;
         if agent.model.trim().is_empty() { return Err("recipient has no model set".into()); }
-        // One non-streaming completion path (tool loop parity is a fast-follow;
-        // the reply text still lands + persists).
+        // Non-streaming completion (streaming tool-loop parity is a fast-follow).
+        // Emit a visible "working" line so the pane isn't blank while it runs.
+        let _ = app.emit(&stream_channel, &provider::StreamEvent::Info { text: "thinking…".into() });
         reply_text = openai_provider::complete(&provider_kind, &key, &agent.model, &framed).await.unwrap_or_default();
+        // Emit the completed text as one delta so the pane shows it live.
+        let _ = app.emit(&stream_channel, &provider::StreamEvent::TextDelta { text: reply_text.clone() });
     } else {
         reply_text = format!("({} runs a local model — headless inter-agent turns use a cloud provider for now.)", agent.name);
     }

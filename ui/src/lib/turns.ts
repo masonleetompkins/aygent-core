@@ -37,6 +37,7 @@ type AgentSlot = {
   turn: TurnState;
   history: unknown[];        // provider-format running history (per agent!)
   unlisten?: UnlistenFn;     // active stream subscription for this agent's turn
+  inbound?: { fromName: string; text: string }; // live inter-agent inbound msg
 };
 
 const slots = new Map<string, AgentSlot>();
@@ -76,6 +77,71 @@ export function isRunning(agentId: string | null): boolean {
 /** Non-reactive read of an agent's current turn slice (for finalizing a save). */
 export function getAgentTurnSnapshot(agentId: string): TurnState {
   return slots.get(agentId)?.turn ?? IDLE;
+}
+
+// --- HEADLESS (inter-agent) turn capture -----------------------------------
+// Human turns call runTurn() which owns its own listener. But INTER-AGENT turns
+// are started by the Rust drainer, not the UI — so nothing is subscribed to
+// their stream channel. This standing watcher listens to the global
+// `agent-activity` broadcast; when an agent's headless turn starts, it attaches
+// a listener on that agent's `inbox-<id>` channel and writes the live stream
+// into the SAME per-agent store slot. Result: open the recipient's pane (or the
+// sender's) and you WATCH the inter-agent conversation happen, token by token.
+// Called once at App mount.
+
+let headlessWatcherStarted = false;
+const headlessUnlisten = new Map<string, UnlistenFn>();
+
+function inboxChannel(agentId: string): string { return `inbox-${agentId}`; }
+
+async function attachHeadless(agentId: string) {
+  if (headlessUnlisten.has(agentId)) return;
+  const un = await listen<any>(inboxChannel(agentId), (ev) => {
+    const m = ev.payload; if (!m) return;
+    const cur = slot(agentId);
+    const kind = m.kind || (m.TextDelta ? "TextDelta" : m.Info ? "Info" : m.ToolUse ? "ToolUse" : m.ToolResult ? "ToolResult" : m.InboundMessage ? "InboundMessage" : m.Done ? "Done" : null);
+    const text = m.text ?? m.TextDelta?.text ?? m.Info?.text ?? "";
+    if (kind === "InboundMessage") {
+      // The peer's message arriving — surfaced as a live inbound bubble.
+      cur.inbound = { fromName: m.fromName || m.from, text: m.text };
+      cur.turn = { ...cur.turn, status: "running", liveText: "", liveTools: [] };
+      emit();
+    } else if (kind === "TextDelta") { cur.turn = { ...cur.turn, status: "running", liveText: cur.turn.liveText + text }; emit(); }
+    else if (kind === "Info") { cur.turn = { ...cur.turn, status: "running", info: text }; emit(); }
+    else if (kind === "ToolUse") { cur.turn = { ...cur.turn, status: "running", liveTools: [...cur.turn.liveTools, { name: m.name, path: m.input?.path, running: true }] }; emit(); }
+    else if (kind === "ToolResult") {
+      const tools = [...cur.turn.liveTools];
+      for (let i = tools.length - 1; i >= 0; i--) { if (tools[i].name === m.name && tools[i].running) { tools[i] = { name: m.name, path: m.path, ok: m.ok, detail: m.detail, running: false }; break; } }
+      cur.turn = { ...cur.turn, liveTools: tools }; emit();
+    }
+  });
+  headlessUnlisten.set(agentId, un);
+}
+
+/** Start the standing watcher for inter-agent (headless) turns. Idempotent. */
+export async function startHeadlessWatcher() {
+  if (headlessWatcherStarted) return;
+  headlessWatcherStarted = true;
+  await listen<any>("agent-activity", (ev) => {
+    const a = ev.payload; if (!a?.agentId) return;
+    if (a.kind === "turn_start") {
+      // Don't clobber a HUMAN turn already running on this agent (that has its
+      // own listener). Only attach for a headless turn.
+      const cur = slot(a.agentId);
+      if (cur.turn.status !== "running") { void attachHeadless(a.agentId); }
+    } else if (a.kind === "turn_done") {
+      const cur = slot(a.agentId);
+      cur.turn = { ...cur.turn, status: "idle" };
+      const un = headlessUnlisten.get(a.agentId);
+      if (un) { try { un(); } catch { /* ignore */ } headlessUnlisten.delete(a.agentId); }
+      emit();
+    }
+  });
+}
+
+/** The live inbound peer-message for an agent (if a headless turn is mid-flight). */
+export function getInbound(agentId: string | null): { fromName: string; text: string } | undefined {
+  return agentId ? slots.get(agentId)?.inbound : undefined;
 }
 
 // --- the turn runner --------------------------------------------------------

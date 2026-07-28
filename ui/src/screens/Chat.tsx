@@ -6,7 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Button } from "../components/ui";
 import { Markdown } from "../components/Markdown";
-import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn } from "../lib/turns";
+import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound } from "../lib/turns";
 
 type ToolLine = { name: string; path: string; ok?: boolean; detail?: string };
 type Msg =
@@ -347,10 +347,16 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
             <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
           )}
           {msgs.map((m, i) => <Bubble key={i} m={m} />)}
+          {/* LIVE inter-agent inbound message: when a peer dispatches a message
+              to the agent you're viewing, show it as a user bubble immediately
+              (before the reply streams) so you WATCH the conversation arrive. */}
+          {running && getInbound(agentId) && (
+            <Bubble m={{ role: "user", text: `📨 from ${getInbound(agentId)!.fromName}: ${getInbound(agentId)!.text}` }} />
+          )}
           {/* LIVE turn for the agent being viewed: render a trailing streaming
               bubble fed by the store, so switching to a running agent shows its
-              tokens + tool cards arriving mid-flight (Atlas #2). Only when the
-              persisted msgs don't already end in an in-flight assistant bubble. */}
+              tokens + tool cards arriving mid-flight (Atlas #2), for BOTH human
+              turns and headless inter-agent turns (same store slot). */}
           {running && (
             <Bubble m={{
               role: "assistant",

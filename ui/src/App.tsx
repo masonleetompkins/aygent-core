@@ -11,6 +11,7 @@ import { Chat } from "./screens/Chat";
 import { Checkpoints } from "./screens/Checkpoints";
 import { Tools } from "./screens/Tools";
 import { initTheme, saveTheme, type Mode } from "./lib/theme";
+import { startHeadlessWatcher } from "./lib/turns";
 
 // Phase 1: app shell (sidebar nav + content pane) on the design system.
 // Screens: Settings (the wedge) + Playground (temp Phase-0 proofs) live now;
@@ -34,6 +35,10 @@ export function App() {
   const [keySet, setKeySet] = useState(false);
 
   useEffect(() => { const t = initTheme(); setMode(t.mode); setAccent(t.accent); }, []);
+  // Start the standing watcher for inter-agent (headless) turns so their live
+  // stream is captured into the per-agent store even though the UI didn't start
+  // them — this is what makes you WATCH agents talk to each other.
+  useEffect(() => { void startHeadlessWatcher(); }, []);
   // Restore the saved Agent Folder on boot (folder persistence) so the user
   // never has to re-pick after a restart. The backend re-registers the broker
   // scope; if the folder vanished it returns null and we prompt a fresh pick.
