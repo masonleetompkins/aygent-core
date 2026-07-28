@@ -567,13 +567,16 @@ fn scheduler_get_paused(db: tauri::State<writer::Db>) -> Result<bool, String> {
 
 /// FIRE NOW: run one schedule immediately (bypasses timing, keeps guardrails).
 /// A real UI action AND the fastest way to prove firing works without waiting.
+/// Async because a SystemJob (distill) runs in-process with local embeddings.
 #[tauri::command]
-fn scheduler_run_now(
-    db: tauri::State<writer::Db>,
-    drain: tauri::State<drainer::DrainSignal>,
+async fn scheduler_run_now(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, writer::Db>,
+    broker: tauri::State<'_, Arc<Broker>>,
+    drain: tauri::State<'_, drainer::DrainSignal>,
     id: i64,
 ) -> Result<bool, String> {
-    scheduler::run_now(&db, &drain, id)
+    scheduler::run_now(&app, &db, &broker, &drain, id).await
 }
 
 // ---- M1.8 Scheduler: read-only inspection (Slice 1 observability) --------

@@ -1,14 +1,22 @@
-fix(scheduler): sane default fire caps by kind + honest 'rate limited' UX + reset
+feat(scheduler): Slice 5 — Distill SystemJob (L1->L2 roll-up, zero model calls)
 
-The 'skipped / ran but enqueued nothing' Mason hit was the fire-count
-guardrail WORKING, not a bug: default max_fires_per_day was 2, and repeated
-Run-now + timer fires blew past 2/day on an every-1-min schedule -> fire_one
-refused with rate_limited. Cost safety did its job; the UX just read as failure.
+The scheduler + vault-memory convergence, the last core scheduler slice.
 
-- create default cap now scales BY KIND: interval => fires-that-fit-in-a-day
-  clamped [2,240]; daily/weekly => 2. (2/day for every-1-min was the trap.)
-- scheduler::reset_counters + cmd scheduler_reset_counters: zero today's
-  fire/cost counters (and re-enable if a cost ceiling auto-paused it) so
-  testing isn't blocked. UI 'Reset limits' button per row.
-- Run-now message is honest now: 'hit today's fire limit... click Reset
-  limits to test again' instead of 'a guard blocked it'.
+- memory.rs distill(): deterministic nightly roll-up. Reads the last N days
+  of L1 daily notes (Daily/YYYY-MM-DD.md), strips frontmatter/headings/bullet
+  markers, and runs each line through the SAME salience extractor +
+  novelty-gated remember() that auto_capture uses. Durable facts promote to L2
+  atoms; repeats reinforce, never duplicate. Idempotent-ish (re-run = mostly
+  reinforce) so coalesce-on-resume catches a backlog safely. ZERO model calls —
+  pure code + local embeddings, free to run nightly.
+- scheduler.rs: fire_one now returns FireOutcome (Enqueued|Skipped|SystemJob).
+  SystemJob is logged 'running' in the txn, then EXECUTED ASYNC after commit
+  (embeddings can't run in the writer closure). run_system_job dispatches by
+  name (distill|reconcile) and back-writes ok/error + snippet into schedule_run.
+  run_distill resolves the vault + Memory dir THROUGH THE JAIL BROKER, uses the
+  in-process embedder. Ticker + run_now both handle the async job path.
+- lib.rs: scheduler_run_now is now async (app+broker+drain state).
+
+Now a 'Nightly memory distill' schedule (already in the UI's job dropdown)
+actually runs the roll-up. Scheduler + memory, working together.
+First compile of distill + FireOutcome refactor — flag if cargo throws.

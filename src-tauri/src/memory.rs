@@ -1171,3 +1171,94 @@ pub async fn auto_capture(
     }
     Ok(report)
 }
+
+// ===========================================================================
+// SLICE 5 (SCHEDULER) — DISTILL: the nightly L1→L2 roll-up. ZERO MODEL CALLS.
+//
+// This is the OpenClaw daily-notes→MEMORY.md maintenance pattern, automated as a
+// deterministic SystemJob the scheduler fires. It reads the last N days of L1
+// episodic notes (Daily/YYYY-MM-DD.md) and runs each LINE through the SAME
+// salience extractor + novelty-gated remember() that auto_capture uses — so
+// durable facts get promoted into L2 atoms, and repeats reinforce instead of
+// duplicating. Distillation is idempotent-ish: re-running over the same days
+// creates nothing new (novelty gate), just reinforces — which is exactly why
+// coalesce-on-resume (fire once) catches up a backlog safely.
+//
+// It is pure code + local embeddings; no LLM, so it's free to run nightly.
+// ===========================================================================
+
+/// Report of a distillation pass (for the schedule_run snippet + UI).
+#[derive(Debug, Serialize, Clone)]
+pub struct DistillReport {
+    pub days_scanned: usize,
+    pub lines_considered: usize,
+    pub created: usize,
+    pub reinforced: usize,
+}
+
+/// Collect the L1 daily notes under <vault>/Daily, newest `days` of them, and
+/// return their body lines (frontmatter + headings stripped) as capture input.
+fn recent_daily_lines(vault_root: &Path, days: usize) -> Vec<String> {
+    let daily_dir = vault_root.join("Daily");
+    let mut files: Vec<PathBuf> = match std::fs::read_dir(&daily_dir) {
+        Ok(rd) => rd.flatten().map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    // Daily notes are named YYYY-MM-DD.md so a lexical sort IS chronological.
+    files.sort();
+    files.reverse();
+    files.truncate(days.max(1));
+
+    let mut lines = Vec::new();
+    for f in files {
+        let Ok(raw) = std::fs::read_to_string(&f) else { continue };
+        let (_fm, body) = split_frontmatter(&raw);
+        for line in body.lines() {
+            let l = line.trim();
+            // Skip blanks + markdown headings; keep bullet/plain content lines.
+            if l.is_empty() || l.starts_with('#') { continue; }
+            let cleaned = l.trim_start_matches(['-', '*', ' ']).trim();
+            if cleaned.len() >= 8 { lines.push(cleaned.to_string()); }
+        }
+    }
+    lines
+}
+
+/// DISTILL: promote durable facts from recent L1 daily notes into L2 atoms.
+/// Deterministic; zero model calls (only local embeddings via remember()).
+#[allow(clippy::too_many_arguments)]
+pub async fn distill(
+    db: &Db,
+    owner_kind: &str,
+    owner_id: &str,
+    vault_root: &Path,
+    abs_memory_dir: &Path,
+    rel_memory_dir: &str,
+    days: usize,
+    salience_threshold: f32,
+    embed_model: &str,
+    embed_endpoint: &str,
+) -> Result<DistillReport, String> {
+    let lines = recent_daily_lines(vault_root, days);
+    let mut report = DistillReport {
+        days_scanned: days,
+        lines_considered: lines.len(),
+        created: 0,
+        reinforced: 0,
+    };
+    for line in lines {
+        // Reuse the exact salience extractor + novelty-gated remember() path.
+        for c in extract_candidates(&line) {
+            if c.salience < salience_threshold { continue; }
+            if let Ok(r) = remember(
+                db, owner_kind, owner_id, abs_memory_dir, rel_memory_dir,
+                &c.text, &c.ntype, "", embed_model, embed_endpoint,
+            ).await {
+                if r.action == "created" { report.created += 1; } else { report.reinforced += 1; }
+            }
+        }
+    }
+    Ok(report)
+}

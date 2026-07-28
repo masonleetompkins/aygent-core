@@ -233,17 +233,32 @@ fn due_now(db: &Db, now: i64) -> Vec<Due> {
     out
 }
 
+/// What firing a schedule produced (so the async ticker knows what to do next).
+pub enum FireOutcome {
+    /// An AgentTurn was enqueued to the drainer; nudge it.
+    Enqueued,
+    /// Nothing to do (rate-limited / cost-ceiling / no-op).
+    Skipped,
+    /// A SystemJob must run async AFTER the txn (embeddings). Carries the job
+    /// name + the schedule_run id to back-write the result into.
+    SystemJob { job: String, run_id: i64 },
+}
+
 /// Fire ONE due schedule: mark-fired + advance next_fire_at + log a run +
 /// enqueue to the drainer, ALL in one writer-actor transaction (exactly-once at
-/// the decision boundary). Returns whether it enqueued a drainer turn.
-fn fire_one(db: &Db, due: &Due, now: i64) -> Result<bool, String> {
+/// the decision boundary). Returns what the ticker should do next.
+fn fire_one(db: &Db, due: &Due, now: i64) -> Result<FireOutcome, String> {
     let next = compute_next_tz(&due.spec, now, &due.tz);
     let id = due.id;
     let agent_id = due.agent_id.clone();
-    // Only AgentTurn enqueues to the drainer; SystemJob is Slice 5.
+    // AgentTurn enqueues to the drainer; SystemJob runs async after the txn.
     let turn_body: Option<String> = match &due.action {
         ScheduleAction::AgentTurn { prompt_template, .. } => Some(prompt_template.clone()),
         ScheduleAction::SystemJob { .. } => None,
+    };
+    let system_job: Option<String> = match &due.action {
+        ScheduleAction::SystemJob { job } => Some(job.clone()),
+        _ => None,
     };
     let body = turn_body.clone().unwrap_or_default();
     let recipient = agent_id.clone(); // the fired turn is addressed to this agent
@@ -283,7 +298,7 @@ fn fire_one(db: &Db, due: &Due, now: i64) -> Result<bool, String> {
                 params![id, agent_id, now],
             ).map_err(|e| format!("log skip: {e}"))?;
             tx.commit().map_err(|e| format!("commit: {e}"))?;
-            return Ok(false);
+            return Ok(FireOutcome::Skipped);
         }
         // Cost ceiling: if today's accrued cost is at/over the ceiling, AUTO-PAUSE
         // the schedule for the day (Atlas's non-negotiable guardrail) + log why.
@@ -297,7 +312,7 @@ fn fire_one(db: &Db, due: &Due, now: i64) -> Result<bool, String> {
                     params![id, agent_id, now, format!("auto-paused: hit daily cost ceiling ({ceiling})")],
                 ).map_err(|e| format!("log ceiling: {e}"))?;
                 tx.commit().map_err(|e| format!("commit: {e}"))?;
-                return Ok(false);
+                return Ok(FireOutcome::Skipped);
             }
         }
 
@@ -307,10 +322,12 @@ fn fire_one(db: &Db, due: &Due, now: i64) -> Result<bool, String> {
             params![id],
         ).map_err(|e| format!("bump fire count: {e}"))?;
 
-        // Durable run row.
-        let state = if turn_body.is_some() { "queued" } else { "ok" };
+        // Durable run row. AgentTurn = queued (drainer runs it); SystemJob =
+        // running (the async ticker executes it right after the txn + back-
+        // writes the outcome).
+        let state = if turn_body.is_some() { "queued" } else if system_job.is_some() { "running" } else { "ok" };
         tx.execute(
-            "INSERT INTO schedule_run (schedule_id, agent_id, fired_at, state) VALUES (?1,?2,?3,?4)",
+            "INSERT INTO schedule_run (schedule_id, agent_id, fired_at, state, started_at) VALUES (?1,?2,?3,?4,?3)",
             params![id, agent_id, now, state],
         ).map_err(|e| format!("insert run: {e}"))?;
         let run_id = tx.last_insert_rowid();
@@ -334,7 +351,11 @@ fn fire_one(db: &Db, due: &Due, now: i64) -> Result<bool, String> {
             ).map_err(|e| format!("init budget: {e}"))?;
         }
         tx.commit().map_err(|e| format!("commit: {e}"))?;
-        Ok(turn_body.is_some())
+        Ok(match (&turn_body, &system_job) {
+            (Some(_), _) => FireOutcome::Enqueued,
+            (None, Some(job)) => FireOutcome::SystemJob { job: job.clone(), run_id },
+            _ => FireOutcome::Skipped,
+        })
     })
 }
 
@@ -457,24 +478,84 @@ pub fn reset_counters(db: &Db, id: i64) -> Result<(), String> {
 
 /// FIRE NOW: run one schedule immediately, bypassing the timing gate (but NOT
 /// the guardrails). Diagnostic + a genuinely useful "run it now" UI action.
-/// Returns whether a turn was enqueued to the drainer.
-pub fn run_now(db: &Db, drain: &crate::drainer::DrainSignal, id: i64) -> Result<bool, String> {
+/// Returns whether SOMETHING ran (a turn enqueued OR a system job executed).
+/// Async because a SystemJob (distill) runs in-process with local embeddings.
+pub async fn run_now(app: &AppHandle, db: &Db, broker: &Arc<Broker>, drain: &crate::drainer::DrainSignal, id: i64) -> Result<bool, String> {
     // Load the one schedule as a Due (ignore enabled/timing).
-    let conn = db.reader()?;
-    let row = conn.query_row(
-        "SELECT id, agent_id, tz, spec_json, action_json FROM schedule WHERE id = ?1",
-        params![id],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)),
-    ).map_err(|e| format!("load schedule {id}: {e}"))?;
-    let (sid, agent_id, tz, spec_json, action_json) = row;
+    let (sid, agent_id, tz, spec_json, action_json) = {
+        let conn = db.reader()?;
+        conn.query_row(
+            "SELECT id, agent_id, tz, spec_json, action_json FROM schedule WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)),
+        ).map_err(|e| format!("load schedule {id}: {e}"))?
+    };
     let spec = serde_json::from_str::<ScheduleSpec>(&spec_json)
         .map_err(|e| format!("this schedule has a corrupt timing spec ({e}) — delete it and create a new one"))?;
     let action = serde_json::from_str::<ScheduleAction>(&action_json)
         .map_err(|e| format!("this schedule has a corrupt action ({e}) — it was likely made by an older build; delete it and create a new one"))?;
     let due = Due { id: sid, agent_id, tz, spec, action };
-    let enq = fire_one(db, &due, now_ms())?;
-    if enq { drain.nudge(); }
-    Ok(enq)
+    match fire_one(db, &due, now_ms())? {
+        FireOutcome::Enqueued => { drain.nudge(); Ok(true) }
+        FireOutcome::SystemJob { job, run_id } => {
+            run_system_job(app, db, broker, &due.agent_id, &job, run_id).await;
+            Ok(true)
+        }
+        FireOutcome::Skipped => Ok(false),
+    }
+}
+
+/// Execute a SystemJob async (called by the ticker + run_now AFTER the fire
+/// txn). Runs the deterministic Rust job (zero model calls for distill), then
+/// back-writes the outcome into its schedule_run row. Registry-style dispatch:
+/// add a job = add an arm here + a UI menu entry.
+async fn run_system_job(app: &AppHandle, db: &Db, broker: &Arc<Broker>, agent_id: &str, job: &str, run_id: i64) {
+    let started = now_ms();
+    let result: Result<String, String> = match job {
+        "distill" | "reconcile" => run_distill(app, db, broker, agent_id).await,
+        other => Err(format!("unknown system job '{other}'")),
+    };
+    let (state, snippet) = match &result {
+        Ok(s) => ("ok", s.clone()),
+        Err(e) => ("error", e.clone()),
+    };
+    let finished = now_ms();
+    let _ = started;
+    let (rid, st, sn) = (run_id, state.to_string(), snippet);
+    let _ = db.write(move |c| {
+        c.execute(
+            "UPDATE schedule_run SET state = ?2, finished_at = ?3, result_snippet = ?4 WHERE id = ?1",
+            params![rid, st, finished, sn],
+        ).map_err(|e| format!("back-write run: {e}"))?;
+        Ok(())
+    });
+    let _ = tauri::Emitter::emit(app, "agent-activity", &serde_json::json!({
+        "agentId": agent_id, "kind": "system_job_done", "job": job,
+    }));
+}
+
+/// The Distill job (Slice 5): resolve the agent's vault through the jail broker,
+/// then run the deterministic L1→L2 roll-up. Zero model calls (local embeddings
+/// only). Returns a human snippet for the run log.
+async fn run_distill(app: &AppHandle, db: &Db, broker: &Arc<Broker>, agent_id: &str) -> Result<String, String> {
+    // Vault root = the agent's jailed folder root.
+    let root = broker.root_for(agent_id).map_err(|e| format!("no vault scope for agent: {e:?}"))?;
+    // Memory dir resolved through the jail (Write) — same as memory_remember.
+    let abs_mem = broker
+        .resolve(agent_id, "Memory/.aygent-scope", crate::broker::Mode::Write)
+        .map_err(|e| format!("Memory path refused by jail: {e:?}"))?;
+    let abs_memory_dir = abs_mem.parent().ok_or("could not resolve Memory dir")?.to_path_buf();
+    let embed_model = crate::ensure_embed_model(app).await?;
+    let report = crate::memory::distill(
+        db, "agent", agent_id, &root, &abs_memory_dir, "Memory",
+        7,     // last 7 days of daily notes
+        0.65,  // conservative salience (same default as auto-capture)
+        &embed_model, "",
+    ).await?;
+    Ok(format!(
+        "distilled {} days, {} lines → {} created, {} reinforced (0 model calls)",
+        report.days_scanned, report.lines_considered, report.created, report.reinforced
+    ))
 }
 
 /// Spawn the background scheduler ticker. Runs for the life of the app.
@@ -523,10 +604,14 @@ pub fn spawn(app: AppHandle, db: Db, _broker: Arc<Broker>, _lanes: Lanes, sig: S
                 eprintln!("[aygent][sched] tick: {} due at {now}", due.len());
             }
             let mut enqueued_any = false;
+            // SystemJobs to run async AFTER the fire txns (embeddings; can't run
+            // inside the writer closure). Collected here, executed below.
+            let mut system_jobs: Vec<(String, String, i64)> = Vec::new(); // (agent_id, job, run_id)
             for d in &due {
                 match fire_one(&db, d, now) {
-                    Ok(true) => { enqueued_any = true; eprintln!("[aygent][sched] fired schedule {} -> agent {}", d.id, d.agent_id); }
-                    Ok(false) => { eprintln!("[aygent][sched] schedule {} due but not enqueued (guard/systemjob)", d.id); }
+                    Ok(FireOutcome::Enqueued) => { enqueued_any = true; eprintln!("[aygent][sched] fired schedule {} -> agent {}", d.id, d.agent_id); }
+                    Ok(FireOutcome::SystemJob { job, run_id }) => { eprintln!("[aygent][sched] system job '{job}' for schedule {} (run {run_id})", d.id); system_jobs.push((d.agent_id.clone(), job, run_id)); }
+                    Ok(FireOutcome::Skipped) => { eprintln!("[aygent][sched] schedule {} skipped (guardrail)", d.id); }
                     Err(e) => eprintln!("[aygent][sched] schedule {} fire failed: {e}", d.id),
                 }
             }
@@ -536,6 +621,10 @@ pub fn spawn(app: AppHandle, db: Db, _broker: Arc<Broker>, _lanes: Lanes, sig: S
                 let _ = tauri::Emitter::emit(&app, "agent-activity", &serde_json::json!({
                     "kind": "scheduler_fired", "count": due.len(),
                 }));
+            }
+            // 4) Run SystemJobs async (deterministic, e.g. Distill = 0 model calls).
+            for (agent_id, job, run_id) in system_jobs {
+                run_system_job(&app, &db, &_broker, &agent_id, &job, run_id).await;
             }
         }
     });
