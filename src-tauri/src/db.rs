@@ -133,12 +133,18 @@ CREATE TABLE IF NOT EXISTS agent (
   archived      INTEGER NOT NULL DEFAULT 0
 );
 
--- Singleton row (id=0) holding app-wide pointers (active agent).
+-- Singleton row (id=0) holding app-wide pointers (active agent) + M1.4 knobs:
+--   inter_agent_budget = max inter-agent turns per conversation chain before it
+--     hard-stops (the runaway-cost backstop). Default 6.
+--   max_concurrency    = max agents allowed to run headless turns at once.
+--     Default 6.
 CREATE TABLE IF NOT EXISTS app_state (
-  id         INTEGER PRIMARY KEY CHECK (id = 0),
-  active_id  TEXT NOT NULL DEFAULT ''
+  id                  INTEGER PRIMARY KEY CHECK (id = 0),
+  active_id           TEXT NOT NULL DEFAULT '',
+  inter_agent_budget  INTEGER NOT NULL DEFAULT 6,
+  max_concurrency     INTEGER NOT NULL DEFAULT 6
 );
-INSERT OR IGNORE INTO app_state (id, active_id) VALUES (0, '');
+INSERT OR IGNORE INTO app_state (id, active_id, inter_agent_budget, max_concurrency) VALUES (0, '', 6, 6);
 
 -- Conversations (chat threads). One agent owns many. `history` is the
 -- provider-format message array the loop needs to continue; `msgs` is the

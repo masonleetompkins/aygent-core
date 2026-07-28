@@ -121,6 +121,34 @@ pub fn active_id(db: &Db) -> Result<String, String> {
         .map_err(|e| format!("active_id: {e}"))
 }
 
+/// M1.4 app-wide knobs: inter-agent budget (turns/chain) + max headless
+/// concurrency (agents running at once). Read together; clamped to sane bounds.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AppKnobs {
+    pub inter_agent_budget: i64,
+    pub max_concurrency: i64,
+}
+
+pub fn get_knobs(db: &Db) -> Result<AppKnobs, String> {
+    let conn = db.reader()?;
+    conn.query_row(
+        "SELECT inter_agent_budget, max_concurrency FROM app_state WHERE id = 0", [],
+        |r| Ok(AppKnobs { inter_agent_budget: r.get(0)?, max_concurrency: r.get(1)? }),
+    ).map_err(|e| format!("get_knobs: {e}"))
+}
+
+pub fn set_knobs(db: &Db, budget: i64, concurrency: i64) -> Result<(), String> {
+    // Clamp: budget 1..=50, concurrency 1..=12 (sane ceilings so a fat-finger
+    // can't unleash a runaway or a thundering herd of paid API calls).
+    let b = budget.clamp(1, 50);
+    let c = concurrency.clamp(1, 12);
+    db.write(move |conn| {
+        conn.execute("UPDATE app_state SET inter_agent_budget = ?1, max_concurrency = ?2 WHERE id = 0",
+            rusqlite::params![b, c]).map_err(|e| format!("set_knobs: {e}"))?;
+        Ok(())
+    })
+}
+
 pub fn get_active_agent(db: &Db) -> Result<Option<AgentProfile>, String> {
     let id = active_id(db)?;
     if id.is_empty() { return Ok(None); }

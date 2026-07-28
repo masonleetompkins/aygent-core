@@ -12,6 +12,7 @@ mod checkpoint;
 mod context_docs;
 mod conversations;
 mod db;
+mod drainer;
 mod lanes;
 mod mailbox;
 mod migrate_json;
@@ -582,6 +583,17 @@ fn agent_context_remove(app: tauri::AppHandle, db: tauri::State<writer::Db>, age
 #[tauri::command]
 fn mailbox_pending_counts(db: tauri::State<writer::Db>) -> Result<Vec<(String, i64)>, String> {
     mailbox::pending_counts(&db)
+}
+
+/// M1.4 app knobs: inter-agent budget (turns/chain) + max headless concurrency.
+#[tauri::command]
+fn get_app_knobs(db: tauri::State<writer::Db>) -> Result<repo::AppKnobs, String> {
+    repo::get_knobs(&db)
+}
+
+#[tauri::command]
+fn set_app_knobs(db: tauri::State<writer::Db>, budget: i64, concurrency: i64) -> Result<(), String> {
+    repo::set_knobs(&db, budget, concurrency)
 }
 
 /// M1.4 #7: the roster of OTHER agents a given agent can message.
@@ -1257,6 +1269,7 @@ async fn agent_stream(
     broker: tauri::State<'_, Arc<Broker>>,
     lanes: tauri::State<'_, lanes::Lanes>,
     db: tauri::State<'_, writer::Db>,
+    drain: tauri::State<'_, drainer::DrainSignal>,
     channel: String,
     prompt: String,
     history: serde_json::Value,
@@ -1484,7 +1497,7 @@ async fn agent_stream(
                         let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
                         let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
                         match mailbox::send(&db, &scope_id, to, body, 0) {
-                            Ok(mailbox::SendResult::Queued { .. }) => (format!("message delivered to {to}"), false),
+                            Ok(mailbox::SendResult::Queued { .. }) => { drain.nudge(); (format!("message delivered to {to}"), false) }
                             Ok(mailbox::SendResult::Refused { reason }) => (format!("not sent: {reason}"), true),
                             Err(e) => (format!("send failed: {e}"), true),
                         }
@@ -1578,11 +1591,12 @@ async fn agent_stream(
                     let (result_text, is_err) = if name == "send_message" {
                         let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
                         let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
-                        match mailbox::send(&db, &scope_id, to, body, 0) {
-                            Ok(mailbox::SendResult::Queued { .. }) => (format!("message delivered to {to} (they'll reply on their own time)"), false),
+                        let r = match mailbox::send(&db, &scope_id, to, body, 0) {
+                            Ok(mailbox::SendResult::Queued { .. }) => { drain.nudge(); (format!("message delivered to {to} (they'll reply on their own time)"), false) }
                             Ok(mailbox::SendResult::Refused { reason }) => (format!("not sent: {reason}"), true),
                             Err(e) => (format!("send failed: {e}"), true),
-                        }
+                        };
+                        r
                     } else {
                     // Run the tool inside catch_unwind so a PANIC (e.g. deep in
                     // genpdf table/render) becomes a VISIBLE tool error the model
@@ -1654,6 +1668,166 @@ async fn agent_stream(
     Ok(messages) // full history back for multi-turn persistence
 }
 
+// --- HEADLESS INTER-AGENT TURN (M1.4 delivery engine) ----------------------
+// Called by the drainer (drainer.rs) when a recipient agent has a delivered
+// mailbox message. Runs ONE turn for the recipient using ITS own provider/model/
+// folder/soul, jailed to ITS broker scope, executing tools through the broker,
+// then PERSISTS the exchange to the recipient's conversation history (so the
+// user sees it when they open that agent) and BROADCASTS activity events on a
+// global `agent-activity` channel so any open UI pane can watch it happen live.
+//
+// This reuses the SAME provider primitives as agent_stream (anthropic_complete /
+// the tool loop); it is intentionally a leaner, non-streaming turn — inter-agent
+// turns don't need token streaming, and keeping it separate avoids destabilizing
+// the battle-tested human path. If the recipient calls send_message during this
+// turn, that's just another mailbox row the drainer picks up next tick (the
+// reply loops back — the mailbox IS the channel).
+pub async fn run_headless_turn(
+    app: &tauri::AppHandle,
+    db: &writer::Db,
+    broker: &Arc<Broker>,
+    _lanes: &lanes::Lanes,
+    agent_id: &str,
+    msg: &mailbox::Message,
+) -> Result<(), String> {
+    use tauri::Emitter;
+    let agent = repo::get_agent(db, agent_id)?.ok_or("recipient agent gone")?;
+
+    // Register the recipient's jail scope (it may not be active in the UI).
+    if !agent.folder_path.is_empty() {
+        let p = std::path::PathBuf::from(&agent.folder_path);
+        if p.is_dir() {
+            let canonical = std::fs::canonicalize(&p).unwrap_or(p);
+            broker.set_scope(agent_id, canonical, false);
+        }
+    }
+
+    // Look up the sender's display name for the in-thread "from X" tag.
+    let from_name = repo::get_agent(db, &msg.from_agent)?.map(|a| a.name).unwrap_or_else(|| msg.from_agent.clone());
+
+    // The prompt = the incoming message, framed so the recipient knows it's from
+    // a peer and MAY reply via send_message (back to the sender).
+    let framed = format!(
+        "You just received a message from another agent, {from_name} (id: {}). Their message:\n\n{}\n\n\
+         Respond/act as appropriate. If you want to reply to them, use the send_message tool with \
+         to_agent = \"{}\". Otherwise just do the work.",
+        msg.from_agent, msg.body, msg.from_agent
+    );
+
+    // Broadcast: this agent is now WORKING (rail shows a spinner).
+    let _ = app.emit("agent-activity", &serde_json::json!({
+        "agentId": agent_id, "kind": "turn_start", "from": msg.from_agent, "fromName": from_name,
+    }));
+
+    // Build the recipient's system prompt: soul + peers + context docs (same as
+    // the human path, minus streaming).
+    let persona = if agent.system_prompt.trim().is_empty() { String::new() } else { format!("\n\n{}", agent.system_prompt.trim()) };
+    let context_block = context_docs::prepend_block(db, agent_id).unwrap_or_default();
+    let roster = mailbox::roster(db, agent_id).unwrap_or_default();
+    let roster_block = if roster.is_empty() { String::new() } else {
+        let list = roster.iter().map(|(id, name)| format!("- {name} (id: {id})")).collect::<Vec<_>>().join("\n");
+        format!("\n\nOTHER AGENTS you can message with send_message:\n{list}")
+    };
+    let system = format!("{AGENT_SYSTEM}{persona}{roster_block}{context_block}");
+
+    // Tools: base file tools + send_message (has_peers = it has a roster).
+    let (tools, _reg) = agent_tools_for_ex(app, Some(&agent.folder_path), !roster.is_empty());
+    let pdf_cfg = pdf_config_for(app, Some(&agent.folder_path));
+
+    // Resolve provider/model (recipient's own; fallback anthropic auto/haiku).
+    let provider_kind = if agent.provider.is_empty() { "anthropic".to_string() } else { agent.provider.clone() };
+
+    // Baseline checkpoint before any writes.
+    if let Ok(root) = broker.root_for(agent_id) { let _ = checkpoint::snapshot(&root, "baseline"); }
+
+    let mut messages = serde_json::json!([{ "role": "user", "content": framed }]);
+    let mut reply_text = String::new();
+
+    // Only Anthropic + OpenAI/OpenRouter run headless for now (local models are
+    // slower + the human path is where they're exercised). Non-cloud recipients
+    // get a note instead of silently doing nothing.
+    if provider_kind == "anthropic" {
+        let key = keychain::get_key("anthropic").map_err(|_| "recipient has no anthropic key".to_string())?;
+        let model = if agent.model.trim().is_empty() {
+            let models = provider::anthropic_list_models(&key).await?;
+            models.iter().find(|m| m.contains("haiku")).cloned().or_else(|| models.first().cloned()).ok_or("no model")?
+        } else { agent.model.clone() };
+
+        for _ in 0..6 {
+            let (content, stop) = provider::anthropic_stream_turn(
+                &key, &model, &system, &messages, &tools, |_ev| {},
+            ).await?;
+            messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": content.clone() }));
+            let mut tool_results = Vec::new();
+            if let Some(arr) = content.as_array() {
+                for blk in arr {
+                    match blk.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => { if let Some(t) = blk.get("text").and_then(|t| t.as_str()) { reply_text.push_str(t); reply_text.push('\n'); } }
+                        Some("tool_use") => {
+                            let name = blk.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                            let id = blk.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                            let input = blk.get("input").cloned().unwrap_or(serde_json::json!({}));
+                            let (result_text, is_err) = if name == "send_message" {
+                                let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
+                                let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                                // Reply carries the parent id so budget + chain track (msg.id).
+                                match mailbox::send(db, agent_id, to, body, msg.id) {
+                                    Ok(mailbox::SendResult::Queued { .. }) => (format!("message delivered to {to}"), false),
+                                    Ok(mailbox::SendResult::Refused { reason }) => (format!("not sent: {reason}"), true),
+                                    Err(e) => (format!("send failed: {e}"), true),
+                                }
+                            } else {
+                                exec_tool_cfg(broker, agent_id, &name, &input, &pdf_cfg)
+                            };
+                            tool_results.push(serde_json::json!({ "type": "tool_result", "tool_use_id": id, "content": result_text, "is_error": is_err }));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !tool_results.is_empty() {
+                messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": tool_results }));
+                if stop == "tool_use" { continue; }
+            }
+            break;
+        }
+    } else if provider_kind == "openai" || provider_kind == "openrouter" {
+        let key = keychain::get_key(&provider_kind).map_err(|_| format!("recipient has no {provider_kind} key"))?;
+        if agent.model.trim().is_empty() { return Err("recipient has no model set".into()); }
+        // One non-streaming completion path (tool loop parity is a fast-follow;
+        // the reply text still lands + persists).
+        reply_text = openai_provider::complete(&provider_kind, &key, &agent.model, &framed).await.unwrap_or_default();
+    } else {
+        reply_text = format!("({} runs a local model — headless inter-agent turns use a cloud provider for now.)", agent.name);
+    }
+
+    // Snapshot after writes.
+    if let Ok(root) = broker.root_for(agent_id) { let _ = checkpoint::snapshot(&root, &format!("from {from_name}")); }
+
+    // PERSIST to the recipient's conversation history so the user sees it. We use
+    // a stable per-agent "inbox" conversation so all inter-agent exchanges for
+    // this agent thread together (id = "inbox-<agentId>").
+    let conv_id = format!("inbox-{agent_id}");
+    let existing = repo::load_conversation(db, &conv_id).ok();
+    let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
+    // Inbound message bubble (from the peer) + the reply.
+    ui_msgs.push(serde_json::json!({ "role": "user", "from": from_name, "text": format!("\u{1F4E8} from {from_name}: {}", msg.body) }));
+    ui_msgs.push(serde_json::json!({ "role": "assistant", "text": reply_text.trim(), "tools": [] }));
+    let conv = repo::Conversation {
+        id: conv_id, agent_id: agent_id.to_string(),
+        title: "Inter-agent inbox".into(), updated: 0, pinned: true, order: 1,
+        msgs: serde_json::json!(ui_msgs),
+        history: existing.map(|c| c.history).unwrap_or(serde_json::json!([])),
+    };
+    let _ = repo::save_conversation(db, conv);
+
+    // Broadcast: done + unread bump for the rail.
+    let _ = app.emit("agent-activity", &serde_json::json!({
+        "agentId": agent_id, "kind": "turn_done", "from": msg.from_agent, "fromName": from_name,
+    }));
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let state = Arc::new(DaemonState {
@@ -1668,11 +1842,17 @@ pub fn run() {
     // session. Created here, managed as Tauri state, acquired in agent_stream.
     let lanes = lanes::Lanes::new();
 
+    // M1.4 delivery engine: the signal the send path uses to WAKE the drainer
+    // the instant a message is enqueued (near-instant delivery). Managed as
+    // state so mailbox commands can nudge it.
+    let drain_signal = drainer::DrainSignal::new();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(broker.clone())
         .manage(state.clone())
-        .manage(lanes)
+        .manage(lanes.clone())
+        .manage(drain_signal.clone())
         .invoke_handler(tauri::generate_handler![
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
@@ -1689,7 +1869,8 @@ pub fn run() {
             agents_set_active, agents_get_active, agents_sharing_folder,
             agent_context_add, agent_context_list, agent_context_remove,
             agent_generate_soul,
-            mailbox_pending_counts, mailbox_take_next, mailbox_roster
+            mailbox_pending_counts, mailbox_take_next, mailbox_roster,
+            get_app_knobs, set_app_knobs
         ])
         .setup(move |_app| {
             // M1.1: bring up the SQLite state spine + single-writer actor, then
@@ -1707,7 +1888,19 @@ pub fn run() {
                     // and continue with whatever imported cleanly.
                     eprintln!("[aygent] JSON→SQLite migration warning: {e}");
                 }
-                _app.manage(db);
+                _app.manage(db.clone());
+
+                // M1.4 DELIVERY ENGINE: spawn the background drainer that runs
+                // recipient inter-agent turns headlessly (independent of any
+                // open chat pane). This is what makes Atlas→Copywriter→Atlas
+                // actually execute. It nudges on send + polls as a safety net.
+                {
+                    use tauri::Manager;
+                    let sig = _app.state::<drainer::DrainSignal>().inner().clone();
+                    let brk = _app.state::<Arc<Broker>>().inner().clone();
+                    let lns = _app.state::<lanes::Lanes>().inner().clone();
+                    drainer::spawn(_app.handle().clone(), db, brk, lns, sig);
+                }
             }
 
             let broker = broker.clone();

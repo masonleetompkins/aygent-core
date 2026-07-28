@@ -42,6 +42,21 @@ export function Settings({
   const [selProvider, setSelProvider] = useState("");
   const [modelMsg, setModelMsg] = useState<string | null>(null);
 
+  // M1.4 multi-agent knobs: inter-agent budget + max concurrency.
+  const [budget, setBudget] = useState(6);
+  const [concurrency, setConcurrency] = useState(6);
+  const [knobMsg, setKnobMsg] = useState<string | null>(null);
+  useEffect(() => {
+    invoke<{ inter_agent_budget: number; max_concurrency: number }>("get_app_knobs")
+      .then((k) => { setBudget(k.inter_agent_budget); setConcurrency(k.max_concurrency); })
+      .catch(() => {});
+  }, []);
+  async function saveKnobs(b: number, c: number) {
+    setBudget(b); setConcurrency(c); setKnobMsg(null);
+    try { await invoke("set_app_knobs", { budget: b, concurrency: c }); setKnobMsg("✓ saved"); }
+    catch (e) { setKnobMsg("✗ " + String(e)); }
+  }
+
   useEffect(() => { invoke<boolean>("has_provider_key", { provider: "anthropic" }).then(setKeySet).catch(() => {}); }, []);
   useEffect(() => {
     if (!folder) return;
@@ -86,6 +101,31 @@ export function Settings({
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18, maxWidth: 620 }}>
       <h2 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>Settings</h2>
+
+      {/* MULTI-AGENT (M1.4) */}
+      <Card title="Multi-agent">
+        <p style={hint}>How your agents collaborate when they message each other.</p>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
+          <span style={{ fontSize: 14, fontWeight: 600 }}>Conversation budget: {budget} turns</span>
+          <span style={{ ...hint, fontSize: 12 }}>
+            When one agent messages another, they can reply back and forth. This caps how many total
+            back-and-forth turns a single agent-to-agent conversation can run before it automatically
+            stops — so two agents can’t loop forever and run up your API bill. (1–50)
+          </span>
+          <input type="range" min={1} max={50} value={budget}
+            onChange={(e) => saveKnobs(Number(e.target.value), concurrency)} />
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 12 }}>
+          <span style={{ fontSize: 14, fontWeight: 600 }}>Max agents running at once: {concurrency}</span>
+          <span style={{ ...hint, fontSize: 12 }}>
+            How many agents can be actively working in parallel (each on its own folder). Higher =
+            more happens simultaneously, but more concurrent API calls at once. (1–12)
+          </span>
+          <input type="range" min={1} max={12} value={concurrency}
+            onChange={(e) => saveKnobs(budget, Number(e.target.value))} />
+        </div>
+        {knobMsg && <p style={{ ...hint, fontSize: 13, marginTop: 8 }}>{knobMsg}</p>}
+      </Card>
 
       {/* APPEARANCE */}
       <Card title="Appearance">

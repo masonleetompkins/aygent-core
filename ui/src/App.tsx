@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Pill } from "./components/ui";
 import { Sidebar, type ScreenId } from "./components/Sidebar";
-import { AgentSwitcher, type AgentProfile } from "./components/AgentSwitcher";
+import { AgentRail } from "./components/AgentRail";
+import { type AgentProfile } from "./components/AgentSwitcher";
 import { Agents } from "./screens/Agents";
 import { Settings } from "./screens/Settings";
 import { Playground } from "./screens/Playground";
@@ -87,9 +88,24 @@ export function App() {
 
   const good = status.kind === "connected";
 
+  // M1.4 parallel UI: viewing an agent no longer changes which agents RUN. We
+  // still call agents_set_active (so the primary Chat pane's folder/model track
+  // the viewed agent), but every agent runs in the background regardless.
+  function onViewAgent(a: AgentProfile) {
+    invoke<AgentProfile | null>("agents_set_active", { id: a.id })
+      .then((updated) => { if (updated) onActiveChange(updated); else onActiveChange(a); })
+      .catch(() => onActiveChange(a));
+    if (screen !== "chat") setScreen("chat");
+  }
+
   return (
     <div style={{ display: "flex", minHeight: "100vh" }}>
       <Sidebar active={screen} onSelect={setScreen} />
+      <AgentRail
+        viewingId={activeAgent?.id ?? null}
+        onView={onViewAgent}
+        onManage={() => setScreen("agents")}
+      />
       <div style={{ flex: 1, height: "100vh", overflowY: "auto" }}>
         {/* top status strip */}
         <div style={{
