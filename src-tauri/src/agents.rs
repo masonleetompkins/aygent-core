@@ -13,7 +13,7 @@
 //   <app_data>/agents/index.json            -> { agents: [AgentProfile], activeId }
 //   <app_data>/agents/<agentId>/settings.json, conversations/, tools/...
 //
-// Checkpoints stay keyed by FOLDER PATH (a shadow git repo per real folder), so
+// Save Points stay keyed by FOLDER PATH (a shadow git repo per real folder), so
 // two agents scoped to the same folder share ONE history + the folder write lock
 // (CONTRACTS §4). Identity must not fork the git timeline.
 
@@ -183,7 +183,7 @@ pub fn delete(app_data: &Path, id: &str) -> Result<(), String> {
     }
     save_index(app_data, &idx)?;
     // Drop this agent's per-agent state (settings/conversations/tools). Folder +
-    // checkpoints are untouched (they belong to the folder, not the agent).
+    // Save Points are untouched (they belong to the folder, not the agent).
     if let Ok(dir) = agent_state_dir(app_data, id) {
         let _ = fs::remove_dir_all(dir);
     }

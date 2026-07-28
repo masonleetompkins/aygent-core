@@ -8,7 +8,7 @@ import { Agents } from "./screens/Agents";
 import { Settings } from "./screens/Settings";
 import { Playground } from "./screens/Playground";
 import { Chat } from "./screens/Chat";
-import { Checkpoints } from "./screens/Checkpoints";
+import { SavePoints } from "./screens/SavePoints";
 import { Tools } from "./screens/Tools";
 import { Scheduler } from "./screens/Scheduler";
 import { Connections } from "./screens/Connections";
@@ -135,7 +135,7 @@ export function App() {
           {screen === "settings" && (
             <Settings mode={mode} accent={accent} onTheme={onTheme} folder={folder} onPickFolder={pickFolder} agentId={activeAgent?.id ?? null} />
           )}
-          {screen === "savepoints" && <Checkpoints folder={folder} />}
+          {screen === "savepoints" && <SavePoints folder={folder} />}
           {screen === "scheduler" && <Scheduler agentId={activeAgent?.id ?? null} />}
           {screen === "connections" && <Connections agentId={activeAgent?.id ?? null} />}
           {screen === "tools" && <Tools folder={folder} />}

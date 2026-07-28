@@ -196,7 +196,7 @@ impl Broker {
             .ok_or(BrokerError::NoScope)
     }
 
-    /// The canonical scoped root for an agent, if set. Checkpoints run git
+    /// The canonical scoped root for an agent, if set. Save Points run git
     /// against this root (never against a path the daemon supplies). Refuses if
     /// the bookmark is stale — same fail-closed rule as resolve().
     pub fn root_for(&self, agent_id: &str) -> Result<PathBuf, BrokerError> {

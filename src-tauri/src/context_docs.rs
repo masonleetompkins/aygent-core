@@ -7,7 +7,7 @@
 //   - Docs live in APP-DATA, RUST-SIDE, OUT OF THE JAIL:
 //       <app_data>/agents/<agentId>/context/<filename>
 //     NOT in the agent's folder — putting them there would sweep them into the
-//     folder's git checkpoint stream (polluting the user's real vault history
+//     folder's git save point stream (polluting the user's real vault history
 //     and bloating snapshots). Wrong layer.
 //
 //   - Extracted text is chunked into the `mem_chunk` table (owner_kind='agent',

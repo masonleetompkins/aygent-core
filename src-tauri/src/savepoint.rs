@@ -1,55 +1,62 @@
-// AYGENT — Checkpoints (Phase 1, Contract C4).
+// AYGENT — Save Points (Phase 1, Contract C4). [module file: savepoint.rs]
 //
 // "The AI agent you actually own" only means something if you can UNDO what it
-// did to your files. Checkpoints give AYGENT a rewind button: before an agent
+// did to your files. Save Points give AYGENT a rewind button: before an agent
 // turn writes anything, we snapshot the folder; if the result is wrong, one
 // click restores the exact prior tree.
+//
+// NAMING: user-facing + code term is "Save Point" (renamed from "Checkpoint"
+// 2026-07-28). The ONE thing that intentionally keeps the old name is the
+// ON-DISK artifact `.aygent/checkpoints.git` + the git config key
+// `aygent.retentiondays` — renaming those would ORPHAN every existing user's
+// save-point history + retention setting on upgrade. That's a migration
+// boundary, not debt; it's commented at each site.
 //
 // ZERO USER SETUP (the whole product promise): we use **git2 / libgit2**, which
 // is compiled INTO our binary. There is NO dependency on a system `git` install
 // and nothing to bundle separately — the git object model just lives inside the
-// app. A user double-clicks AYGENT and checkpoints work, full stop.
+// app. A user double-clicks AYGENT and save points work, full stop.
 //
 // DESIGN (per docs/CONTRACTS.md §4 — the frozen Folder-lock protocol picked git):
 //   - Each agent folder gets a SHADOW git repo whose GIT_DIR lives at
-//     `<root>/.aygent/checkpoints.git`, with the work-tree set to `<root>`.
-//     A separate GIT_DIR (not `<root>/.git`) means we NEVER touch or conflict
-//     with a user's real git repo if the folder already is one.
-//   - A checkpoint = stage-all + commit of the whole work-tree. The commit
+//     `<root>/.aygent/checkpoints.git` (on-disk name kept — see NAMING above),
+//     with the work-tree set to `<root>`. A separate GIT_DIR (not `<root>/.git`)
+//     means we NEVER touch or conflict with a user's real git repo.
+//   - A save point = stage-all + commit of the whole work-tree. The commit
 //     message carries the user prompt that caused the turn.
 //   - Rewind = reset the work-tree to that commit's tree (checkout + remove
 //     files the target didn't have), then commit the restore so HEAD tracks it.
 //   - We SNAPSHOT-BEFORE the rewind too, so "undo the undo" is always possible.
 //
 // SECURITY: the repo is opened at the broker-resolved root (never a
-// daemon-supplied path). `.aygent/` is git-ignored so checkpoints never recurse
+// daemon-supplied path). `.aygent/` is git-ignored so save points never recurse
 // into the shadow repo itself.
 
 use git2::{IndexAddOption, Repository, ResetType, Signature};
 use std::path::{Path, PathBuf};
 
-/// One checkpoint entry surfaced to the UI timeline.
+/// One save-point entry surfaced to the UI timeline.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct Checkpoint {
+pub struct SavePoint {
     pub id: String,        // commit sha (short)
     pub message: String,   // the prompt/label that caused this snapshot
     pub timestamp: i64,    // unix seconds (commit time)
-    pub files: usize,      // files changed vs the previous checkpoint
-    pub is_current: bool,  // is this the checkpoint the cursor is on right now?
+    pub files: usize,      // files changed vs the previous save point
+    pub is_current: bool,  // is this the save point the cursor is on right now?
 }
 
 /// The timeline + where we currently are on it. Drives the Undo/Redo buttons:
-/// undo is possible when the cursor has a parent; redo when a checkpoint sits
+/// undo is possible when the cursor has a parent; redo when a save point sits
 /// AFTER the cursor on the history chain.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Timeline {
-    pub items: Vec<Checkpoint>,
+    pub items: Vec<SavePoint>,
     pub can_undo: bool,
     pub can_redo: bool,
 }
 
-// We keep TWO refs, so "future" checkpoints are never orphaned by a rewind:
-//   HISTORY_REF  — the append-only tip of ALL checkpoints ever taken.
+// We keep TWO refs, so "future" save points are never orphaned by a rewind:
+//   HISTORY_REF  — the append-only tip of ALL save points ever taken.
 //   CURSOR_REF   — where the user currently is (what the work-tree matches).
 // Undo/redo just walk the cursor along the history chain and checkout its tree.
 // Taking a NEW snapshot commits on top of the cursor and moves BOTH refs to it
@@ -58,11 +65,13 @@ const HISTORY_REF: &str = "refs/aygent/history";
 const CURSOR_REF: &str = "refs/aygent/cursor";
 
 fn git_dir(root: &Path) -> PathBuf {
+    // On-disk name kept as `checkpoints.git` ON PURPOSE (migration boundary —
+    // renaming would orphan every existing user's save-point history).
     root.join(".aygent").join("checkpoints.git")
 }
 
 fn sig() -> Result<Signature<'static>, String> {
-    Signature::now("AYGENT Checkpoints", "checkpoints@aygent.local")
+    Signature::now("AYGENT Save Points", "savepoints@aygent.local")
         .map_err(|e| format!("signature: {e}"))
 }
 
@@ -133,12 +142,12 @@ fn set_ref(repo: &Repository, name: &str, oid: git2::Oid, log: &str) -> Result<(
         .map_err(|e| format!("set ref {name}: {e}"))
 }
 
-/// Take a checkpoint of the whole work-tree. `label` becomes the commit message
-/// (typically the user prompt). Returns the new checkpoint's short sha, or None
-/// if nothing changed since the last checkpoint (no empty commits).
+/// Take a save point of the whole work-tree. `label` becomes the commit message
+/// (typically the user prompt). Returns the new save point's short sha, or None
+/// if nothing changed since the last save point (no empty commits).
 ///
 /// The new commit's PARENT is the current CURSOR (not the history tip). So if
-/// the user undid a few steps and then made a new change, the new checkpoint
+/// the user undid a few steps and then made a new change, the new save point
 /// branches off where they are — and both refs advance to it, discarding the
 /// now-stale redo future. Exactly a text editor's undo/redo semantics.
 pub fn snapshot(root: &Path, label: &str) -> Result<Option<String>, String> {
@@ -150,7 +159,7 @@ pub fn snapshot(root: &Path, label: &str) -> Result<Option<String>, String> {
     let parent_oid = ref_oid(&repo, CURSOR_REF);
     let parent_commit = parent_oid.and_then(|o| repo.find_commit(o).ok());
 
-    // Skip empty checkpoints (tree identical to the cursor's tree), but always
+    // Skip empty save points (tree identical to the cursor's tree), but always
     // allow the very first commit so there's an anchor.
     if let Some(ref parent) = parent_commit {
         if parent.tree_id() == tree_oid {
@@ -159,23 +168,23 @@ pub fn snapshot(root: &Path, label: &str) -> Result<Option<String>, String> {
     }
 
     let signature = sig()?;
-    let msg = if label.trim().is_empty() { "checkpoint" } else { label.trim() };
+    let msg = if label.trim().is_empty() { "save point" } else { label.trim() };
     let parents: Vec<&git2::Commit> = parent_commit.iter().collect();
     // Commit WITHOUT moving HEAD; we manage our own refs explicitly.
     let oid = repo
         .commit(None, &signature, &signature, msg, &tree, &parents)
         .map_err(|e| format!("commit: {e}"))?;
 
-    // Both the history tip and the cursor advance to the new checkpoint.
+    // Both the history tip and the cursor advance to the new save point.
     set_ref(&repo, HISTORY_REF, oid, "snapshot")?;
     set_ref(&repo, CURSOR_REF, oid, "snapshot")?;
     Ok(Some(short(&oid)))
 }
 
 /// The full timeline (newest-first) + undo/redo availability. We walk from the
-/// HISTORY tip (so "future" checkpoints above the cursor are still shown), and
+/// HISTORY tip (so "future" save points above the cursor are still shown), and
 /// mark the CURSOR commit as current. Undo is possible when the cursor has a
-/// parent; redo when a checkpoint sits after the cursor on the chain.
+/// parent; redo when a save point sits after the cursor on the chain.
 pub fn timeline(root: &Path) -> Result<Timeline, String> {
     if !git_dir(root).exists() {
         return Ok(Timeline { items: vec![], can_undo: false, can_redo: false });
@@ -197,7 +206,7 @@ pub fn timeline(root: &Path) -> Result<Timeline, String> {
     for oid in walk {
         let oid = oid.map_err(|e| format!("walk: {e}"))?;
         let commit = repo.find_commit(oid).map_err(|e| format!("find_commit: {e}"))?;
-        let message = commit.summary().unwrap_or("checkpoint").to_string();
+        let message = commit.summary().unwrap_or("save point").to_string();
         let timestamp = commit.time().seconds();
 
         let files = if commit.parent_count() > 0 {
@@ -220,7 +229,7 @@ pub fn timeline(root: &Path) -> Result<Timeline, String> {
             redo_available = true;
         }
 
-        items.push(Checkpoint {
+        items.push(SavePoint {
             id: short(&oid),
             message,
             timestamp,
@@ -241,7 +250,7 @@ pub fn timeline(root: &Path) -> Result<Timeline, String> {
 /// Move the cursor to `oid` and make the work-tree match that commit's tree.
 /// This is the ONE place the folder contents change: a hard-reset of the tree +
 /// index to the target, plus moving CURSOR_REF. HISTORY_REF is left untouched,
-/// so "future" checkpoints above the new cursor stay reachable for redo.
+/// so "future" save points above the new cursor stay reachable for redo.
 fn goto(repo: &Repository, oid: git2::Oid) -> Result<(), String> {
     let commit = repo.find_commit(oid).map_err(|e| format!("find_commit: {e}"))?;
     let obj = commit.as_object();
@@ -254,8 +263,8 @@ fn goto(repo: &Repository, oid: git2::Oid) -> Result<(), String> {
     Ok(())
 }
 
-/// Rewind (jump) the folder to an explicit checkpoint. Before moving, we capture
-/// any uncommitted work as a checkpoint so nothing is ever lost. Then we move
+/// Rewind (jump) the folder to an explicit save point. Before moving, we capture
+/// any uncommitted work as a save point so nothing is ever lost. Then we move
 /// the cursor to the target and restore its tree. HISTORY is preserved, so
 /// everything above the target remains redo-reachable.
 pub fn rewind(root: &Path, target: &str) -> Result<(), String> {
@@ -263,20 +272,20 @@ pub fn rewind(root: &Path, target: &str) -> Result<(), String> {
     let target_commit = repo
         .revparse_single(target)
         .and_then(|o| o.peel_to_commit())
-        .map_err(|_| format!("unknown checkpoint: {target}"))?;
+        .map_err(|_| format!("unknown save point: {target}"))?;
 
     // Capture any uncommitted edits first (best-effort) so a jump never drops work.
     let _ = snapshot(root, "before rewind");
     goto(&repo, target_commit.id())
 }
 
-/// UNDO: move the cursor one checkpoint back (to its parent) and restore that
-/// state. No-op error if already at the oldest checkpoint.
+/// UNDO: move the cursor one save point back (to its parent) and restore that
+/// state. No-op error if already at the oldest save point.
 pub fn undo(root: &Path) -> Result<Option<String>, String> {
     let repo = open_or_init(root)?;
     // Capture any live edits first, so undo can be redone back to "now".
     let _ = snapshot(root, "before undo");
-    let cursor = ref_oid(&repo, CURSOR_REF).ok_or("no checkpoints yet")?;
+    let cursor = ref_oid(&repo, CURSOR_REF).ok_or("no save points yet")?;
     let commit = repo.find_commit(cursor).map_err(|e| format!("find_commit: {e}"))?;
     if commit.parent_count() == 0 {
         return Ok(None); // already at the oldest
@@ -286,12 +295,12 @@ pub fn undo(root: &Path) -> Result<Option<String>, String> {
     Ok(Some(short(&parent.id())))
 }
 
-/// REDO: move the cursor one checkpoint FORWARD along the history chain (to the
+/// REDO: move the cursor one save point FORWARD along the history chain (to the
 /// child whose ancestor is the current cursor) and restore that state. No-op if
 /// the cursor is already at the tip.
 pub fn redo(root: &Path) -> Result<Option<String>, String> {
     let repo = open_or_init(root)?;
-    let tip = ref_oid(&repo, HISTORY_REF).ok_or("no checkpoints yet")?;
+    let tip = ref_oid(&repo, HISTORY_REF).ok_or("no save points yet")?;
     let cursor = ref_oid(&repo, CURSOR_REF).unwrap_or(tip);
     if cursor == tip {
         return Ok(None); // nothing to redo
@@ -315,10 +324,10 @@ pub fn redo(root: &Path) -> Result<Option<String>, String> {
 }
 
 // --- Retention + purge -----------------------------------------------------
-// A folder's checkpoint history must not grow forever. We store a retention
+// A folder's save-point history must not grow forever. We store a retention
 // window (in DAYS, 1..=90) in the shadow repo's OWN git config (key
 // `aygent.retentiondays`) so it travels with the folder and needs no separate
-// DB. After each snapshot we prune checkpoints older than the window. Pruning
+// DB. After each snapshot we prune save points older than the window. Pruning
 // rewrites the history chain to drop old commits while KEEPING the cursor's
 // state reachable, then runs gc so disk is actually reclaimed.
 
@@ -345,7 +354,7 @@ pub fn set_retention(root: &Path, days: i64) -> Result<(), String> {
     prune(root, d)
 }
 
-/// Drop checkpoints older than `days`. We walk the history newest-first and keep
+/// Drop save points older than `days`. We walk the history newest-first and keep
 /// commits within the window; the first commit that falls outside becomes the
 /// new "root" (its tree is preserved as a fresh baseline so nothing within the
 /// window loses its parent). The cursor is always kept reachable. Best-effort:
@@ -390,7 +399,7 @@ pub fn prune(root: &Path, days: i64) -> Result<(), String> {
     let oldest_kept = repo.find_commit(oldest_kept_oid).map_err(|e| format!("find: {e}"))?;
     let sigt = sig()?;
     let new_root = repo
-        .commit(None, &sigt, &sigt, oldest_kept.summary().unwrap_or("checkpoint"),
+        .commit(None, &sigt, &sigt, oldest_kept.summary().unwrap_or("save point"),
                 &oldest_kept.tree().map_err(|e| format!("tree: {e}"))?, &[])
         .map_err(|e| format!("reroot commit: {e}"))?;
 
@@ -406,7 +415,7 @@ pub fn prune(root: &Path, days: i64) -> Result<(), String> {
         let tree = c.tree().map_err(|e| format!("tree: {e}"))?;
         let sigc = sig()?;
         let new_oid = repo
-            .commit(None, &sigc, &sigc, c.summary().unwrap_or("checkpoint"), &tree, &[&parent])
+            .commit(None, &sigc, &sigc, c.summary().unwrap_or("save point"), &tree, &[&parent])
             .map_err(|e| format!("recommit: {e}"))?;
         remap.insert(oid, new_oid);
         prev = new_oid;
@@ -422,7 +431,7 @@ pub fn prune(root: &Path, days: i64) -> Result<(), String> {
     Ok(())
 }
 
-/// PURGE ALL: delete the entire checkpoint history for this folder. The next
+/// PURGE ALL: delete the entire save-point history for this folder. The next
 /// snapshot re-inits a fresh repo. Removes the shadow git dir wholesale — the
 /// user's actual files are untouched (they live in the work-tree, not the repo).
 pub fn purge_all(root: &Path) -> Result<(), String> {

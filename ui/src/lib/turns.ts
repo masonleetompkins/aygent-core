@@ -29,7 +29,7 @@ export type TurnState = {
   status: "idle" | "running";
   liveText: string;          // accumulated streamed tokens for the in-flight assistant msg
   liveTools: ToolCard[];     // tool cards for the in-flight turn
-  info?: string;             // latest info line (model, checkpoint…)
+  info?: string;             // latest info line (model, save point…)
   memory?: string;           // 🧠 auto-capture note for THIS turn (shown under the user msg)
   error?: string;
 };

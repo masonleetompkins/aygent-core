@@ -3,7 +3,7 @@
 // Chat history is APP STATE, not user files — so it lives in the app's data dir,
 // NOT inside the agent folder. Two reasons this matters:
 //   1. The vault stays clean (no agent metadata cluttering the user's notes).
-//   2. Conversations don't get swept into CHECKPOINTS (which snapshot the agent
+//   2. Conversations don't get swept into Save Points (which snapshot the agent
 //      folder). Storing chat logs in the folder would recurse the two systems.
 //
 // LAYOUT:  <app_data>/conversations/<folder_key>/<conv_id>.json

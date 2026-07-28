@@ -1,26 +1,28 @@
 // Save Points — the rewind timeline. AYGENT snapshots the agent folder before
-// every turn (Rust checkpoint module, git-backed per Contract C4). This screen
+// every turn (Rust save point module, git-backed per Contract C4). This screen
 // lists those save points newest-first and lets you restore the folder to any of
 // them with one click. Restoring first snapshots the current state, so a rewind
-// is itself undoable. (Renamed from "Checkpoints" 2026-07-28 — user-facing term
-// is "Save Point"; internal Rust cmds keep the checkpoint_* names.)
+// is itself undoable. (Renamed from "Save Points" 2026-07-28 — "Save Point"
+// everywhere: UI + Rust cmds (savepoint_*) + module (savepoint.rs). Only the
+// on-disk .aygent/Save Points.git artifact keeps its name, to not orphan
+// existing users' history.)
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Pill } from "../components/ui";
 
-type Checkpoint = {
+type SavePoint = {
   id: string;
   message: string;
   timestamp: number; // unix seconds
   files: number;
   is_current: boolean;
 };
-type Timeline = { items: Checkpoint[]; can_undo: boolean; can_redo: boolean };
+type Timeline = { items: SavePoint[]; can_undo: boolean; can_redo: boolean };
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 
-export function Checkpoints({ folder }: { folder: string | null }) {
-  const [items, setItems] = useState<Checkpoint[]>([]);
+export function SavePoints({ folder }: { folder: string | null }) {
+  const [items, setItems] = useState<SavePoint[]>([]);
   const [canUndo, setCanUndo] = useState(false);
   const [canRedo, setCanRedo] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -31,7 +33,7 @@ export function Checkpoints({ folder }: { folder: string | null }) {
     if (!folder) return;
     setErr(null);
     try {
-      const t = await invoke<Timeline>("checkpoint_timeline");
+      const t = await invoke<Timeline>("savepoint_timeline");
       setItems(t.items); setCanUndo(t.can_undo); setCanRedo(t.can_redo);
     } catch (e) { setErr(String(e)); }
   }
@@ -40,12 +42,12 @@ export function Checkpoints({ folder }: { folder: string | null }) {
 
   async function snapshotNow() {
     setBusy(true); setErr(null);
-    try { await invoke("checkpoint_snapshot", { label: "manual save point" }); await refresh(); }
+    try { await invoke("savepoint_snapshot", { label: "manual save point" }); await refresh(); }
     catch (e) { setErr(String(e)); }
     finally { setBusy(false); }
   }
 
-  async function step(cmd: "checkpoint_undo" | "checkpoint_redo") {
+  async function step(cmd: "savepoint_undo" | "savepoint_redo") {
     setBusy(true); setErr(null);
     try { await invoke(cmd); await refresh(); }
     catch (e) { setErr(String(e)); }
@@ -54,7 +56,7 @@ export function Checkpoints({ folder }: { folder: string | null }) {
 
   async function rewind(id: string) {
     setBusy(true); setErr(null); setConfirmId(null);
-    try { await invoke("checkpoint_rewind", { target: id }); await refresh(); }
+    try { await invoke("savepoint_rewind", { target: id }); await refresh(); }
     catch (e) { setErr(String(e)); }
     finally { setBusy(false); }
   }
@@ -71,8 +73,8 @@ export function Checkpoints({ folder }: { folder: string | null }) {
       {folder && (
         <>
           <div style={{ display: "flex", gap: 8 }}>
-            <Button onClick={() => step("checkpoint_undo")} disabled={busy || !canUndo}>↶ Undo</Button>
-            <Button onClick={() => step("checkpoint_redo")} disabled={busy || !canRedo}>↷ Redo</Button>
+            <Button onClick={() => step("savepoint_undo")} disabled={busy || !canUndo}>↶ Undo</Button>
+            <Button onClick={() => step("savepoint_redo")} disabled={busy || !canRedo}>↷ Redo</Button>
             <div style={{ width: 1, background: "var(--line)", margin: "2px 4px" }} />
             <Button variant="secondary" onClick={snapshotNow} disabled={busy}>{busy ? "…" : "Save Point now"}</Button>
             <Button variant="secondary" onClick={refresh} disabled={busy}>Refresh</Button>
@@ -92,7 +94,7 @@ export function Checkpoints({ folder }: { folder: string | null }) {
           {items.length > 0 && (
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               {items.map((c) => (
-                <CheckpointRow
+                <SavePointRow
                   key={c.id}
                   c={c}
                   busy={busy}
@@ -110,10 +112,10 @@ export function Checkpoints({ folder }: { folder: string | null }) {
   );
 }
 
-function CheckpointRow({
+function SavePointRow({
   c, busy, confirming, onAskRewind, onCancel, onConfirm,
 }: {
-  c: Checkpoint; busy: boolean; confirming: boolean;
+  c: SavePoint; busy: boolean; confirming: boolean;
   onAskRewind: () => void; onCancel: () => void; onConfirm: () => void;
 }) {
   return (

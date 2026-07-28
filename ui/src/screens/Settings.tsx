@@ -63,17 +63,17 @@ export function Settings({
   useEffect(() => { invoke<boolean>("has_provider_key", { provider: "anthropic" }).then(setKeySet).catch(() => {}); }, []);
   useEffect(() => {
     if (!folder) return;
-    invoke<number>("checkpoint_get_retention").then(setRetention).catch(() => {});
+    invoke<number>("savepoint_get_retention").then(setRetention).catch(() => {});
   }, [folder]);
 
   async function saveRetention(days: number) {
     setRetention(days); setCpMsg(null);
-    try { await invoke("checkpoint_set_retention", { days }); setCpMsg(`✓ keeping ${days} days`); }
+    try { await invoke("savepoint_set_retention", { days }); setCpMsg(`✓ keeping ${days} days`); }
     catch (e) { setCpMsg("✗ " + String(e)); }
   }
   async function purgeAll() {
     setConfirmPurge(false); setCpMsg(null);
-    try { await invoke("checkpoint_purge"); setCpMsg("✓ all checkpoints purged"); }
+    try { await invoke("savepoint_purge"); setCpMsg("✓ all Save Points purged"); }
     catch (e) { setCpMsg("✗ " + String(e)); }
   }
   async function saveKey() {
@@ -148,7 +148,7 @@ export function Settings({
         )}
       </Card>
 
-      {/* SAVE POINTS (formerly Checkpoints — Mason rename). */}
+      {/* SAVE POINTS (renamed from Checkpoints 2026-07-28 — full rename). */}
       <Card title="Save Points">
         <p style={hint}>Every change your agent makes is a Save Point so you can rewind. Keep history for a window, then it prunes automatically.</p>
         {!folder ? (

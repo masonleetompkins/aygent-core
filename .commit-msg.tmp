@@ -1,17 +1,29 @@
-feat(settings+savepoints): reorder Settings, kill dead radios, rename Checkpoints -> Save Points
+refactor(savepoints): rename Checkpoints -> Save Points EVERYWHERE (no half-rename debt)
 
-Mason's list:
-- Settings card order is now: Appearance, Providers, Local Models, Memory,
-  Save Points, Multi-agent.
-- Local Models: removed the dead radio buttons (models are picked per-agent in
-  the Agents tab, so a non-selectable info row now — name/size/tool-capability
-  + Delete). Copy updated to say models show up per-agent.
-- RENAME Checkpoints -> "Save Points" everywhere user-facing (gamer-nerd term):
-  sidebar tab ("savepoints" screen id + "Save Points" label), the screen
-  (title, empty state, "Save Point now" button, row fallback label), Settings
-  card ("Save Points", copy), Agents share-folder copy, and the two Info-stream
-  strings in the turn loop. INTERNAL Rust cmd names (checkpoint_*) + the
-  checkpoint.rs module keep their names on purpose (renaming identifiers = pure
-  churn + breakage risk, zero user benefit); only user-facing text changed.
+Per Mason: a term that means one thing in UI and another in code is debt
+before launch. Full rename, all layers:
 
-First compile after the reorder + rename \u2014 flag if cargo/tsc throws.
+CODE
+- src/checkpoint.rs -> src/savepoint.rs (git mv); mod checkpoint -> mod savepoint
+- struct Checkpoint -> SavePoint; all checkpoint:: calls -> savepoint::
+- Tauri cmds checkpoint_* -> savepoint_* (snapshot/timeline/rewind/undo/redo/
+  get_retention/set_retention/purge) + handler registration + all UI invoke()
+  strings (SavePoints.tsx, Settings.tsx) kept in exact sync
+- active_checkpoint_root -> active_savepoint_root
+- signature "AYGENT Checkpoints" -> "AYGENT Save Points"
+
+UI
+- ui/screens/Checkpoints.tsx -> SavePoints.tsx (git mv); component/types renamed
+  (Checkpoints->SavePoints, Checkpoint->SavePoint, CheckpointRow->SavePointRow)
+- App.tsx import + screen id "checkpoints" -> "savepoints"; Sidebar label/id
+- all user-facing copy + comments swept across agents/broker/context_docs/
+  conversations/lanes/repo/settings/writer/turns
+
+INTENTIONALLY KEPT (migration boundary, commented at each site):
+- on-disk `.aygent/checkpoints.git` shadow-repo path
+- git config key `aygent.retentiondays`
+Renaming these would ORPHAN every existing user's save-point history +
+retention on upgrade. Code is fully renamed AROUND them.
+
+First compile after a cross-cutting rename (module file move + screen-id type
+change + 9 cmd renames both sides) — flag if cargo/tsc throws.

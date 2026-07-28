@@ -4,7 +4,7 @@
 // AT A TIME. A second "send" on a session while its turn is still running is
 // serialized behind the first — never interleaved. This kills the whole class
 // of tool/session races (two turns writing the same note, mangled streaming,
-// double checkpoints) at the source instead of patching each symptom.
+// double Save Points) at the source instead of patching each symptom.
 //
 // SCOPE vs the writer actor:
 //   - writer.rs serializes DB *writes* globally (data integrity).

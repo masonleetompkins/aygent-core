@@ -11,7 +11,7 @@ mod broker;
 mod broker_ws;
 mod catalog;
 mod connections;
-mod checkpoint;
+mod savepoint;
 mod context_docs;
 mod conversations;
 mod db;
@@ -794,53 +794,53 @@ fn conv_reorder(
 /// Returns the new checkpoint sha, or null if nothing changed. Root comes from
 /// the broker (never a UI-supplied path) so git only ever runs on the jail root.
 #[tauri::command]
-fn checkpoint_snapshot(
+fn savepoint_snapshot(
     broker: tauri::State<Arc<Broker>>,
     label: String,
 ) -> Result<Option<String>, String> {
     let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
-    checkpoint::snapshot(&root, &label)
+    savepoint::snapshot(&root, &label)
 }
 
-/// The full checkpoint timeline + undo/redo availability, newest first.
+/// The full save-point timeline + undo/redo availability, newest first.
 #[tauri::command]
-fn checkpoint_timeline(
+fn savepoint_timeline(
     broker: tauri::State<Arc<Broker>>,
-) -> Result<checkpoint::Timeline, String> {
+) -> Result<savepoint::Timeline, String> {
     let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
-    checkpoint::timeline(&root)
+    savepoint::timeline(&root)
 }
 
-/// Rewind (jump) the agent folder to a specific checkpoint. Snapshots current
+/// Rewind (jump) the agent folder to a specific save point. Snapshots current
 /// state first, so the jump never loses uncommitted work.
 #[tauri::command]
-fn checkpoint_rewind(
+fn savepoint_rewind(
     broker: tauri::State<Arc<Broker>>,
     target: String,
 ) -> Result<(), String> {
     let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
-    checkpoint::rewind(&root, &target)
+    savepoint::rewind(&root, &target)
 }
 
-/// Undo: step the cursor one checkpoint back and restore that state.
+/// Undo: step the cursor one save point back and restore that state.
 #[tauri::command]
-fn checkpoint_undo(broker: tauri::State<Arc<Broker>>) -> Result<Option<String>, String> {
+fn savepoint_undo(broker: tauri::State<Arc<Broker>>) -> Result<Option<String>, String> {
     let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
-    checkpoint::undo(&root)
+    savepoint::undo(&root)
 }
 
-/// Redo: step the cursor one checkpoint forward and restore that state.
+/// Redo: step the cursor one save point forward and restore that state.
 #[tauri::command]
-fn checkpoint_redo(broker: tauri::State<Arc<Broker>>) -> Result<Option<String>, String> {
+fn savepoint_redo(broker: tauri::State<Arc<Broker>>) -> Result<Option<String>, String> {
     let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
-    checkpoint::redo(&root)
+    savepoint::redo(&root)
 }
 
-/// Resolve the checkpoint root for the ACTIVE agent's folder. Bug (Mason 07-28):
+/// Resolve the save-point root for the ACTIVE agent's folder. Bug (Mason 07-28):
 /// get/set retention both used broker.root_for("default") — the legacy hardcoded
 /// scope — so a value set on the real agent folder was never read back and the
 /// slider snapped to 30. Resolve the active agent's own root so read == write.
-fn active_checkpoint_root(broker: &Arc<Broker>, db: &writer::Db) -> Result<std::path::PathBuf, String> {
+fn active_savepoint_root(broker: &Arc<Broker>, db: &writer::Db) -> Result<std::path::PathBuf, String> {
     if let Ok(Some(a)) = repo::get_active_agent(db) {
         if !a.folder_path.is_empty() {
             if let Ok(root) = broker.root_for(&a.id) { return Ok(root); }
@@ -851,23 +851,23 @@ fn active_checkpoint_root(broker: &Arc<Broker>, db: &writer::Db) -> Result<std::
 
 /// Read the retention window (days, 1..=90) for the active agent's folder.
 #[tauri::command]
-fn checkpoint_get_retention(broker: tauri::State<Arc<Broker>>, db: tauri::State<writer::Db>) -> Result<i64, String> {
-    let root = active_checkpoint_root(&broker, &db)?;
-    checkpoint::get_retention(&root)
+fn savepoint_get_retention(broker: tauri::State<Arc<Broker>>, db: tauri::State<writer::Db>) -> Result<i64, String> {
+    let root = active_savepoint_root(&broker, &db)?;
+    savepoint::get_retention(&root)
 }
 
 /// Set the retention window (days) + prune anything older immediately.
 #[tauri::command]
-fn checkpoint_set_retention(broker: tauri::State<Arc<Broker>>, db: tauri::State<writer::Db>, days: i64) -> Result<(), String> {
-    let root = active_checkpoint_root(&broker, &db)?;
-    checkpoint::set_retention(&root, days)
+fn savepoint_set_retention(broker: tauri::State<Arc<Broker>>, db: tauri::State<writer::Db>, days: i64) -> Result<(), String> {
+    let root = active_savepoint_root(&broker, &db)?;
+    savepoint::set_retention(&root, days)
 }
 
-/// Purge ALL checkpoint history for the folder (user's files untouched).
+/// Purge ALL save-point history for the folder (user's files untouched).
 #[tauri::command]
-fn checkpoint_purge(broker: tauri::State<Arc<Broker>>) -> Result<(), String> {
+fn savepoint_purge(broker: tauri::State<Arc<Broker>>) -> Result<(), String> {
     let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
-    checkpoint::purge_all(&root)
+    savepoint::purge_all(&root)
 }
 
 // --- M0.3: provider key (Keychain) + Anthropic end-to-end -------------------
@@ -1936,7 +1936,7 @@ async fn agent_stream(
         });
         // Baseline checkpoint before any tool writes (same as Anthropic path).
         if let Ok(root) = broker.root_for(&scope_id) {
-            let _ = checkpoint::snapshot(&root, "baseline");
+            let _ = savepoint::snapshot(&root, "baseline");
         }
         // Enabled registry tools (e.g. PDF) contribute extra instructions the
         // local model should know about, appended to its native tool prompt.
@@ -1995,7 +1995,7 @@ async fn agent_stream(
         // Snapshot AFTER the turn's writes, labeled with the prompt (same C4
         // semantics as the Anthropic path — rewindable local tool edits).
         if let Ok(root) = broker.root_for(&scope_id) {
-            let _ = checkpoint::snapshot(&root, &prompt);
+            let _ = savepoint::snapshot(&root, &prompt);
         }
         run_auto_capture(&app, &db, &broker, &scope_id, &prompt, &channel).await;
         return Ok(messages);
@@ -2012,7 +2012,7 @@ async fn agent_stream(
 
         // Baseline checkpoint before the turn (rewind anchor), same as Anthropic.
         if let Ok(root) = broker.root_for(&scope_id) {
-            let _ = checkpoint::snapshot(&root, "baseline");
+            let _ = savepoint::snapshot(&root, "baseline");
         }
 
         let (tools, reg_instr) = agent_tools_for_full(&app, folder.as_deref(), !roster.is_empty(), Some((&db, &scope_id)));
@@ -2073,7 +2073,7 @@ async fn agent_stream(
 
         // Snapshot AFTER the turn's writes, labeled with the prompt (C4).
         if let Ok(root) = broker.root_for(&scope_id) {
-            match checkpoint::snapshot(&root, &prompt) {
+            match savepoint::snapshot(&root, &prompt) {
                 Ok(Some(sha)) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("checkpoint {sha}") }); }
                 _ => {}
             }
@@ -2106,7 +2106,7 @@ async fn agent_stream(
     // the bug where a turn's writes were absorbed (mislabeled) into the NEXT
     // turn's pre-snapshot, or lost entirely if they were the last edit.
     if let Ok(root) = broker.root_for("default") {
-        let _ = checkpoint::snapshot(&root, "baseline");
+        let _ = savepoint::snapshot(&root, "baseline");
     }
 
     let (tools, reg_instr) = agent_tools_for_full(&app, folder.as_deref(), !roster.is_empty(), Some((&db, &scope_id)));
@@ -2207,14 +2207,14 @@ async fn agent_stream(
     // by that prompt — which is what a user intuitively expects. Skips silently if
     // nothing changed (no empty checkpoints). Best-effort: never blocks the reply.
     if let Ok(root) = broker.root_for(&scope_id) {
-        match checkpoint::snapshot(&root, &prompt) {
+        match savepoint::snapshot(&root, &prompt) {
             Ok(Some(sha)) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("save point {sha}") }); }
             Ok(None) => {}
             Err(e) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("save point skipped: {e}") }); }
         }
         // Auto-prune anything past the retention window (best-effort; never blocks).
-        if let Ok(days) = checkpoint::get_retention(&root) {
-            let _ = checkpoint::prune(&root, days);
+        if let Ok(days) = savepoint::get_retention(&root) {
+            let _ = savepoint::prune(&root, days);
         }
     }
 
@@ -2398,7 +2398,7 @@ pub async fn run_headless_turn(
     let provider_kind = if agent.provider.is_empty() { "anthropic".to_string() } else { agent.provider.clone() };
 
     // Baseline checkpoint before any writes.
-    if let Ok(root) = broker.root_for(agent_id) { let _ = checkpoint::snapshot(&root, "baseline"); }
+    if let Ok(root) = broker.root_for(agent_id) { let _ = savepoint::snapshot(&root, "baseline"); }
 
     let mut messages = serde_json::json!([{ "role": "user", "content": framed }]);
     let mut reply_text = String::new();
@@ -2486,7 +2486,7 @@ pub async fn run_headless_turn(
     }
 
     // Snapshot after writes.
-    if let Ok(root) = broker.root_for(agent_id) { let _ = checkpoint::snapshot(&root, &format!("from {from_name}")); }
+    if let Ok(root) = broker.root_for(agent_id) { let _ = savepoint::snapshot(&root, &format!("from {from_name}")); }
 
     // If the turn produced no text (e.g. it only called write_file), don't show
     // a blank bubble — summarize what it did so the user + sender see SOMETHING.
@@ -2580,9 +2580,9 @@ pub fn run() {
             local_download, local_delete, local_tool_capability, restore_agent_folder,
             openai_models, tools_list, tools_upsert, tools_delete, tools_set_enabled,
             tools_config, tools_set_config,
-            checkpoint_snapshot, checkpoint_timeline, checkpoint_rewind,
-            checkpoint_undo, checkpoint_redo,
-            checkpoint_get_retention, checkpoint_set_retention, checkpoint_purge,
+            savepoint_snapshot, savepoint_timeline, savepoint_rewind,
+            savepoint_undo, savepoint_redo,
+            savepoint_get_retention, savepoint_set_retention, savepoint_purge,
             conv_list, conv_load, conv_save, conv_delete, conv_reorder,
             agents_list, agents_create, agents_update, agents_delete,
             agents_set_active, agents_get_active, agents_sharing_folder,

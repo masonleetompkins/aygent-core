@@ -258,7 +258,7 @@ pub fn folder_for(db: &Db, id: &str) -> Result<Option<String>, String> {
 
 /// M1.4 (Atlas #2): the OTHER non-archived agents that share `folder_path` with
 /// the given agent (empty `exclude_id` to just list everyone on that folder).
-/// Agents on the SAME folder share checkpoint history + the folder write-lock
+/// Agents on the SAME folder share save point history + the folder write-lock
 /// (CONTRACTS §4) — the UI surfaces this so the user knows, and until the write
 /// lock lands (fast-follow) we WARN rather than silently allow torn writes.
 pub fn agents_sharing_folder(db: &Db, folder_path: &str, exclude_id: &str) -> Result<Vec<AgentProfile>, String> {

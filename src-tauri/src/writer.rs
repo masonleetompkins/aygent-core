@@ -11,7 +11,7 @@
 //     actor gives a single, well-defined mutation point (Atlas C6's intent) and
 //     keeps `rusqlite::Connection` (which is !Sync) off every other thread.
 //   - It's the natural serialization point that C5 (single-writer-per-note) and
-//     C4 (checkpoint quiesce) also want: one place, one order.
+//     C4 (save point quiesce) also want: one place, one order.
 //
 // USAGE:
 //   let db = Db::start(app_data)?;            // spawns the writer thread

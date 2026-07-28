@@ -4,7 +4,7 @@
 // per-conversation). First use: the selected MODEL. Like conversations, this is
 // APP STATE — it lives in the app data dir keyed by a hash of the folder path,
 // NOT inside the user's folder (vault stays clean; nothing gets swept into
-// checkpoints).
+// Save Points).
 //
 // LAYOUT:  <app_data>/settings/<folder_key>.json
 //   { "model": "claude-..." }   — empty/missing model = "auto" (backend picks
