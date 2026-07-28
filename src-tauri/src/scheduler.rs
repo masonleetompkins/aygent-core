@@ -437,24 +437,32 @@ pub fn spawn(app: AppHandle, db: Db, _broker: Arc<Broker>, _lanes: Lanes, sig: S
         retire_proof_schedule(&db);
 
         // Safety-net cap so a wall-clock jump / laptop wake / DST is re-evaluated
-        // within 60s even if the next fire is far out.
-        let max_sleep = std::time::Duration::from_secs(60);
+        // AND so a MISSED nudge can never stall firing. tokio::Notify only wakes
+        // a waiter that's already awaiting when notify_one() fires — a nudge sent
+        // while the ticker is mid-loop (in fire_one, recomputing, etc.) can be
+        // dropped. So we ALSO poll on a short cap: the loop re-reads the table at
+        // least every RECHECK secs regardless of nudges. Bug (Mason 07-28): a
+        // 1-min schedule created mid-run never fired because the wake was racing
+        // the long idle sleep. A short recheck makes firing robust; the nudge is
+        // just the fast path on top.
+        let recheck = std::time::Duration::from_secs(5);
 
         loop {
-            // 1) When is the next fire? Sleep until then (capped), or until nudged.
+            // 1) When is the next fire? Sleep until then (capped at `recheck`),
+            //    or until nudged.
             let now = now_ms();
             let sleep_dur = match earliest_next(&db) {
                 Some(next) if next > now => {
-                    let ms = (next - now).min(max_sleep.as_millis() as i64).max(0) as u64;
+                    let ms = (next - now).min(recheck.as_millis() as i64).max(0) as u64;
                     std::time::Duration::from_millis(ms)
                 }
                 Some(_) => std::time::Duration::from_millis(0), // something already due
-                None => max_sleep, // no schedules — idle-wait, wake on nudge
+                None => recheck, // no schedules — short idle-poll; wake on nudge too
             };
 
             tokio::select! {
                 _ = tokio::time::sleep(sleep_dur) => {}
-                _ = sig.notified() => { continue; } // hot edit — recompute
+                _ = sig.notified() => {} // hot edit — fall through and re-evaluate
             }
 
             // 2) Fire everything due — UNLESS globally paused (kill switch).
