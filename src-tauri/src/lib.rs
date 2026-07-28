@@ -1804,20 +1804,34 @@ pub async fn run_headless_turn(
     // Snapshot after writes.
     if let Ok(root) = broker.root_for(agent_id) { let _ = checkpoint::snapshot(&root, &format!("from {from_name}")); }
 
-    // PERSIST to the recipient's conversation history so the user sees it. We use
-    // a stable per-agent "inbox" conversation so all inter-agent exchanges for
-    // this agent thread together (id = "inbox-<agentId>").
+    // If the turn produced no text (e.g. it only called write_file), don't show
+    // a blank bubble — summarize what it did so the user + sender see SOMETHING.
+    // This fixes bug #5's "blank message back".
+    let reply_display = if reply_text.trim().is_empty() {
+        "(done — completed the request without a text reply)".to_string()
+    } else { reply_text.trim().to_string() };
+
+    // PERSIST to the recipient's conversation. CRITICAL (bug #5): we persist the
+    // REAL provider-format `history` (messages), not just a display record — so
+    // this exchange becomes actual conversational MEMORY. The inbox thread and
+    // the agent's normal chat now share ONE conversation id so when you talk to
+    // the agent directly it REMEMBERS the inter-agent message. We append the
+    // full turn (framed inbound + assistant reply) to whatever history exists.
     let conv_id = format!("inbox-{agent_id}");
     let existing = repo::load_conversation(db, &conv_id).ok();
     let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
-    // Inbound message bubble (from the peer) + the reply.
     ui_msgs.push(serde_json::json!({ "role": "user", "from": from_name, "text": format!("\u{1F4E8} from {from_name}: {}", msg.body) }));
-    ui_msgs.push(serde_json::json!({ "role": "assistant", "text": reply_text.trim(), "tools": [] }));
+    ui_msgs.push(serde_json::json!({ "role": "assistant", "text": reply_display, "tools": [] }));
+    // Real history: prior history + this turn's messages (framed user + all
+    // assistant/tool turns we accumulated in `messages`). `messages` starts with
+    // the framed user msg; append the whole thing to prior history.
+    let mut hist = existing.as_ref().and_then(|c| c.history.as_array().cloned()).unwrap_or_default();
+    if let Some(turn) = messages.as_array() { for m in turn { hist.push(m.clone()); } }
     let conv = repo::Conversation {
         id: conv_id, agent_id: agent_id.to_string(),
         title: "Inter-agent inbox".into(), updated: 0, pinned: true, order: 1,
         msgs: serde_json::json!(ui_msgs),
-        history: existing.map(|c| c.history).unwrap_or(serde_json::json!([])),
+        history: serde_json::json!(hist),
     };
     let _ = repo::save_conversation(db, conv);
 

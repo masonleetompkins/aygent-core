@@ -29,6 +29,67 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
   // chat). The ref is always the current thread id.
   const convIdRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
+
+  // #4 @mention: the list of agents to offer in the picker, loaded once.
+  const [allAgents, setAllAgents] = useState<Array<{ id: string; name: string; icon: string; color: string }>>([]);
+  useEffect(() => {
+    invoke<{ agents: Array<{ id: string; name: string; icon: string; color: string; archived: boolean }> }>("agents_list")
+      .then((r) => setAllAgents((r.agents || []).filter((a) => !a.archived)))
+      .catch(() => {});
+  }, []);
+  // Active @mention query state: { query, matches, sel, start } or null.
+  const [mention, setMention] = useState<{ query: string; matches: typeof allAgents; sel: number; start: number } | null>(null);
+
+  // #3 auto-grow: resize the textarea to fit its content, capped at 50vh.
+  useEffect(() => {
+    const ta = taRef.current; if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = Math.min(ta.scrollHeight, Math.floor(window.innerHeight * 0.5)) + "px";
+  }, [input]);
+
+  // #4 detect an @mention token at the caret and surface matching agents.
+  function onInputChange(value: string, caret: number) {
+    // Find the @token immediately before the caret (letters/digits/_-, no space).
+    const upto = value.slice(0, caret);
+    const m = upto.match(/@([\w-]*)$/);
+    if (m) {
+      const q = m[1].toLowerCase();
+      const matches = allAgents.filter((a) => a.name.toLowerCase().includes(q)).slice(0, 6);
+      setMention({ query: m[1], matches, sel: 0, start: caret - m[0].length });
+    } else {
+      setMention(null);
+    }
+  }
+
+  // Insert the picked agent's @Name into the input, replacing the partial token.
+  function pickMention(a: { id: string; name: string }) {
+    if (!mention) return;
+    const before = input.slice(0, mention.start);
+    const after = input.slice(mention.start + 1 + mention.query.length);
+    const inserted = `@${a.name} `;
+    const next = before + inserted + after;
+    setInput(next);
+    setMention(null);
+    // Restore focus + caret after the inserted mention.
+    requestAnimationFrame(() => {
+      const ta = taRef.current; if (!ta) return;
+      const pos = (before + inserted).length;
+      ta.focus(); ta.setSelectionRange(pos, pos);
+    });
+  }
+
+  // #3 + #4 key handling: mention nav when open; else Enter=send, Shift+Enter=newline.
+  function onInputKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (mention && mention.matches.length > 0) {
+      if (e.key === "ArrowDown") { e.preventDefault(); setMention({ ...mention, sel: (mention.sel + 1) % mention.matches.length }); return; }
+      if (e.key === "ArrowUp") { e.preventDefault(); setMention({ ...mention, sel: (mention.sel - 1 + mention.matches.length) % mention.matches.length }); return; }
+      if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); pickMention(mention.matches[mention.sel]); return; }
+      if (e.key === "Escape") { e.preventDefault(); setMention(null); return; }
+    }
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+    // Shift+Enter falls through -> newline (default textarea behavior).
+  }
   // POINTER-BASED reorder. Native HTML5 draggable is broken in Tauri's macOS
   // WebKit webview (the row grays out on drag-start but `drop`/`dragend` never
   // fire, so the item stays stuck grey and nothing persists). We implement drag
@@ -83,7 +144,10 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
   }
 
   async function openConv(id: string) {
-    if (!folder || busy) return;
+    // VIEWING is never blocked by `busy` — you can always read any conversation,
+    // even while an agent is mid-turn. `busy` only gates SENDING (the lane
+    // serializes turns; it must not lock the whole pane). This was bug #2.
+    if (!folder) return;
     try {
       const c = await invoke<any>("conv_load", { folder, id });
       setConv(c.id);
@@ -297,11 +361,42 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
           {msgs.map((m, i) => <Bubble key={i} m={m} />)}
         </div>
 
-        <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
-          <Input value={input} disabled={blocked || busy}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") send(); }}
-            placeholder={blocked ? "Set up folder + key in Settings first…" : "Message your agent…"} />
+        <div style={{ display: "flex", gap: 8, marginTop: 14, alignItems: "flex-end", position: "relative" }}>
+          {/* #4: @mention picker — shows matching agents as you type @Name. */}
+          {mention && mention.matches.length > 0 && (
+            <div style={{
+              position: "absolute", bottom: "calc(100% + 6px)", left: 0, minWidth: 220,
+              background: "var(--surface)", border: "var(--border-width) solid var(--line)",
+              borderRadius: "var(--radius-control)", boxShadow: "var(--elevation)", overflow: "hidden", zIndex: 20,
+            }}>
+              {mention.matches.map((a, i) => (
+                <button key={a.id} onMouseDown={(e) => { e.preventDefault(); pickMention(a); }}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 8, width: "100%", textAlign: "left",
+                    padding: "8px 12px", border: "none", cursor: "pointer", fontSize: 14,
+                    background: i === mention.sel ? "var(--bg)" : "transparent", color: "var(--text)",
+                  }}>
+                  <span style={{ width: 22, height: 22, borderRadius: 6, background: a.color, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13 }}>{a.icon || "🤖"}</span>
+                  <span>{a.name}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          {/* #3: auto-growing multiline textarea; Shift+Enter = newline, Enter = send. */}
+          <textarea
+            ref={taRef}
+            value={input} disabled={blocked || busy}
+            rows={1}
+            onChange={(e) => { setInput(e.target.value); onInputChange(e.target.value, e.target.selectionStart); }}
+            onKeyDown={onInputKeyDown}
+            placeholder={blocked ? "Set up folder + key in Settings first…" : "Message your agent…  (@ to call another agent)"}
+            style={{
+              flex: 1, resize: "none", overflowY: "auto",
+              maxHeight: "50vh", minHeight: 42, lineHeight: 1.5,
+              background: "var(--bg)", border: "var(--border-width) solid var(--line)",
+              borderRadius: "var(--radius-control)", color: "var(--text)", padding: "10px 12px",
+              fontSize: 15, fontFamily: "inherit",
+            }} />
           <Button onClick={send} disabled={blocked || busy}>{busy ? "…" : "Send"}</Button>
         </div>
       </div>

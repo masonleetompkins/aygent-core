@@ -118,14 +118,13 @@ export function Agents({
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <span style={{ fontWeight: 700, fontSize: 16 }}>{a.name}</span>
-              {a.id === activeId && <Pill tone="ok">active</Pill>}
             </div>
             <div style={{ fontSize: 12, color: "var(--text-faint)", fontFamily: "ui-monospace, monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
               {a.folder_path || "no folder"} · {a.model || "auto"} · {a.provider || "anthropic"} · {a.context_mode}
             </div>
           </div>
           <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-            {a.id !== activeId && <Button variant="secondary" onClick={() => activate(a)}>Switch to</Button>}
+            <Button variant="secondary" onClick={() => { activate(a); }}>Open</Button>
             <Button variant="secondary" onClick={() => setEditing(a)}>Edit</Button>
             {agents.length > 1 && <Button variant="secondary" onClick={() => remove(a)}>Delete</Button>}
           </div>
