@@ -36,6 +36,33 @@ export function Playground({ folder, ws, agentId }: { folder: string | null; ws:
   const [retrieveErr, setRetrieveErr] = useState<string | null>(null);
   const [retrieving, setRetrieving] = useState(false);
 
+  // --- Slice 2: L1 episodic write (gate + append) ---
+  const [gate, setGate] = useState<{ all_pass: boolean; files: { file: string; pass: boolean; why: string }[] } | null>(null);
+  const [gateBusy, setGateBusy] = useState(false);
+  const [entry, setEntry] = useState("10:24 shipped Slice 2 — the vault write path is real");
+  const [appendMsg, setAppendMsg] = useState<string | null>(null);
+  const [appendErr, setAppendErr] = useState<string | null>(null);
+  const [appendBusy, setAppendBusy] = useState(false);
+
+  async function runGate() {
+    setGateBusy(true); setGate(null);
+    try { setGate(await invoke("memory_gate_check")); }
+    catch (e) { setGate({ all_pass: false, files: [{ file: "gate", pass: false, why: String(e) }] }); }
+    finally { setGateBusy(false); }
+  }
+  async function runAppend() {
+    if (!agentId) { setAppendErr("No active agent — pick one in the rail first."); return; }
+    setAppendBusy(true); setAppendMsg(null); setAppendErr(null);
+    const today = new Date();
+    const date = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+    try {
+      const r = await invoke<{ path: string; created: boolean; bytes_before: number; bytes_added: number; bytes_after: number }>(
+        "memory_append_daily", { agentId, date, entry });
+      setAppendMsg(`✓ ${r.created ? "created" : "appended to"} ${r.path} · +${r.bytes_added} bytes (${r.bytes_before}→${r.bytes_after})`);
+    } catch (e) { setAppendErr(String(e)); }
+    finally { setAppendBusy(false); }
+  }
+
   async function runIngest() {
     if (!agentId) { setIngestErr("No active agent — pick one in the rail first."); return; }
     setIngesting(true); setIngest(null); setIngestErr(null);
@@ -176,6 +203,43 @@ export function Playground({ folder, ws, agentId }: { folder: string | null; ws:
               ))}
             </div>
           )}
+        </div>
+      </Card>
+
+      {/* M1.7 Slice 2 — L1 episodic WRITE (append to daily note). Gate-guarded. */}
+      <Card title="Vault memory (Slice 2 — episodic write)">
+        <p style={hint}>
+          The first real write to a vault: <b>append</b> a dated line to today’s daily note.
+          Guarded by a <b>byte-stability gate</b> — the append can only ever add to the tail;
+          it can never modify a byte of what’s already there (the &quot;never corrupt your vault&quot;
+          invariant). Run the gate first; it must be all-green before you trust a write.
+        </p>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <div><Button variant="secondary" onClick={runGate} disabled={gateBusy}>
+            {gateBusy ? "Checking…" : "Run byte-stability gate"}
+          </Button></div>
+          {gate && (
+            <>
+              <Pill tone={gate.all_pass ? "ok" : "danger"}>
+                {gate.all_pass ? "✓ GATE GREEN — all corpus files preserve their prefix" : "✗ GATE FAILED — do NOT enable writes"}
+              </Pill>
+              <Transcript error={!gate.all_pass}
+                text={gate.files.map((f) => `${f.pass ? "✓" : "✗"} ${f.file} — ${f.why}`).join("\n")} />
+            </>
+          )}
+        </div>
+
+        <div style={{ borderTop: "var(--border-width) solid var(--line)", paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+          <p style={hint}>Append an episodic line to today’s <code>Daily/YYYY-MM-DD.md</code> (created if missing):</p>
+          <div style={{ display: "flex", gap: 8 }}>
+            <Input value={entry} onChange={(e) => setEntry(e.target.value)} placeholder="what happened…" />
+            <Button onClick={runAppend} disabled={appendBusy || !agentId}>
+              {appendBusy ? "…" : "Append"}
+            </Button>
+          </div>
+          {appendMsg && <Pill tone="ok">{appendMsg}</Pill>}
+          {appendErr && <Transcript text={"✗ " + appendErr} error />}
         </div>
       </Card>
     </div>

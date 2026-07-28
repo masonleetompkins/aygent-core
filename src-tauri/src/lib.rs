@@ -16,6 +16,7 @@ mod drainer;
 mod lanes;
 mod mailbox;
 mod memory;
+mod vault_write;
 mod migrate_json;
 mod repo;
 mod writer;
@@ -345,6 +346,42 @@ async fn memory_retrieve(
         top_k.unwrap_or(4), expand_hops.unwrap_or(1),
         &embed_model, "",
     ).await
+}
+
+// ---- M1.7 Slice 2: L1 EPISODIC WRITE (append to daily note) --------------
+// The FIRST sanctioned mutation of a real vault. Guarded by the byte-stability
+// gate (vault_write.rs tests) + the prefix invariant + the jail broker. We
+// resolve the daily-note path THROUGH THE BROKER in WRITE mode so an append can
+// only ever land inside the agent's folder scope — same jail the agent obeys.
+#[tauri::command]
+fn memory_append_daily(
+    broker: tauri::State<Arc<Broker>>,
+    agent_id: String,
+    date: String,      // "YYYY-MM-DD"
+    entry: String,     // the episodic line(s) to append (no leading dash needed)
+) -> Result<vault_write::AppendReceipt, String> {
+    // Daily notes live under /Daily by convention (Atlas L1). Resolve the
+    // RELATIVE path through the broker for this agent's scope.
+    let rel = format!("Daily/{}", vault_write::daily_note_name_from_str(&date)?);
+    let abs = broker
+        .resolve(&agent_id, &rel, broker::Mode::Write)
+        .map_err(|e| format!("path refused by jail: {e:?}"))?;
+    let header = vault_write::daily_header(&date);
+    let block = if entry.trim_start().starts_with('-') {
+        entry
+    } else {
+        format!("- {entry}")
+    };
+    vault_write::append_to_note(&abs, &header, &block)
+}
+
+/// Report whether the byte-stability gate is compiled/available. The REAL proof
+/// is `cargo test` (the gate tests) — this is a lightweight UI affordance that
+/// runs the identity + append checks in-process on the bundled corpus so the
+/// panel can show a green/red without a terminal.
+#[tauri::command]
+fn memory_gate_check() -> Result<serde_json::Value, String> {
+    vault_write::run_gate_in_process()
 }
 
 /// Pick a folder WITHOUT changing any agent's scope — used by the memory test
@@ -2059,7 +2096,8 @@ pub fn run() {
             agent_generate_soul,
             mailbox_pending_counts, mailbox_take_next, mailbox_roster,
             get_app_knobs, set_app_knobs,
-            memory_ingest, memory_retrieve, memory_stats, pick_vault_folder
+            memory_ingest, memory_retrieve, memory_stats, pick_vault_folder,
+            memory_append_daily, memory_gate_check
         ])
         .setup(move |_app| {
             // M1.1: bring up the SQLite state spine + single-writer actor, then
