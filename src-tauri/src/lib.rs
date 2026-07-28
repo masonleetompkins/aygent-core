@@ -2093,17 +2093,35 @@ pub async fn run_headless_turn(
         }
     }
 
-    // Look up the sender's display name for the in-thread "from X" tag.
-    let from_name = repo::get_agent(db, &msg.from_agent)?.map(|a| a.name).unwrap_or_else(|| msg.from_agent.clone());
+    // ORIGIN: a scheduler-fired turn has from_agent = "scheduler:<run_id>" — it
+    // is NOT a peer message. It's a TASK to perform, with no one to reply to.
+    // Framing + display name branch on this so the agent does the work and
+    // never tries to send_message back to a non-existent "scheduler" agent
+    // (Mason 07-28: it composed a great fact then failed trying to reply to
+    // scheduler:7). Inter-agent turns keep the reply-capable peer framing.
+    let is_scheduled = msg.from_agent.starts_with("scheduler:");
 
-    // The prompt = the incoming message, framed so the recipient knows it's from
-    // a peer and MAY reply via send_message (back to the sender).
-    let framed = format!(
-        "You just received a message from another agent, {from_name} (id: {}). Their message:\n\n{}\n\n\
-         Respond/act as appropriate. If you want to reply to them, use the send_message tool with \
-         to_agent = \"{}\". Otherwise just do the work.",
-        msg.from_agent, msg.body, msg.from_agent
-    );
+    let from_name = if is_scheduled {
+        "Scheduler".to_string()
+    } else {
+        repo::get_agent(db, &msg.from_agent)?.map(|a| a.name).unwrap_or_else(|| msg.from_agent.clone())
+    };
+
+    let framed = if is_scheduled {
+        format!(
+            "This is a SCHEDULED TASK that just fired (no sender to reply to). Do the task, \
+             then stop — your output is recorded in your own notes. Do NOT use send_message; \
+             there is no one to send it to.\n\nTask:\n\n{}",
+            msg.body
+        )
+    } else {
+        format!(
+            "You just received a message from another agent, {from_name} (id: {}). Their message:\n\n{}\n\n\
+             Respond/act as appropriate. If you want to reply to them, use the send_message tool with \
+             to_agent = \"{}\". Otherwise just do the work.",
+            msg.from_agent, msg.body, msg.from_agent
+        )
+    };
 
     // The per-agent stream channel the UI subscribes to (SAME id the human path
     // uses for this agent's inbox conversation) so the turn streams LIVE into
@@ -2121,7 +2139,7 @@ pub async fn run_headless_turn(
         ui_msgs.push(serde_json::json!({ "role": "user", "from": from_name, "text": format!("\u{1F4E8} from {from_name}: {}", msg.body) }));
         let conv = repo::Conversation {
             id: conv_id, agent_id: agent_id.to_string(),
-            title: "Inter-agent inbox".into(), updated: 0, pinned: true, order: 1,
+            title: "Activity".into(), updated: 0, pinned: true, order: 1,
             msgs: serde_json::json!(ui_msgs),
             history: existing.map(|c| c.history).unwrap_or(serde_json::json!([])),
         };
@@ -2273,7 +2291,7 @@ pub async fn run_headless_turn(
     if let Some(turn) = messages.as_array() { for m in turn { hist.push(m.clone()); } }
     let conv = repo::Conversation {
         id: conv_id, agent_id: agent_id.to_string(),
-        title: "Inter-agent inbox".into(), updated: 0, pinned: true, order: 1,
+        title: "Activity".into(), updated: 0, pinned: true, order: 1,
         msgs: serde_json::json!(ui_msgs),
         history: serde_json::json!(hist),
     };
@@ -2298,7 +2316,7 @@ pub fn persist_inbox_error(db: &writer::Db, agent_id: &str, msg: &mailbox::Messa
     ui_msgs.push(serde_json::json!({ "role": "assistant", "text": format!("⚠️ Couldn't process this message: {err}. (Check this agent has a provider key + model set.)"), "tools": [] }));
     let conv = repo::Conversation {
         id: conv_id, agent_id: agent_id.to_string(),
-        title: "Inter-agent inbox".into(), updated: 0, pinned: true, order: 1,
+        title: "Activity".into(), updated: 0, pinned: true, order: 1,
         msgs: serde_json::json!(ui_msgs),
         history: existing.map(|c| c.history).unwrap_or(serde_json::json!([])),
     };
