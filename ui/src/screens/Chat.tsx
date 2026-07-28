@@ -507,8 +507,9 @@ function HistoryItem({
 
 function Bubble({ m }: { m: Msg }) {
   const isUser = m.role === "user";
+  const memory = isUser && m.role === "user" ? m.memory : undefined;
   return (
-    <div style={{ display: "flex", justifyContent: isUser ? "flex-end" : "flex-start" }}>
+    <div style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start" }}>
       <div style={{
         maxWidth: "82%",
         background: isUser ? "var(--accent)" : "var(--surface)",
@@ -525,12 +526,8 @@ function Bubble({ m }: { m: Msg }) {
           : <Markdown text={m.text} />)}
         {!isUser && m.role === "assistant" && m.streaming && !m.text && <Thinking />}
       </div>
-      {isUser && m.role === "user" && m.memory && (
-        <span style={{
-          alignSelf: "flex-end", marginTop: 4, fontSize: 12, color: "var(--text-muted)",
-          background: "var(--surface)", border: "var(--border-width) solid var(--line)",
-          borderRadius: "var(--radius-pill)", padding: "2px 10px",
-        }}>{m.memory}</span>
+      {memory && (
+        <span style={{ marginTop: 3, marginRight: 4, fontSize: 12, color: "#3fa46a" }}>{memory}</span>
       )}
     </div>
   );
