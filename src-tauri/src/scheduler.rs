@@ -376,10 +376,15 @@ pub fn create(
     let action_json = serde_json::to_string(action).map_err(|e| format!("action: {e}"))?;
     let (agent_id, name, kind, tz) = (agent_id.to_string(), name.to_string(), kind.to_string(), tz.to_string());
     db.write(move |c| {
+        // COLUMN ORDER: ...spec_json, TZ, ACTION_JSON... — the params MUST match.
+        // Bug (Mason 07-28): params passed action_json before tz, so the action
+        // JSON landed in the tz column and the timezone landed in action_json.
+        // Reading action_json back then got 'America/Los_Angeles' -> not JSON ->
+        // 'expected value at line 1 column 1'. Params now match column order.
         c.execute(
             "INSERT INTO schedule (agent_id,name,kind,spec_json,tz,action_json,enabled,max_fires_per_day,max_cost_units_per_day,next_fire_at,created_at,updated_at)
              VALUES (?1,?2,?3,?4,?5,?6,1,?7,?8,?9,?10,?10)",
-            params![agent_id, name, kind, spec_json, action_json, tz, max_fires_per_day, max_cost_units_per_day, next, now],
+            params![agent_id, name, kind, spec_json, tz, action_json, max_fires_per_day, max_cost_units_per_day, next, now],
         ).map_err(|e| format!("insert schedule: {e}"))?;
         Ok(c.last_insert_rowid())
     })

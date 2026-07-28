@@ -110,12 +110,7 @@ export function Scheduler({ agentId }: { agentId: string | null }) {
     try { setRuns(await invoke<Run[]>("scheduler_runs", { scheduleId: id, limit: 10 })); }
     catch (e) { setErr(String(e)); }
   }
-  async function debugRow(id: number) {
-    try {
-      const row = await invoke<any>("scheduler_debug_row", { id });
-      setErr("DEBUG " + JSON.stringify(row));
-    } catch (e) { setErr(String(e)); }
-  }
+
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18, maxWidth: 720 }}>
@@ -158,7 +153,6 @@ export function Scheduler({ agentId }: { agentId: string | null }) {
               <Button onClick={() => runNow(s)}>▶ Run now</Button>
               <Button variant="secondary" onClick={() => toggleOne(s)}>{s.enabled ? "Pause" : "Resume"}</Button>
               <Button variant="secondary" onClick={() => showRuns(s.id)}>History</Button>
-              <Button variant="secondary" onClick={() => debugRow(s.id)}>Debug</Button>
               <Button variant="secondary" onClick={() => remove(s)}>Delete</Button>
             </div>
           </div>
