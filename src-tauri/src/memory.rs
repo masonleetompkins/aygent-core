@@ -472,10 +472,29 @@ pub async fn ingest_vault(
         m
     };
 
+    // Which notes ALREADY have an embedding? A file is only truly "unchanged"
+    // (safe to skip) if its sha matches AND a vec row exists. Bug (Mason 07-28):
+    // an earlier failed run wrote note rows + shas but NO vectors (embedder was
+    // down); the next run saw matching shas and skipped everything -> vec table
+    // stayed empty -> retrieve had nothing to rank -> "No hits". Requiring an
+    // existing vector makes the cache self-heal.
+    let has_vec: HashSet<String> = {
+        let conn = db.reader()?;
+        let mut stmt = conn
+            .prepare("SELECT path FROM vec WHERE owner_kind=?1 AND owner_id=?2")
+            .map_err(|e| format!("prep hasvec: {e}"))?;
+        let rows = stmt
+            .query_map(params![owner_kind, owner_id], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("query hasvec: {e}"))?;
+        rows.flatten().collect()
+    };
+
     // Pass 2: embed (async, only changed files), then persist everything.
     for p in &pending {
         let sha = sha_hex(&p.raw);
-        let unchanged = existing_sha.get(&p.path).map(|s| s == &sha).unwrap_or(false);
+        // Skip ONLY if the content is unchanged AND we already have its vector.
+        let unchanged = existing_sha.get(&p.path).map(|s| s == &sha).unwrap_or(false)
+            && has_vec.contains(&p.path);
 
         // Embedding target = title + body (frontmatter stripped). Keep it lean.
         let embed_text = format!("{}\n\n{}", p.parsed.title, p.parsed.body);
