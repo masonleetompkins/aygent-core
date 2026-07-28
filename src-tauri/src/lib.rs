@@ -1480,7 +1480,7 @@ async fn agent_stream(
         let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("model: {model}") });
 
         for _ in 0..8 {
-            let (assistant, stop) = openai_provider::openai_stream_turn(
+            let (assistant, _stop) = openai_provider::openai_stream_turn(
                 &provider_kind, &key, &model, &sys, &messages, &tools,
                 |ev| { let _ = app.emit(&channel, &ev); },
             ).await?;
@@ -1814,7 +1814,9 @@ pub async fn run_headless_turn(
                                     Ok(mailbox::SendResult::Queued { .. }) => {
                                         // WAKE the drainer so the reply is delivered to the
                                         // recipient near-instantly (loops the conversation).
-                                        drain.nudge();
+                                        // Headless turns don't own the DrainSignal as a param,
+                                        // so pull it from Tauri managed state (set at boot).
+                                        app.state::<drainer::DrainSignal>().nudge();
                                         (format!("message delivered to {to}"), false)
                                     }
                                     Ok(mailbox::SendResult::Refused { reason }) => (format!("not sent: {reason}"), true),
