@@ -1,15 +1,17 @@
-fix(agent): stop reflexive tool-rummaging on plain chat + clean list_files error
+fix(memory): auto-capture ran on Anthropic path only + swallowed errors silently
 
-Mason's screenshot: a purely conversational message ("I prefer dark roast,
-I decided $20, help me plan the launch") triggered list_files, github_list_prs,
-read_file, and more list_files — none of which the message asked for. The
-agent treated every turn as "go explore the folder/tools."
+Mason: clean answer, no tool spam (prompt fix held), but NO "remembered"
+note. Root cause: the auto-capture hook was inline on the Anthropic path's
+fall-through return ONLY. The local-model path and OpenAI path have their own
+early `return Ok(messages)` that never reached it. And every branch swallowed
+errors, so a silent no-op gave zero diagnosis.
 
-- AGENT_SYSTEM rewritten: tools are OPTIONAL, use ONLY when the request needs
-  one; if the user is chatting/sharing/asking-answerable, JUST REPLY — never
-  read/list files or call an API speculatively "to gather context"; prefer the
-  fewest tool calls. (Prompt nudge, not a hard guarantee — watch for recurrence.)
-- list_files on a FILE now returns clean guidance ("'X' is a file, not a
-  directory. Use read_file...") instead of the raw "Not a directory (os error
-  20)". Empty dir returns "(empty directory)". File-op errors read like help,
-  not OS noise.
+- Extract run_auto_capture() shared helper; call it from ALL three provider
+  return paths (local, OpenAI, Anthropic).
+- It now LOGS every branch to the terminal: OFF / no-vault-scope / no-Memory-
+  dir / embedder-unavailable / "N candidates -> C created, R reinforced" /
+  failed. A silent miss is now impossible to miss.
+
+Rebuild, chat a fact-bearing message, and the terminal (cargo tauri dev)
+prints exactly what capture did — that tells us if it's path, scope, embedder,
+or salience.

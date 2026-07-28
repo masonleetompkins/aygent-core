@@ -1984,6 +1984,7 @@ async fn agent_stream(
         if let Ok(root) = broker.root_for(&scope_id) {
             let _ = checkpoint::snapshot(&root, &prompt);
         }
+        run_auto_capture(&app, &db, &broker, &scope_id, &prompt, &channel).await;
         return Ok(messages);
     }
 
@@ -2064,6 +2065,7 @@ async fn agent_stream(
                 _ => {}
             }
         }
+        run_auto_capture(&app, &db, &broker, &scope_id, &prompt, &channel).await;
         return Ok(messages);
     }
 
@@ -2203,34 +2205,56 @@ async fn agent_stream(
         }
     }
 
-    // M1.7 AUTO-CAPTURE INTO THE REAL TURN LOOP: after the turn completes, run
-    // the salience+novelty-gated capture over the USER's message (the human's
-    // input carries the durable facts — "I prefer X", "I decided Y"). This is
-    // the Self-Gardening loop firing on ACTUAL conversation, not the test panel.
-    // Fully best-effort: gated on a per-agent toggle, never blocks/breaks the
-    // reply, errors are swallowed. Runs only when the agent has a vault scope.
-    if memory_auto_remember_enabled(&db, &scope_id) {
-        if let Ok(abs_sentinel) = broker.resolve(&scope_id, "Memory/.aygent-scope", broker::Mode::Write) {
-            if let Some(abs_memory_dir) = abs_sentinel.parent().map(|p| p.to_path_buf()) {
-                if let Ok(embed_model) = ensure_embed_model(&app).await {
-                    match memory::auto_capture(
-                        &db, "agent", &scope_id, &abs_memory_dir, "Memory",
-                        &prompt, 0.65, "", &embed_model, "",
-                    ).await {
-                        Ok(r) if r.created + r.reinforced > 0 => {
-                            let _ = app.emit(&channel, &provider::StreamEvent::Info {
-                                text: format!("\u{1F9E0} remembered {} new, reinforced {}", r.created, r.reinforced),
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
+    // M1.7 AUTO-CAPTURE (Anthropic path). Shared helper so ALL provider paths
+    // capture (bug: it was only here, on the Anthropic fall-through).
+    run_auto_capture(&app, &db, &broker, &scope_id, &prompt, &channel).await;
 
     emit(&provider::StreamEvent::Done { stop_reason: "end_turn".into() });
     Ok(messages) // full history back for multi-turn persistence
+}
+
+// M1.7 AUTO-CAPTURE INTO THE REAL TURN LOOP: after a turn completes, run the
+// salience+novelty-gated capture over the USER's message (the human's input
+// carries the durable facts — "I prefer X", "I decided Y"). The Self-Gardening
+// loop firing on ACTUAL conversation. Best-effort (gated on a per-agent toggle,
+// never blocks the reply) BUT it now LOGS every branch to the terminal so a
+// silent no-op can't hide (Mason 07-28: no 🧠 note + zero diagnosis). Called
+// from every provider path's return so capture works regardless of model.
+async fn run_auto_capture(
+    app: &tauri::AppHandle,
+    db: &writer::Db,
+    broker: &Arc<Broker>,
+    agent_id: &str,
+    prompt: &str,
+    channel: &str,
+) {
+    use tauri::Emitter;
+    if !memory_auto_remember_enabled(db, agent_id) {
+        eprintln!("[aygent][mem] auto-capture OFF for agent {agent_id}");
+        return;
+    }
+    let abs_sentinel = match broker.resolve(agent_id, "Memory/.aygent-scope", broker::Mode::Write) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("[aygent][mem] no vault scope for {agent_id} ({e:?}) — skipping capture"); return; }
+    };
+    let Some(abs_memory_dir) = abs_sentinel.parent().map(|p| p.to_path_buf()) else {
+        eprintln!("[aygent][mem] could not resolve Memory dir — skipping"); return;
+    };
+    let embed_model = match ensure_embed_model(app).await {
+        Ok(m) => m,
+        Err(e) => { eprintln!("[aygent][mem] embed model unavailable ({e}) — skipping capture"); return; }
+    };
+    match memory::auto_capture(db, "agent", agent_id, &abs_memory_dir, "Memory", prompt, 0.65, "", &embed_model, "").await {
+        Ok(r) => {
+            eprintln!("[aygent][mem] auto-capture: {} candidate(s) → {} created, {} reinforced", r.candidates, r.created, r.reinforced);
+            if r.created + r.reinforced > 0 {
+                let _ = app.emit(channel, &provider::StreamEvent::Info {
+                    text: format!("\u{1F9E0} remembered {} new, reinforced {}", r.created, r.reinforced),
+                });
+            }
+        }
+        Err(e) => eprintln!("[aygent][mem] auto-capture failed: {e}"),
+    }
 }
 
 // --- HEADLESS INTER-AGENT TURN (M1.4 delivery engine) ----------------------
