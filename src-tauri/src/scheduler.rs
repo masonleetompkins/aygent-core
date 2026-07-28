@@ -216,10 +216,18 @@ fn due_now(db: &Db, now: i64) -> Vec<Due> {
     let mut out = Vec::new();
     for row in rows.flatten() {
         let (id, agent_id, tz, spec_json, action_json) = row;
-        let (Ok(spec), Ok(action)) = (
-            serde_json::from_str::<ScheduleSpec>(&spec_json),
-            serde_json::from_str::<ScheduleAction>(&action_json),
-        ) else { continue };
+        // A malformed/empty spec or action row (e.g. created by an older build)
+        // must NEVER silently stall the ticker. Log WHICH schedule is bad + why
+        // (this was Mason's 07-28 'never fires' bug: empty action_json parsed to
+        // 'expected value at line 1 column 1' and the row was skipped silently).
+        let spec = match serde_json::from_str::<ScheduleSpec>(&spec_json) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("[aygent][sched] schedule {id} has bad spec_json ({e}) — skipping. Delete + recreate it."); continue; }
+        };
+        let action = match serde_json::from_str::<ScheduleAction>(&action_json) {
+            Ok(a) => a,
+            Err(e) => { eprintln!("[aygent][sched] schedule {id} has bad action_json ({e}) — skipping. Delete + recreate it."); continue; }
+        };
         out.push(Due { id, agent_id, tz, spec, action });
     }
     out
@@ -441,8 +449,10 @@ pub fn run_now(db: &Db, drain: &crate::drainer::DrainSignal, id: i64) -> Result<
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)),
     ).map_err(|e| format!("load schedule {id}: {e}"))?;
     let (sid, agent_id, tz, spec_json, action_json) = row;
-    let spec = serde_json::from_str::<ScheduleSpec>(&spec_json).map_err(|e| format!("spec: {e}"))?;
-    let action = serde_json::from_str::<ScheduleAction>(&action_json).map_err(|e| format!("action: {e}"))?;
+    let spec = serde_json::from_str::<ScheduleSpec>(&spec_json)
+        .map_err(|e| format!("this schedule has a corrupt timing spec ({e}) — delete it and create a new one"))?;
+    let action = serde_json::from_str::<ScheduleAction>(&action_json)
+        .map_err(|e| format!("this schedule has a corrupt action ({e}) — it was likely made by an older build; delete it and create a new one"))?;
     let due = Due { id: sid, agent_id, tz, spec, action };
     let enq = fire_one(db, &due, now_ms())?;
     if enq { drain.nudge(); }
