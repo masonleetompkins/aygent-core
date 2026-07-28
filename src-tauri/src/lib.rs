@@ -588,6 +588,29 @@ fn scheduler_list(db: tauri::State<writer::Db>, agent_id: Option<String>) -> Res
     Ok(out)
 }
 
+/// DEBUG: dump the raw stored columns for a schedule so we can see exactly what
+/// create wrote (diagnosing the empty action_json bug). Temporary.
+#[tauri::command]
+fn scheduler_debug_row(db: tauri::State<writer::Db>, id: i64) -> Result<serde_json::Value, String> {
+    let conn = db.reader()?;
+    conn.query_row(
+        "SELECT id, agent_id, name, kind, spec_json, action_json, tz, enabled, next_fire_at FROM schedule WHERE id = ?1",
+        params![id],
+        |r| Ok(serde_json::json!({
+            "id": r.get::<_, i64>(0)?,
+            "agent_id": r.get::<_, String>(1)?,
+            "name": r.get::<_, String>(2)?,
+            "kind": r.get::<_, String>(3)?,
+            "spec_json": r.get::<_, String>(4)?,
+            "action_json": r.get::<_, String>(5)?,
+            "action_json_len": r.get::<_, String>(5)?.len(),
+            "tz": r.get::<_, String>(6)?,
+            "enabled": r.get::<_, i64>(7)?,
+            "next_fire_at": r.get::<_, Option<i64>>(8)?,
+        })),
+    ).map_err(|e| format!("debug row: {e}"))
+}
+
 /// Recent run history for a schedule (observability drill-in).
 #[tauri::command]
 fn scheduler_runs(db: tauri::State<writer::Db>, schedule_id: i64, limit: Option<i64>) -> Result<Vec<serde_json::Value>, String> {
@@ -2331,7 +2354,8 @@ pub fn run() {
             memory_append_daily, memory_gate_check, memory_remember,
             memory_auto_capture, scheduler_list, scheduler_runs,
             scheduler_create, scheduler_set_enabled, scheduler_delete,
-            scheduler_set_paused, scheduler_get_paused, scheduler_run_now
+            scheduler_set_paused, scheduler_get_paused, scheduler_run_now,
+            scheduler_debug_row
         ])
         .setup(move |_app| {
             // M1.1: bring up the SQLite state spine + single-writer actor, then
