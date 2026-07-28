@@ -1021,3 +1021,153 @@ pub async fn remember(
         confidence,
     })
 }
+
+// ===========================================================================
+// SLICE 4 — AUTO-CAPTURE + SALIENCE (the Self-Gardening killer loop)
+//
+// The agent captures durable facts from a conversation WITHOUT being told to.
+// Two levers, tuned to bias toward UNDER-remembering (Atlas Risk 2: a vault the
+// agent litters = rage-quit):
+//   - SALIENCE extraction: from the user's turn, pull candidate durable facts.
+//     A candidate must look like a STABLE fact about the user/world, not a
+//     transient state or a question. Cheap heuristic first (no extra LLM call):
+//     first-person declaratives about preferences/habits/decisions/identity.
+//   - NOVELTY gate: every candidate routes through remember(), which already
+//     dedups (>= cutoff -> reinforce, else create). So auto-capture can NEVER
+//     spawn a duplicate — that's why Slice 3 had to land first.
+//
+// Default posture: CONSERVATIVE. We only auto-promote to L2 when a candidate
+// clears the salience bar; everything else is left for the (future) episodic
+// journal. Better to miss a fact than to litter someone's real vault.
+// ===========================================================================
+
+/// A salience candidate extracted from a turn, with why it scored.
+#[derive(Debug, Serialize, Clone)]
+pub struct Candidate {
+    pub text: String,
+    pub ntype: String,
+    pub salience: f32,
+}
+
+/// Lowercased signal phrases that mark a DURABLE first-person fact. Kept small
+/// + explicit so behavior is predictable (the closed-vocabulary principle).
+const DURABLE_MARKERS: &[(&str, &str)] = &[
+    // (phrase, inferred ntype)
+    ("i prefer", "preference"),
+    ("i like", "preference"),
+    ("i love", "preference"),
+    ("i hate", "preference"),
+    ("i don't like", "preference"),
+    ("i always", "preference"),
+    ("i usually", "preference"),
+    ("i decided", "decision"),
+    ("we decided", "decision"),
+    ("i'm going to", "decision"),
+    ("my goal", "decision"),
+    ("i work", "fact"),
+    ("i live", "fact"),
+    ("my name is", "fact"),
+    ("i'm a", "fact"),
+    ("i am a", "fact"),
+    ("i have", "fact"),
+    ("i take", "fact"),
+    ("i switched", "fact"),
+    ("i'm taking a break", "fact"),
+    ("remember that", "fact"),
+    ("remember:", "fact"),
+];
+
+/// TRANSIENT/low-value markers that DISQUALIFY a line even if it looks durable
+/// (present-moment states, questions, hypotheticals).
+fn is_transient(line: &str) -> bool {
+    let l = line.trim().to_lowercase();
+    if l.ends_with('?') { return true; } // a question is not a fact
+    const TRANSIENT: &[&str] = &[
+        "right now", "at the moment", "today i feel", "i'm hungry", "i'm tired now",
+        "maybe", "i wonder", "what if", "could you", "can you", "please",
+    ];
+    TRANSIENT.iter().any(|t| l.contains(t))
+}
+
+/// Extract salience candidates from a user turn. Splits into sentence-ish lines,
+/// keeps those that carry a durable marker and aren't transient, and scores
+/// them. Explicit "remember" phrasing scores highest.
+pub fn extract_candidates(user_text: &str) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    // Split on sentence terminators + newlines; keep it simple + robust.
+    let normalized = user_text.replace(['\n', ';'], ".");
+    for raw in normalized.split(['.', '!']) {
+        let sentence = raw.trim();
+        if sentence.len() < 8 { continue; }        // too short to be a fact
+        if sentence.len() > 240 { continue; }      // too long = probably a ramble
+        if is_transient(sentence) { continue; }
+        let lower = sentence.to_lowercase();
+        let mut best: Option<(&str, f32)> = None;
+        for (phrase, ntype) in DURABLE_MARKERS {
+            if lower.contains(phrase) {
+                // explicit "remember" phrasing is the strongest signal.
+                let score = if phrase.starts_with("remember") { 0.95 } else { 0.7 };
+                let take = match best { Some((_, s)) => score > s, None => true };
+                if take { best = Some((ntype, score)); }
+            }
+        }
+        if let Some((ntype, salience)) = best {
+            out.push(Candidate {
+                text: sentence.to_string(),
+                ntype: ntype.to_string(),
+                salience,
+            });
+        }
+    }
+    out
+}
+
+/// Report of an auto-capture pass over one turn.
+#[derive(Debug, Serialize, Clone)]
+pub struct AutoCaptureReport {
+    pub candidates: usize,
+    pub created: usize,
+    pub reinforced: usize,
+    pub results: Vec<RememberResult>,
+}
+
+/// Run auto-capture over a user turn: extract salience candidates, and for each
+/// that clears the threshold, route through remember() (novelty-gated). Returns
+/// a report the UI can show. `salience_threshold` biases conservative.
+#[allow(clippy::too_many_arguments)]
+pub async fn auto_capture(
+    db: &Db,
+    owner_kind: &str,
+    owner_id: &str,
+    abs_memory_dir: &Path,
+    rel_memory_dir: &str,
+    user_text: &str,
+    salience_threshold: f32,
+    source: &str,
+    embed_model: &str,
+    embed_endpoint: &str,
+) -> Result<AutoCaptureReport, String> {
+    let candidates = extract_candidates(user_text);
+    let mut report = AutoCaptureReport {
+        candidates: candidates.len(),
+        created: 0,
+        reinforced: 0,
+        results: Vec::new(),
+    };
+    for c in candidates {
+        if c.salience < salience_threshold {
+            continue;
+        }
+        match remember(
+            db, owner_kind, owner_id, abs_memory_dir, rel_memory_dir,
+            &c.text, &c.ntype, source, embed_model, embed_endpoint,
+        ).await {
+            Ok(r) => {
+                if r.action == "created" { report.created += 1; } else { report.reinforced += 1; }
+                report.results.push(r);
+            }
+            Err(_) => { /* one bad candidate never kills the pass */ }
+        }
+    }
+    Ok(report)
+}

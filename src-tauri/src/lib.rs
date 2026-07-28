@@ -419,6 +419,37 @@ async fn memory_remember(
     ).await
 }
 
+// ---- M1.7 Slice 4: AUTO-CAPTURE + salience (Self-Gardening killer loop) ----
+// Extract durable facts from a turn WITHOUT being told to, salience-gate them,
+// and route each through the novelty-deduped remember(). Conservative by
+// default (bias to under-remember). Same jail-broker Memory/ resolution.
+#[tauri::command]
+async fn memory_auto_capture(
+    app: tauri::AppHandle,
+    broker: tauri::State<'_, Arc<Broker>>,
+    db: tauri::State<'_, writer::Db>,
+    agent_id: String,
+    user_text: String,
+    threshold: Option<f32>,  // salience cutoff; default 0.65 (conservative)
+) -> Result<memory::AutoCaptureReport, String> {
+    let abs_sentinel = broker
+        .resolve(&agent_id, "Memory/.aygent-scope", broker::Mode::Write)
+        .map_err(|e| format!("Memory path refused by jail: {e:?}"))?;
+    let abs_memory_dir = abs_sentinel
+        .parent()
+        .ok_or("could not resolve Memory dir")?
+        .to_path_buf();
+    let embed_model = ensure_embed_model(&app).await?;
+    memory::auto_capture(
+        &db, "agent", &agent_id,
+        &abs_memory_dir, "Memory",
+        &user_text,
+        threshold.unwrap_or(0.65),
+        "",
+        &embed_model, "",
+    ).await
+}
+
 /// Pick a folder WITHOUT changing any agent's scope — used by the memory test
 /// panel so you browse to a vault instead of hand-typing a path (which is how a
 /// repo root gets picked by mistake). Returns the chosen absolute path or None.
@@ -2132,7 +2163,8 @@ pub fn run() {
             mailbox_pending_counts, mailbox_take_next, mailbox_roster,
             get_app_knobs, set_app_knobs,
             memory_ingest, memory_retrieve, memory_stats, pick_vault_folder,
-            memory_append_daily, memory_gate_check, memory_remember
+            memory_append_daily, memory_gate_check, memory_remember,
+            memory_auto_capture
         ])
         .setup(move |_app| {
             // M1.1: bring up the SQLite state spine + single-writer actor, then

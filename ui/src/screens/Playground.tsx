@@ -47,6 +47,20 @@ export function Playground({ folder, ws, agentId }: { folder: string | null; ws:
   const [rememberErr, setRememberErr] = useState<string | null>(null);
   const [rememberBusy, setRememberBusy] = useState(false);
 
+  // --- Slice 4: auto-capture + salience (the killer loop) ---
+  const [turn, setTurn] = useState("I prefer dark roast coffee, no sugar. I switched to decaf a few weeks ago to sleep better. Also I decided to ship AYGENT at $20 one-time. Can you help me with the billing page?");
+  const [capture, setCapture] = useState<{ candidates: number; created: number; reinforced: number; results: { action: string; path: string; title: string; similarity: number; matched_path: string; confidence: number }[] } | null>(null);
+  const [captureErr, setCaptureErr] = useState<string | null>(null);
+  const [captureBusy, setCaptureBusy] = useState(false);
+
+  async function runCapture() {
+    if (!agentId) { setCaptureErr("No active agent — pick one in the rail first."); return; }
+    setCaptureBusy(true); setCaptureErr(null); setCapture(null);
+    try { setCapture(await invoke("memory_auto_capture", { agentId, userText: turn })); }
+    catch (e) { setCaptureErr(String(e)); }
+    finally { setCaptureBusy(false); }
+  }
+
   async function runRemember() {
     if (!agentId) { setRememberErr("No active agent — pick one in the rail first."); return; }
     setRememberBusy(true); setRememberErr(null);
@@ -288,6 +302,40 @@ export function Playground({ folder, ws, agentId }: { folder: string | null; ws:
                   ? `➕ created ${r.path} · conf ${r.confidence.toFixed(2)}${r.similarity > 0 ? ` (nearest ${r.similarity.toFixed(2)})` : ""}`
                   : `♻ reinforced ${r.matched_path} · sim ${r.similarity.toFixed(2)} → conf ${r.confidence.toFixed(2)}`}
               </Pill>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      {/* M1.7 Slice 4 — AUTO-CAPTURE + salience. The Self-Gardening killer loop. */}
+      <Card title="Vault memory (Slice 4 — auto-capture)">
+        <p style={hint}>
+          Paste a chunk of conversation as if you just said it. The agent extracts the
+          <b> durable facts</b> on its own — salience-gated (it ignores questions + transient
+          states) and novelty-deduped (never a dupe). This is the unprompted Self-Gardening loop:
+          you talk, it quietly files what matters, into files you own.
+        </p>
+        {!agentId && <Pill tone="muted">Pick an agent in the rail first.</Pill>}
+        <textarea value={turn} onChange={(e) => setTurn(e.target.value)} rows={4}
+          style={{ background: "var(--bg)", color: "var(--text)", border: "var(--border-width) solid var(--line)",
+                   borderRadius: "var(--radius-control)", padding: "9px 12px", fontSize: 14, resize: "vertical",
+                   fontFamily: "inherit", boxShadow: "var(--elevation)" }} />
+        <div><Button onClick={runCapture} disabled={captureBusy || !agentId}>{captureBusy ? "Capturing…" : "Auto-capture"}</Button></div>
+        {captureErr && <Transcript text={"✗ " + captureErr} error />}
+        {capture && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <Pill tone={capture.created + capture.reinforced > 0 ? "ok" : "muted"}>
+              {`${capture.candidates} candidate(s) → ➕ ${capture.created} created · ♻ ${capture.reinforced} reinforced`}
+            </Pill>
+            {capture.results.map((r, i) => (
+              <div key={i} style={{ border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-card)",
+                                    padding: "8px 12px", background: "var(--bg)", boxShadow: "var(--elevation)" }}>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <Pill tone={r.action === "created" ? "ok" : "muted"}>{r.action === "created" ? "➕ created" : "♻ reinforced"}</Pill>
+                  <span style={{ ...hint, fontSize: 12 }}>{r.action === "created" ? r.path : r.matched_path} · conf {r.confidence.toFixed(2)}</span>
+                </div>
+                <p style={{ ...hint, marginTop: 4 }}>{r.title}</p>
+              </div>
             ))}
           </div>
         )}
