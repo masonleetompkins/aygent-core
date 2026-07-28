@@ -16,6 +16,7 @@ mod drainer;
 mod lanes;
 mod mailbox;
 mod memory;
+mod scheduler;
 mod vault_write;
 mod migrate_json;
 mod repo;
@@ -448,6 +449,67 @@ async fn memory_auto_capture(
         "",
         &embed_model, "",
     ).await
+}
+
+// ---- M1.8 Scheduler: read-only inspection (Slice 1 observability) --------
+/// List schedules (optionally for one agent) with their timing + last-run state,
+/// so the UI/panel can show next/last/status without a terminal.
+#[tauri::command]
+fn scheduler_list(db: tauri::State<writer::Db>, agent_id: Option<String>) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db.reader()?;
+    let mut out = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.agent_id, s.name, s.kind, s.spec_json, s.action_json, s.enabled,
+                s.next_fire_at, s.last_fired_at, s.daily_fire_count,
+                (SELECT state FROM schedule_run r WHERE r.schedule_id=s.id ORDER BY r.fired_at DESC LIMIT 1),
+                (SELECT result_snippet FROM schedule_run r WHERE r.schedule_id=s.id ORDER BY r.fired_at DESC LIMIT 1)
+         FROM schedule s
+         WHERE (?1 IS NULL OR s.agent_id = ?1)
+         ORDER BY s.next_fire_at ASC",
+    ).map_err(|e| format!("prep list: {e}"))?;
+    let rows = stmt.query_map(params![agent_id], |r| {
+        Ok(serde_json::json!({
+            "id": r.get::<_, i64>(0)?,
+            "agent_id": r.get::<_, String>(1)?,
+            "name": r.get::<_, String>(2)?,
+            "kind": r.get::<_, String>(3)?,
+            "spec_json": r.get::<_, String>(4)?,
+            "action_json": r.get::<_, String>(5)?,
+            "enabled": r.get::<_, i64>(6)? != 0,
+            "next_fire_at": r.get::<_, Option<i64>>(7)?,
+            "last_fired_at": r.get::<_, Option<i64>>(8)?,
+            "daily_fire_count": r.get::<_, i64>(9)?,
+            "last_status": r.get::<_, Option<String>>(10)?,
+            "last_result": r.get::<_, Option<String>>(11)?,
+        }))
+    }).map_err(|e| format!("query list: {e}"))?;
+    for row in rows.flatten() { out.push(row); }
+    Ok(out)
+}
+
+/// Recent run history for a schedule (observability drill-in).
+#[tauri::command]
+fn scheduler_runs(db: tauri::State<writer::Db>, schedule_id: i64, limit: Option<i64>) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db.reader()?;
+    let lim = limit.unwrap_or(20).clamp(1, 200);
+    let mut stmt = conn.prepare(
+        "SELECT id, fired_at, started_at, finished_at, state, skip_reason, result_snippet
+         FROM schedule_run WHERE schedule_id = ?1 ORDER BY fired_at DESC LIMIT ?2",
+    ).map_err(|e| format!("prep runs: {e}"))?;
+    let rows = stmt.query_map(params![schedule_id, lim], |r| {
+        Ok(serde_json::json!({
+            "id": r.get::<_, i64>(0)?,
+            "fired_at": r.get::<_, i64>(1)?,
+            "started_at": r.get::<_, Option<i64>>(2)?,
+            "finished_at": r.get::<_, Option<i64>>(3)?,
+            "state": r.get::<_, String>(4)?,
+            "skip_reason": r.get::<_, Option<String>>(5)?,
+            "result_snippet": r.get::<_, Option<String>>(6)?,
+        }))
+    }).map_err(|e| format!("query runs: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows.flatten() { out.push(row); }
+    Ok(out)
 }
 
 /// Pick a folder WITHOUT changing any agent's scope — used by the memory test
@@ -2137,6 +2199,7 @@ pub fn run() {
     // the instant a message is enqueued (near-instant delivery). Managed as
     // state so mailbox commands can nudge it.
     let drain_signal = drainer::DrainSignal::new();
+    let sched_signal = scheduler::SchedSignal::new();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -2144,6 +2207,7 @@ pub fn run() {
         .manage(state.clone())
         .manage(lanes.clone())
         .manage(drain_signal.clone())
+        .manage(sched_signal.clone())
         .invoke_handler(tauri::generate_handler![
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
@@ -2164,7 +2228,7 @@ pub fn run() {
             get_app_knobs, set_app_knobs,
             memory_ingest, memory_retrieve, memory_stats, pick_vault_folder,
             memory_append_daily, memory_gate_check, memory_remember,
-            memory_auto_capture
+            memory_auto_capture, scheduler_list, scheduler_runs
         ])
         .setup(move |_app| {
             // M1.1: bring up the SQLite state spine + single-writer actor, then
@@ -2193,7 +2257,21 @@ pub fn run() {
                     let sig = _app.state::<drainer::DrainSignal>().inner().clone();
                     let brk = _app.state::<Arc<Broker>>().inner().clone();
                     let lns = _app.state::<lanes::Lanes>().inner().clone();
-                    drainer::spawn(_app.handle().clone(), db, brk, lns, sig);
+                    drainer::spawn(_app.handle().clone(), db.clone(), brk, lns, sig);
+                }
+
+                // M1.8 SCHEDULER: spawn the ticker ("the drainer with a clock in
+                // front of it"). Sleeps-until-next, marks fires exactly-once
+                // through the writer actor, hands each fire to the drainer. Slice
+                // 1: seeds one 60s proof schedule so a headless turn fires on
+                // time, unattended, out of the box.
+                {
+                    use tauri::Manager;
+                    let ssig = _app.state::<scheduler::SchedSignal>().inner().clone();
+                    let dsig = _app.state::<drainer::DrainSignal>().inner().clone();
+                    let brk = _app.state::<Arc<Broker>>().inner().clone();
+                    let lns = _app.state::<lanes::Lanes>().inner().clone();
+                    scheduler::spawn(_app.handle().clone(), db, brk, lns, ssig, dsig);
                 }
             }
 

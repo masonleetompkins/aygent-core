@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 /// Current schema version. Bump when adding a migration step below.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// The DB file name under <app_data>.
 pub const DB_FILE: &str = "aygent.db";
@@ -112,6 +112,18 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("migrate v3: {e}"))?;
         set_version(conn, 3)?;
         v = 3;
+    }
+
+    if v < 4 {
+        // M1.8 SCHEDULER — per-agent cron/heartbeat/interval that fires headless
+        // turns. Atlas: "the drainer with a clock in front of it." schedule holds
+        // the timing (typed spec as JSON + a derived next_fire_at the ticker
+        // sorts on) + action + guardrails; schedule_run is the durable run log
+        // for observability (last/next/status/history). See scheduler.rs.
+        conn.execute_batch(SCHEMA_V4)
+            .map_err(|e| format!("migrate v4: {e}"))?;
+        set_version(conn, 4)?;
+        v = 4;
     }
 
     let _ = v;
@@ -313,4 +325,55 @@ CREATE TABLE IF NOT EXISTS vec (
   embedding   BLOB NOT NULL,
   PRIMARY KEY (owner_kind, owner_id, path)
 );
+"#;
+
+/// SCHEMA v4 (M1.8) — the SCHEDULER. Two tables. Timing-critical fields
+/// (next_fire_at, enabled) are real indexed columns the ticker queries hot; the
+/// evolving typed enums (ScheduleSpec, ScheduleAction) ride as JSON so adding a
+/// variant later needs NO migration (serde forward-compat). All timestamps are
+/// UTC epoch MILLISECONDS (INTEGER); local-tz interpretation lives in spec+tz.
+const SCHEMA_V4: &str = r#"
+-- One row per user schedule. `spec_json` (Interval|DailyAt|WeeklyAt) is the
+-- source of truth for recomputation; `next_fire_at` is the derived index the
+-- ticker sorts on. `action_json` = AgentTurn{prompt,context} | SystemJob{kind}.
+CREATE TABLE IF NOT EXISTS schedule (
+  id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id               TEXT    NOT NULL,
+  name                   TEXT    NOT NULL,
+  kind                   TEXT    NOT NULL,            -- 'cron' | 'heartbeat' | 'interval'
+  spec_json              TEXT    NOT NULL,            -- serialized ScheduleSpec
+  tz                     TEXT    NOT NULL DEFAULT 'local',
+  action_json            TEXT    NOT NULL,            -- serialized ScheduleAction
+  enabled                INTEGER NOT NULL DEFAULT 1,
+  catch_up_policy        TEXT    NOT NULL DEFAULT 'coalesce', -- coalesce|skip|fire_each
+  max_fires_per_day      INTEGER NOT NULL DEFAULT 2,
+  max_cost_units_per_day INTEGER,                     -- NULL = no ceiling
+  next_fire_at           INTEGER NOT NULL,            -- UTC ms; ticker sorts on this
+  last_fired_at          INTEGER,                     -- UTC ms; NULL until first fire
+  daily_fire_count       INTEGER NOT NULL DEFAULT 0,
+  cost_units_today       INTEGER NOT NULL DEFAULT 0,
+  count_reset_day        INTEGER NOT NULL DEFAULT 0,  -- local YYYYMMDD of last reset
+  created_at             INTEGER NOT NULL DEFAULT 0,
+  updated_at             INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY (agent_id) REFERENCES agent(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_schedule_due ON schedule (enabled, next_fire_at);
+
+-- Durable run log — the observability spine. Every fire AND every skip (with
+-- reason) gets a row, so "why didn't it fire?" always has an on-screen answer.
+CREATE TABLE IF NOT EXISTS schedule_run (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  schedule_id     INTEGER NOT NULL,
+  agent_id        TEXT    NOT NULL,
+  fired_at        INTEGER NOT NULL,      -- when the ticker decided to fire (UTC ms)
+  started_at      INTEGER,               -- when the drainer began the turn
+  finished_at     INTEGER,
+  state           TEXT    NOT NULL,      -- queued|running|ok|error|skipped
+  skip_reason     TEXT,                  -- rate_limited|paused|cost_ceiling
+  cost_units      INTEGER,
+  result_snippet  TEXT,
+  conversation_id TEXT,
+  FOREIGN KEY (schedule_id) REFERENCES schedule(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_run_by_schedule ON schedule_run (schedule_id, fired_at DESC);
 "#;
