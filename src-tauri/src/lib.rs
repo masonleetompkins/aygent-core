@@ -20,6 +20,7 @@ mod mailbox;
 mod memory;
 mod scheduler;
 mod vault_write;
+mod web;
 mod migrate_json;
 mod repo;
 mod writer;
@@ -1557,6 +1558,18 @@ fn exec_tool_cfg(
                 Err(e) => (format!("refused by jail: {e:?}"), true),
             }
         }
+        // WEB FETCH (M1.9, first real agent tool). The daemon has NO network
+        // (Seatbelt); the privileged Rust side makes the request and returns
+        // only extracted text — same mediated-reach model as the path broker,
+        // applied to the internet. http(s) only; internal/localhost hosts blocked.
+        "fetch_url" => {
+            let url = input.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            if url.is_empty() { return ("fetch_url needs a `url`".into(), true); }
+            match web::fetch_blocking(url) {
+                Ok(text) => (text, false),
+                Err(e) => (format!("fetch failed: {e}"), true),
+            }
+        }
         other => (format!("unknown tool: {other}"), true),
     }
 }
@@ -1600,6 +1613,13 @@ fn builtin_tool_schema(name: &str) -> Option<serde_json::Value> {
                 "content": { "type": "string", "description": "markdown or plain text body" },
                 "output_path": { "type": "string", "description": "e.g. report.pdf" }
             }, "required": ["title", "content", "output_path"] }
+        })),
+        "fetch_url" => Some(serde_json::json!({
+            "name": "fetch_url",
+            "description": "Fetch a web page or API endpoint over HTTPS and return its readable text (HTML is stripped to prose). Use this to read articles, docs, or JSON APIs when you need current information. http(s) only; long pages are truncated.",
+            "input_schema": { "type": "object", "properties": {
+                "url": { "type": "string", "description": "the full http(s) URL to fetch" }
+            }, "required": ["url"] }
         })),
         _ => None,
     }
@@ -1666,7 +1686,8 @@ fn pdf_config_for(app: &tauri::AppHandle, folder: Option<&str>) -> serde_json::V
 
 const AGENT_SYSTEM: &str = "You are AYGENT, an agent that can ONLY touch files inside the user's \
     chosen folder via your tools. You cannot run shell commands. Use read_file/write_file/list_files \
-    for file work. Be concise and friendly.";
+    for file work, and fetch_url to read a web page or API over HTTPS when you need current \
+    information from the internet. Be concise and friendly.";
 
 // Base system prompt for local models. When the model is tool-capable, we
 // APPEND its family-native tool instructions (local_tools::system_prompt_with_tools).

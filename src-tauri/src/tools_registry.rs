@@ -86,17 +86,32 @@ pub fn set_tool_config(app_data: &Path, folder: &str, tool_id: &str, values: ser
 
 /// The built-in tools that always exist in the registry (seeded on first read).
 fn builtins() -> Vec<ToolDef> {
-    vec![ToolDef {
-        id: "builtin.pdf".into(),
-        name: "generate_pdf".into(),
-        display_name: "PDF Generator".into(),
-        description: "Create a PDF document from markdown/text content, saved into the agent folder. \
-            Args: title (string), content (markdown string), output_path (e.g. \"report.pdf\").".into(),
-        kind: "builtin".into(),
-        builtin: true,
-        instructions: String::new(),
-        allowed_tools: vec![],
-    }]
+    vec![
+        ToolDef {
+            id: "builtin.pdf".into(),
+            name: "generate_pdf".into(),
+            display_name: "PDF Generator".into(),
+            description: "Create a PDF document from markdown/text content, saved into the agent folder. \
+                Args: title (string), content (markdown string), output_path (e.g. \"report.pdf\").".into(),
+            kind: "builtin".into(),
+            builtin: true,
+            instructions: String::new(),
+            allowed_tools: vec![],
+        },
+        ToolDef {
+            id: "builtin.web".into(),
+            name: "fetch_url".into(),
+            display_name: "Web Fetch".into(),
+            description: "Fetch a web page or API over HTTPS and return its readable text (HTML stripped \
+                to prose). Lets an agent read current info from the internet. The daemon has no network; \
+                the request is made on the privileged side and only extracted text is returned. \
+                Args: url (http/https).".into(),
+            kind: "builtin".into(),
+            builtin: true,
+            instructions: String::new(),
+            allowed_tools: vec![],
+        },
+    ]
 }
 
 /// Config SCHEMA for a tool (what settings it exposes). The UI renders controls

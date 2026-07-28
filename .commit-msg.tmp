@@ -1,22 +1,24 @@
-feat(scheduler): Slice 5 — Distill SystemJob (L1->L2 roll-up, zero model calls)
+feat(tools): web fetch — the first real agent tool (fetch_url)
 
-The scheduler + vault-memory convergence, the last core scheduler slice.
+Turns a scheduled "briefing" agent from "recite what it knows" into "go
+read the web." Also the template for every tool that follows.
 
-- memory.rs distill(): deterministic nightly roll-up. Reads the last N days
-  of L1 daily notes (Daily/YYYY-MM-DD.md), strips frontmatter/headings/bullet
-  markers, and runs each line through the SAME salience extractor +
-  novelty-gated remember() that auto_capture uses. Durable facts promote to L2
-  atoms; repeats reinforce, never duplicate. Idempotent-ish (re-run = mostly
-  reinforce) so coalesce-on-resume catches a backlog safely. ZERO model calls —
-  pure code + local embeddings, free to run nightly.
-- scheduler.rs: fire_one now returns FireOutcome (Enqueued|Skipped|SystemJob).
-  SystemJob is logged 'running' in the txn, then EXECUTED ASYNC after commit
-  (embeddings can't run in the writer closure). run_system_job dispatches by
-  name (distill|reconcile) and back-writes ok/error + snippet into schedule_run.
-  run_distill resolves the vault + Memory dir THROUGH THE JAIL BROKER, uses the
-  in-process embedder. Ticker + run_now both handle the async job path.
-- lib.rs: scheduler_run_now is now async (app+broker+drain state).
+JAIL MODEL: the daemon has NO network (Seatbelt). So fetch_url routes
+through the privileged Rust side — same mediated-reach model as the path
+broker, applied to the internet. The jailed brain never opens a socket;
+it gets back only extracted text.
 
-Now a 'Nightly memory distill' schedule (already in the UI's job dropdown)
-actually runs the roll-up. Scheduler + memory, working together.
-First compile of distill + FireOutcome refactor — flag if cargo throws.
+- web.rs: async reqwest GET (redirects, 20s timeout, 5MB body cap, 40k
+  char cap), http(s)-only, basic SSRF guard (blocks localhost / private
+  ranges / cloud metadata / .local). Dependency-free HTML->text: drops
+  script/style/head/svg blocks, block-tags->newlines, strips tags,
+  decodes common entities, collapses whitespace. Non-HTML (json/text/md)
+  passes through. fetch_blocking bridges the async fetch to the sync
+  tool-exec path (same pattern as the embed bridge).
+- lib.rs: exec_tool_cfg handles fetch_url; builtin_tool_schema advertises
+  it; AGENT_SYSTEM prompt tells the agent it has fetch_url for current info.
+- tools_registry: register builtin.web / "Web Fetch" so it shows in the
+  Tools tab and can be enabled per agent (like the PDF tool).
+
+First compile of web.rs + fetch_blocking thread::scope bridge — flag if
+cargo throws (the runtime-handle bridge is the riskiest bit).
