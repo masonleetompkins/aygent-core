@@ -453,6 +453,72 @@ async fn memory_auto_capture(
     ).await
 }
 
+// ---- M1.8 Scheduler: CRUD (Slice 2) --------------------------------------
+// Real schedules come from the UI now (the Slice-1 auto-seed is retired). Two
+// kinds the user builds: a HEARTBEAT (interval + "keep conversation context")
+// and a SCHEDULED JOB (daily/weekly at a wall-clock time, fresh context).
+
+/// Create a schedule. `when` = {type:"interval",every_secs} | {type:"daily_at",
+/// hh,mm} | {type:"weekly_at",days:[0..6],hh,mm}. `action` = {type:"agent_turn",
+/// prompt,context:"fresh"|"continue"} | {type:"system_job",job}. tz is an IANA
+/// name (e.g. "America/Los_Angeles") or "local".
+#[tauri::command]
+fn scheduler_create(
+    db: tauri::State<writer::Db>,
+    sched: tauri::State<scheduler::SchedSignal>,
+    agent_id: String,
+    name: String,
+    when: serde_json::Value,
+    action: serde_json::Value,
+    tz: Option<String>,
+    max_fires_per_day: Option<i64>,
+) -> Result<i64, String> {
+    // Parse the UI's JSON into the typed enums (tolerant of the UI's field names).
+    let spec: scheduler::ScheduleSpec = serde_json::from_value(when)
+        .map_err(|e| format!("bad `when` spec: {e}"))?;
+    let act: scheduler::ScheduleAction = serde_json::from_value(action)
+        .map_err(|e| format!("bad `action`: {e}"))?;
+    // kind label for the row (observability/UI grouping): heartbeat if an
+    // interval-continue turn, cron if daily/weekly, else interval.
+    let kind = match (&spec, &act) {
+        (scheduler::ScheduleSpec::Interval { .. }, scheduler::ScheduleAction::AgentTurn { context, .. }) if context == "continue" => "heartbeat",
+        (scheduler::ScheduleSpec::Interval { .. }, _) => "interval",
+        _ => "cron",
+    };
+    let id = scheduler::create(
+        &db, &agent_id, &name, kind, &spec,
+        tz.as_deref().unwrap_or("local"), &act,
+        max_fires_per_day.unwrap_or(2),
+    )?;
+    sched.nudge(); // hot: ticker recomputes wake_at immediately
+    Ok(id)
+}
+
+/// Enable/disable one schedule (pause a single one). Hot.
+#[tauri::command]
+fn scheduler_set_enabled(
+    db: tauri::State<writer::Db>,
+    sched: tauri::State<scheduler::SchedSignal>,
+    id: i64,
+    enabled: bool,
+) -> Result<(), String> {
+    scheduler::set_enabled(&db, id, enabled)?;
+    sched.nudge();
+    Ok(())
+}
+
+/// Delete a schedule (cascades its run log). Hot.
+#[tauri::command]
+fn scheduler_delete(
+    db: tauri::State<writer::Db>,
+    sched: tauri::State<scheduler::SchedSignal>,
+    id: i64,
+) -> Result<(), String> {
+    scheduler::delete(&db, id)?;
+    sched.nudge();
+    Ok(())
+}
+
 // ---- M1.8 Scheduler: read-only inspection (Slice 1 observability) --------
 /// List schedules (optionally for one agent) with their timing + last-run state,
 /// so the UI/panel can show next/last/status without a terminal.
@@ -2230,7 +2296,8 @@ pub fn run() {
             get_app_knobs, set_app_knobs,
             memory_ingest, memory_retrieve, memory_stats, pick_vault_folder,
             memory_append_daily, memory_gate_check, memory_remember,
-            memory_auto_capture, scheduler_list, scheduler_runs
+            memory_auto_capture, scheduler_list, scheduler_runs,
+            scheduler_create, scheduler_set_enabled, scheduler_delete
         ])
         .setup(move |_app| {
             // M1.1: bring up the SQLite state spine + single-writer actor, then

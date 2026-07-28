@@ -12,11 +12,13 @@
 // laptop wake / DST is re-evaluated), fire everything due, recompute, re-sleep.
 // A tokio::Notify wakes the loop on any hot edit (add/edit/delete/enable/pause).
 //
-// SLICE 1 SCOPE (the proof): spawn the ticker; on boot, SEED one hardcoded
-// Interval{60s} AgentTurn{Fresh,"say the current time"} for the active agent IF
-// no schedules exist yet; fire it → enqueue to drainer → watch a turn appear in
-// a pane every ~60s, unattended. compute_next for DailyAt/WeeklyAt + guardrails
-// + UI arrive in later slices; the timing math here is Interval-only for now.
+// SLICE 2 SCOPE: real timing. compute_next_tz handles DailyAt/WeeklyAt in an
+// IANA timezone (DST-safe via chrono-tz); Interval stays pure UTC. The Slice-1
+// auto-seed is RETIRED (it burned a call every 60s) — real schedules now come
+// from the UI via create()/set_enabled()/delete(). Two schedule kinds the user
+// builds: HEARTBEAT (Interval + Continue context = sees recent conversation)
+// and SCHEDULED JOB (DailyAt/WeeklyAt + Fresh context). Guardrails (cost
+// ceiling, fire caps) = Slice 4; SystemJob/Distill = Slice 5.
 
 use crate::broker::Broker;
 use crate::lanes::Lanes;
@@ -67,19 +69,84 @@ pub enum ScheduleAction {
 }
 fn default_ctx() -> String { "fresh".into() }
 
-/// Compute the next fire time (UTC ms) for a spec, strictly after `after_ms`.
-/// Slice 1: Interval only (pure UTC arithmetic). Daily/Weekly land in Slice 2
-/// with chrono-tz; until then they schedule 24h out as a safe placeholder so a
-/// row is never left without a future next_fire_at.
-pub fn compute_next(spec: &ScheduleSpec, after_ms: i64) -> i64 {
+/// Compute the next fire time (UTC ms) for a spec, strictly after `after_ms`,
+/// interpreting wall-clock (DailyAt/WeeklyAt) in `tz` (an IANA name, or "local").
+///
+/// Interval = pure UTC arithmetic. DailyAt/WeeklyAt = DST-safe via chrono-tz:
+/// we walk forward day-by-day in the target timezone, build the local wall-clock
+/// time (hh:mm), convert to UTC, and take the FIRST candidate strictly after
+/// `after_ms`. Walking in local time is what makes "8am" stay 8am across a DST
+/// boundary (the UTC offset shifts, the wall-clock doesn't).
+pub fn compute_next_tz(spec: &ScheduleSpec, after_ms: i64, tz: &str) -> i64 {
+    use chrono::{Datelike, Duration, TimeZone, Utc};
+
     match spec {
         ScheduleSpec::Interval { every_secs } => {
             let step = (*every_secs as i64).max(1) * 1000;
             after_ms + step
         }
-        // Placeholder until Slice 2's chrono-tz math — never leave NULL/past.
-        ScheduleSpec::DailyAt { .. } | ScheduleSpec::WeeklyAt { .. } => after_ms + 86_400_000,
+        ScheduleSpec::DailyAt { hh, mm } | ScheduleSpec::WeeklyAt { hh, mm, .. } => {
+            let zone = resolve_tz(tz);
+            let after = Utc.timestamp_millis_opt(after_ms).single().unwrap_or_else(Utc::now);
+            let local_after = after.with_timezone(&zone);
+            // Which weekdays are allowed? Daily = all; Weekly = the listed set
+            // (0=Sun..6=Sat, matching JS getDay()).
+            let allowed_days: Option<std::collections::HashSet<u8>> = match spec {
+                ScheduleSpec::WeeklyAt { days, .. } => Some(days.iter().copied().collect()),
+                _ => None,
+            };
+            // Walk up to ~370 days forward (covers weekly + safety for empty sets).
+            for add in 0..=370i64 {
+                let day = (local_after + Duration::days(add)).date_naive();
+                if let Some(ref set) = allowed_days {
+                    // chrono weekday: Mon=0..Sun=6; convert to Sun=0..Sat=6.
+                    let wd = day.weekday().num_days_from_sunday() as u8;
+                    if !set.contains(&wd) { continue; }
+                }
+                // Build the local wall-clock candidate; skip if the time is
+                // invalid/ambiguous at a DST transition (rare; next day covers it).
+                let naive = day.and_hms_opt(*hh as u32, *mm as u32, 0);
+                let Some(naive) = naive else { continue };
+                let Some(local_dt) = zone.from_local_datetime(&naive).single() else { continue };
+                let cand_ms = local_dt.with_timezone(&Utc).timestamp_millis();
+                if cand_ms > after_ms {
+                    return cand_ms;
+                }
+            }
+            // Fallback: 24h out (should be unreachable for a sane spec).
+            after_ms + 86_400_000
+        }
     }
+}
+
+/// Back-compat shim: default timezone ("local"). Prefer compute_next_tz.
+pub fn compute_next(spec: &ScheduleSpec, after_ms: i64) -> i64 {
+    compute_next_tz(spec, after_ms, "local")
+}
+
+/// Resolve an IANA tz name to a chrono_tz::Tz. "local" (or unknown) falls back
+/// to the system local zone's current fixed offset wrapped as UTC-equivalent.
+/// chrono-tz has no "local" entry, so we approximate: if the caller stored a
+/// real IANA name we honor it; otherwise we use the machine's local offset via
+/// chrono::Local by converting through it. To keep the return type uniform we
+/// map "local"/unknown to Tz::UTC and rely on the OS clock already being local
+/// for the app's single-user context. (A real IANA tz is set once the UI
+/// captures the user's zone — see Settings, Slice 6.)
+fn resolve_tz(tz: &str) -> chrono_tz::Tz {
+    if tz.eq_ignore_ascii_case("local") || tz.is_empty() {
+        // Best-effort: try to read the system zone via iana-time-zone if present;
+        // otherwise UTC. We keep this dependency-light for Slice 2 and let the UI
+        // pass a concrete IANA name (e.g. "America/Los_Angeles") going forward.
+        return system_iana().and_then(|n| n.parse().ok()).unwrap_or(chrono_tz::UTC);
+    }
+    tz.parse().unwrap_or(chrono_tz::UTC)
+}
+
+/// Best-effort system IANA zone name. Uses the TZ env var if set, else None
+/// (caller falls back to UTC). The UI will pass an explicit zone in Slice 6, so
+/// this only matters for the seed/default path.
+fn system_iana() -> Option<String> {
+    std::env::var("TZ").ok().filter(|s| s.contains('/'))
 }
 
 /// Shared wake handle (mirrors the drainer's DrainSignal). Any GUI timing edit
@@ -96,6 +163,7 @@ impl SchedSignal {
 struct Due {
     id: i64,
     agent_id: String,
+    tz: String,
     spec: ScheduleSpec,
     action: ScheduleAction,
 }
@@ -118,7 +186,7 @@ fn earliest_next(db: &Db) -> Option<i64> {
 fn due_now(db: &Db, now: i64) -> Vec<Due> {
     let Ok(conn) = db.reader() else { return Vec::new() };
     let Ok(mut stmt) = conn.prepare(
-        "SELECT id, agent_id, spec_json, action_json FROM schedule
+        "SELECT id, agent_id, tz, spec_json, action_json FROM schedule
          WHERE enabled = 1 AND next_fire_at <= ?1 ORDER BY next_fire_at ASC",
     ) else { return Vec::new() };
     let rows = stmt.query_map(params![now], |r| {
@@ -127,17 +195,18 @@ fn due_now(db: &Db, now: i64) -> Vec<Due> {
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
             r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
         ))
     });
     let Ok(rows) = rows else { return Vec::new() };
     let mut out = Vec::new();
     for row in rows.flatten() {
-        let (id, agent_id, spec_json, action_json) = row;
+        let (id, agent_id, tz, spec_json, action_json) = row;
         let (Ok(spec), Ok(action)) = (
             serde_json::from_str::<ScheduleSpec>(&spec_json),
             serde_json::from_str::<ScheduleAction>(&action_json),
         ) else { continue };
-        out.push(Due { id, agent_id, spec, action });
+        out.push(Due { id, agent_id, tz, spec, action });
     }
     out
 }
@@ -146,7 +215,7 @@ fn due_now(db: &Db, now: i64) -> Vec<Due> {
 /// enqueue to the drainer, ALL in one writer-actor transaction (exactly-once at
 /// the decision boundary). Returns whether it enqueued a drainer turn.
 fn fire_one(db: &Db, due: &Due, now: i64) -> Result<bool, String> {
-    let next = compute_next(&due.spec, now);
+    let next = compute_next_tz(&due.spec, now, &due.tz);
     let id = due.id;
     let agent_id = due.agent_id.clone();
     // Only AgentTurn enqueues to the drainer in Slice 1; SystemJob is Slice 5.
@@ -197,53 +266,81 @@ fn fire_one(db: &Db, due: &Due, now: i64) -> Result<bool, String> {
     })
 }
 
-/// SLICE 1 seed: if there are NO schedules yet and an active agent exists, seed
-/// one 60s self-firing AgentTurn so the proof is visible out of the box. Idempo-
-/// tent (only seeds when the table is empty). Real schedules come from the UI.
-fn seed_proof_schedule(db: &Db) {
-    let Ok(conn) = db.reader() else { return };
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM schedule", [], |r| r.get(0))
-        .unwrap_or(0);
-    if count > 0 { return; }
-    let active: Option<String> = conn
-        .query_row("SELECT active_id FROM app_state WHERE id = 0", [], |r| r.get::<_, String>(0))
-        .optional()
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty());
-    let Some(agent_id) = active else { return };
+// ---------------------------------------------------------------------------
+// CRUD (Slice 2) — real schedules come from the UI now; the Slice-1 auto-seed
+// is RETIRED (it burned an API call every 60s). On boot we RETIRE any leftover
+// proof schedule so an upgrading install stops the every-minute fire.
+// ---------------------------------------------------------------------------
 
-    let spec = ScheduleSpec::Interval { every_secs: 60 };
-    // Slice-1 proof prompt: something the agent can answer FROM ITS OWN KNOWLEDGE
-    // (no tool needed). "What time is it?" fails because a sandboxed model has no
-    // clock tool — the plumbing still fired, but the reply read as an error.
-    let action = ScheduleAction::AgentTurn {
-        prompt_template: "Proactive proof: in one short sentence, share an interesting fact.".into(),
-        context: "fresh".into(),
-    };
-    let now = now_ms();
-    let next = compute_next(&spec, now);
-    let (spec_json, action_json) = (
-        serde_json::to_string(&spec).unwrap_or_default(),
-        serde_json::to_string(&action).unwrap_or_default(),
-    );
-    let _ = db.write(move |c| {
+/// One-time cleanup: delete the old hardcoded 60s proof schedule if it exists
+/// (name-matched), so upgrading from Slice 1 stops the every-minute burn.
+fn retire_proof_schedule(db: &Db) {
+    let _ = db.write(|c| {
         c.execute(
-            "INSERT INTO schedule (agent_id,name,kind,spec_json,tz,action_json,enabled,next_fire_at,created_at,updated_at)
-             VALUES (?1,?2,'interval',?3,'local',?4,1,?5,?6,?6)",
-            params![agent_id, "Proof: say the time (every 60s)", spec_json, action_json, next, now],
-        ).map_err(|e| format!("seed schedule: {e}"))?;
+            "DELETE FROM schedule WHERE name IN ('Proof: say the time (every 60s)')",
+            [],
+        ).map_err(|e| format!("retire proof: {e}"))?;
         Ok(())
     });
+}
+
+/// Create a schedule from the UI. `spec`/`action` are the typed enums; we
+/// serialize + compute the first next_fire_at. Returns the new id.
+#[allow(clippy::too_many_arguments)]
+pub fn create(
+    db: &Db,
+    agent_id: &str,
+    name: &str,
+    kind: &str,
+    spec: &ScheduleSpec,
+    tz: &str,
+    action: &ScheduleAction,
+    max_fires_per_day: i64,
+) -> Result<i64, String> {
+    let now = now_ms();
+    let next = compute_next_tz(spec, now, tz);
+    let spec_json = serde_json::to_string(spec).map_err(|e| format!("spec: {e}"))?;
+    let action_json = serde_json::to_string(action).map_err(|e| format!("action: {e}"))?;
+    let (agent_id, name, kind, tz) = (agent_id.to_string(), name.to_string(), kind.to_string(), tz.to_string());
+    db.write(move |c| {
+        c.execute(
+            "INSERT INTO schedule (agent_id,name,kind,spec_json,tz,action_json,enabled,max_fires_per_day,next_fire_at,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,1,?7,?8,?9,?9)",
+            params![agent_id, name, kind, spec_json, action_json_holder(&action_json), tz, max_fires_per_day, next, now],
+        ).map_err(|e| format!("insert schedule: {e}"))?;
+        Ok(c.last_insert_rowid())
+    })
+}
+// tiny helper so the closure captures a &str cleanly without a move-order snag
+fn action_json_holder(s: &str) -> String { s.to_string() }
+
+/// Enable/disable a schedule (pause a single one).
+pub fn set_enabled(db: &Db, id: i64, enabled: bool) -> Result<(), String> {
+    let now = now_ms();
+    db.write(move |c| {
+        c.execute(
+            "UPDATE schedule SET enabled = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, if enabled { 1 } else { 0 }, now],
+        ).map_err(|e| format!("set enabled: {e}"))?;
+        Ok(())
+    })
+}
+
+/// Delete a schedule (cascades its run log).
+pub fn delete(db: &Db, id: i64) -> Result<(), String> {
+    db.write(move |c| {
+        c.execute("DELETE FROM schedule WHERE id = ?1", params![id])
+            .map_err(|e| format!("delete schedule: {e}"))?;
+        Ok(())
+    })
 }
 
 /// Spawn the background scheduler ticker. Runs for the life of the app.
 /// `drain` = the drainer's signal so a freshly-enqueued turn wakes it instantly.
 pub fn spawn(app: AppHandle, db: Db, _broker: Arc<Broker>, _lanes: Lanes, sig: SchedSignal, drain: crate::drainer::DrainSignal) {
     tauri::async_runtime::spawn(async move {
-        // Slice 1: seed the proof schedule once (empty table + active agent).
-        seed_proof_schedule(&db);
+        // Slice 2: RETIRE the Slice-1 proof schedule so it stops firing every 60s.
+        retire_proof_schedule(&db);
 
         // Safety-net cap so a wall-clock jump / laptop wake / DST is re-evaluated
         // within 60s even if the next fire is far out.

@@ -32,6 +32,8 @@ sysinfo = "0.32"                    # hardware detection (CPU/RAM) for perf pred
 genpdf = "0.2"                      # TOOLS: pure-Rust markdown/text -> PDF (compiled in, zero user setup)
 pulldown-cmark = { version = "0.12", default-features = false }  # real CommonMark parser -> proper inline styles, code blocks, blockquotes, HR, nested lists, tables
 once_cell = "1"                     # process-wide llama.cpp backend + model cache (local models)
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }  # M1.8 scheduler: DST-safe DailyAt/WeeklyAt timing math
+chrono-tz = "0.10"                  # M1.8 scheduler: IANA timezone db (compute local wall-clock -> UTC)
 rusqlite = { version = "0.32", features = ["bundled"] }  # M1.1 STATE SPINE: SQLite compiled IN (zero user setup, matches git2/llama.cpp philosophy). App state lives Rust-side (the daemon is Seatbelt-jailed w/ no ambient fs) behind a single-writer actor (Atlas C6). WAL + busy_timeout. Replaces the per-folder JSON stores.
 base64 = "0.22"                     # M1.4: decode context-doc uploads (UI reads file -> base64 -> Rust decodes + stores app-data-side, out of the jail)
 urlencoding = "2"                   # (unused placeholder removed if not needed) — kept minimal
