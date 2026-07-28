@@ -39,6 +39,24 @@ export function Playground({ folder, ws, agentId }: { folder: string | null; ws:
   // --- Slice 2: L1 episodic write (gate + append) ---
   const [gate, setGate] = useState<{ all_pass: boolean; files: { file: string; pass: boolean; why: string }[] } | null>(null);
   const [gateBusy, setGateBusy] = useState(false);
+
+  // --- Slice 3: explicit L2 write + novelty dedup ---
+  const [fact, setFact] = useState("Mason takes a break from weed for fertility reasons");
+  const [ftype, setFtype] = useState("fact");
+  const [remembered, setRemembered] = useState<{ action: string; path: string; title: string; similarity: number; matched_path: string; confidence: number }[]>([]);
+  const [rememberErr, setRememberErr] = useState<string | null>(null);
+  const [rememberBusy, setRememberBusy] = useState(false);
+
+  async function runRemember() {
+    if (!agentId) { setRememberErr("No active agent — pick one in the rail first."); return; }
+    setRememberBusy(true); setRememberErr(null);
+    try {
+      const r = await invoke<{ action: string; path: string; title: string; similarity: number; matched_path: string; confidence: number }>(
+        "memory_remember", { agentId, text: fact, ntype: ftype });
+      setRemembered((prev) => [r, ...prev].slice(0, 8));
+    } catch (e) { setRememberErr(String(e)); }
+    finally { setRememberBusy(false); }
+  }
   const [entry, setEntry] = useState("10:24 shipped Slice 2 — the vault write path is real");
   const [appendMsg, setAppendMsg] = useState<string | null>(null);
   const [appendErr, setAppendErr] = useState<string | null>(null);
@@ -241,6 +259,38 @@ export function Playground({ folder, ws, agentId }: { folder: string | null; ws:
           {appendMsg && <Pill tone="ok">{appendMsg}</Pill>}
           {appendErr && <Transcript text={"✗ " + appendErr} error />}
         </div>
+      </Card>
+
+      {/* M1.7 Slice 3 — explicit L2 write ("remember this") + novelty dedup. */}
+      <Card title="Vault memory (Slice 3 — remember + dedup)">
+        <p style={hint}>
+          “Remember this” → a durable single-idea note in <code>Memory/</code> with typed frontmatter,
+          embedded + linked. The <b>novelty gate</b>: say the SAME fact twice and you get
+          <b> one</b> memory, <i>reinforced</i> (confidence bumped) — not a duplicate. Try clicking
+          <b> Remember</b> twice on the same text, then tweak the wording and try again.
+        </p>
+        {!agentId && <Pill tone="muted">Pick an agent in the rail first.</Pill>}
+        <div style={{ display: "flex", gap: 8 }}>
+          <Input value={fact} onChange={(e) => setFact(e.target.value)} placeholder="a durable fact / preference / decision…" />
+          <select value={ftype} onChange={(e) => setFtype(e.target.value)}
+            style={{ background: "var(--bg)", color: "var(--text)", border: "var(--border-width) solid var(--line)",
+                     borderRadius: "var(--radius-control)", padding: "0 10px", fontSize: 13 }}>
+            {["fact", "preference", "decision", "person", "project", "note"].map((t) => <option key={t} value={t}>{t}</option>)}
+          </select>
+          <Button onClick={runRemember} disabled={rememberBusy || !agentId}>{rememberBusy ? "…" : "Remember"}</Button>
+        </div>
+        {rememberErr && <Transcript text={"✗ " + rememberErr} error />}
+        {remembered.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {remembered.map((r, i) => (
+              <Pill key={i} tone={r.action === "created" ? "ok" : "muted"}>
+                {r.action === "created"
+                  ? `➕ created ${r.path} · conf ${r.confidence.toFixed(2)}${r.similarity > 0 ? ` (nearest ${r.similarity.toFixed(2)})` : ""}`
+                  : `♻ reinforced ${r.matched_path} · sim ${r.similarity.toFixed(2)} → conf ${r.confidence.toFixed(2)}`}
+              </Pill>
+            ))}
+          </div>
+        )}
       </Card>
     </div>
   );

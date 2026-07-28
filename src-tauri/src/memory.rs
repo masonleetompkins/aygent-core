@@ -757,3 +757,267 @@ pub fn stats(db: &Db, owner_kind: &str, owner_id: &str) -> Result<(i64, i64, i64
         .unwrap_or(0);
     Ok((notes, links, vecs))
 }
+
+// ===========================================================================
+// SLICE 3 — EXPLICIT L2 WRITE ("remember this") + NOVELTY DEDUP
+//
+// An L2 atom = one durable idea as a single Memory/<slug>.md note with typed
+// frontmatter + provenance. The NOVELTY GATE is what keeps a vault from rotting
+// into 400 near-duplicate notes: before creating a note, embed the candidate
+// and compare to existing atoms in scope. If it's near-identical (cosine >=
+// threshold) to one you already know, DON'T spawn a dupe — STRENGTHEN the
+// existing note instead (bump confidence, add a second provenance ref, touch
+// `updated`). "Said twice" reinforces one memory; it never forks it.
+//
+// Writes go through the SAME gate-guarded atomic writer (vault_write) + the DB
+// index update, so a new atom is immediately retrievable + linked.
+// ===========================================================================
+
+/// Default novelty cutoff (cosine). >= this to an existing atom => it's the
+/// "same fact" => reinforce, don't duplicate. 0.92 per Atlas's design.
+pub const NOVELTY_CUTOFF: f32 = 0.92;
+
+/// What happened on a remember(): a fresh atom, or a reinforced existing one.
+#[derive(Debug, Serialize, Clone)]
+pub struct RememberResult {
+    pub action: String,      // "created" | "reinforced"
+    pub path: String,        // vault-relative path of the atom
+    pub title: String,
+    pub similarity: f32,      // best cosine to prior memory (0 if none)
+    pub matched_path: String, // the atom we reinforced (empty if created)
+    pub confidence: f64,
+}
+
+/// Turn free text into a filesystem-safe slug for Memory/<slug>.md.
+fn slugify(text: &str) -> String {
+    let mut s = String::new();
+    let mut last_dash = false;
+    for ch in text.chars().flat_map(|c| c.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            s.push(ch);
+            last_dash = false;
+        } else if !last_dash && !s.is_empty() {
+            s.push('-');
+            last_dash = true;
+        }
+    }
+    let s = s.trim_matches('-').to_string();
+    let s: String = s.chars().take(60).collect();
+    if s.is_empty() { "memory".into() } else { s.trim_matches('-').to_string() }
+}
+
+/// Today's date as YYYY-MM-DD (local). Kept here so memory.rs has no chrono dep;
+/// the caller can also pass an explicit date via the command layer.
+fn today_ymd() -> String {
+    // Derive from system time via a tiny civil-date calc (no chrono). UTC is
+    // fine for a frontmatter stamp; the command layer passes local date for the
+    // daily-note path where it matters.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Compose an L2 atom's markdown: typed frontmatter + body. `source` is an
+/// optional provenance block-ref (e.g. "[[2026-07-28^s3]]").
+fn compose_atom(
+    ntype: &str,
+    agent: &str,
+    pool: &str,
+    confidence: f64,
+    source: &str,
+    tags: &[String],
+    body: &str,
+) -> String {
+    let today = today_ymd();
+    let pool_val = if pool.is_empty() { "null".to_string() } else { pool.to_string() };
+    let src_val = if source.is_empty() { "null".to_string() } else { source.to_string() };
+    let tag_list = if tags.is_empty() {
+        format!("[{ntype}]")
+    } else {
+        format!("[{}]", tags.join(", "))
+    };
+    format!(
+        "---\n\
+         type: {ntype}\n\
+         agent: {agent}\n\
+         pool: {pool_val}\n\
+         created: {today}\n\
+         updated: {today}\n\
+         confidence: {confidence}\n\
+         source: {src_val}\n\
+         supersedes: null\n\
+         status: active\n\
+         tags: {tag_list}\n\
+         ---\n\
+         {body}\n"
+    )
+}
+
+/// The novelty probe: embed `text`, return the best (cosine, path, confidence)
+/// among ACTIVE atoms in this scope. (Only compares against Memory atoms, i.e.
+/// ntype != 'daily' — we dedup durable facts, not episodic log lines.)
+async fn best_match(
+    db: &Db,
+    owner_kind: &str,
+    owner_id: &str,
+    text: &str,
+    embed_model: &str,
+    embed_endpoint: &str,
+) -> Result<(f32, String, f64, Vec<f32>), String> {
+    let cand = embed(text, embed_model, embed_endpoint).await?;
+    struct Row { path: String, conf: f64, emb: Vec<f32> }
+    let rows: Vec<Row> = {
+        let conn = db.reader()?;
+        let mut stmt = conn.prepare(
+            "SELECT n.path, n.confidence, v.embedding
+             FROM note n JOIN vec v
+               ON v.owner_kind=n.owner_kind AND v.owner_id=n.owner_id AND v.path=n.path
+             WHERE n.owner_kind=?1 AND n.owner_id=?2 AND n.status='active' AND n.ntype!='daily'",
+        ).map_err(|e| format!("prep novelty: {e}"))?;
+        let mapped = stmt.query_map(params![owner_kind, owner_id], |r| Ok(Row {
+            path: r.get(0)?, conf: r.get(1)?, emb: blob_to_f32(&r.get::<_, Vec<u8>>(2)?),
+        })).map_err(|e| format!("query novelty: {e}"))?;
+        mapped.filter_map(|x| x.ok()).collect()
+    };
+    let mut best = (0.0f32, String::new(), 0.0f64);
+    for r in &rows {
+        let c = cosine(&cand, &r.emb);
+        if c > best.0 { best = (c, r.path.clone(), r.conf); }
+    }
+    Ok((best.0, best.1, best.2, cand))
+}
+
+/// EXPLICIT "remember this": create an L2 atom OR reinforce a near-duplicate.
+/// `abs_memory_dir` is the jail-resolved absolute path to the Memory/ folder;
+/// `rel_memory_dir` is its vault-relative form (for note identity + links).
+#[allow(clippy::too_many_arguments)]
+pub async fn remember(
+    db: &Db,
+    owner_kind: &str,
+    owner_id: &str,
+    abs_memory_dir: &Path,
+    rel_memory_dir: &str,
+    text: &str,
+    ntype: &str,
+    source: &str,
+    embed_model: &str,
+    embed_endpoint: &str,
+) -> Result<RememberResult, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("nothing to remember (empty text)".into());
+    }
+
+    // 1) Novelty gate: is this the same fact as something we already know?
+    let (sim, matched_path, matched_conf, cand_emb) =
+        best_match(db, owner_kind, owner_id, text, embed_model, embed_endpoint).await?;
+
+    if sim >= NOVELTY_CUTOFF && !matched_path.is_empty() {
+        // REINFORCE the existing atom: bump confidence (toward 1.0), touch
+        // `updated`, append this occurrence's provenance. We do NOT rewrite the
+        // note body (that risks corruption + drift) — we update the DB index
+        // (confidence/updated) which is the source of ranking, and record the
+        // extra provenance as a suggested-link edge so the graph reflects it.
+        let new_conf = (matched_conf + (1.0 - matched_conf) * 0.34).min(0.99);
+        let today = today_ymd();
+        let (ok, oi, mp) = (owner_kind.to_string(), owner_id.to_string(), matched_path.clone());
+        let src = source.to_string();
+        db.write(move |c| {
+            let tx = c.transaction().map_err(|e| format!("txn: {e}"))?;
+            tx.execute(
+                "UPDATE note SET confidence=?4, updated=?5 WHERE owner_kind=?1 AND owner_id=?2 AND path=?3",
+                params![ok, oi, mp, new_conf, today],
+            ).map_err(|e| format!("reinforce update: {e}"))?;
+            if !src.is_empty() {
+                tx.execute(
+                    "INSERT OR IGNORE INTO link (owner_kind,owner_id,src_path,dst_path,kind) VALUES (?1,?2,?3,?4,'supersedes')",
+                    params![ok, oi, mp, src],
+                ).map_err(|e| format!("reinforce provenance: {e}"))?;
+            }
+            tx.commit().map_err(|e| format!("commit: {e}"))?;
+            Ok(())
+        })?;
+        return Ok(RememberResult {
+            action: "reinforced".into(),
+            path: matched_path.clone(),
+            title: text.chars().take(80).collect(),
+            similarity: sim,
+            matched_path,
+            confidence: new_conf,
+        });
+    }
+
+    // 2) CREATE a fresh atom. Slug from the text; suffix on collision so we
+    //    never overwrite an existing note (create_note also refuses).
+    let base_slug = slugify(text);
+    let mut slug = base_slug.clone();
+    let mut n = 2;
+    loop {
+        let candidate = abs_memory_dir.join(format!("{slug}.md"));
+        if !candidate.exists() { break; }
+        slug = format!("{base_slug}-{n}");
+        n += 1;
+        if n > 50 { return Err("could not find a free slug".into()); }
+    }
+    let abs_path = abs_memory_dir.join(format!("{slug}.md"));
+    let rel_path = format!("{}/{}.md", rel_memory_dir.trim_end_matches('/'), slug);
+    let confidence = 0.8f64;
+    let tags = vec![ntype.to_string()];
+    let contents = compose_atom(ntype, owner_id, "", confidence, source, &tags, text);
+
+    // Gate-guarded atomic create (never overwrites).
+    let receipt = crate::vault_write::create_note(&abs_path, &contents)?;
+    let _ = receipt;
+
+    // 3) Index the new atom immediately: note + vec (+ provenance link edge).
+    let parsed = parse_note(&contents, &abs_path);
+    let sha = sha_hex(&contents);
+    let emb_blob = (cand_emb.len() as i64, f32_to_blob(&cand_emb));
+    let (ok, oi, rp) = (owner_kind.to_string(), owner_id.to_string(), rel_path.clone());
+    let src = source.to_string();
+    let (title, ntype_s, agent_s, body_s, created_s, updated_s) =
+        (parsed.title.clone(), parsed.ntype.clone(), owner_id.to_string(), parsed.body.clone(), today_ymd(), today_ymd());
+    db.write(move |c| {
+        let tx = c.transaction().map_err(|e| format!("txn: {e}"))?;
+        tx.execute(
+            "INSERT INTO note (owner_kind,owner_id,path,sha,title,ntype,agent,pool,confidence,status,body,created,updated,indexed_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'',?8,'active',?9,?10,?11,?12)",
+            params![ok, oi, rp, sha, title, ntype_s, agent_s, confidence, body_s, created_s, updated_s, now()],
+        ).map_err(|e| format!("insert atom note: {e}"))?;
+        tx.execute(
+            "INSERT INTO vec (owner_kind,owner_id,path,dim,embedding) VALUES (?1,?2,?3,?4,?5)",
+            params![ok, oi, rp, emb_blob.0, emb_blob.1],
+        ).map_err(|e| format!("insert atom vec: {e}"))?;
+        if !src.is_empty() {
+            tx.execute(
+                "INSERT OR IGNORE INTO link (owner_kind,owner_id,src_path,dst_path,kind) VALUES (?1,?2,?3,?4,'wikilink')",
+                params![ok, oi, rp, src],
+            ).map_err(|e| format!("insert atom provenance: {e}"))?;
+        }
+        tx.commit().map_err(|e| format!("commit: {e}"))?;
+        Ok(())
+    })?;
+
+    Ok(RememberResult {
+        action: "created".into(),
+        path: rel_path,
+        title: parsed.title,
+        similarity: sim,
+        matched_path: String::new(),
+        confidence,
+    })
+}

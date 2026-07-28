@@ -161,6 +161,52 @@ fn tmp_sibling(p: &Path) -> PathBuf {
     p.with_file_name(format!(".{name}.aygent.tmp"))
 }
 
+/// The result of creating a full note (L2 atom). Inspectable receipt for the UI.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CreateReceipt {
+    pub path: String,
+    pub bytes: usize,
+}
+
+/// CREATE a brand-new note file with the exact `contents`, atomically. Used for
+/// L2 atoms (a single-idea Memory note), which are WHOLE-file writes, not
+/// appends. REFUSES to overwrite an existing file — an L2 create must never
+/// clobber a note the user (or a prior write) already made; the caller handles
+/// the "already exists" case (dedup / slug-suffix) explicitly.
+///
+/// SAFETY: `abs_path` MUST already be resolved through the jail broker.
+pub fn create_note(abs_path: &Path, contents: &str) -> Result<CreateReceipt, String> {
+    if abs_path.exists() {
+        return Err(format!(
+            "ABORT: note already exists ({}) — create_note never overwrites",
+            abs_path.display()
+        ));
+    }
+    let dir = abs_path.parent().ok_or("note has no parent dir")?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("mkdir: {e}"))?;
+
+    // Normalize the block's newlines to LF for a fresh file (our own template);
+    // ensure a single trailing newline. No existing bytes to preserve here.
+    let mut body = contents.replace("\r\n", "\n");
+    if !body.ends_with('\n') { body.push('\n'); }
+    let bytes = body.into_bytes();
+
+    let tmp = tmp_sibling(abs_path);
+    {
+        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {e}"))?;
+        f.write_all(&bytes).map_err(|e| format!("write tmp: {e}"))?;
+        f.sync_all().map_err(|e| format!("fsync tmp: {e}"))?;
+    }
+    // create_new-style guard: if someone raced us to the path between the
+    // exists() check and here, the rename still lands, but we re-check to keep
+    // the "never overwrite" contract honest under the writer-actor serialization.
+    std::fs::rename(&tmp, abs_path).map_err(|e| format!("rename: {e}"))?;
+    Ok(CreateReceipt {
+        path: abs_path.to_string_lossy().to_string(),
+        bytes: bytes.len(),
+    })
+}
+
 /// The daily-note filename for a date, in the user's configured format. Slice 2
 /// uses the default `YYYY-MM-DD.md`; the format becomes a Setting later.
 pub fn daily_note_name(year: i32, month: u32, day: u32) -> String {

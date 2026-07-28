@@ -384,6 +384,41 @@ fn memory_gate_check() -> Result<serde_json::Value, String> {
     vault_write::run_gate_in_process()
 }
 
+// ---- M1.7 Slice 3: explicit L2 write ("remember this") + novelty dedup ----
+// Create a durable atomic Memory note, OR reinforce a near-duplicate. The
+// Memory/ dir is resolved THROUGH THE JAIL BROKER in Write mode so an atom can
+// only ever land inside the agent's folder scope.
+#[tauri::command]
+async fn memory_remember(
+    app: tauri::AppHandle,
+    broker: tauri::State<'_, Arc<Broker>>,
+    db: tauri::State<'_, writer::Db>,
+    agent_id: String,
+    text: String,
+    ntype: Option<String>,   // decision | preference | fact | person | project | note
+    source: Option<String>,  // optional provenance block-ref, e.g. "[[2026-07-28^s3]]"
+) -> Result<memory::RememberResult, String> {
+    // Resolve Memory/ through the jail (Write mode). We resolve a sentinel path
+    // inside it, then take its parent as the dir — the broker validates the
+    // whole path is in-scope.
+    let abs_sentinel = broker
+        .resolve(&agent_id, "Memory/.aygent-scope", broker::Mode::Write)
+        .map_err(|e| format!("Memory path refused by jail: {e:?}"))?;
+    let abs_memory_dir = abs_sentinel
+        .parent()
+        .ok_or("could not resolve Memory dir")?
+        .to_path_buf();
+    let embed_model = ensure_embed_model(&app).await?;
+    memory::remember(
+        &db, "agent", &agent_id,
+        &abs_memory_dir, "Memory",
+        &text,
+        ntype.as_deref().unwrap_or("note"),
+        source.as_deref().unwrap_or(""),
+        &embed_model, "",
+    ).await
+}
+
 /// Pick a folder WITHOUT changing any agent's scope — used by the memory test
 /// panel so you browse to a vault instead of hand-typing a path (which is how a
 /// repo root gets picked by mistake). Returns the chosen absolute path or None.
@@ -2097,7 +2132,7 @@ pub fn run() {
             mailbox_pending_counts, mailbox_take_next, mailbox_roster,
             get_app_knobs, set_app_knobs,
             memory_ingest, memory_retrieve, memory_stats, pick_vault_folder,
-            memory_append_daily, memory_gate_check
+            memory_append_daily, memory_gate_check, memory_remember
         ])
         .setup(move |_app| {
             // M1.1: bring up the SQLite state spine + single-writer actor, then
