@@ -6,3 +6,4 @@ dist/
 .env
 *.dmg
 src-tauri/gen/
+.git-commit-msg.tmp

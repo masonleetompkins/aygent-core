@@ -1,6 +1,0 @@
-fix(headless): nudge drainer via managed state; silence unused stop
-
-E0425: `drain` was out of scope in run_headless_turn (that param name
-only exists in agent_stream). Pull DrainSignal from Tauri managed state
-so a headless reply wakes the drainer for instant delivery. Also rename
-unused `stop` -> `_stop` in the OpenAI stream path.
