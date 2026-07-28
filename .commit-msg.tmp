@@ -1,18 +1,17 @@
-fix+cleanup(settings): 6-point Settings tidy + retention-resets-to-30 bug
+feat(settings+savepoints): reorder Settings, kill dead radios, rename Checkpoints -> Save Points
 
-Mason's cleanup list:
-1. Appearance moved to the TOP.
-2. Multi-agent copy simplified (two one-line descriptions, no walls of text).
-3. Model card REMOVED (model choice is per-agent in the Agents tab).
-4. Local Models = DOWNLOAD-ONLY here; selection happens per-agent in Agents
-   (dropped the in-Settings selection + its orphaned state/effect).
-5. BUG FIX: checkpoint retention always snapped back to 30. Cause: the get/set
-   retention commands used broker.root_for("default") (legacy hardcoded scope)
-   while writes landed on the real agent folder — read != write. Now both use
-   active_checkpoint_root() = the ACTIVE agent's folder, so a set persists.
-6. Agent Folder card REMOVED (folder is set per-agent in the Agents tab).
+Mason's list:
+- Settings card order is now: Appearance, Providers, Local Models, Memory,
+  Save Points, Multi-agent.
+- Local Models: removed the dead radio buttons (models are picked per-agent in
+  the Agents tab, so a non-selectable info row now — name/size/tool-capability
+  + Delete). Copy updated to say models show up per-agent.
+- RENAME Checkpoints -> "Save Points" everywhere user-facing (gamer-nerd term):
+  sidebar tab ("savepoints" screen id + "Save Points" label), the screen
+  (title, empty state, "Save Point now" button, row fallback label), Settings
+  card ("Save Points", copy), Agents share-folder copy, and the two Info-stream
+  strings in the turn loop. INTERNAL Rust cmd names (checkpoint_*) + the
+  checkpoint.rs module keep their names on purpose (renaming identifiers = pure
+  churn + breakage risk, zero user benefit); only user-facing text changed.
 
-Settings is now: Appearance, Multi-agent, Providers, Local Models (download),
-Memory, Checkpoints. Cleaner + correct.
-First compile of the retention-root fix (adds db state to the two cmds) — flag
-if cargo throws.
+First compile after the reorder + rename \u2014 flag if cargo/tsc throws.

@@ -1,8 +1,9 @@
-// Checkpoints — the rewind timeline. AYGENT snapshots the agent folder before
+// Save Points — the rewind timeline. AYGENT snapshots the agent folder before
 // every turn (Rust checkpoint module, git-backed per Contract C4). This screen
-// lists those snapshots newest-first and lets you restore the folder to any of
+// lists those save points newest-first and lets you restore the folder to any of
 // them with one click. Restoring first snapshots the current state, so a rewind
-// is itself undoable.
+// is itself undoable. (Renamed from "Checkpoints" 2026-07-28 — user-facing term
+// is "Save Point"; internal Rust cmds keep the checkpoint_* names.)
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Pill } from "../components/ui";
@@ -39,7 +40,7 @@ export function Checkpoints({ folder }: { folder: string | null }) {
 
   async function snapshotNow() {
     setBusy(true); setErr(null);
-    try { await invoke("checkpoint_snapshot", { label: "manual checkpoint" }); await refresh(); }
+    try { await invoke("checkpoint_snapshot", { label: "manual save point" }); await refresh(); }
     catch (e) { setErr(String(e)); }
     finally { setBusy(false); }
   }
@@ -61,11 +62,11 @@ export function Checkpoints({ folder }: { folder: string | null }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18, maxWidth: 680 }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
-        <h2 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>Checkpoints</h2>
+        <h2 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>Save Points</h2>
         <span style={hint}>Rewind your folder to any earlier state.</span>
       </div>
 
-      {!folder && <Pill tone="muted">Pick an Agent Folder in Settings first.</Pill>}
+      {!folder && <Pill tone="muted">Pick an agent with a folder first.</Pill>}
 
       {folder && (
         <>
@@ -73,7 +74,7 @@ export function Checkpoints({ folder }: { folder: string | null }) {
             <Button onClick={() => step("checkpoint_undo")} disabled={busy || !canUndo}>↶ Undo</Button>
             <Button onClick={() => step("checkpoint_redo")} disabled={busy || !canRedo}>↷ Redo</Button>
             <div style={{ width: 1, background: "var(--line)", margin: "2px 4px" }} />
-            <Button variant="secondary" onClick={snapshotNow} disabled={busy}>{busy ? "…" : "Snapshot now"}</Button>
+            <Button variant="secondary" onClick={snapshotNow} disabled={busy}>{busy ? "…" : "Save Point now"}</Button>
             <Button variant="secondary" onClick={refresh} disabled={busy}>Refresh</Button>
           </div>
 
@@ -82,8 +83,8 @@ export function Checkpoints({ folder }: { folder: string | null }) {
           {items.length === 0 && !err && (
             <Card>
               <p style={hint}>
-                No checkpoints yet. One is taken automatically before each turn that changes
-                files — or hit <b>Snapshot now</b> to make one.
+                No save points yet. One is taken automatically before each turn that changes
+                files — or hit <b>Save Point now</b> to make one.
               </p>
             </Card>
           )}
@@ -121,7 +122,7 @@ function CheckpointRow({
         <div style={{ display: "flex", flexDirection: "column", gap: 3, minWidth: 0, flex: 1 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <span style={{ fontWeight: 600, fontSize: 15, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-              {c.message || "checkpoint"}
+              {c.message || "save point"}
             </span>
             {c.is_current && <Pill tone="ok">current</Pill>}
           </div>

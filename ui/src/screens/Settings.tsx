@@ -116,23 +116,6 @@ export function Settings({
         </div>
       </Card>
 
-      {/* MULTI-AGENT (M1.4) — simplified copy (Mason cleanup #2). */}
-      <Card title="Multi-agent">
-        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
-          <span style={{ fontSize: 14, fontWeight: 600 }}>Conversation budget: {budget} turns</span>
-          <span style={{ ...hint, fontSize: 12 }}>Max back-and-forth turns between two agents before it auto-stops.</span>
-          <input type="range" min={1} max={50} value={budget}
-            onChange={(e) => saveKnobs(Number(e.target.value), concurrency)} />
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 12 }}>
-          <span style={{ fontSize: 14, fontWeight: 600 }}>Max agents at once: {concurrency}</span>
-          <span style={{ ...hint, fontSize: 12 }}>How many agents can run in parallel.</span>
-          <input type="range" min={1} max={12} value={concurrency}
-            onChange={(e) => saveKnobs(budget, Number(e.target.value))} />
-        </div>
-        {knobMsg && <p style={{ ...hint, fontSize: 13, marginTop: 8 }}>{knobMsg}</p>}
-      </Card>
-
       {/* PROVIDERS */}
       <Card title="Providers">
         <p style={hint}>Bring your own keys. They go straight to the macOS Keychain — the UI never keeps them.</p>
@@ -165,11 +148,11 @@ export function Settings({
         )}
       </Card>
 
-      {/* CHECKPOINTS */}
-      <Card title="Checkpoints">
-        <p style={hint}>Every change your agent makes is snapshotted so you can rewind. Keep history for a window, then it prunes automatically.</p>
+      {/* SAVE POINTS (formerly Checkpoints — Mason rename). */}
+      <Card title="Save Points">
+        <p style={hint}>Every change your agent makes is a Save Point so you can rewind. Keep history for a window, then it prunes automatically.</p>
         {!folder ? (
-          <p style={{ ...hint, color: "var(--text-faint)" }}>Pick an Agent Folder below to configure checkpoints.</p>
+          <p style={{ ...hint, color: "var(--text-faint)" }}>Pick an agent with a folder to configure Save Points.</p>
         ) : (
           <>
             <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
@@ -192,7 +175,7 @@ export function Settings({
                 <>
                   <Button onClick={purgeAll}>Confirm purge</Button>
                   <Button variant="secondary" onClick={() => setConfirmPurge(false)}>Cancel</Button>
-                  <span style={{ ...hint, color: "var(--danger)", fontSize: 13 }}>Deletes all checkpoints (your files are untouched).</span>
+                  <span style={{ ...hint, color: "var(--danger)", fontSize: 13 }}>Deletes all Save Points (your files are untouched).</span>
                 </>
               )}
             </div>
@@ -357,15 +340,18 @@ function LocalModels({ folder, activePath, onChoose }: {
             const toolable = toolCaps[d.path];
             return (
             <div key={d.filename} style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <ModelRow
-                active={activePath === d.path}
-                onClick={() => folder && onChoose(d.path, d.filename.replace(/\.gguf$/i, ""))}
-                title={d.filename.replace(/\.gguf$/i, "")}
-                sub={toolable === undefined
-                  ? (folder ? "click to use this model" : "pick an Agent Folder to use")
-                  : (toolable ? "✓ works with file tools" : "chat only — no file tools")}
-                meta={`${d.size_gb.toFixed(1)}GB · local`}
-              />
+              {/* Non-selectable info row (Mason: models are picked per-agent in
+                  the Agents tab, so NO radio/select here — just show what's
+                  installed). */}
+              <div style={{ flex: 1, border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-card)", padding: "10px 14px", background: "var(--bg)", boxShadow: "var(--elevation)" }}>
+                <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+                  <b style={{ fontSize: 14 }}>{d.filename.replace(/\.gguf$/i, "")}</b>
+                  <span style={{ ...hint, fontFamily: "ui-monospace, monospace", fontSize: 12 }}>{d.size_gb.toFixed(1)}GB · local</span>
+                </div>
+                <span style={{ ...hint, fontSize: 12 }}>
+                  {toolable === undefined ? "installed" : toolable ? "✓ works with file tools" : "chat only — no file tools"}
+                </span>
+              </div>
               <Button variant="secondary" onClick={() => del(d)}>Delete</Button>
             </div>
             );
@@ -374,9 +360,9 @@ function LocalModels({ folder, activePath, onChoose }: {
       )}
       {downloaded.length > 0 && (
         <p style={{ ...hint, color: "var(--text-faint)", fontSize: 12 }}>
-          Models marked “works with file tools” can read &amp; write files in your Agent Folder. Smaller
-          models are less reliable at it than cloud models — and every change is checkpointed, so you can
-          always rewind.
+          Downloaded models show up in each agent’s setup (Agents tab) to be selected. Models marked
+          “works with file tools” can read &amp; write files in the agent’s folder — and every change is
+          a Save Point, so you can always rewind.
         </p>
       )}
 

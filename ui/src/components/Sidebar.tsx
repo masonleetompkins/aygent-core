@@ -3,7 +3,7 @@
 import type { ReactNode } from "react";
 
 export type ScreenId =
-  | "chat" | "agents" | "tools" | "settings" | "scheduler" | "connections" | "checkpoints" | "playground";
+  | "chat" | "agents" | "tools" | "settings" | "scheduler" | "connections" | "savepoints" | "playground";
 
 export interface NavItem { id: ScreenId; label: string; icon: string; enabled: boolean; }
 
@@ -15,7 +15,7 @@ export const NAV: NavItem[] = [
   { id: "tools", label: "Tools", icon: "🧰", enabled: true },
   { id: "scheduler", label: "Scheduler", icon: "⏰", enabled: true },
   { id: "connections", label: "Connections", icon: "🔌", enabled: true },
-  { id: "checkpoints", label: "Checkpoints", icon: "↩", enabled: true },
+  { id: "savepoints", label: "Save Points", icon: "↩", enabled: true },
   { id: "settings", label: "Settings", icon: "⚙", enabled: true },
   { id: "playground", label: "Playground", icon: "🧪", enabled: true },
 ];

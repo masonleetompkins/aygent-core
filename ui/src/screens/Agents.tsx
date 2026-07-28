@@ -152,7 +152,7 @@ function AgentForm({
   const [systemPrompt, setSystemPrompt] = useState(initial?.system_prompt ?? "");
   const [saving, setSaving] = useState(false);
 
-  // M1.4: agents that SHARE this folder (share checkpoint history + write-lock).
+  // M1.4: agents that SHARE this folder (share save-point history + write-lock).
   const [sharedWith, setSharedWith] = useState<AgentProfile[]>([]);
   useEffect(() => {
     if (!folder) { setSharedWith([]); return; }
@@ -344,7 +344,7 @@ function AgentForm({
           </span>
           {sharedWith.length > 0 && (
             <span style={{ fontSize: 12, color: "var(--accent)", background: "color-mix(in srgb, var(--accent) 10%, transparent)", border: "1px solid color-mix(in srgb, var(--accent) 30%, transparent)", borderRadius: "var(--radius-control)", padding: "7px 10px" }}>
-              🔗 Shares this folder with {sharedWith.map((a) => a.name).join(", ")} — they share the same edit history &amp; checkpoints, and take turns writing so their changes never collide.
+              🔗 Shares this folder with {sharedWith.map((a) => a.name).join(", ")} — they share the same edit history &amp; save points, and take turns writing so their changes never collide.
             </span>
           )}
         </label>

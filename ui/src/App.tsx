@@ -17,7 +17,7 @@ import { startHeadlessWatcher } from "./lib/turns";
 
 // Phase 1: app shell (sidebar nav + content pane) on the design system.
 // Screens: Settings (the wedge) + Playground (temp Phase-0 proofs) live now;
-// Chat/Agents/Scheduler/Connections/Checkpoints land next.
+// Chat/Agents/Scheduler/Connections/SavePoints land next.
 
 type Status =
   | { kind: "booting" }
@@ -135,7 +135,7 @@ export function App() {
           {screen === "settings" && (
             <Settings mode={mode} accent={accent} onTheme={onTheme} folder={folder} onPickFolder={pickFolder} agentId={activeAgent?.id ?? null} />
           )}
-          {screen === "checkpoints" && <Checkpoints folder={folder} />}
+          {screen === "savepoints" && <Checkpoints folder={folder} />}
           {screen === "scheduler" && <Scheduler agentId={activeAgent?.id ?? null} />}
           {screen === "connections" && <Connections agentId={activeAgent?.id ?? null} />}
           {screen === "tools" && <Tools folder={folder} />}

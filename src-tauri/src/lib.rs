@@ -2208,9 +2208,9 @@ async fn agent_stream(
     // nothing changed (no empty checkpoints). Best-effort: never blocks the reply.
     if let Ok(root) = broker.root_for(&scope_id) {
         match checkpoint::snapshot(&root, &prompt) {
-            Ok(Some(sha)) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("checkpoint {sha}") }); }
+            Ok(Some(sha)) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("save point {sha}") }); }
             Ok(None) => {}
-            Err(e) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("checkpoint skipped: {e}") }); }
+            Err(e) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("save point skipped: {e}") }); }
         }
         // Auto-prune anything past the retention window (best-effort; never blocks).
         if let Ok(days) = checkpoint::get_retention(&root) {
