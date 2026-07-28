@@ -429,6 +429,26 @@ pub fn delete(db: &Db, id: i64) -> Result<(), String> {
     })
 }
 
+/// FIRE NOW: run one schedule immediately, bypassing the timing gate (but NOT
+/// the guardrails). Diagnostic + a genuinely useful "run it now" UI action.
+/// Returns whether a turn was enqueued to the drainer.
+pub fn run_now(db: &Db, drain: &crate::drainer::DrainSignal, id: i64) -> Result<bool, String> {
+    // Load the one schedule as a Due (ignore enabled/timing).
+    let conn = db.reader()?;
+    let row = conn.query_row(
+        "SELECT id, agent_id, tz, spec_json, action_json FROM schedule WHERE id = ?1",
+        params![id],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)),
+    ).map_err(|e| format!("load schedule {id}: {e}"))?;
+    let (sid, agent_id, tz, spec_json, action_json) = row;
+    let spec = serde_json::from_str::<ScheduleSpec>(&spec_json).map_err(|e| format!("spec: {e}"))?;
+    let action = serde_json::from_str::<ScheduleAction>(&action_json).map_err(|e| format!("action: {e}"))?;
+    let due = Due { id: sid, agent_id, tz, spec, action };
+    let enq = fire_one(db, &due, now_ms())?;
+    if enq { drain.nudge(); }
+    Ok(enq)
+}
+
 /// Spawn the background scheduler ticker. Runs for the life of the app.
 /// `drain` = the drainer's signal so a freshly-enqueued turn wakes it instantly.
 pub fn spawn(app: AppHandle, db: Db, _broker: Arc<Broker>, _lanes: Lanes, sig: SchedSignal, drain: crate::drainer::DrainSignal) {
@@ -471,12 +491,15 @@ pub fn spawn(app: AppHandle, db: Db, _broker: Arc<Broker>, _lanes: Lanes, sig: S
             }
             let now = now_ms();
             let due = due_now(&db, now);
+            if !due.is_empty() {
+                eprintln!("[aygent][sched] tick: {} due at {now}", due.len());
+            }
             let mut enqueued_any = false;
             for d in &due {
                 match fire_one(&db, d, now) {
-                    Ok(true) => { enqueued_any = true; }
-                    Ok(false) => {}
-                    Err(e) => eprintln!("[aygent] schedule {} fire failed: {e}", d.id),
+                    Ok(true) => { enqueued_any = true; eprintln!("[aygent][sched] fired schedule {} -> agent {}", d.id, d.agent_id); }
+                    Ok(false) => { eprintln!("[aygent][sched] schedule {} due but not enqueued (guard/systemjob)", d.id); }
+                    Err(e) => eprintln!("[aygent][sched] schedule {} fire failed: {e}", d.id),
                 }
             }
             // 3) Wake the drainer so the just-enqueued turns run immediately.

@@ -96,6 +96,14 @@ export function Scheduler({ agentId }: { agentId: string | null }) {
     try { await invoke("scheduler_delete", { id: s.id }); refresh(); }
     catch (e) { setErr(String(e)); }
   }
+  async function runNow(s: Schedule) {
+    setErr(null);
+    try {
+      const enq = await invoke<boolean>("scheduler_run_now", { id: s.id });
+      setErr(enq ? `Fired “${s.name}” now — check the agent’s chat + History in a few seconds.` : `“${s.name}” ran but enqueued nothing (a guard blocked it, or it’s a system job).`);
+      setTimeout(refresh, 1500);
+    } catch (e) { setErr(String(e)); }
+  }
   async function showRuns(id: number) {
     if (openRuns === id) { setOpenRuns(null); return; }
     setOpenRuns(id);
@@ -108,6 +116,7 @@ export function Scheduler({ agentId }: { agentId: string | null }) {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <h2 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>Scheduler</h2>
         <div style={{ display: "flex", gap: 8 }}>
+          <Button variant="secondary" onClick={refresh}>↻ Refresh</Button>
           <Button variant="secondary" onClick={togglePauseAll}>
             {paused ? "▶ Resume all" : "⏸ Pause all"}
           </Button>
@@ -140,6 +149,7 @@ export function Scheduler({ agentId }: { agentId: string | null }) {
             <span style={{ ...hint, fontSize: 13 }}>next: {s.enabled ? fmtWhen(s.next_fire_at) : "—"}</span>
             {s.last_status && <Pill tone={statusTone(s.last_status)}>{s.last_status}</Pill>}
             <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+              <Button onClick={() => runNow(s)}>▶ Run now</Button>
               <Button variant="secondary" onClick={() => toggleOne(s)}>{s.enabled ? "Pause" : "Resume"}</Button>
               <Button variant="secondary" onClick={() => showRuns(s.id)}>History</Button>
               <Button variant="secondary" onClick={() => remove(s)}>Delete</Button>

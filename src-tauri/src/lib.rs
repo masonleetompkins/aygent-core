@@ -541,6 +541,17 @@ fn scheduler_get_paused(db: tauri::State<writer::Db>) -> Result<bool, String> {
     Ok(scheduler::get_paused(&db))
 }
 
+/// FIRE NOW: run one schedule immediately (bypasses timing, keeps guardrails).
+/// A real UI action AND the fastest way to prove firing works without waiting.
+#[tauri::command]
+fn scheduler_run_now(
+    db: tauri::State<writer::Db>,
+    drain: tauri::State<drainer::DrainSignal>,
+    id: i64,
+) -> Result<bool, String> {
+    scheduler::run_now(&db, &drain, id)
+}
+
 // ---- M1.8 Scheduler: read-only inspection (Slice 1 observability) --------
 /// List schedules (optionally for one agent) with their timing + last-run state,
 /// so the UI/panel can show next/last/status without a terminal.
@@ -2320,7 +2331,7 @@ pub fn run() {
             memory_append_daily, memory_gate_check, memory_remember,
             memory_auto_capture, scheduler_list, scheduler_runs,
             scheduler_create, scheduler_set_enabled, scheduler_delete,
-            scheduler_set_paused, scheduler_get_paused
+            scheduler_set_paused, scheduler_get_paused, scheduler_run_now
         ])
         .setup(move |_app| {
             // M1.1: bring up the SQLite state spine + single-writer actor, then
