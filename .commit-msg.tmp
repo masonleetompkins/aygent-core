@@ -1,20 +1,15 @@
-feat(memory): auto-capture in the REAL turn loop (Self-Gardening goes live)
+fix(agent): stop reflexive tool-rummaging on plain chat + clean list_files error
 
-Auto-capture was test-panel-only; now it fires on ACTUAL conversation.
+Mason's screenshot: a purely conversational message ("I prefer dark roast,
+I decided $20, help me plan the launch") triggered list_files, github_list_prs,
+read_file, and more list_files — none of which the message asked for. The
+agent treated every turn as "go explore the folder/tools."
 
-- agent_stream (Anthropic path): after the turn completes + checkpoints,
-  run memory::auto_capture over the USER's prompt (the human's input carries
-  the durable facts). Fully best-effort: gated on a per-agent toggle, runs
-  only with a vault scope, resolves Memory/ THROUGH THE JAIL BROKER, swallows
-  errors, never blocks/breaks the reply. Emits a small "remembered N new,
-  reinforced M" info event when it captures something.
-- db migration 7: agent_settings.auto_remember (default 1 = ON; capture is
-  salience+novelty gated so it's conservative + safe). ALTER ADD, forward-only.
-- repo: get_auto_remember / set_auto_remember (default ON when absent).
-- lib.rs: memory_auto_remember_enabled gate + memory_get/set_auto_remember
-  cmds so the UI can toggle per agent.
-
-Now a normal chat ("I prefer dark roast; I decided to ship at $20") quietly
-deposits L2 atoms into the vault, novelty-deduped, no button. The loop the
-whole memory arc was built for, firing on real use.
-First compile of the turn-loop hook + migration 7 — flag if cargo throws.
+- AGENT_SYSTEM rewritten: tools are OPTIONAL, use ONLY when the request needs
+  one; if the user is chatting/sharing/asking-answerable, JUST REPLY — never
+  read/list files or call an API speculatively "to gather context"; prefer the
+  fewest tool calls. (Prompt nudge, not a hard guarantee — watch for recurrence.)
+- list_files on a FILE now returns clean guidance ("'X' is a file, not a
+  directory. Use read_file...") instead of the raw "Not a directory (os error
+  20)". Empty dir returns "(empty directory)". File-op errors read like help,
+  not OS noise.

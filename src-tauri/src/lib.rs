@@ -1586,14 +1586,23 @@ fn exec_tool_cfg(
             }
         }
         "list_files" => match broker.resolve("default", path, broker::Mode::Read) {
-            Ok(real) => match std::fs::read_dir(&real) {
-                Ok(rd) => {
-                    let names: Vec<String> = rd.filter_map(|e| e.ok())
-                        .map(|e| e.file_name().to_string_lossy().to_string()).collect();
-                    (names.join("\n"), false)
+            Ok(real) => {
+                if real.is_file() {
+                    // Clean guidance instead of a raw 'Not a directory (os error
+                    // 20)': the model listed a FILE. Tell it to read_file instead.
+                    (format!("'{path}' is a file, not a directory. Use read_file to read it, or list_files on its parent folder."), true)
+                } else {
+                    match std::fs::read_dir(&real) {
+                        Ok(rd) => {
+                            let names: Vec<String> = rd.filter_map(|e| e.ok())
+                                .map(|e| e.file_name().to_string_lossy().to_string()).collect();
+                            if names.is_empty() { ("(empty directory)".into(), false) }
+                            else { (names.join("\n"), false) }
+                        }
+                        Err(e) => (format!("could not list '{path}': {e}"), true),
+                    }
                 }
-                Err(e) => (format!("io error: {e}"), true),
-            },
+            }
             Err(e) => (format!("refused by jail: {e:?}"), true),
         },
         // TOOLS registry: PDF generator (first built-in tool). Output path is
@@ -1766,10 +1775,15 @@ fn pdf_config_for(app: &tauri::AppHandle, folder: Option<&str>) -> serde_json::V
     }
 }
 
-const AGENT_SYSTEM: &str = "You are AYGENT, an agent that can ONLY touch files inside the user's \
-    chosen folder via your tools. You cannot run shell commands. Use read_file/write_file/list_files \
-    for file work, and fetch_url to read a web page or API over HTTPS when you need current \
-    information from the internet. Be concise and friendly.";
+const AGENT_SYSTEM: &str = "You are AYGENT, a helpful, concise, friendly assistant running privately \
+    on the user's own machine. You have TOOLS available but they are OPTIONAL — use a tool ONLY when \
+    the user's request actually requires it. If the user is just chatting, sharing information, or \
+    asking a question you can answer directly, JUST REPLY — do not call any tools, do not read or list \
+    files, do not call an API. Never explore the folder or call tools speculatively 'to gather \
+    context'; act only on what was asked. When a task DOES need a tool: use read_file/write_file/\
+    list_files for files in the user's chosen folder (you cannot run shell commands), fetch_url to \
+    read a web page/API over HTTPS, and any connected-service tools (e.g. github_list_prs) for that \
+    service. Prefer the smallest number of tool calls that gets the job done.";
 
 // Base system prompt for local models. When the model is tool-capable, we
 // APPEND its family-native tool instructions (local_tools::system_prompt_with_tools).
