@@ -84,17 +84,19 @@ pub fn send(
         }
     }
 
-    // Resolve the parent chain (root_id, depth, ancestry) if this is a reply.
-    let (root_id_opt, depth, ancestry_in): (Option<i64>, i64, String) = if parent_id > 0 {
+    // Resolve the parent chain (root_id, depth, ancestry, parent from/to) if
+    // this is a reply. parent_from/parent_to let us block only a TRUE no-op
+    // (re-sending the exact same hop) without killing a legitimate reply.
+    let (root_id_opt, depth, ancestry_in, parent_from, parent_to): (Option<i64>, i64, String, String, String) = if parent_id > 0 {
         let conn = db.reader()?;
         conn.query_row(
-            "SELECT root_id, depth, ancestry FROM mailbox WHERE id = ?1",
+            "SELECT root_id, depth, ancestry, from_agent, to_agent FROM mailbox WHERE id = ?1",
             params![parent_id],
-            |r| Ok((Some(r.get::<_, i64>(0)?), r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+            |r| Ok((Some(r.get::<_, i64>(0)?), r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)),
         ).optional().map_err(|e| format!("parent lookup: {e}"))?
-         .unwrap_or((None, DEFAULT_DEPTH, String::new()))
+         .unwrap_or((None, DEFAULT_DEPTH, String::new(), String::new(), String::new()))
     } else {
-        (None, DEFAULT_DEPTH, String::new())
+        (None, DEFAULT_DEPTH, String::new(), String::new(), String::new())
     };
 
     // Depth TTL: a reply gets parent.depth - 1.
@@ -103,18 +105,21 @@ pub fn send(
         return Ok(SendResult::Refused { reason: "message hop limit reached (loop guard)".into() });
     }
 
-    // Cycle guard — CORRECTED (bug from testing): a REPLY to someone earlier in
-    // the chain is exactly what we want (A asks B -> B replies to A). The old
-    // guard blocked ANY recipient already in the ancestry, which killed the
-    // first legitimate reply (Mason's screenshot: "blocked by cycle-detection").
-    // True runaway (A<->B forever) is stopped by the DEPTH TTL + the per-tree
-    // BUDGET, not by forbidding replies. The only thing we still hard-block is
-    // IMMEDIATE self-re-entry (the last hop was already to this same recipient),
-    // which would be a tight A->B->B loop with no new information.
-    let ancestry_list: Vec<&str> = ancestry_in.split(',').filter(|s| !s.is_empty()).collect();
-    if ancestry_list.last() == Some(&to_agent) {
-        return Ok(SendResult::Refused { reason: "already messaging that agent in this exact step".into() });
+    // Cycle guard — CORRECTED AGAIN (bug #2 from testing, Mason's 07-28 screenshot):
+    // A REPLY to the original sender is exactly what we want (A asks C -> C replies
+    // to A). ancestry stores the SENDER chain, so ancestry.last() is the PREVIOUS
+    // SENDER, not the previous recipient. Checking `ancestry.last() == to_agent`
+    // wrongly refused C->A, because A was the original sender = last in ancestry.
+    // That killed the loop-back (work done, but agent 1 never heard back).
+    //
+    // True runaway (A<->B forever) is still stopped by the DEPTH TTL + per-tree
+    // BUDGET. The ONLY thing we hard-block here is a genuine no-op: re-sending the
+    // EXACT SAME HOP as the parent (same from AND same to) — that carries no new
+    // information and is the double-send the model sometimes emits in one turn.
+    if parent_id > 0 && parent_from == from_agent && parent_to == to_agent {
+        return Ok(SendResult::Refused { reason: "that message was already sent in this step".into() });
     }
+    let ancestry_list: Vec<&str> = ancestry_in.split(',').filter(|s| !s.is_empty()).collect();
     let mut new_ancestry_parts: Vec<String> = ancestry_list.iter().map(|s| s.to_string()).collect();
     new_ancestry_parts.push(from_agent.to_string());
     let new_ancestry = new_ancestry_parts.join(",");

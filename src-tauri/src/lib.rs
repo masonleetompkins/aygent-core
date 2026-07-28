@@ -1798,6 +1798,11 @@ pub async fn run_headless_turn(
             ).await?;
             messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": content.clone() }));
             let mut tool_results = Vec::new();
+            // Dedupe identical send_message calls WITHIN one turn: the model
+            // sometimes emits the same reply twice in a single response. The
+            // first delivers; the rest are acknowledged as already-sent (not an
+            // error) so the model doesn't narrate a failure (Mason's 07-28 test).
+            let mut sent_in_turn: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
             if let Some(arr) = content.as_array() {
                 for blk in arr {
                     match blk.get("type").and_then(|t| t.as_str()) {
@@ -1809,6 +1814,11 @@ pub async fn run_headless_turn(
                             let (result_text, is_err) = if name == "send_message" {
                                 let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
                                 let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                                // Already sent this exact (to, body) this turn? Ack, don't resend.
+                                if !sent_in_turn.insert((to.to_string(), body.to_string())) {
+                                    tool_results.push(serde_json::json!({ "type": "tool_result", "tool_use_id": id, "content": format!("already delivered to {to} in this turn"), "is_error": false }));
+                                    continue;
+                                }
                                 // Reply carries the parent id so budget + chain track (msg.id).
                                 match mailbox::send(db, agent_id, to, body, msg.id) {
                                     Ok(mailbox::SendResult::Queued { .. }) => {
