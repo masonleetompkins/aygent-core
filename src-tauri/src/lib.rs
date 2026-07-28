@@ -4,6 +4,8 @@
 // Seatbelt profile that denies file+exec — Atlas C1). Also mints the
 // per-session WS token (C6) and hands it + the daemon port to the UI.
 
+use rusqlite::params; // scheduler_list/scheduler_runs read-only queries
+
 mod agents;
 mod broker;
 mod broker_ws;
