@@ -275,16 +275,48 @@ fn conv_list(db: tauri::State<writer::Db>, folder: String) -> Result<Vec<repo::C
 }
 
 // ---- M1.7 Slice 1: vault memory read path (ingest + retrieve) ----------
-// Local-only embeddings via Ollama nomic-embed-text (zero cloud), same model
-// the OpenClaw memorySearch uses. Endpoint defaults to the standard local
-// Ollama; overridable for power users running it elsewhere.
-const MEM_EMBED_MODEL: &str = "nomic-embed-text";
-const MEM_EMBED_ENDPOINT: &str = "http://127.0.0.1:11434";
+// Embeddings run IN-PROCESS through the compiled-in llama.cpp engine (NO Ollama,
+// no external process, install nothing — Mason's hard stipulation). The embedder
+// is a small GGUF that AYGENT auto-downloads to its own models dir on first use,
+// exactly like the chat catalog. `MEM_EMBED_FILE` is the local filename;
+// `MEM_EMBED_URL` is the public HF source (Q4_K_M, ~85MB).
+const MEM_EMBED_FILE: &str = "nomic-embed-text-v1.5.Q4_K_M.gguf";
+const MEM_EMBED_URL: &str =
+    "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q4_K_M.gguf?download=true";
+
+/// Resolve the local embedding GGUF path, downloading it on first use. This is
+/// what keeps "install nothing" true: the model lives in AYGENT's own app-data
+/// models dir, fetched by AYGENT itself, never by the user in a terminal.
+async fn ensure_embed_model(app: &tauri::AppHandle) -> Result<String, String> {
+    let dir = models_dir(app)?;
+    let dest = dir.join(MEM_EMBED_FILE);
+    if dest.is_file() {
+        return Ok(dest.to_string_lossy().to_string());
+    }
+    // Download to a .part then rename (same pattern as local_download). Public
+    // GGUF repo = no auth token needed.
+    let tmp = dir.join(format!("{MEM_EMBED_FILE}.part"));
+    let client = reqwest::Client::builder()
+        .user_agent("aygent/0.1")
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| format!("http: {e}"))?;
+    let resp = client.get(MEM_EMBED_URL).header("Accept", "*/*").send().await
+        .map_err(|e| format!("embed model download request: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("embed model download failed: HTTP {}", resp.status()));
+    }
+    let bytes = resp.bytes().await.map_err(|e| format!("embed model download body: {e}"))?;
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("write embed model: {e}"))?;
+    std::fs::rename(&tmp, &dest).map_err(|e| format!("finalize embed model: {e}"))?;
+    Ok(dest.to_string_lossy().to_string())
+}
 
 /// Ingest a vault folder into the derived memory index for an agent (isolated).
 /// owner = ('agent', agent_id). Returns a report the test UI/CLI can print.
 #[tauri::command]
 async fn memory_ingest(
+    app: tauri::AppHandle,
     db: tauri::State<'_, writer::Db>,
     agent_id: String,
     vault_path: String,
@@ -293,22 +325,25 @@ async fn memory_ingest(
     if !root.is_dir() {
         return Err(format!("vault path is not a folder: {vault_path}"));
     }
-    memory::ingest_vault(&db, "agent", &agent_id, &root, MEM_EMBED_MODEL, MEM_EMBED_ENDPOINT).await
+    let embed_model = ensure_embed_model(&app).await?;
+    memory::ingest_vault(&db, "agent", &agent_id, &root, &embed_model, "").await
 }
 
 /// Retrieve memory for a query: semantic top-K + graph expansion. Read-only.
 #[tauri::command]
 async fn memory_retrieve(
+    app: tauri::AppHandle,
     db: tauri::State<'_, writer::Db>,
     agent_id: String,
     query: String,
     top_k: Option<usize>,
     expand_hops: Option<usize>,
 ) -> Result<Vec<memory::RetrievedNote>, String> {
+    let embed_model = ensure_embed_model(&app).await?;
     memory::retrieve(
         &db, "agent", &agent_id, &query,
         top_k.unwrap_or(4), expand_hops.unwrap_or(1),
-        MEM_EMBED_MODEL, MEM_EMBED_ENDPOINT,
+        &embed_model, "",
     ).await
 }
 

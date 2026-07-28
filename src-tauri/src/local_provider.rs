@@ -212,3 +212,80 @@ fn decode(path: &str, prompt: &str, ctx_tokens: u32, tx: tokio::sync::mpsc::Unbo
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// EMBEDDINGS — IN-PROCESS, through the SAME llama.cpp backend (no Ollama, ever).
+//
+// Mason's hard stipulation: AYGENT installs NOTHING outside the app. Chat
+// already runs GGUF weights in-process via llama-cpp-2; embeddings are the same
+// engine with `with_embeddings(true)` + `embeddings_seq_ith`. The embedding
+// model is a small GGUF (nomic-embed-text, ~80MB Q4) that AYGENT auto-downloads
+// to its own models dir on first use — identical mechanism to the chat catalog.
+// Zero terminal, zero external process, zero user setup. THIS is "own your agent."
+//
+// API mirrors the official llama-cpp-2 embeddings example: build a context with
+// embeddings enabled, add the tokens as one sequence, decode, read the pooled
+// sequence embedding, L2-normalize (so cosine == dot and scores are stable).
+// ---------------------------------------------------------------------------
+
+use llama_cpp_2::context::params::LlamaPoolingType;
+
+/// L2-normalize so downstream cosine is a plain dot product and magnitudes
+/// don't skew similarity.
+fn l2_normalize(v: &[f32]) -> Vec<f32> {
+    let mag = v.iter().fold(0.0f32, |acc, &x| x.mul_add(x, acc)).sqrt();
+    if mag == 0.0 {
+        return v.to_vec();
+    }
+    v.iter().map(|&x| x / mag).collect()
+}
+
+/// Embed one text with a local embedding GGUF, entirely in-process. Runs the
+/// heavy llama.cpp work on a blocking thread (it's synchronous + CPU/GPU-bound)
+/// so it never stalls the async runtime. Returns the normalized embedding.
+pub async fn embed_local(model_path: String, text: String) -> Result<Vec<f32>, String> {
+    tokio::task::spawn_blocking(move || embed_blocking(&model_path, &text))
+        .await
+        .map_err(|e| format!("embed join: {e}"))?
+}
+
+fn embed_blocking(model_path: &str, text: &str) -> Result<Vec<f32>, String> {
+    let be = backend()?;
+    let model = load_model(model_path)?;
+
+    // Embeddings need a context built with embeddings ENABLED + MEAN pooling so
+    // we get ONE vector for the whole input (not per-token). n_ctx sized to the
+    // embed model's training window (nomic = 2048); a long note is truncated to
+    // fit rather than erroring.
+    let ctx_params = LlamaContextParams::default()
+        .with_embeddings(true)
+        .with_pooling_type(LlamaPoolingType::Mean);
+    let mut ctx = model
+        .new_context(be, ctx_params)
+        .map_err(|e| format!("embed context: {e}"))?;
+
+    let n_ctx = ctx.n_ctx() as usize;
+    let mut tokens = model
+        .str_to_token(text, AddBos::Always)
+        .map_err(|e| format!("embed tokenize: {e}"))?;
+    if tokens.is_empty() {
+        return Err("embed: empty input after tokenize".into());
+    }
+    // Truncate to the context window (keep the head — title + lead of the note).
+    if tokens.len() > n_ctx {
+        tokens.truncate(n_ctx);
+    }
+
+    let mut batch = LlamaBatch::new(tokens.len().max(1), 1);
+    batch
+        .add_sequence(&tokens, 0, false)
+        .map_err(|e| format!("embed add_sequence: {e}"))?;
+
+    ctx.clear_kv_cache();
+    ctx.decode(&mut batch).map_err(|e| format!("embed decode: {e}"))?;
+
+    let emb = ctx
+        .embeddings_seq_ith(0)
+        .map_err(|e| format!("embed read: {e}"))?;
+    Ok(l2_normalize(emb))
+}

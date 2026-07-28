@@ -12,8 +12,9 @@
 //      |alias, #heading, ^blockid, ![[embeds]]), and #tags. AST-lite but
 //      READ-ONLY, so we never risk the byte-stability gate here — that gate
 //      guards WRITES (Slice 2+), and there are none yet.
-//   3. Populate the DERIVED index: note + link + vec (embedding via local Ollama
-//      nomic-embed-text). sha lets us skip re-embedding unchanged files.
+//   3. Populate the DERIVED index: note + link + vec (embedding IN-PROCESS via
+//      the compiled-in llama.cpp engine — NO Ollama, install nothing). sha lets
+//      us skip re-embedding unchanged files.
 //   4. Retrieval = cosine similarity + GRAPH EXPANSION: top-K semantic hits, then
 //      pull their linked neighbors in. The "smarter, faster" multiplier and the
 //      seed of the Self-Gardening killer feature (surface the link you never made).
@@ -26,7 +27,7 @@
 
 use crate::writer::Db;
 use rusqlite::{params, OptionalExtension};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -264,41 +265,20 @@ pub fn parse_note(raw: &str, path: &Path) -> ParsedNote {
 }
 
 // ---------------------------------------------------------------------------
-// EMBEDDINGS (local Ollama nomic-embed-text — zero cloud, same as memorySearch)
+// EMBEDDINGS — IN-PROCESS via the compiled-in llama.cpp engine. NO OLLAMA.
+//
+// Mason's hard stipulation: AYGENT installs NOTHING outside the app. So we embed
+// through the SAME llama-cpp-2 backend that already runs chat (local_provider),
+// using a small embedding GGUF that AYGENT auto-downloads to its own models dir
+// on first use. `embed_model` here is the absolute PATH to that GGUF (resolved
+// by the caller), not an HTTP model name. `_endpoint` is retained in the
+// signature only so the call sites don't churn; it is unused.
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
-struct OllamaEmbedReq<'a> {
-    model: &'a str,
-    prompt: &'a str,
-}
-#[derive(Deserialize)]
-struct OllamaEmbedResp {
-    embedding: Vec<f32>,
-}
-
-/// Embed one text via a local Ollama server. Default endpoint; overridable so a
-/// power user who runs Ollama elsewhere still works.
-pub async fn embed(text: &str, model: &str, endpoint: &str) -> Result<Vec<f32>, String> {
-    let url = format!("{}/api/embeddings", endpoint.trim_end_matches('/'));
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .json(&OllamaEmbedReq { model, prompt: text })
-        .send()
-        .await
-        .map_err(|e| format!("ollama embed request: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("ollama embed HTTP {}", resp.status()));
-    }
-    let parsed: OllamaEmbedResp = resp
-        .json()
-        .await
-        .map_err(|e| format!("ollama embed decode: {e}"))?;
-    if parsed.embedding.is_empty() {
-        return Err("ollama returned empty embedding".into());
-    }
-    Ok(parsed.embedding)
+/// Embed one text in-process. `embed_model` is the absolute path to the local
+/// embedding GGUF; `_endpoint` is ignored (kept for signature stability).
+pub async fn embed(text: &str, embed_model: &str, _endpoint: &str) -> Result<Vec<f32>, String> {
+    crate::local_provider::embed_local(embed_model.to_string(), text.to_string()).await
 }
 
 fn f32_to_blob(v: &[f32]) -> Vec<u8> {
@@ -434,15 +414,16 @@ pub async fn ingest_vault(
     let files = collect_md_files(root);
     report.scanned = files.len();
 
-    // FAIL FAST + CLEAR if the local embedder isn't reachable — otherwise every
-    // single file logs the same connection error (192 identical lines). One
-    // probe, one actionable message.
+    // FAIL FAST + CLEAR if the in-process embedder can't load its GGUF — one
+    // probe, one actionable message, instead of the same error per file. The
+    // embedder runs INSIDE AYGENT (llama.cpp), so a failure here means the GGUF
+    // is missing/corrupt, not that some external service is down.
     if !files.is_empty() {
         if let Err(e) = embed("probe", embed_model, embed_endpoint).await {
             return Err(format!(
-                "local embedder unreachable at {embed_endpoint} ({e}). \
-                 Is Ollama running with '{embed_model}' pulled? Try: `ollama pull {embed_model}` \
-                 then make sure `ollama serve` is up. (Scanned {} .md files but embedded none.)",
+                "in-process embedder failed to load ({e}). The embedding model GGUF \
+                 at '{embed_model}' may be missing or still downloading. \
+                 (Scanned {} .md files but embedded none.)",
                 files.len()
             ));
         }

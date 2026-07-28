@@ -112,10 +112,15 @@ export function Playground({ folder, ws, agentId }: { folder: string | null; ws:
       {/* M1.7 Slice 1 — Vault Memory read path (ingest + graph-expansion retrieval). */}
       <Card title="Vault memory (Slice 1 — read path)">
         <p style={hint}>
-          Point at a vault folder, ingest it (parse links + embed via local Ollama
-          <b> nomic-embed-text</b>), then ask a question. Success = a query whose literal
+          Point at a vault folder, ingest it (parse links + embed <b>in-process</b> via the
+          built-in engine — AYGENT auto-downloads the tiny embedding model on first use,
+          no install, no Ollama), then ask a question. Success = a query whose literal
           words match almost nothing still surfaces the right notes — some <code>semantic</code>,
           some pulled in via <code>graph:</code> expansion. Zero vault writes.
+        </p>
+        <p style={{ ...hint, fontSize: 12 }}>
+          First ingest downloads the ~85MB embedding model into AYGENT’s own folder — that one-time
+          fetch can take a moment; after that it’s instant and fully offline.
         </p>
         {!agentId && <Pill tone="muted">Pick an agent in the rail first (memory is scoped to it).</Pill>}
 
