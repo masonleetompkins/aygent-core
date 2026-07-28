@@ -426,3 +426,27 @@ pub fn save_settings(db: &Db, agent_id: &str, s: AgentSettings) -> Result<(), St
         Ok(())
     })
 }
+
+/// Whether this agent auto-remembers durable facts from conversation (M1.7).
+/// Defaults ON when no row/column value exists (capture is conservative).
+pub fn get_auto_remember(db: &Db, agent_id: &str) -> bool {
+    let Ok(conn) = db.reader() else { return true };
+    conn.query_row(
+        "SELECT auto_remember FROM agent_settings WHERE agent_id = ?1",
+        params![agent_id],
+        |r| r.get::<_, i64>(0),
+    ).optional().ok().flatten().map(|v| v != 0).unwrap_or(true)
+}
+
+/// Set the per-agent auto-remember toggle (upserts the settings row).
+pub fn set_auto_remember(db: &Db, agent_id: &str, on: bool) -> Result<(), String> {
+    let agent_id = agent_id.to_string();
+    db.write(move |c| {
+        c.execute(
+            "INSERT INTO agent_settings (agent_id, model, provider, auto_remember) VALUES (?1, '', '', ?2)
+             ON CONFLICT(agent_id) DO UPDATE SET auto_remember = excluded.auto_remember",
+            params![agent_id, if on { 1 } else { 0 }],
+        ).map_err(|e| format!("set_auto_remember: {e}"))?;
+        Ok(())
+    })
+}

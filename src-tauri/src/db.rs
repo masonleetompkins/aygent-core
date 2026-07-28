@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 /// Current schema version. Bump when adding a migration step below.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// The DB file name under <app_data>.
 pub const DB_FILE: &str = "aygent.db";
@@ -145,6 +145,16 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("migrate v6: {e}"))?;
         set_version(conn, 6)?;
         v = 6;
+    }
+
+    if v < 7 {
+        // M1.7 auto-capture-in-turn-loop: per-agent 'auto_remember' toggle on
+        // agent_settings. Default 1 (ON) — capture is salience+novelty gated so
+        // it's conservative + safe; a user can turn it off. ALTER ADD, forward-only.
+        conn.execute_batch(SCHEMA_V7)
+            .map_err(|e| format!("migrate v7: {e}"))?;
+        set_version(conn, 7)?;
+        v = 7;
     }
 
     let _ = v;
@@ -437,4 +447,11 @@ CREATE TABLE IF NOT EXISTS agent_connection (
   FOREIGN KEY (agent_id) REFERENCES agent(id) ON DELETE CASCADE,
   FOREIGN KEY (connection_id) REFERENCES connection(id) ON DELETE CASCADE
 );
+"#;
+
+/// SCHEMA v7 (M1.7 auto-capture in the real turn loop) — per-agent toggle for
+/// whether the agent auto-remembers durable facts from conversation. Default ON
+/// (capture is salience+novelty gated = conservative). ALTER ADD, forward-only.
+const SCHEMA_V7: &str = r#"
+ALTER TABLE agent_settings ADD COLUMN auto_remember INTEGER NOT NULL DEFAULT 1;
 "#;

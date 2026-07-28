@@ -455,6 +455,26 @@ async fn memory_auto_capture(
     ).await
 }
 
+// ---- M1.7 auto-capture gate (per-agent toggle) ---------------------------
+/// Whether this agent auto-remembers durable facts from conversation. Default
+/// ON (capture is salience+novelty gated = conservative). Thin wrapper so the
+/// turn loop reads it cheaply.
+fn memory_auto_remember_enabled(db: &writer::Db, agent_id: &str) -> bool {
+    repo::get_auto_remember(db, agent_id)
+}
+
+/// UI: read the per-agent auto-remember toggle.
+#[tauri::command]
+fn memory_get_auto_remember(db: tauri::State<writer::Db>, agent_id: String) -> Result<bool, String> {
+    Ok(repo::get_auto_remember(&db, &agent_id))
+}
+
+/// UI: set the per-agent auto-remember toggle.
+#[tauri::command]
+fn memory_set_auto_remember(db: tauri::State<writer::Db>, agent_id: String, enabled: bool) -> Result<(), String> {
+    repo::set_auto_remember(&db, &agent_id, enabled)
+}
+
 // ---- M1.9 Connections: GitHub (Slice 1) ----------------------------------
 // A Connection = keychain-backed bearer credential + non-secret metadata,
 // exposed to an agent as Rust-side token-attached tools (connections.rs).
@@ -2169,6 +2189,32 @@ async fn agent_stream(
         }
     }
 
+    // M1.7 AUTO-CAPTURE INTO THE REAL TURN LOOP: after the turn completes, run
+    // the salience+novelty-gated capture over the USER's message (the human's
+    // input carries the durable facts — "I prefer X", "I decided Y"). This is
+    // the Self-Gardening loop firing on ACTUAL conversation, not the test panel.
+    // Fully best-effort: gated on a per-agent toggle, never blocks/breaks the
+    // reply, errors are swallowed. Runs only when the agent has a vault scope.
+    if memory_auto_remember_enabled(&db, &scope_id) {
+        if let Ok(abs_sentinel) = broker.resolve(&scope_id, "Memory/.aygent-scope", broker::Mode::Write) {
+            if let Some(abs_memory_dir) = abs_sentinel.parent().map(|p| p.to_path_buf()) {
+                if let Ok(embed_model) = ensure_embed_model(&app).await {
+                    match memory::auto_capture(
+                        &db, "agent", &scope_id, &abs_memory_dir, "Memory",
+                        &prompt, 0.65, "", &embed_model, "",
+                    ).await {
+                        Ok(r) if r.created + r.reinforced > 0 => {
+                            let _ = app.emit(&channel, &provider::StreamEvent::Info {
+                                text: format!("\u{1F9E0} remembered {} new, reinforced {}", r.created, r.reinforced),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     emit(&provider::StreamEvent::Done { stop_reason: "end_turn".into() });
     Ok(messages) // full history back for multi-turn persistence
 }
@@ -2489,7 +2535,8 @@ pub fn run() {
             scheduler_set_paused, scheduler_get_paused, scheduler_run_now,
             scheduler_debug_row, scheduler_reset_counters,
             github_connect, connections_list, connection_disconnect,
-            connection_set_agent_enabled, connection_enabled_for_agent
+            connection_set_agent_enabled, connection_enabled_for_agent,
+            memory_get_auto_remember, memory_set_auto_remember
         ])
         .setup(move |_app| {
             // M1.1: bring up the SQLite state spine + single-writer actor, then
