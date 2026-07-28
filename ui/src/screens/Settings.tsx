@@ -44,13 +44,6 @@ export function Settings({
   const [retention, setRetention] = useState(30);
   const [cpMsg, setCpMsg] = useState<string | null>(null);
   const [confirmPurge, setConfirmPurge] = useState(false);
-  // Model SELECTION moved to the Agents screen. Settings keeps only the LOCAL
-  // model manager (download/manage) + the active local selection so a chosen
-  // local model still shows as active here. selProvider/selModel reflect the
-  // folder's saved selection purely so LocalModels can highlight the active one.
-  const [selModel, setSelModel] = useState("");
-  const [selProvider, setSelProvider] = useState("");
-  const [modelMsg, setModelMsg] = useState<string | null>(null);
 
   // M1.4 multi-agent knobs: inter-agent budget + max concurrency.
   const [budget, setBudget] = useState(6);
@@ -71,19 +64,7 @@ export function Settings({
   useEffect(() => {
     if (!folder) return;
     invoke<number>("checkpoint_get_retention").then(setRetention).catch(() => {});
-    invoke<{ provider: string; model: string }>("get_selection", { folder })
-      .then((s) => { setSelProvider(s.provider); setSelModel(s.model); }).catch(() => {});
   }, [folder]);
-
-  // Choose a downloaded LOCAL model (provider="local", model=absolute gguf path).
-  async function chooseLocalModel(path: string, name: string) {
-    if (!folder) return;
-    setSelProvider("local"); setSelModel(path); setModelMsg(null);
-    try {
-      await invoke("set_selection", { folder, provider: "local", model: path });
-      setModelMsg(`✓ using ${name} (local)`);
-    } catch (e) { setModelMsg("✗ " + String(e)); }
-  }
 
   async function saveRetention(days: number) {
     setRetention(days); setCpMsg(null);
@@ -112,34 +93,8 @@ export function Settings({
     <div style={{ display: "flex", flexDirection: "column", gap: 18, maxWidth: 620 }}>
       <h2 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>Settings</h2>
 
-      {/* MULTI-AGENT (M1.4) */}
-      <Card title="Multi-agent">
-        <p style={hint}>How your agents collaborate when they message each other.</p>
-        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
-          <span style={{ fontSize: 14, fontWeight: 600 }}>Conversation budget: {budget} turns</span>
-          <span style={{ ...hint, fontSize: 12 }}>
-            When one agent messages another, they can reply back and forth. This caps how many total
-            back-and-forth turns a single agent-to-agent conversation can run before it automatically
-            stops — so two agents can’t loop forever and run up your API bill. (1–50)
-          </span>
-          <input type="range" min={1} max={50} value={budget}
-            onChange={(e) => saveKnobs(Number(e.target.value), concurrency)} />
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 12 }}>
-          <span style={{ fontSize: 14, fontWeight: 600 }}>Max agents running at once: {concurrency}</span>
-          <span style={{ ...hint, fontSize: 12 }}>
-            How many agents can be actively working in parallel (each on its own folder). Higher =
-            more happens simultaneously, but more concurrent API calls at once. (1–12)
-          </span>
-          <input type="range" min={1} max={12} value={concurrency}
-            onChange={(e) => saveKnobs(budget, Number(e.target.value))} />
-        </div>
-        {knobMsg && <p style={{ ...hint, fontSize: 13, marginTop: 8 }}>{knobMsg}</p>}
-      </Card>
-
-      {/* APPEARANCE */}
+      {/* APPEARANCE — at the top (Mason cleanup #1). */}
       <Card title="Appearance">
-        <p style={hint}>The theme controls the lighting — light casts soft shadows, dark emits glows.</p>
         <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
           <span style={{ fontSize: 14, fontWeight: 600, width: 90 }}>Mode</span>
           <Button variant={mode === "light" ? "primary" : "secondary"} onClick={() => onTheme("light", accent)}>◐ Light</Button>
@@ -159,7 +114,23 @@ export function Settings({
             ))}
           </div>
         </div>
-        <p style={{ ...hint, color: "var(--text-faint)", fontSize: 12 }}>The accent tints outlines and the shadow/glow — not just buttons.</p>
+      </Card>
+
+      {/* MULTI-AGENT (M1.4) — simplified copy (Mason cleanup #2). */}
+      <Card title="Multi-agent">
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
+          <span style={{ fontSize: 14, fontWeight: 600 }}>Conversation budget: {budget} turns</span>
+          <span style={{ ...hint, fontSize: 12 }}>Max back-and-forth turns between two agents before it auto-stops.</span>
+          <input type="range" min={1} max={50} value={budget}
+            onChange={(e) => saveKnobs(Number(e.target.value), concurrency)} />
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 12 }}>
+          <span style={{ fontSize: 14, fontWeight: 600 }}>Max agents at once: {concurrency}</span>
+          <span style={{ ...hint, fontSize: 12 }}>How many agents can run in parallel.</span>
+          <input type="range" min={1} max={12} value={concurrency}
+            onChange={(e) => saveKnobs(budget, Number(e.target.value))} />
+        </div>
+        {knobMsg && <p style={{ ...hint, fontSize: 13, marginTop: 8 }}>{knobMsg}</p>}
       </Card>
 
       {/* PROVIDERS */}
@@ -170,24 +141,12 @@ export function Settings({
         <ProviderRow provider="openrouter" label="OpenRouter" placeholder="sk-or-…" />
       </Card>
 
-      {/* MODEL selection moved to the Agents screen (per-agent, not per-folder).
-          Settings keeps only Providers/keys, appearance, checkpoints, folder. */}
-      <Card title="Model">
-        <p style={hint}>
-          Model choice now lives with each agent — open the <b>Agents</b> tab to pick a provider
-          and model per agent. Add your API keys above; the agent screen lists each provider's
-          models, most-capable first.
-        </p>
-      </Card>
+      {/* MODEL card removed (Mason cleanup #3) — model choice lives per-agent in
+          the Agents tab. */}
 
-      {/* LOCAL MODELS — download + run GGUF models entirely in-app, no external tools.
-          Downloading/managing lives here; SELECTING a downloaded model is done per-agent
-          in the Agents tab (provider = "local"). */}
-      <LocalModels
-        folder={folder}
-        activePath={selProvider === "local" ? selModel : ""}
-        onChoose={chooseLocalModel}
-      />
+      {/* LOCAL MODELS — DOWNLOAD-ONLY here (Mason cleanup #4). Downloaded models
+          show up per-agent in the Agents tab to be selected; no selection here. */}
+      <LocalModels folder={folder} activePath="" onChoose={() => {}} />
 
       {/* MEMORY (M1.7) */}
       <Card title="Memory">
@@ -242,14 +201,8 @@ export function Settings({
         )}
       </Card>
 
-      {/* AGENT FOLDER */}
-      <Card title="Agent Folder">
-        <p style={hint}>The one folder your agent can touch. Everything else on your Mac is invisible to it.</p>
-        {folder
-          ? <code style={{ fontSize: 13, wordBreak: "break-all", fontFamily: "ui-monospace, monospace" }}>🔒 {folder}</code>
-          : <p style={{ ...hint, color: "var(--text-faint)" }}>No folder chosen — the agent can touch nothing yet.</p>}
-        <div><Button onClick={onPickFolder}>{folder ? "Change folder…" : "Choose folder…"}</Button></div>
-      </Card>
+      {/* AGENT FOLDER card removed (Mason cleanup #6) — each agent's folder is set
+          in the Agents tab, not globally here. */}
     </div>
   );
 }

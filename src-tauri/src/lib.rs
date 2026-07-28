@@ -836,17 +836,30 @@ fn checkpoint_redo(broker: tauri::State<Arc<Broker>>) -> Result<Option<String>, 
     checkpoint::redo(&root)
 }
 
-/// Read the retention window (days, 1..=90).
+/// Resolve the checkpoint root for the ACTIVE agent's folder. Bug (Mason 07-28):
+/// get/set retention both used broker.root_for("default") — the legacy hardcoded
+/// scope — so a value set on the real agent folder was never read back and the
+/// slider snapped to 30. Resolve the active agent's own root so read == write.
+fn active_checkpoint_root(broker: &Arc<Broker>, db: &writer::Db) -> Result<std::path::PathBuf, String> {
+    if let Ok(Some(a)) = repo::get_active_agent(db) {
+        if !a.folder_path.is_empty() {
+            if let Ok(root) = broker.root_for(&a.id) { return Ok(root); }
+        }
+    }
+    broker.root_for("default").map_err(|e| format!("{e:?}"))
+}
+
+/// Read the retention window (days, 1..=90) for the active agent's folder.
 #[tauri::command]
-fn checkpoint_get_retention(broker: tauri::State<Arc<Broker>>) -> Result<i64, String> {
-    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+fn checkpoint_get_retention(broker: tauri::State<Arc<Broker>>, db: tauri::State<writer::Db>) -> Result<i64, String> {
+    let root = active_checkpoint_root(&broker, &db)?;
     checkpoint::get_retention(&root)
 }
 
 /// Set the retention window (days) + prune anything older immediately.
 #[tauri::command]
-fn checkpoint_set_retention(broker: tauri::State<Arc<Broker>>, days: i64) -> Result<(), String> {
-    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+fn checkpoint_set_retention(broker: tauri::State<Arc<Broker>>, db: tauri::State<writer::Db>, days: i64) -> Result<(), String> {
+    let root = active_checkpoint_root(&broker, &db)?;
     checkpoint::set_retention(&root, days)
 }
 
