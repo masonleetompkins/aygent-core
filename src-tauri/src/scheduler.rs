@@ -215,8 +215,11 @@ fn seed_proof_schedule(db: &Db) {
     let Some(agent_id) = active else { return };
 
     let spec = ScheduleSpec::Interval { every_secs: 60 };
+    // Slice-1 proof prompt: something the agent can answer FROM ITS OWN KNOWLEDGE
+    // (no tool needed). "What time is it?" fails because a sandboxed model has no
+    // clock tool — the plumbing still fired, but the reply read as an error.
     let action = ScheduleAction::AgentTurn {
-        prompt_template: "What is the current time? Reply in one short sentence.".into(),
+        prompt_template: "Proactive proof: in one short sentence, share an interesting fact.".into(),
         context: "fresh".into(),
     };
     let now = now_ms();
