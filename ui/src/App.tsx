@@ -135,7 +135,7 @@ export function App() {
           )}
           {screen === "checkpoints" && <Checkpoints folder={folder} />}
           {screen === "tools" && <Tools folder={folder} />}
-          {screen === "playground" && <Playground folder={folder} ws={ws} />}
+          {screen === "playground" && <Playground folder={folder} ws={ws} agentId={activeAgent?.id ?? null} />}
         </div>
       </div>
     </div>
