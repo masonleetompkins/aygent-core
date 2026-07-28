@@ -104,6 +104,14 @@ pub fn spawn(
                         // charged at take_next -> no infinite retry).
                         if let Err(e) = crate::run_headless_turn(&app2, &db2, &broker2, &lanes2, &agent_id, &msg).await {
                             eprintln!("[aygent] inbox turn for {agent_id} failed: {e}");
+                            // Atlas #5 cause 3: a turn that errors BEFORE persist
+                            // (no key/model) would ring the rail then go silent.
+                            // Surface the error INTO the inbox thread so the user
+                            // sees WHY instead of a blank rail.
+                            crate::persist_inbox_error(&db2, &agent_id, &msg, &e);
+                            let _ = tauri::Emitter::emit(&app2, "agent-activity", &serde_json::json!({
+                                "agentId": agent_id, "kind": "turn_done", "error": e,
+                            }));
                         }
                     }
                     drop(permit);

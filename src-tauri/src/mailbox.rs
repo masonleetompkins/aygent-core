@@ -103,10 +103,17 @@ pub fn send(
         return Ok(SendResult::Refused { reason: "message hop limit reached (loop guard)".into() });
     }
 
-    // Cycle guard: if the recipient already appears in the ancestry, drop it.
+    // Cycle guard — CORRECTED (bug from testing): a REPLY to someone earlier in
+    // the chain is exactly what we want (A asks B -> B replies to A). The old
+    // guard blocked ANY recipient already in the ancestry, which killed the
+    // first legitimate reply (Mason's screenshot: "blocked by cycle-detection").
+    // True runaway (A<->B forever) is stopped by the DEPTH TTL + the per-tree
+    // BUDGET, not by forbidding replies. The only thing we still hard-block is
+    // IMMEDIATE self-re-entry (the last hop was already to this same recipient),
+    // which would be a tight A->B->B loop with no new information.
     let ancestry_list: Vec<&str> = ancestry_in.split(',').filter(|s| !s.is_empty()).collect();
-    if ancestry_list.contains(&to_agent) {
-        return Ok(SendResult::Refused { reason: "cycle detected (recipient already in this chain)".into() });
+    if ancestry_list.last() == Some(&to_agent) {
+        return Ok(SendResult::Refused { reason: "already messaging that agent in this exact step".into() });
     }
     let mut new_ancestry_parts: Vec<String> = ancestry_list.iter().map(|s| s.to_string()).collect();
     new_ancestry_parts.push(from_agent.to_string());

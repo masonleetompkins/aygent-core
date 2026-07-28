@@ -4,9 +4,9 @@
 // Tauri event channel. Falls back to a thinking animation if no text streams.
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { Button, Input } from "../components/ui";
+import { Button } from "../components/ui";
 import { Markdown } from "../components/Markdown";
+import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn } from "../lib/turns";
 
 type ToolLine = { name: string; path: string; ok?: boolean; detail?: string };
 type Msg =
@@ -20,7 +20,10 @@ type ConvMeta = { id: string; title: string; updated: number; pinned: boolean; o
 export function Chat({ folder, keySet, agentId }: { folder: string | null; keySet: boolean; agentId: string | null }) {
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
+  // `busy` is now DERIVED from the per-agent turn store (see `running` below),
+  // not a local pane flag — so gating is per-agent (send to B while A runs).
+  // Kept as a name for the sidebar's new-chat gate.
+
   const [convs, setConvs] = useState<ConvMeta[]>([]);
   const [convId, setConvId] = useState<string | null>(null);
   const historyRef = useRef<any>([]); // provider-format running history
@@ -240,14 +243,20 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
   // immediately) and after the turn COMPLETES (to store the reply + history).
   const msgsRef = useRef<Msg[]>([]);
   async function persist(nextMsgs: Msg[]) {
-    const id = convIdRef.current;
+    await persistFor(convIdRef.current, nextMsgs, historyRef.current);
+  }
+
+  // Persist against a SPECIFIC conv id + history (not the currently-viewed pane's
+  // — avoids the stale-capture bug when a turn finishes after you've navigated
+  // away). Atlas: persist against the turn's captured convId.
+  async function persistFor(id: string | null, nextMsgs: Msg[], hist: unknown[]) {
     if (!folder || !id) return;
     const firstUser = nextMsgs.find((m) => m.role === "user") as { text: string } | undefined;
     const title = (firstUser?.text?.trim() || "New chat").slice(0, 60);
     try {
       await invoke("conv_save", {
         folder,
-        conv: { id, title, updated: 0, pinned: false, order: 0, msgs: nextMsgs, history: historyRef.current },
+        conv: { id, title, updated: 0, pinned: false, order: 0, msgs: nextMsgs, history: hist },
       });
       await refreshList();
     } catch { /* non-fatal: chat still works even if save fails */ }
@@ -255,92 +264,71 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
 
   async function send() {
     const prompt = input.trim();
-    if (!prompt || busy) return;
-    setInput(""); setBusy(true);
+    // Gate on THIS agent's status (per-agent), not a global pane flag — so you
+    // can send to a second agent while the first still runs (Atlas #2).
+    if (!prompt || !agentId || isRunning(agentId)) return;
+    setInput("");
 
-    // Build the next msgs array explicitly (don't rely on async state for the
-    // save). This is the source of truth we persist from.
+    const myAgent = agentId;
+    const myConvId = convIdRef.current || `agent://${Date.now()}`;
+    const channel = myConvId; // per-conversation channel = the stable session id
+
+    // Optimistic user bubble + a streaming assistant placeholder in the pane.
     const withUser: Msg[] = [...msgsRef.current, { role: "user", text: prompt }];
-    const nextMsgs: Msg[] = [...withUser, { role: "assistant", text: "", tools: [], streaming: true }];
-    msgsRef.current = nextMsgs;
-    setMsgs(nextMsgs);
-    // Persist IMMEDIATELY so the thread shows up in the sidebar with a real
-    // title the moment you send — even before the reply streams in.
-    void persist(withUser);
+    msgsRef.current = [...withUser, { role: "assistant", text: "", tools: [], streaming: true }];
+    setMsgs(msgsRef.current);
+    void persist(withUser); // thread appears in the sidebar immediately
 
-    const channel = `agent://${Date.now()}`;
+    // Seed the store's per-agent history from this conversation so a follow-up
+    // continues the thread.
+    setHistory(myAgent, historyRef.current);
 
-    // Accumulate into a REF (source of truth for THIS turn), then mirror into
-    // state for rendering. With StrictMode removed there is exactly ONE listener
-    // per turn, so no id-dedupe games are needed — every event is appended once.
-    const acc = { text: "", tools: [] as ToolLine[] };
-
-    const mirror = () => setMsgs((m) => {
-      const copy = [...m];
-      const last = copy[copy.length - 1];
-      if (last?.role === "assistant") {
-        last.text = acc.text;
-        last.tools = acc.tools.map((t) => ({ ...t }));
-      }
-      return copy;
-    });
-
-    const unlisten = await listen<any>(channel, (e) => {
-      const ev = e.payload;
-      switch (ev.kind) {
-        case "TextDelta": acc.text += ev.text; break;
-        case "ToolUse": acc.tools.push({ name: ev.name, path: ev.input?.path ?? "" }); break;
-        case "ToolResult": {
-          for (let i = acc.tools.length - 1; i >= 0; i--) {
-            if (acc.tools[i].name === ev.name && acc.tools[i].ok === undefined) {
-              acc.tools[i] = { ...acc.tools[i], ok: ev.ok, detail: ev.detail }; break;
-            }
-          }
-          break;
-        }
-        case "Error": acc.text += `\n✗ ${ev.text}`; break;
-        case "Info": case "Done": break;
-      }
-      mirror();
-    });
+    // Refresh model/provider selection just before the call.
+    if (folder) {
+      try {
+        const s = await invoke<{ provider: string; model: string }>("get_selection", { folder });
+        providerRef.current = s.provider; modelRef.current = s.model;
+      } catch { /* keep last */ }
+    }
 
     try {
-      // Refresh the folder's selection right before the call, so changing it in
-      // Settings takes effect on the very next message.
-      if (folder) {
-        try {
-          const s = await invoke<{ provider: string; model: string }>("get_selection", { folder });
-          providerRef.current = s.provider; modelRef.current = s.model;
-        } catch { /* keep last */ }
-      }
-      const updated = await invoke<any>("agent_stream", {
-        channel, prompt, history: historyRef.current,
+      // runTurn OWNS the listener + accumulator in the App-level store, so the
+      // stream keeps landing even if you navigate away. It resolves with the
+      // final history. The live text/tools render via the subscribed `turn`
+      // slice below (see the streaming bubble), so no local mirror needed.
+      const updated = await runTurn({
+        agentId: myAgent, channel, prompt,
         model: modelRef.current || null,
         provider: providerRef.current || null,
         folder: folder || null,
-        agentId: agentId || null,
-        sessionId: convIdRef.current || channel,
+        sessionId: myConvId,
       });
       historyRef.current = updated;
-    } catch (err) {
-      acc.text += `\n✗ ${String(err)}`;
-      mirror();
-    } finally {
-      unlisten();
-      // Build the final msgs array from our ref + the accumulated reply (don't
-      // read it back out of React state — that was the stale-capture save bug).
+      // Compose the final saved msgs from the store's completed live slice.
+      const done = getAgentTurnSnapshot(myAgent);
       const finalMsgs: Msg[] = [
         ...withUser,
-        { role: "assistant", text: acc.text, tools: acc.tools, streaming: false },
+        { role: "assistant", text: done.liveText || "(done)", tools: done.liveTools as ToolLine[], streaming: false },
       ];
-      msgsRef.current = finalMsgs;
-      setMsgs(finalMsgs);
-      setBusy(false);
-      void persist(finalMsgs); // store the completed turn + updated history
+      // Only overwrite the visible pane if we're STILL viewing this agent+conv.
+      if (agentId === myAgent && convIdRef.current === myConvId) {
+        msgsRef.current = finalMsgs; setMsgs(finalMsgs);
+      }
+      void persistFor(myConvId, finalMsgs, historyRef.current);
+    } catch (err) {
+      const errMsgs: Msg[] = [...withUser, { role: "assistant", text: `✗ ${String(err)}`, tools: [], streaming: false }];
+      if (agentId === myAgent && convIdRef.current === myConvId) { msgsRef.current = errMsgs; setMsgs(errMsgs); }
+      void persistFor(myConvId, errMsgs, historyRef.current);
     }
   }
 
   const blocked = !folder || !keySet;
+
+  // Per-agent live turn (from the App-level store). This is what makes switching
+  // TO a running agent show its live stream + thinking dots — the store never
+  // unmounts, so the stream is always captured and any pane can reattach.
+  const turn = useAgentTurn(agentId);
+  const running = turn.status === "running";
 
   return (
     <div style={{ display: "flex", height: "calc(100vh - 130px)", gap: 16 }}>
@@ -355,10 +343,22 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
         )}
 
         <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 14, paddingRight: 6 }}>
-          {msgs.length === 0 && !blocked && (
+          {msgs.length === 0 && !running && !blocked && (
             <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
           )}
           {msgs.map((m, i) => <Bubble key={i} m={m} />)}
+          {/* LIVE turn for the agent being viewed: render a trailing streaming
+              bubble fed by the store, so switching to a running agent shows its
+              tokens + tool cards arriving mid-flight (Atlas #2). Only when the
+              persisted msgs don't already end in an in-flight assistant bubble. */}
+          {running && (
+            <Bubble m={{
+              role: "assistant",
+              text: turn.liveText,
+              tools: turn.liveTools.map((t) => ({ name: t.name, path: t.path ?? "", ok: t.ok, detail: t.detail })),
+              streaming: true,
+            }} />
+          )}
         </div>
 
         <div style={{ display: "flex", gap: 8, marginTop: 14, alignItems: "flex-end", position: "relative" }}>
@@ -385,7 +385,7 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
           {/* #3: auto-growing multiline textarea; Shift+Enter = newline, Enter = send. */}
           <textarea
             ref={taRef}
-            value={input} disabled={blocked || busy}
+            value={input} disabled={blocked || running}
             rows={1}
             onChange={(e) => { setInput(e.target.value); onInputChange(e.target.value, e.target.selectionStart); }}
             onKeyDown={onInputKeyDown}
@@ -397,14 +397,14 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
               borderRadius: "var(--radius-control)", color: "var(--text)", padding: "10px 12px",
               fontSize: 15, fontFamily: "inherit",
             }} />
-          <Button onClick={send} disabled={blocked || busy}>{busy ? "…" : "Send"}</Button>
+          <Button onClick={send} disabled={blocked || running}>{running ? "…" : "Send"}</Button>
         </div>
       </div>
 
       {/* HISTORY SIDEBAR — right-hand side, so the active chat stays centered */}
       {!blocked && (
         <HistorySidebar
-          convs={convs} activeId={convId} busy={busy} dragId={dragId} overId={overId}
+          convs={convs} activeId={convId} busy={running} dragId={dragId} overId={overId}
           listElRef={listElRef}
           onNew={newConv} onOpen={openConv} onDelete={deleteConv}
           onPin={togglePin} onPointerDragStart={startPointerDrag}

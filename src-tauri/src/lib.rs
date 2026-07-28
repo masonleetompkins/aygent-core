@@ -250,8 +250,14 @@ fn app_data(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
 /// to the active agent. This keeps the UI stable while state moves to SQLite.
 fn agent_for_folder(db: &writer::Db, folder: &str) -> Result<String, String> {
     if !folder.is_empty() {
+        // Canonicalize both sides before comparing (Atlas #5 cause 1): a folder
+        // stored with a trailing slash / symlink / case difference would fail a
+        // raw string equality and the conversation would appear "missing".
+        let want = std::fs::canonicalize(folder).unwrap_or_else(|_| std::path::PathBuf::from(folder));
         for a in repo::list_agents(db)? {
             if a.folder_path == folder { return Ok(a.id); }
+            let have = std::fs::canonicalize(&a.folder_path).unwrap_or_else(|_| std::path::PathBuf::from(&a.folder_path));
+            if have == want { return Ok(a.id); }
         }
     }
     // Fall back to the active agent (single-folder users, or a not-yet-mapped
@@ -1840,6 +1846,25 @@ pub async fn run_headless_turn(
         "agentId": agent_id, "kind": "turn_done", "from": msg.from_agent, "fromName": from_name,
     }));
     Ok(())
+}
+
+/// Persist a VISIBLE error into an agent's inbox thread when a headless turn
+/// fails before it could reply (Atlas #5 cause 3: no key/model → rail rings then
+/// silence). Now the user sees WHY in the thread instead of a blank rail.
+pub fn persist_inbox_error(db: &writer::Db, agent_id: &str, msg: &mailbox::Message, err: &str) {
+    let from_name = repo::get_agent(db, &msg.from_agent).ok().flatten().map(|a| a.name).unwrap_or_else(|| msg.from_agent.clone());
+    let conv_id = format!("inbox-{agent_id}");
+    let existing = repo::load_conversation(db, &conv_id).ok();
+    let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
+    ui_msgs.push(serde_json::json!({ "role": "user", "from": from_name, "text": format!("\u{1F4E8} from {from_name}: {}", msg.body) }));
+    ui_msgs.push(serde_json::json!({ "role": "assistant", "text": format!("⚠️ Couldn't process this message: {err}. (Check this agent has a provider key + model set.)"), "tools": [] }));
+    let conv = repo::Conversation {
+        id: conv_id, agent_id: agent_id.to_string(),
+        title: "Inter-agent inbox".into(), updated: 0, pinned: true, order: 1,
+        msgs: serde_json::json!(ui_msgs),
+        history: existing.map(|c| c.history).unwrap_or(serde_json::json!([])),
+    };
+    let _ = repo::save_conversation(db, conv);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
