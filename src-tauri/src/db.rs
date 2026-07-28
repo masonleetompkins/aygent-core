@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 /// Current schema version. Bump when adding a migration step below.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// The DB file name under <app_data>.
 pub const DB_FILE: &str = "aygent.db";
@@ -101,6 +101,17 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("migrate v2: {e}"))?;
         set_version(conn, 2)?;
         v = 2;
+    }
+
+    if v < 3 {
+        // M1.7 Slice 1 — Vault-native memory READ PATH. note+link+vec are a
+        // DERIVED CACHE over the markdown vault (source of truth = files). Fully
+        // rebuildable: delete these rows and re-ingest and nothing is lost
+        // (ethos: user owns the files). See memory.rs.
+        conn.execute_batch(SCHEMA_V3)
+            .map_err(|e| format!("migrate v3: {e}"))?;
+        set_version(conn, 3)?;
+        v = 3;
     }
 
     let _ = v;
@@ -241,4 +252,65 @@ CREATE TABLE IF NOT EXISTS agent_context (
   FOREIGN KEY (agent_id) REFERENCES agent(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_agent_context_agent ON agent_context(agent_id);
+"#;
+
+/// SCHEMA v3 (M1.7 Slice 1) — vault-native memory READ PATH.
+///
+/// These three tables are a DERIVED INDEX over the markdown vault. The vault
+/// files are the source of truth; every row here is rebuildable by re-ingesting.
+/// Ownership uses (owner_kind, owner_id) — same C5 privacy boundary as mem_chunk
+/// — so an isolated agent's graph can never leak into a pool via a NULL bug.
+///
+/// `note`  = one row per markdown file: its type/agent/pool (from frontmatter),
+///           a content hash (skip re-embed when unchanged), and status.
+/// `link`  = the backlink graph: (src -> dst, kind). kind = wikilink|embed|tag
+///           |suggested|supersedes. Queryable from BOTH ends = graph expansion.
+/// `vec`   = the embedding per note (nomic-embed, 768-dim, local). Stored as a
+///           raw little-endian f32 BLOB; cosine is computed in Rust for Slice 1
+///           (sqlite-vec KNN is a drop-in upgrade later — shape already fits).
+const SCHEMA_V3: &str = r#"
+-- One row per ingested markdown note. Derived from the file; source of truth is
+-- the file on disk. sha lets ingest skip unchanged files (no needless re-embed).
+CREATE TABLE IF NOT EXISTS note (
+  owner_kind  TEXT NOT NULL,            -- 'agent' | 'pool'
+  owner_id    TEXT NOT NULL,
+  path        TEXT NOT NULL,            -- vault-relative path (the note's identity)
+  sha         TEXT NOT NULL DEFAULT '',-- content hash of the raw file bytes
+  title       TEXT NOT NULL DEFAULT '',
+  ntype       TEXT NOT NULL DEFAULT 'note', -- frontmatter `type`
+  agent       TEXT NOT NULL DEFAULT '',     -- frontmatter `agent` (provenance)
+  pool        TEXT NOT NULL DEFAULT '',     -- frontmatter `pool` (null-> '')
+  confidence  REAL NOT NULL DEFAULT 0.0,
+  status      TEXT NOT NULL DEFAULT 'active',
+  body        TEXT NOT NULL DEFAULT '',     -- markdown body (frontmatter stripped)
+  created     TEXT NOT NULL DEFAULT '',
+  updated     TEXT NOT NULL DEFAULT '',
+  indexed_at  INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (owner_kind, owner_id, path)
+);
+CREATE INDEX IF NOT EXISTS idx_note_owner ON note(owner_kind, owner_id);
+CREATE INDEX IF NOT EXISTS idx_note_type  ON note(owner_kind, owner_id, ntype);
+
+-- The backlink graph. src/dst are vault-relative note paths (dst may be
+-- unresolved = a dangling link; we still record it so de-orphaning can see it).
+CREATE TABLE IF NOT EXISTS link (
+  owner_kind  TEXT NOT NULL,
+  owner_id    TEXT NOT NULL,
+  src_path    TEXT NOT NULL,
+  dst_path    TEXT NOT NULL,
+  kind        TEXT NOT NULL DEFAULT 'wikilink', -- wikilink|embed|tag|suggested|supersedes
+  PRIMARY KEY (owner_kind, owner_id, src_path, dst_path, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_link_src ON link(owner_kind, owner_id, src_path);
+CREATE INDEX IF NOT EXISTS idx_link_dst ON link(owner_kind, owner_id, dst_path);
+
+-- One embedding per note. dim + a raw f32 LE blob; cosine in Rust for Slice 1.
+CREATE TABLE IF NOT EXISTS vec (
+  owner_kind  TEXT NOT NULL,
+  owner_id    TEXT NOT NULL,
+  path        TEXT NOT NULL,
+  dim         INTEGER NOT NULL DEFAULT 0,
+  embedding   BLOB NOT NULL,
+  PRIMARY KEY (owner_kind, owner_id, path)
+);
 "#;

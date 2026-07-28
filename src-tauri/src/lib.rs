@@ -15,6 +15,7 @@ mod db;
 mod drainer;
 mod lanes;
 mod mailbox;
+mod memory;
 mod migrate_json;
 mod repo;
 mod writer;
@@ -271,6 +272,51 @@ fn agent_for_folder(db: &writer::Db, folder: &str) -> Result<String, String> {
 fn conv_list(db: tauri::State<writer::Db>, folder: String) -> Result<Vec<repo::ConvMeta>, String> {
     let agent_id = agent_for_folder(&db, &folder)?;
     repo::list_conversations(&db, &agent_id)
+}
+
+// ---- M1.7 Slice 1: vault memory read path (ingest + retrieve) ----------
+// Local-only embeddings via Ollama nomic-embed-text (zero cloud), same model
+// the OpenClaw memorySearch uses. Endpoint defaults to the standard local
+// Ollama; overridable for power users running it elsewhere.
+const MEM_EMBED_MODEL: &str = "nomic-embed-text";
+const MEM_EMBED_ENDPOINT: &str = "http://127.0.0.1:11434";
+
+/// Ingest a vault folder into the derived memory index for an agent (isolated).
+/// owner = ('agent', agent_id). Returns a report the test UI/CLI can print.
+#[tauri::command]
+async fn memory_ingest(
+    db: tauri::State<'_, writer::Db>,
+    agent_id: String,
+    vault_path: String,
+) -> Result<memory::IngestReport, String> {
+    let root = std::path::PathBuf::from(&vault_path);
+    if !root.is_dir() {
+        return Err(format!("vault path is not a folder: {vault_path}"));
+    }
+    memory::ingest_vault(&db, "agent", &agent_id, &root, MEM_EMBED_MODEL, MEM_EMBED_ENDPOINT).await
+}
+
+/// Retrieve memory for a query: semantic top-K + graph expansion. Read-only.
+#[tauri::command]
+async fn memory_retrieve(
+    db: tauri::State<'_, writer::Db>,
+    agent_id: String,
+    query: String,
+    top_k: Option<usize>,
+    expand_hops: Option<usize>,
+) -> Result<Vec<memory::RetrievedNote>, String> {
+    memory::retrieve(
+        &db, "agent", &agent_id, &query,
+        top_k.unwrap_or(4), expand_hops.unwrap_or(1),
+        MEM_EMBED_MODEL, MEM_EMBED_ENDPOINT,
+    ).await
+}
+
+/// Quick counts (notes/links/vecs) for a scope — sanity read after ingest.
+#[tauri::command]
+fn memory_stats(db: tauri::State<writer::Db>, agent_id: String) -> Result<serde_json::Value, String> {
+    let (notes, links, vecs) = memory::stats(&db, "agent", &agent_id)?;
+    Ok(serde_json::json!({ "notes": notes, "links": links, "vecs": vecs }))
 }
 
 /// Load one full conversation (msgs + provider history). `folder` is accepted
@@ -1962,7 +2008,8 @@ pub fn run() {
             agent_context_add, agent_context_list, agent_context_remove,
             agent_generate_soul,
             mailbox_pending_counts, mailbox_take_next, mailbox_roster,
-            get_app_knobs, set_app_knobs
+            get_app_knobs, set_app_knobs,
+            memory_ingest, memory_retrieve, memory_stats
         ])
         .setup(move |_app| {
             // M1.1: bring up the SQLite state spine + single-writer actor, then
