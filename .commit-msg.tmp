@@ -1,0 +1,14 @@
+fix(scheduler): sane default fire caps by kind + honest 'rate limited' UX + reset
+
+The 'skipped / ran but enqueued nothing' Mason hit was the fire-count
+guardrail WORKING, not a bug: default max_fires_per_day was 2, and repeated
+Run-now + timer fires blew past 2/day on an every-1-min schedule -> fire_one
+refused with rate_limited. Cost safety did its job; the UX just read as failure.
+
+- create default cap now scales BY KIND: interval => fires-that-fit-in-a-day
+  clamped [2,240]; daily/weekly => 2. (2/day for every-1-min was the trap.)
+- scheduler::reset_counters + cmd scheduler_reset_counters: zero today's
+  fire/cost counters (and re-enable if a cost ceiling auto-paused it) so
+  testing isn't blocked. UI 'Reset limits' button per row.
+- Run-now message is honest now: 'hit today's fire limit... click Reset
+  limits to test again' instead of 'a guard blocked it'.

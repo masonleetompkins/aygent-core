@@ -486,14 +486,38 @@ fn scheduler_create(
         (scheduler::ScheduleSpec::Interval { .. }, _) => "interval",
         _ => "cron",
     };
+    // Sensible default fire cap BY KIND if the UI didn't set one: a daily/weekly
+    // job fires ~once, so 2/day is plenty; an interval/heartbeat may fire many
+    // times, so cap by frequency (fires that fit in a day, ceiling 240). 2/day
+    // for an every-1-min schedule was the confusing 'skipped' Mason hit.
+    let default_cap: i64 = match &spec {
+        scheduler::ScheduleSpec::Interval { every_secs } => {
+            let per_day = 86_400 / (*every_secs).max(1) as i64;
+            per_day.clamp(2, 240)
+        }
+        _ => 2,
+    };
     let id = scheduler::create(
         &db, &agent_id, &name, kind, &spec,
         tz.as_deref().unwrap_or("local"), &act,
-        max_fires_per_day.unwrap_or(2),
+        max_fires_per_day.unwrap_or(default_cap),
         max_cost_units_per_day,
     )?;
     sched.nudge(); // hot: ticker recomputes wake_at immediately
     Ok(id)
+}
+
+/// Reset a schedule's daily fire/cost counters NOW (so testing isn't blocked by
+/// the cap). Also re-enables it if a cost ceiling auto-paused it.
+#[tauri::command]
+fn scheduler_reset_counters(
+    db: tauri::State<writer::Db>,
+    sched: tauri::State<scheduler::SchedSignal>,
+    id: i64,
+) -> Result<(), String> {
+    scheduler::reset_counters(&db, id)?;
+    sched.nudge();
+    Ok(())
 }
 
 /// Enable/disable one schedule (pause a single one). Hot.
@@ -2373,7 +2397,7 @@ pub fn run() {
             memory_auto_capture, scheduler_list, scheduler_runs,
             scheduler_create, scheduler_set_enabled, scheduler_delete,
             scheduler_set_paused, scheduler_get_paused, scheduler_run_now,
-            scheduler_debug_row
+            scheduler_debug_row, scheduler_reset_counters
         ])
         .setup(move |_app| {
             // M1.1: bring up the SQLite state spine + single-writer actor, then

@@ -442,6 +442,19 @@ pub fn delete(db: &Db, id: i64) -> Result<(), String> {
     })
 }
 
+/// Reset today's fire/cost counters for a schedule NOW (unblock testing) + clear
+/// count_reset_day so the next fire re-bases cleanly. Re-enable if it was
+/// auto-paused by a cost ceiling.
+pub fn reset_counters(db: &Db, id: i64) -> Result<(), String> {
+    db.write(move |c| {
+        c.execute(
+            "UPDATE schedule SET daily_fire_count = 0, cost_units_today = 0, count_reset_day = 0, enabled = 1 WHERE id = ?1",
+            params![id],
+        ).map_err(|e| format!("reset counters: {e}"))?;
+        Ok(())
+    })
+}
+
 /// FIRE NOW: run one schedule immediately, bypassing the timing gate (but NOT
 /// the guardrails). Diagnostic + a genuinely useful "run it now" UI action.
 /// Returns whether a turn was enqueued to the drainer.

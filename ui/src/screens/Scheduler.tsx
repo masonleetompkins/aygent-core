@@ -100,9 +100,16 @@ export function Scheduler({ agentId }: { agentId: string | null }) {
     setErr(null);
     try {
       const enq = await invoke<boolean>("scheduler_run_now", { id: s.id });
-      setErr(enq ? `Fired “${s.name}” now — check the agent’s chat + History in a few seconds.` : `“${s.name}” ran but enqueued nothing (a guard blocked it, or it’s a system job).`);
+      setErr(enq
+        ? `Fired “${s.name}” now — check the agent’s Activity + History in a few seconds.`
+        : `“${s.name}” didn’t fire — it hit today’s fire limit (or is a system job). Click “Reset limits” to test again.`);
       setTimeout(refresh, 1500);
     } catch (e) { setErr(String(e)); }
+  }
+  async function resetLimits(s: Schedule) {
+    setErr(null);
+    try { await invoke("scheduler_reset_counters", { id: s.id }); setErr(`Limits reset for “${s.name}” — you can fire it again now.`); refresh(); }
+    catch (e) { setErr(String(e)); }
   }
   async function showRuns(id: number) {
     if (openRuns === id) { setOpenRuns(null); return; }
@@ -153,6 +160,7 @@ export function Scheduler({ agentId }: { agentId: string | null }) {
               <Button onClick={() => runNow(s)}>▶ Run now</Button>
               <Button variant="secondary" onClick={() => toggleOne(s)}>{s.enabled ? "Pause" : "Resume"}</Button>
               <Button variant="secondary" onClick={() => showRuns(s.id)}>History</Button>
+              <Button variant="secondary" onClick={() => resetLimits(s)}>Reset limits</Button>
               <Button variant="secondary" onClick={() => remove(s)}>Delete</Button>
             </div>
           </div>
