@@ -360,8 +360,13 @@ fn collect_md_files(root: &Path) -> Vec<PathBuf> {
             let p = entry.path();
             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
             if p.is_dir() {
-                if name.starts_with('.') {
-                    continue; // .git, .aygent, .obsidian, .trash
+                // Skip dotfolders (.git/.aygent/.obsidian/.trash) AND build/dep
+                // junk so pointing at a repo root doesn't ingest node_modules
+                // READMEs, Rust target/, etc. A real vault has none of these.
+                if name.starts_with('.')
+                    || matches!(name, "node_modules" | "target" | "dist" | "build" | ".git")
+                {
+                    continue;
                 }
                 stack.push(p);
             } else if p.extension().and_then(|e| e.to_str()) == Some("md") {
@@ -428,6 +433,20 @@ pub async fn ingest_vault(
 
     let files = collect_md_files(root);
     report.scanned = files.len();
+
+    // FAIL FAST + CLEAR if the local embedder isn't reachable — otherwise every
+    // single file logs the same connection error (192 identical lines). One
+    // probe, one actionable message.
+    if !files.is_empty() {
+        if let Err(e) = embed("probe", embed_model, embed_endpoint).await {
+            return Err(format!(
+                "local embedder unreachable at {embed_endpoint} ({e}). \
+                 Is Ollama running with '{embed_model}' pulled? Try: `ollama pull {embed_model}` \
+                 then make sure `ollama serve` is up. (Scanned {} .md files but embedded none.)",
+                files.len()
+            ));
+        }
+    }
 
     // Pass 1: read + parse all files, build a stem index for link resolution.
     struct Pending {

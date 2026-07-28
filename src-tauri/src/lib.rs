@@ -312,6 +312,21 @@ async fn memory_retrieve(
     ).await
 }
 
+/// Pick a folder WITHOUT changing any agent's scope — used by the memory test
+/// panel so you browse to a vault instead of hand-typing a path (which is how a
+/// repo root gets picked by mistake). Returns the chosen absolute path or None.
+#[tauri::command]
+async fn pick_vault_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.dialog().file().pick_folder(move |chosen| {
+        let _ = tx.send(chosen);
+    });
+    let chosen = tokio::task::spawn_blocking(move || rx.recv().ok().flatten())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(chosen.map(|p| p.to_string()))
+}
+
 /// Quick counts (notes/links/vecs) for a scope — sanity read after ingest.
 #[tauri::command]
 fn memory_stats(db: tauri::State<writer::Db>, agent_id: String) -> Result<serde_json::Value, String> {
@@ -2009,7 +2024,7 @@ pub fn run() {
             agent_generate_soul,
             mailbox_pending_counts, mailbox_take_next, mailbox_roster,
             get_app_knobs, set_app_knobs,
-            memory_ingest, memory_retrieve, memory_stats
+            memory_ingest, memory_retrieve, memory_stats, pick_vault_folder
         ])
         .setup(move |_app| {
             // M1.1: bring up the SQLite state spine + single-writer actor, then

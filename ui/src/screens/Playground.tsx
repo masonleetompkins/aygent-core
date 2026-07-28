@@ -124,6 +124,10 @@ export function Playground({ folder, ws, agentId }: { folder: string | null; ws:
           <div style={{ display: "flex", gap: 8 }}>
             <Input mono value={vaultPath} onChange={(e) => setVaultPath(e.target.value)}
               placeholder="/Users/you/Documents/aygent/test-vault" />
+            <Button variant="secondary" onClick={async () => {
+              const p = await invoke<string | null>("pick_vault_folder");
+              if (p) setVaultPath(p);
+            }}>Browse…</Button>
             <Button onClick={runIngest} disabled={ingesting || !agentId || !vaultPath}>
               {ingesting ? "Ingesting…" : "Ingest"}
             </Button>
