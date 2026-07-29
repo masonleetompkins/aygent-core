@@ -170,15 +170,12 @@ export function Browser() {
   const label = (t: Tab) => t.title || (t.addr.trim() ? t.addr : "New Tab");
 
   return (
-    // The Browser MUST be a strictly-bounded box: the native webview is
-    // positioned over paneRef's measured rect, so if paneRef is allowed to
-    // overflow its parent (it did — the ancestor scroll container is
-    // height:100vh/overflow:auto, and height:100% + flex:1 let the page row grow
-    // to content height), its border box sweeps across the whole window and the
-    // measured rect balloons. Clamp: fill available height, never exceed it,
-    // never scroll. absolute-inset guarantees a definite height regardless of
-    // the parent's flex quirks.
-    <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", minHeight: 0, gap: 8, overflow: "hidden" }}>
+    // Normal in-flow layout: fill the parent content area (App.tsx wraps every
+    // screen in a flex:1 / minHeight:0 column with 28x32 padding). height:100%
+    // + minHeight:0 lets this fill that box; overflow:hidden keeps paneRef from
+    // spilling. Do NOT use position:absolute/inset:0 here — that escapes the
+    // padded content wrapper and overlays the entire app (sidebar + logo).
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0, gap: 8, overflow: "hidden" }}>
       {/* TAB ROW — active tab is the inline address field. */}
       <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
         {tabs.map((t) => {
