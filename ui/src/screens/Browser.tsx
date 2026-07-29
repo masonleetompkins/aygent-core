@@ -13,7 +13,7 @@
 // resize + hide it when you leave the tab.
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Input } from "../components/ui";
 import { Icon } from "../components/Icon";
 
@@ -54,36 +54,38 @@ export function Browser() {
   function syncBounds() {
     const el = paneRef.current;
     if (!el) return;
-    requestAnimationFrame(() => {
-      const r = el.getBoundingClientRect();
-      // GUARD against the "pop-out over the UI" bug. Before layout settles,
-      // paneRef can momentarily report a rect that spans nearly the whole
-      // window (top-left origin, full width) — positioning the native webview
-      // there makes it cover the sidebar + tab row (the pop-out). The pane is
-      // ALWAYS right of the sidebar and below the tab row, so a rect that
-      // starts at the window origin is layout-not-ready: skip it (the 500ms
-      // interval + next rAF will catch the settled rect). Do NOT reject on a
-      // small width — only on an origin-hugging (chrome-covering) position.
+    // DOUBLE rAF: read AFTER React commit + browser layout/paint, so r.top and
+    // parentHeight come from the SAME settled frame. wry Y-flips the child
+    // against the parent NSView height at apply-time; sending the height we
+    // measured against lets Rust flip deterministically (kills the resize race
+    // where the child rides too high because Rust flipped against a stale
+    // height). Diagnosis: Atlas, from wry wkwebview source.
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const el2 = paneRef.current;
+      if (!el2) return;
+      const r = el2.getBoundingClientRect();
       if (r.width < 40 || r.height < 40) return;
       if (r.left <= 4 && r.top <= 4) return; // origin-hugging = not laid out yet
+      // Main webview content-area logical height == the parent NSView height
+      // wry flips against. Measured in the same frame as r. No hardcoding.
+      const parentHeight = Math.round(document.documentElement.clientHeight);
       const rightPane = driver === "agent" ? AGENT_PANE_W + 10 : 0; // +gap
       // Webview rect == paneRef's BORDER-BOX rect (no inset). The rounded
       // outline is a pointer-events:none overlay rendered ON TOP of the webview,
       // so its ~radius corner arcs mask the webview's square corners while the
-      // webview fills the whole box. Because both the webview and the overlay
-      // are driven by this SAME measured rect, they stay locked at every size.
+      // webview fills the whole box.
       const bounds = {
         x: Math.round(r.left), y: Math.round(r.top),
         width: Math.round(Math.max(r.width - rightPane, 1)),
         height: Math.round(r.height),
+        parentHeight,
       };
-      // Skip redundant calls — only push when the rect actually changed. Keeps
-      // us from hammering set_bounds twice a second for no reason.
-      const key = `${bounds.x},${bounds.y},${bounds.width},${bounds.height}`;
+      // Skip redundant calls — only push when the rect actually changed.
+      const key = `${bounds.x},${bounds.y},${bounds.width},${bounds.height},${bounds.parentHeight}`;
       if (key === lastBoundsRef.current) return;
       lastBoundsRef.current = key;
       invoke("webview_set_bounds", bounds).catch(() => {});
-    });
+    }));
   }
 
   // Mount: on leaving the tab, hide the native webview so it doesn't float over
@@ -94,16 +96,21 @@ export function Browser() {
     const onResize = () => syncBounds();
     window.addEventListener("resize", onResize);
     // Track the pane's own size changes (sidebar collapse, window resize, agent
-    // pane toggle) precisely instead of blind-polling every 500ms — the
-    // interval was firing set_bounds twice a second forever + spamming logs.
+    // pane toggle) precisely instead of blind-polling.
     let ro: ResizeObserver | undefined;
     if (paneRef.current && "ResizeObserver" in window) {
       ro = new ResizeObserver(() => syncBounds());
       ro.observe(paneRef.current);
     }
+    // Native window resize + fullscreen↔windowed transitions: AppKit relays out
+    // the parent AFTER the event, so re-sync on the event AND a beat later to
+    // catch the settled parent height (Atlas: the settle covers wry's post-
+    // transition re-flip).
+    const winUn = getCurrentWindow().onResized(() => { syncBounds(); setTimeout(syncBounds, 60); });
     return () => {
       window.removeEventListener("resize", onResize);
       ro?.disconnect();
+      winUn.then((f) => f()).catch(() => {});
       invoke("webview_hide").catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

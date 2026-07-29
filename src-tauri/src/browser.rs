@@ -988,6 +988,11 @@ pub fn webview_set_bounds(
     y: f64,
     width: f64,
     height: f64,
+    // Parent content-area height the FRONTEND measured `y` against, sent so the
+    // Y-flip is deterministic instead of racing wry's live parent height.
+    // Accepted even if wry re-flips internally — keeping the arg makes the invoke
+    // signature stable and lets us switch to a manual flip if the race persists.
+    #[allow(unused_variables)] parent_height: Option<f64>,
 ) -> Result<(), String> {
     use tauri::{LogicalPosition, LogicalSize, Manager};
     if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
