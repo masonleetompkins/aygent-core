@@ -991,8 +991,16 @@ pub fn webview_set_bounds(
 ) -> Result<(), String> {
     use tauri::{LogicalPosition, LogicalSize, Manager};
     if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
+        // Diagnostic: prints to the TERMINAL (Rust stdout). Frontend console.log
+        // goes to WebInspector, not here — so we log the rect we actually apply.
+        let scale = wv.scale_factor().unwrap_or(1.0);
+        println!(
+            "[browser] set_bounds pos=({x},{y}) size=({width}x{height}) scale={scale} FOUND=true"
+        );
         let _ = wv.set_position(LogicalPosition::new(x, y));
         let _ = wv.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
+    } else {
+        println!("[browser] set_bounds pos=({x},{y}) size=({width}x{height}) FOUND=false (no webview!)");
     }
     Ok(())
 }
