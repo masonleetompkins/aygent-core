@@ -1435,6 +1435,17 @@ async fn agent_run(
                     let input = blk.get("input").cloned().unwrap_or(serde_json::json!({}));
                     let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
 
+                    // BROWSER TOOLS (Slice 4): async, driven through the CDP
+                    // session + per-agent domain policy. Intercept before the
+                    // sync broker dispatch since they need app+state+await.
+                    if browser::is_agent_tool(name) {
+                        let allowed = agent_browser_domains(&app, agent_id);
+                        let (rt, ie) = browser::agent_tool(&app, &browser_state, name, &input, &allowed).await;
+                        transcript.push_str(&format!("  ⚙ {name} → {}\n", if ie { format!("✗ {rt}") } else { "✓".to_string() }));
+                        tool_results.push(serde_json::json!({ "type": "tool_result", "tool_use_id": id, "content": rt, "is_error": ie }));
+                        continue;
+                    }
+
                     // EXECUTE THROUGH THE BROKER (jailed).
                     let (result_text, is_err) = match name {
                         "read_file" => match broker.resolve_and_open("default", path, broker::Mode::Read) {
@@ -1754,6 +1765,25 @@ fn agent_tools_for_full(
         }
     }
 
+    // BROWSER TOOLS (Slice 4): if the in-app browser is installed AND this agent
+    // has at least one allowed browsing domain, expose the browser_* tools.
+    // Fails closed — no allowed domains => no agent browsing.
+    if browser::is_installed(app) {
+        if let Some(f) = folder {
+            let domains = agent_browser_domains(app, f);
+            if !domains.is_empty() {
+                for schema in browser::agent_tool_schemas() { tools.push(schema); }
+                extra_instructions.push_str(&format!(
+                    "\n\nYou can browse the web in the SHARED in-app browser (the human watches live \
+                     and can take over). Allowed domains: {}. Use browser_open to visit a page, \
+                     browser_read to read it, browser_click_text / browser_type_text to interact. If \
+                     you hit a login, CAPTCHA, or paywall, say so — the human will take the wheel.",
+                    domains.join(", ")
+                ));
+            }
+        }
+    }
+
     if let (Ok(ad), Some(f)) = (app_data(app), folder) {
         for t in tools_registry::enabled_tools(&ad, f) {
             match t.kind.as_str() {
@@ -1787,6 +1817,50 @@ fn agent_tools_for_full(
 /// Back-compat: the base-only tool set (used where no folder/app context).
 fn agent_tools() -> serde_json::Value {
     serde_json::json!(base_tools())
+}
+
+/// SLICE 4 — per-agent browser DOMAIN POLICY. The agent may only navigate to
+/// hosts on this allowlist (fails closed: empty => no agent browsing). Stored
+/// per-folder in app data (GUI-managed, no config files): 
+///   <app_data>/browser-policy/<folderkey>.json -> ["example.com", ...]
+/// The human tier is unrestricted (Slice 3) — this list ONLY gates the agent.
+fn agent_browser_domains(app: &tauri::AppHandle, folder: &str) -> Vec<String> {
+    let Ok(ad) = app_data(app) else { return vec![]; };
+    let dir = ad.join("browser-policy");
+    let key = folder_key_fnv(folder);
+    let path = dir.join(format!("{key}.json"));
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
+        .unwrap_or_default()
+}
+
+/// FNV-1a folder key (same scheme as tools/conversations).
+fn folder_key_fnv(folder: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in folder.as_bytes() { hash ^= *b as u64; hash = hash.wrapping_mul(0x100000001b3); }
+    format!("{hash:016x}")
+}
+
+/// Read the agent's browser allowlist (GUI).
+#[tauri::command]
+fn browser_policy_get(app: tauri::AppHandle, folder: String) -> Result<Vec<String>, String> {
+    Ok(agent_browser_domains(&app, &folder))
+}
+
+/// Set the agent's browser allowlist (GUI).
+#[tauri::command]
+fn browser_policy_set(app: tauri::AppHandle, folder: String, domains: Vec<String>) -> Result<(), String> {
+    let ad = app_data(&app)?;
+    let dir = ad.join("browser-policy");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir browser-policy: {e}"))?;
+    let path = dir.join(format!("{}.json", folder_key_fnv(&folder)));
+    let clean: Vec<String> = domains.into_iter()
+        .map(|d| d.trim().trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_ascii_lowercase())
+        .filter(|d| !d.is_empty())
+        .collect();
+    let text = serde_json::to_string_pretty(&clean).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("write policy: {e}"))
 }
 
 /// The PDF tool's per-folder config ({} if unavailable). Passed into exec so the
@@ -1831,6 +1905,7 @@ async fn agent_stream(
     lanes: tauri::State<'_, lanes::Lanes>,
     db: tauri::State<'_, writer::Db>,
     drain: tauri::State<'_, drainer::DrainSignal>,
+    browser_state: tauri::State<'_, browser::BrowserProc>,
     channel: String,
     prompt: String,
     history: serde_json::Value,
@@ -2602,6 +2677,7 @@ pub fn run() {
             browser::browser_status, browser::browser_install, browser::browser_launch_probe,
             browser::browser_navigate, browser::browser_shutdown, browser::browser_start_view,
             browser::browser_click, browser::browser_scroll, browser::browser_type, browser::browser_key,
+            browser_policy_get, browser_policy_set,
             openai_models, tools_list, tools_upsert, tools_delete, tools_set_enabled,
             tools_config, tools_set_config,
             savepoint_snapshot, savepoint_timeline, savepoint_rewind,

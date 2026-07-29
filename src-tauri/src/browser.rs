@@ -983,6 +983,202 @@ pub async fn browser_key(
     Ok(())
 }
 
+// ===========================================================================
+// SLICE 4 — AGENT BROWSER TOOLS.
+//
+// The agent drives the SAME browser the human sees (frames keep streaming, so
+// the human watches the agent work). Tools are mediated through the CDP session
+// exactly like the human's input, plus a per-agent DOMAIN POLICY (mirrors
+// web.rs's SSRF posture): the agent may only navigate to allowlisted hosts;
+// file:// / localhost / internal are hard-blocked. The human tier is unrestricted
+// (Slice 3) — that split is the whole point (human gets past what the agent can't).
+//
+// One async entry point `agent_tool` that the turn loop calls for any browser_*
+// tool. Returns (result_text, is_error) like exec_tool.
+// ===========================================================================
+
+/// Names the agent sees. Kept SMALL + robust (Atlas: favor a small set).
+pub const AGENT_TOOL_NAMES: &[&str] = &[
+    "browser_open", "browser_read", "browser_click_text", "browser_type_text", "browser_screenshot",
+];
+
+/// Is `name` one of our agent browser tools?
+pub fn is_agent_tool(name: &str) -> bool {
+    AGENT_TOOL_NAMES.contains(&name)
+}
+
+/// The JSON schemas fed to the model for the browser tools (added to the tool
+/// list when the browser is enabled).
+pub fn agent_tool_schemas() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "name": "browser_open",
+            "description": "Open a URL in the shared in-app browser (the human can watch + take over). Only allowlisted domains are permitted. Returns the page's readable text + title.",
+            "input_schema": { "type": "object", "properties": {
+                "url": { "type": "string", "description": "http(s) URL to open" }
+            }, "required": ["url"] }
+        }),
+        serde_json::json!({
+            "name": "browser_read",
+            "description": "Read the current page's visible text (its accessibility/DOM text). Use this to see what's on the page you opened.",
+            "input_schema": { "type": "object", "properties": {} }
+        }),
+        serde_json::json!({
+            "name": "browser_click_text",
+            "description": "Click the first visible element (link/button) whose text contains the given string. Use this to click links/buttons by their label.",
+            "input_schema": { "type": "object", "properties": {
+                "text": { "type": "string", "description": "visible text of the element to click" }
+            }, "required": ["text"] }
+        }),
+        serde_json::json!({
+            "name": "browser_type_text",
+            "description": "Type text into the currently focused field (click a field first). Optionally press Enter after.",
+            "input_schema": { "type": "object", "properties": {
+                "text": { "type": "string" },
+                "submit": { "type": "boolean", "description": "press Enter after typing" }
+            }, "required": ["text"] }
+        }),
+        serde_json::json!({
+            "name": "browser_screenshot",
+            "description": "Capture what the page looks like right now as an image (returns a note; the human sees the live view). Use when the visible layout matters.",
+            "input_schema": { "type": "object", "properties": {} }
+        }),
+    ]
+}
+
+/// Execute an agent browser tool against the live session, enforcing the
+/// per-agent domain policy. `allowed_domains`: the agent's allowlist (empty =
+/// nothing allowed — fail closed). Returns (text, is_error).
+pub async fn agent_tool(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, BrowserProc>,
+    name: &str,
+    input: &serde_json::Value,
+    allowed_domains: &[String],
+) -> (String, bool) {
+    match name {
+        "browser_open" => {
+            let url = normalize_url(input.get("url").and_then(|u| u.as_str()).unwrap_or(""));
+            // POLICY: agent may only navigate to allowlisted hosts; block
+            // internal/localhost/file (mirrors web.rs).
+            if let Err(e) = check_agent_url(&url, allowed_domains) {
+                return (e, true);
+            }
+            if let Err(e) = ensure_session(app, state).await { return (format!("browser error: {e}"), true); }
+            if let Err(e) = session_call(state, "Page.navigate", serde_json::json!({ "url": url })).await {
+                return (format!("navigate failed: {e}"), true);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            match read_page_text(state).await {
+                Ok((title, text)) => (format!("Opened. Title: {title}\n\n{text}"), false),
+                Err(e) => (format!("opened but read failed: {e}"), true),
+            }
+        }
+        "browser_read" => match read_page_text(state).await {
+            Ok((title, text)) => (format!("Title: {title}\n\n{text}"), false),
+            Err(e) => (format!("read failed: {e}"), true),
+        },
+        "browser_click_text" => {
+            let want = input.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            if want.is_empty() { return ("browser_click_text needs `text`".into(), true); }
+            // Find the element's center via a DOM query, then dispatch a click there.
+            let expr = format!(
+                "(() => {{ const t={:?}; const els=[...document.querySelectorAll('a,button,input[type=submit],[role=button]')]; \
+                 const el=els.find(e=>(e.innerText||e.value||'').toLowerCase().includes(t.toLowerCase())); \
+                 if(!el) return null; const r=el.getBoundingClientRect(); \
+                 return JSON.stringify([r.left+r.width/2, r.top+r.height/2]); }})()",
+                want
+            );
+            match session_call(state, "Runtime.evaluate", serde_json::json!({ "expression": expr, "returnByValue": true })).await {
+                Ok(r) => {
+                    if let Some(s) = r["result"]["value"].as_str() {
+                        if let Ok(xy) = serde_json::from_str::<Vec<f64>>(s) {
+                            let (x, y) = (xy[0], xy[1]);
+                            for phase in ["mouseMoved", "mousePressed", "mouseReleased"] {
+                                let mut ev = serde_json::json!({ "type": phase, "x": x, "y": y, "button": "left", "clickCount": 1 });
+                                if phase == "mouseMoved" { ev["button"] = "none".into(); }
+                                if let Err(e) = session_call(state, "Input.dispatchMouseEvent", ev).await {
+                                    return (format!("click dispatch failed: {e}"), true);
+                                }
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                            return (format!("clicked element containing '{want}'"), false);
+                        }
+                    }
+                    (format!("no clickable element found containing '{want}'"), true)
+                }
+                Err(e) => (format!("click query failed: {e}"), true),
+            }
+        }
+        "browser_type_text" => {
+            let text = input.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            let submit = input.get("submit").and_then(|b| b.as_bool()).unwrap_or(false);
+            if let Err(e) = session_call(state, "Input.insertText", serde_json::json!({ "text": text })).await {
+                return (format!("type failed: {e}"), true);
+            }
+            if submit {
+                let down = serde_json::json!({ "type": "keyDown", "key": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13, "text": "\r" });
+                let up = serde_json::json!({ "type": "keyUp", "key": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13 });
+                let _ = session_call(state, "Input.dispatchKeyEvent", down).await;
+                let _ = session_call(state, "Input.dispatchKeyEvent", up).await;
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            }
+            (format!("typed {} chars{}", text.len(), if submit { " + Enter" } else { "" }), false)
+        }
+        "browser_screenshot" => {
+            match session_call(state, "Page.captureScreenshot", serde_json::json!({ "format": "jpeg", "quality": 60 })).await {
+                Ok(_) => ("captured a screenshot (the human sees the live view)".into(), false),
+                Err(e) => (format!("screenshot failed: {e}"), true),
+            }
+        }
+        other => (format!("unknown browser tool: {other}"), true),
+    }
+}
+
+/// Read the page title + visible text (agent's primary "sense"). Caps length so
+/// one read can't blow the model context.
+async fn read_page_text(state: &tauri::State<'_, BrowserProc>) -> Result<(String, String), String> {
+    let expr = "JSON.stringify([document.title, (document.body?document.body.innerText:'').slice(0,8000)])";
+    let r = session_call(state, "Runtime.evaluate", serde_json::json!({ "expression": expr, "returnByValue": true })).await?;
+    let s = r["result"]["value"].as_str().ok_or("no page text")?;
+    let arr: Vec<String> = serde_json::from_str(s).map_err(|e| format!("parse page text: {e}"))?;
+    if arr.len() == 2 { Ok((arr[0].clone(), arr[1].clone())) } else { Err("unexpected page text shape".into()) }
+}
+
+/// Agent URL policy (mirrors web.rs is_blocked_host + adds an allowlist).
+/// Fails CLOSED: empty allowlist => nothing allowed.
+fn check_agent_url(url: &str, allowed_domains: &[String]) -> Result<(), String> {
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err("agent may only open http(s) URLs".into());
+    }
+    // Extract host.
+    let host = lower
+        .split("://").nth(1).unwrap_or("")
+        .split('/').next().unwrap_or("")
+        .split('@').last().unwrap_or("")
+        .split(':').next().unwrap_or("")
+        .to_string();
+    if host.is_empty() { return Err("could not parse host".into()); }
+    // Block internal/localhost (SSRF).
+    if host == "localhost" || host.starts_with("127.") || host.starts_with("10.")
+        || host.starts_with("192.168.") || host.ends_with(".local") || host == "0.0.0.0"
+        || host.starts_with("169.254.") {
+        return Err("refused: internal/localhost host is not allowed for the agent".into());
+    }
+    // Allowlist: host must equal or be a subdomain of an allowed domain.
+    let ok = allowed_domains.iter().any(|d| {
+        let d = d.trim().to_ascii_lowercase();
+        !d.is_empty() && (host == d || host.ends_with(&format!(".{d}")))
+    });
+    if !ok {
+        return Err(format!(
+            "refused: '{host}' is not in this agent's allowed browsing domains. Add it in the agent's browser policy to let it visit this site."
+        ));
+    }
+    Ok(())
+}
+
 /// Add https:// to a bare host; leave full URLs + about:/file: as-is-ish.
 fn normalize_url(input: &str) -> String {
     let s = input.trim();
