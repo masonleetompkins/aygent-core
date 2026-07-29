@@ -1598,6 +1598,47 @@ fn exec_tool_cfg(
                 Err(e) => (format!("refused by jail: {e:?}"), true),
             }
         }
+        // RENAME / MOVE a file (so the model never has to copy-and-orphan — Mason
+        // 07-28). BOTH the source and destination are resolved THROUGH THE JAIL,
+        // so a rename can only ever move a file WITHIN the agent's folder.
+        "rename_file" => {
+            let from = input.get("from").and_then(|p| p.as_str())
+                .or_else(|| input.get("path").and_then(|p| p.as_str())).unwrap_or("");
+            let to = input.get("to").and_then(|p| p.as_str())
+                .or_else(|| input.get("new_path").and_then(|p| p.as_str())).unwrap_or("");
+            if from.is_empty() || to.is_empty() {
+                return ("rename_file needs `from` and `to` paths".into(), true);
+            }
+            // Source must resolve (read) + destination must resolve (write) — both jailed.
+            let src = match broker.resolve(agent_id, from, broker::Mode::Read) {
+                Ok(p) => p, Err(e) => return (format!("source refused by jail: {e:?}"), true),
+            };
+            let dst = match broker.resolve(agent_id, to, broker::Mode::Write) {
+                Ok(p) => p, Err(e) => return (format!("destination refused by jail: {e:?}"), true),
+            };
+            if !src.exists() { return (format!("'{from}' does not exist"), true); }
+            if dst.exists() { return (format!("'{to}' already exists — pick a different name or delete it first"), true); }
+            if let Some(parent) = dst.parent() { let _ = std::fs::create_dir_all(parent); }
+            match std::fs::rename(&src, &dst) {
+                Ok(_) => (format!("renamed '{from}' → '{to}'"), false),
+                Err(e) => (format!("rename failed: {e}"), true),
+            }
+        }
+        // DELETE a file (Mason 07-28: the agent needs to clean up, not just create).
+        // Jailed resolve; refuses directories (use a dedicated dir op later if needed).
+        "delete_file" => {
+            let target = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            if target.is_empty() { return ("delete_file needs a `path`".into(), true); }
+            let real = match broker.resolve(agent_id, target, broker::Mode::Write) {
+                Ok(p) => p, Err(e) => return (format!("refused by jail: {e:?}"), true),
+            };
+            if !real.exists() { return (format!("'{target}' does not exist"), true); }
+            if real.is_dir() { return (format!("'{target}' is a folder — delete_file only removes files"), true); }
+            match std::fs::remove_file(&real) {
+                Ok(_) => (format!("deleted '{target}'"), false),
+                Err(e) => (format!("delete failed: {e}"), true),
+            }
+        }
         "list_files" => match broker.resolve("default", path, broker::Mode::Read) {
             Ok(real) => {
                 if real.is_file() {
@@ -1663,6 +1704,10 @@ fn base_tools() -> Vec<serde_json::Value> {
         serde_json::json!({ "name": "write_file", "description": "Write a UTF-8 text file inside the agent folder. Path relative to folder root.",
           "input_schema": { "type": "object", "properties": { "path": { "type": "string" }, "content": { "type": "string" } }, "required": ["path", "content"] } }),
         serde_json::json!({ "name": "list_files", "description": "List entries in a directory inside the agent folder. Path relative to root; '.' for root.",
+          "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } }),
+        serde_json::json!({ "name": "rename_file", "description": "Rename or move a file inside the agent folder. Use this to change a file's name (do NOT write a copy and leave the old one). Both paths are relative to the folder root.",
+          "input_schema": { "type": "object", "properties": { "from": { "type": "string", "description": "current path" }, "to": { "type": "string", "description": "new path" } }, "required": ["from", "to"] } }),
+        serde_json::json!({ "name": "delete_file", "description": "Delete a file inside the agent folder. Path relative to root. Only removes files, not folders.",
           "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } }),
     ]
 }
@@ -1794,9 +1839,11 @@ const AGENT_SYSTEM: &str = "You are AYGENT, a helpful, concise, friendly assista
     asking a question you can answer directly, JUST REPLY — do not call any tools, do not read or list \
     files, do not call an API. Never explore the folder or call tools speculatively 'to gather \
     context'; act only on what was asked. When a task DOES need a tool: use read_file/write_file/\
-    list_files for files in the user's chosen folder (you cannot run shell commands), fetch_url to \
-    read a web page/API over HTTPS, and any connected-service tools (e.g. github_list_prs) for that \
-    service. Prefer the smallest number of tool calls that gets the job done.";
+    list_files for files in the user's chosen folder (you cannot run shell commands). To RENAME or \
+    MOVE a file use rename_file (NEVER write a copy under the new name and leave the old file — \
+    rename it); to remove a file use delete_file. Use fetch_url to read a web page/API over HTTPS, \
+    and any connected-service tools (e.g. github_list_prs) for that service. Prefer the smallest \
+    number of tool calls that gets the job done.";
 
 // Base system prompt for local models. When the model is tool-capable, we
 // APPEND its family-native tool instructions (local_tools::system_prompt_with_tools).
