@@ -2580,7 +2580,10 @@ pub fn run() {
 
     // BROWSER (Slice 1): the long-lived headless Chromium handle. Launched on
     // first navigate, reused across navigations, held here as managed state.
-    let browser_proc = std::sync::Arc::new(browser::BrowserProc::new());
+    // NOTE: manage the PLAIN struct (it holds its own Mutex) so the managed type
+    // matches the commands' State<'_, BrowserProc> — an Arc<BrowserProc> would
+    // register a DIFFERENT type => 'state not managed'.
+    let browser_proc = browser::BrowserProc::new();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -2589,7 +2592,7 @@ pub fn run() {
         .manage(lanes.clone())
         .manage(drain_signal.clone())
         .manage(sched_signal.clone())
-        .manage(browser_proc.clone())
+        .manage(browser_proc)
         .invoke_handler(tauri::generate_handler![
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
