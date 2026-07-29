@@ -23,10 +23,11 @@ const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 // ranking + labels now (see screens/Agents.tsx: modelRank/modelLabel).
 
 export function Settings({
-  mode, accent, onTheme, folder, onPickFolder, agentId,
+  mode, accent, onTheme, folder, onPickFolder, agentId, daemonStatus, daemonOk,
 }: {
   mode: Mode; accent: string; onTheme: (m: Mode, a: string) => void;
   folder: string | null; onPickFolder: () => void; agentId: string | null;
+  daemonStatus?: string; daemonOk?: boolean;
 }) {
   // M1.7: per-agent auto-remember toggle (surface the setting we built).
   const [autoRemember, setAutoRemember] = useState(true);
@@ -95,6 +96,7 @@ export function Settings({
 
       {/* APPEARANCE — at the top. */}
       <Card title="Appearance">
+        {/* (daemon sanity-check card is at the bottom) */}
         <div style={{ display: "flex", gap: "var(--space-2)", alignItems: "center" }}>
           <span style={{ fontSize: "var(--text-body)", fontWeight: 600, width: 90 }}>Mode</span>
           <Button variant={mode === "light" ? "primary" : "secondary"} onClick={() => onTheme("light", accent)}>◐ Light</Button>
@@ -184,8 +186,20 @@ export function Settings({
         )}
       </Card>
 
-      {/* AGENT FOLDER card removed (Mason cleanup #6) — each agent's folder is set
-          in the Agents tab, not globally here. */}
+      {/* AGENT FOLDER card removed — each agent's folder is set in the Agents tab. */}
+
+      {/* DAEMON — quiet sanity-check (moved out of the old persistent top strip).
+          Just confirms the local engine is up; not something to stare at. */}
+      {daemonStatus && (
+        <Card title="System">
+          <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
+            <span style={{ fontSize: "var(--text-body)", color: daemonOk ? "var(--ok)" : "var(--text-muted)" }}>
+              {daemonOk ? "●" : "○"}
+            </span>
+            <span style={{ fontSize: "var(--text-caption)", color: "var(--text-muted)" }}>{daemonStatus}</span>
+          </div>
+        </Card>
+      )}
     </div>
   );
 }

@@ -1,12 +1,10 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Pill } from "./components/ui";
 import { Sidebar, type ScreenId } from "./components/Sidebar";
 import { AgentRail } from "./components/AgentRail";
 import { type AgentProfile } from "./components/AgentSwitcher";
 import { Agents } from "./screens/Agents";
 import { Settings } from "./screens/Settings";
-import { Playground } from "./screens/Playground";
 import { Chat } from "./screens/Chat";
 import { SavePoints } from "./screens/SavePoints";
 import { Tools } from "./screens/Tools";
@@ -16,8 +14,6 @@ import { initTheme, saveTheme, type Mode } from "./lib/theme";
 import { startHeadlessWatcher } from "./lib/turns";
 
 // Phase 1: app shell (sidebar nav + content pane) on the design system.
-// Screens: Settings (the wedge) + Playground (temp Phase-0 proofs) live now;
-// Chat/Agents/Scheduler/Connections/SavePoints land next.
 
 type Status =
   | { kind: "booting" }
@@ -28,7 +24,6 @@ type Status =
 
 export function App() {
   const [status, setStatus] = useState<Status>({ kind: "booting" });
-  const [ws, setWs] = useState<WebSocket | null>(null);
   const [folder, setFolder] = useState<string | null>(null);
   const [activeAgent, setActiveAgent] = useState<AgentProfile | null>(null);
   const [screen, setScreen] = useState<ScreenId>("chat");
@@ -78,7 +73,7 @@ export function App() {
       socket.onopen = () => socket!.send(JSON.stringify({ type: "auth", token: info.token }));
       socket.onmessage = (ev) => {
         let msg: any; try { msg = JSON.parse(ev.data); } catch { return; }
-        if (msg.type === "auth:ok") { sentAt = Date.now(); setWs(socket); socket!.send(JSON.stringify({ type: "ping" })); }
+        if (msg.type === "auth:ok") { sentAt = Date.now(); socket!.send(JSON.stringify({ type: "ping" })); }
         else if (msg.type === "pong") setStatus({ kind: "connected", port: info.port!, latency: Date.now() - sentAt });
       };
       socket.onerror = () => setStatus({ kind: "error", msg: "ws error" });
@@ -114,14 +109,8 @@ export function App() {
         onManage={() => setScreen("agents")}
       />
       <div style={{ flex: 1, height: "100vh", overflowY: "auto" }}>
-        {/* top status strip */}
-        <div style={{
-          display: "flex", justifyContent: "flex-end", alignItems: "center",
-          padding: "14px 28px", borderBottom: "var(--border-width) solid var(--line)",
-        }}>
-          <Pill tone={good ? "ok" : "muted"}>{good ? "● " : "○ "}{statusLine(status)}</Pill>
-        </div>
-
+        {/* The persistent daemon-status strip was dev telemetry — removed. The
+           connection state now lives as a quiet sanity-check in Settings. */}
         <div style={{ padding: "28px 32px" }}>
           {screen === "chat" && <Chat folder={folder} keySet={keySet} agentId={activeAgent?.id ?? null} />}
           {screen === "agents" && (
@@ -133,13 +122,12 @@ export function App() {
             />
           )}
           {screen === "settings" && (
-            <Settings mode={mode} accent={accent} onTheme={onTheme} folder={folder} onPickFolder={pickFolder} agentId={activeAgent?.id ?? null} />
+            <Settings mode={mode} accent={accent} onTheme={onTheme} folder={folder} onPickFolder={pickFolder} agentId={activeAgent?.id ?? null} daemonStatus={statusLine(status)} daemonOk={good} />
           )}
           {screen === "savepoints" && <SavePoints folder={folder} />}
           {screen === "scheduler" && <Scheduler agentId={activeAgent?.id ?? null} />}
           {screen === "connections" && <Connections agentId={activeAgent?.id ?? null} />}
           {screen === "tools" && <Tools folder={folder} />}
-          {screen === "playground" && <Playground folder={folder} ws={ws} agentId={activeAgent?.id ?? null} />}
         </div>
       </div>
     </div>

@@ -3,7 +3,7 @@
 import type { ReactNode } from "react";
 
 export type ScreenId =
-  | "chat" | "agents" | "tools" | "settings" | "scheduler" | "connections" | "savepoints" | "playground";
+  | "chat" | "agents" | "tools" | "settings" | "scheduler" | "connections" | "savepoints";
 
 export interface NavItem { id: ScreenId; label: string; icon: string; enabled: boolean; }
 
@@ -17,7 +17,6 @@ export const NAV: NavItem[] = [
   { id: "connections", label: "Connections", icon: "🔌", enabled: true },
   { id: "savepoints", label: "Save Points", icon: "↩", enabled: true },
   { id: "settings", label: "Settings", icon: "⚙", enabled: true },
-  { id: "playground", label: "Playground", icon: "🧪", enabled: true },
 ];
 
 export function Sidebar({ active, onSelect }: { active: ScreenId; onSelect: (id: ScreenId) => void }) {
