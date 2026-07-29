@@ -10,7 +10,7 @@ import { Icon, AGENT_ICONS, type IconName } from "../components/Icon";
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 // Agent icons are SF-Symbol-style glyphs (see Icon.tsx); rendered in the
-// accent color/glow — no per-agent background color anymore (Mason's call).
+// accent color (flat, no glow) — no per-agent background color anymore (Mason's call).
 const ICONS = AGENT_ICONS;
 
 // Rank a model id most-powerful-first. Higher score = more capable = higher in
@@ -116,7 +116,7 @@ export function Agents({
           <div style={{
             width: 44, height: 44, flexShrink: 0, color: "var(--accent)",
             display: "flex", alignItems: "center", justifyContent: "center",
-          }}><Icon name={(a.icon as IconName) || "sparkles"} size={26} glow /></div>
+          }}><Icon name={(a.icon as IconName) || "sparkles"} size={26} /></div>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <span style={{ fontWeight: 700, fontSize: 16 }}>{a.name}</span>
@@ -316,7 +316,7 @@ function AgentForm({
                   background: sel ? "color-mix(in srgb, var(--accent) 10%, var(--bg))" : "var(--bg)",
                   boxShadow: sel ? "var(--elevation)" : "none",
                   transition: "border-color .12s, box-shadow .12s, color .12s",
-                }}><Icon name={i} size={20} glow={sel} /></button>
+                }}><Icon name={i} size={20} /></button>
               );
             })}
           </div>

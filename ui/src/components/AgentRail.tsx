@@ -105,8 +105,8 @@ export function AgentRail({
               position: "relative",
               width: 42, height: 42, borderRadius: "var(--radius-control)",
               // NO background color fill — the SF-symbol itself carries the
-              // accent color + glow (Mason's call). Viewing = accent outline +
-              // accent-tinted icon; idle = quiet muted icon.
+              // accent color (flat, no glow — Mason's call). Viewing = accent
+              // outline + accent-tinted icon; idle = quiet muted icon.
               border: viewing ? "var(--border-width) solid var(--accent)" : "var(--border-width) solid transparent",
               background: "transparent",
               color: viewing ? "var(--accent)" : "var(--text-muted)",
@@ -117,7 +117,7 @@ export function AgentRail({
               transition: "border .15s ease, color .15s ease, box-shadow .15s ease",
             }}
           >
-            <Icon name={(a.icon as IconName) || "sparkles"} size={22} glow={viewing || busy} />
+            <Icon name={(a.icon as IconName) || "sparkles"} size={22} />
             {badge > 0 && (
               <span style={{
                 position: "absolute", top: -3, right: -3, minWidth: 16, height: 16,

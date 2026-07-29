@@ -53,21 +53,19 @@ const PATHS: Record<IconName, JSX.Element> = {
 };
 
 export function Icon({
-  name, size = 18, stroke = 1.8, color, style, glow = false,
+  name, size = 18, stroke = 1.8, color, style,
 }: {
   name: IconName; size?: number; stroke?: number; color?: string;
-  style?: CSSProperties; glow?: boolean;
+  style?: CSSProperties;
 }) {
+  // Flat symbols only — no shadow/glow. The accent color alone carries them
+  // (Mason's call: glow read as muddy/unfinished).
   return (
     <svg
       width={size} height={size} viewBox="0 0 24 24"
       fill="none" stroke={color ?? "currentColor"} strokeWidth={stroke}
       strokeLinecap="round" strokeLinejoin="round"
-      style={{
-        display: "block", flexShrink: 0,
-        filter: glow ? "drop-shadow(0 0 6px currentColor)" : undefined,
-        ...style,
-      }}
+      style={{ display: "block", flexShrink: 0, ...style }}
       aria-hidden="true"
     >
       {PATHS[name]}

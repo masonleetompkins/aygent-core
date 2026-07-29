@@ -176,18 +176,29 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
     } catch { /* ignore */ }
   }
 
-  // Rename a chat: prompt for a new title, persist it via conv_save (loads the
-  // full conversation first so we don't clobber msgs/history) then refresh.
-  async function renameConv(id: string) {
+  // Rename a chat by id: persist a new title via conv_save (loads the full
+  // conversation first so we don't clobber msgs/history) then refresh. Used by
+  // both the sidebar pencil (prompt) and the inline header field (direct value).
+  async function saveConvTitle(id: string, next: string) {
     if (!folder) return;
-    const cur = convs.find((x) => x.id === id);
-    const next = window.prompt("Rename chat", cur?.title || "")?.trim();
-    if (next === undefined || next === null || next === "") return;
+    const title = next.trim();
+    if (!title) return;
     try {
       const c = await invoke<any>("conv_load", { folder, id });
-      await invoke("conv_save", { folder, conv: { ...c, title: next } });
+      await invoke("conv_save", { folder, conv: { ...c, title } });
       await refreshList();
     } catch { /* ignore */ }
+  }
+  async function renameConv(id: string) {
+    const cur = convs.find((x) => x.id === id);
+    const next = window.prompt("Rename chat", cur?.title || "");
+    if (next == null) return;
+    await saveConvTitle(id, next);
+  }
+  // Rename the CURRENTLY OPEN chat (from the inline header field).
+  async function renameCurrent(next: string) {
+    if (!convId) return;
+    await saveConvTitle(convId, next);
   }
 
   // Persist a drop: move `srcId` to `targetId`'s slot, recompute a dense order
@@ -352,10 +363,19 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
   const running = turn.status === "running";
 
   return (
-    <div style={{ display: "flex", height: "calc(100vh - 130px)", gap: "var(--space-4)" }}>
-      {/* MAIN CHAT COLUMN (stays centered/left; history lives on the RIGHT) */}
-      <div style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0, maxWidth: 720, margin: "0 auto" }}>
-        <h2 style={{ fontSize: "var(--text-h1)", fontWeight: "var(--weight-heading)", margin: "0 0 var(--space-3)" }}>Chat</h2>
+    <div style={{ display: "flex", height: "100%", minHeight: 0, gap: "var(--space-4)" }}>
+      {/* MAIN CHAT COLUMN (stays centered/left; history lives on the RIGHT).
+         height:100% + the column flexes so the input pins to the true bottom. */}
+      <div style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0, minHeight: 0, maxWidth: 720, margin: "0 auto" }}>
+        {/* Header: "Chat" + editable chat name underneath. */}
+        <div style={{ margin: "0 0 var(--space-3)", flexShrink: 0 }}>
+          <h2 style={{ fontSize: "var(--text-h1)", fontWeight: "var(--weight-heading)", margin: 0 }}>Chat</h2>
+          <ChatTitle
+            title={convs.find((c) => c.id === convId)?.title || ""}
+            disabled={!folder || !convId}
+            onRename={(next) => renameCurrent(next)}
+          />
+        </div>
 
         {blocked && (
           <p style={{ ...hint, marginBottom: 12 }}>
@@ -392,7 +412,7 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
           </div>
         </div>
 
-        <div style={{ display: "flex", gap: 8, marginTop: 14, alignItems: "flex-end", position: "relative" }}>
+        <div style={{ display: "flex", gap: 8, marginTop: "var(--space-3)", flexShrink: 0, alignItems: "flex-end", position: "relative" }}>
           {/* #4: @mention picker — shows matching agents as you type @Name. */}
           {mention && mention.matches.length > 0 && (
             <div style={{
@@ -407,7 +427,7 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
                     padding: "8px 12px", border: "none", cursor: "pointer", fontSize: 14,
                     background: i === mention.sel ? "var(--bg)" : "transparent", color: "var(--text)",
                   }}>
-                  <span style={{ width: 22, height: 22, borderRadius: 6, background: a.color, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13 }}>{a.icon || "🤖"}</span>
+                  <span style={{ width: 22, height: 22, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--accent)" }}><Icon name={(a.icon as IconName) || "sparkles"} size={18} /></span>
                   <span>{a.name}</span>
                 </button>
               ))}
@@ -508,19 +528,69 @@ function HistoryItem({
       <button
         onClick={(e) => { e.stopPropagation(); onPin(); }}
         title={c.pinned ? "Unpin" : "Pin to top"}
-        style={{ background: "none", border: "none", cursor: "pointer", padding: 0, fontSize: 12, opacity: c.pinned ? 1 : hover ? 0.5 : 0 }}
-      >{c.pinned ? "★" : "☆"}</button>
+        style={{ background: "none", border: "none", cursor: "pointer", padding: 0, display: "flex", color: c.pinned ? "var(--accent)" : "var(--text-muted)", opacity: c.pinned ? 1 : hover ? 0.6 : 0 }}
+      ><Icon name={c.pinned ? "pin-fill" : "pin"} size={13} /></button>
       <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", color: "var(--text)" }}>
         {c.title || "Untitled"}
       </span>
       {hover && (
-        <button
-          onClick={(e) => { e.stopPropagation(); onDelete(); }}
-          title="Delete chat"
-          style={{ background: "none", border: "none", cursor: "pointer", padding: 0, fontSize: 13, color: "var(--danger)" }}
-        >✕</button>
+        <>
+          <button
+            onClick={(e) => { e.stopPropagation(); onRename(); }}
+            title="Rename chat"
+            style={{ background: "none", border: "none", cursor: "pointer", padding: 0, display: "flex", color: "var(--text-muted)" }}
+          ><Icon name="pencil" size={13} /></button>
+          <button
+            onClick={(e) => { e.stopPropagation(); onDelete(); }}
+            title="Delete chat"
+            style={{ background: "none", border: "none", cursor: "pointer", padding: 0, display: "flex", color: "var(--danger)" }}
+          ><Icon name="trash" size={13} /></button>
+        </>
       )}
     </div>
+  );
+}
+
+// Inline-editable chat name shown under the "Chat" header. Click to edit; Enter
+// or blur commits, Escape cancels. Empty renders a muted "Untitled" prompt.
+function ChatTitle({ title, disabled, onRename }: { title: string; disabled: boolean; onRename: (next: string) => void; }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(title);
+  const inRef = useRef<HTMLInputElement>(null);
+  useEffect(() => { if (!editing) setDraft(title); }, [title, editing]);
+  useEffect(() => { if (editing) inRef.current?.focus(); }, [editing]);
+  function commit() { const t = draft.trim(); if (t && t !== title) onRename(t); setEditing(false); }
+  if (disabled) return null;
+  if (editing) {
+    return (
+      <input
+        ref={inRef}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); commit(); } else if (e.key === "Escape") { setDraft(title); setEditing(false); } }}
+        placeholder="Untitled"
+        style={{
+          marginTop: 2, background: "var(--bg)", border: "var(--border-width) solid var(--accent)",
+          borderRadius: "var(--radius-control)", color: "var(--text)", padding: "2px 8px",
+          fontSize: "var(--text-body)", fontFamily: "inherit", maxWidth: 360, width: "100%",
+        }}
+      />
+    );
+  }
+  return (
+    <button
+      onClick={() => setEditing(true)}
+      title="Rename this chat"
+      style={{
+        marginTop: 2, display: "flex", alignItems: "center", gap: 6, background: "none", border: "none",
+        cursor: "text", padding: "2px 0", color: title ? "var(--text-muted)" : "var(--text-faint)",
+        fontSize: "var(--text-body)", fontFamily: "inherit", maxWidth: 360,
+      }}
+    >
+      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{title || "Untitled"}</span>
+      <Icon name="pencil" size={13} style={{ opacity: 0.6 }} />
+    </button>
   );
 }
 
