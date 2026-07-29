@@ -2601,6 +2601,7 @@ pub fn run() {
             local_download, local_delete, local_tool_capability, restore_agent_folder,
             browser::browser_status, browser::browser_install, browser::browser_launch_probe,
             browser::browser_navigate, browser::browser_shutdown, browser::browser_start_view,
+            browser::browser_click, browser::browser_scroll, browser::browser_type, browser::browser_key,
             openai_models, tools_list, tools_upsert, tools_delete, tools_set_enabled,
             tools_config, tools_set_config,
             savepoint_snapshot, savepoint_timeline, savepoint_rewind,

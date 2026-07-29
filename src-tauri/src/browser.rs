@@ -866,6 +866,123 @@ pub async fn browser_start_view(
     ensure_session(&app, &state).await
 }
 
+// ===========================================================================
+// SLICE 3 — HUMAN INPUT FORWARDING.
+//
+// The UI captures clicks/keys/scroll on the live frame, maps the coordinates
+// into PAGE space (the frame is scaled to fit the pane; the UI sends normalized
+// 0..1 coords + we multiply by the real viewport), and dispatches them into
+// Chromium via CDP Input.dispatch{Mouse,Key}Event. Now you can click the CAPTCHA.
+//
+// Coords: the UI sends x,y as fractions (0..1) of the displayed frame. We read
+// the real layout viewport (via Page.getLayoutMetrics, cached) and scale. This
+// is DPR-robust because screencast frames + layout metrics are both in CSS px.
+// ===========================================================================
+
+/// Current CSS viewport (width,height) of the live page, for coord mapping.
+async fn viewport_size(state: &tauri::State<'_, BrowserProc>) -> Result<(f64, f64), String> {
+    let m = session_call(state, "Page.getLayoutMetrics", serde_json::json!({})).await?;
+    // cssLayoutViewport is CSS px (matches screencast frame space).
+    let vp = &m["cssLayoutViewport"];
+    let w = vp["clientWidth"].as_f64().unwrap_or(1280.0);
+    let h = vp["clientHeight"].as_f64().unwrap_or(800.0);
+    Ok((w.max(1.0), h.max(1.0)))
+}
+
+/// Forward a mouse CLICK at normalized (fx,fy in 0..1) coords on the frame.
+/// Dispatches move -> press -> release so pages that track hover/mousedown work.
+#[tauri::command]
+pub async fn browser_click(
+    state: tauri::State<'_, BrowserProc>,
+    fx: f64,
+    fy: f64,
+    button: Option<String>,
+) -> Result<(), String> {
+    let (w, h) = viewport_size(&state).await?;
+    let x = (fx.clamp(0.0, 1.0)) * w;
+    let y = (fy.clamp(0.0, 1.0)) * h;
+    let btn = button.unwrap_or_else(|| "left".into());
+    let base = serde_json::json!({ "x": x, "y": y, "button": btn, "clickCount": 1 });
+    // move first (hover), then down, then up.
+    let mut mv = base.clone(); mv["type"] = "mouseMoved".into(); mv["button"] = "none".into();
+    session_call(&state, "Input.dispatchMouseEvent", mv).await?;
+    let mut down = base.clone(); down["type"] = "mousePressed".into();
+    session_call(&state, "Input.dispatchMouseEvent", down).await?;
+    let mut up = base.clone(); up["type"] = "mouseReleased".into();
+    session_call(&state, "Input.dispatchMouseEvent", up).await?;
+    Ok(())
+}
+
+/// Forward a scroll (wheel) at normalized coords by (dx,dy) CSS px.
+#[tauri::command]
+pub async fn browser_scroll(
+    state: tauri::State<'_, BrowserProc>,
+    fx: f64,
+    fy: f64,
+    dx: f64,
+    dy: f64,
+) -> Result<(), String> {
+    let (w, h) = viewport_size(&state).await?;
+    let x = (fx.clamp(0.0, 1.0)) * w;
+    let y = (fy.clamp(0.0, 1.0)) * h;
+    session_call(
+        &state,
+        "Input.dispatchMouseEvent",
+        serde_json::json!({ "type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Forward typed text (a run of characters) into the focused element. Uses
+/// Input.insertText for the bulk (fast + handles unicode/emoji), which is what
+/// you want after a click focuses a field.
+#[tauri::command]
+pub async fn browser_type(
+    state: tauri::State<'_, BrowserProc>,
+    text: String,
+) -> Result<(), String> {
+    session_call(
+        &state,
+        "Input.insertText",
+        serde_json::json!({ "text": text }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Forward a single special KEY (Enter, Backspace, Tab, arrows, etc.) that
+/// insertText can't express. `key` is a DOM key name; we map the common ones to
+/// the windowsVirtualKeyCode CDP needs so the page's keydown handlers fire.
+#[tauri::command]
+pub async fn browser_key(
+    state: tauri::State<'_, BrowserProc>,
+    key: String,
+) -> Result<(), String> {
+    let (vk, dom_key, text): (i64, &str, &str) = match key.as_str() {
+        "Enter" => (13, "Enter", "\r"),
+        "Backspace" => (8, "Backspace", ""),
+        "Tab" => (9, "Tab", ""),
+        "Escape" => (27, "Escape", ""),
+        "ArrowUp" => (38, "ArrowUp", ""),
+        "ArrowDown" => (40, "ArrowDown", ""),
+        "ArrowLeft" => (37, "ArrowLeft", ""),
+        "ArrowRight" => (39, "ArrowRight", ""),
+        "Delete" => (46, "Delete", ""),
+        other => return Err(format!("unsupported key: {other}")),
+    };
+    let down = serde_json::json!({
+        "type": "keyDown", "key": dom_key, "windowsVirtualKeyCode": vk,
+        "nativeVirtualKeyCode": vk, "text": text,
+    });
+    session_call(&state, "Input.dispatchKeyEvent", down).await?;
+    let up = serde_json::json!({
+        "type": "keyUp", "key": dom_key, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk,
+    });
+    session_call(&state, "Input.dispatchKeyEvent", up).await?;
+    Ok(())
+}
+
 /// Add https:// to a bare host; leave full URLs + about:/file: as-is-ish.
 fn normalize_url(input: &str) -> String {
     let s = input.trim();

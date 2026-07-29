@@ -30,6 +30,9 @@ export function Browser() {
   const editRef = useRef<HTMLInputElement>(null);
   // Slice 2: the live frame streamed from Chromium (base64 JPEG data URL).
   const [frame, setFrame] = useState<string | null>(null);
+  // Slice 3: the frame element, so clicks/keys map to page coords + forward in.
+  const frameRef = useRef<HTMLImageElement>(null);
+  const [interactive, setInteractive] = useState(false); // human is driving
 
   const active = tabs.find((t) => t.id === activeId) ?? tabs[0];
 
@@ -65,6 +68,40 @@ export function Browser() {
       if (id === activeId) setActiveId(next[next.length - 1].id);
       return next;
     });
+  }
+
+  // --- Slice 3: forward human input on the live frame into Chromium ---------
+  // Map a pointer event to normalized 0..1 coords over the frame image.
+  function normCoords(e: React.PointerEvent | React.WheelEvent | React.MouseEvent) {
+    const el = frameRef.current;
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    const fx = (e.clientX - r.left) / r.width;
+    const fy = (e.clientY - r.top) / r.height;
+    return { fx: Math.min(Math.max(fx, 0), 1), fy: Math.min(Math.max(fy, 0), 1) };
+  }
+  function onFrameClick(e: React.MouseEvent) {
+    const c = normCoords(e);
+    if (!c) return;
+    setInteractive(true);
+    frameRef.current?.focus();
+    invoke("browser_click", { fx: c.fx, fy: c.fy, button: "left" }).catch(() => {});
+  }
+  function onFrameWheel(e: React.WheelEvent) {
+    const c = normCoords(e);
+    if (!c) return;
+    invoke("browser_scroll", { fx: c.fx, fy: c.fy, dx: e.deltaX, dy: e.deltaY }).catch(() => {});
+  }
+  function onFrameKeyDown(e: React.KeyboardEvent) {
+    // Special keys go via browser_key; printable chars via browser_type.
+    const special = ["Enter", "Backspace", "Tab", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Delete"];
+    if (special.includes(e.key)) {
+      e.preventDefault();
+      invoke("browser_key", { key: e.key }).catch(() => {});
+    } else if (e.key.length === 1 && !e.metaKey && !e.ctrlKey) {
+      e.preventDefault();
+      invoke("browser_type", { text: e.key }).catch(() => {});
+    }
   }
 
   // Click a tab: switch to it. If it's ALREADY active, enter URL-edit mode.
@@ -179,10 +216,18 @@ export function Browser() {
       }}>
         {frame ? (
           <img
+            ref={frameRef}
             src={frame}
             alt={active.page?.title || active.page?.url || "page"}
             draggable={false}
-            style={{ width: "100%", display: "block" }}
+            tabIndex={0}
+            onClick={onFrameClick}
+            onWheel={onFrameWheel}
+            onKeyDown={onFrameKeyDown}
+            style={{
+              width: "100%", display: "block", cursor: "pointer", outline: "none",
+              boxShadow: interactive ? "inset 0 0 0 2px var(--accent)" : "none",
+            }}
           />
         ) : (
           <div style={{
