@@ -33,15 +33,18 @@ export function App() {
   const [openSet, setOpenSet] = useState<Set<string>>(new Set());
   // Roster order = the canonical ordering source (same list the rail renders).
   const [rosterOrder, setRosterOrder] = useState<string[]>([]);
+  const [screen, setScreen] = useState<ScreenId>("chat");
+  const [mode, setMode] = useState<Mode>("light");
+  const [accent, setAccent] = useState("");
+  const [keySet, setKeySet] = useState(false);
+
+  // Load the canonical roster order (declared AFTER `screen` so the dep is in
+  // scope — TDZ: referencing `screen` above its declaration crashed the module).
   useEffect(() => {
     invoke<{ agents: AgentProfile[] }>("agents_list")
       .then((r) => setRosterOrder((r.agents || []).filter((a) => !a.archived).map((a) => a.id)))
       .catch(() => {});
   }, [screen]);
-  const [screen, setScreen] = useState<ScreenId>("chat");
-  const [mode, setMode] = useState<Mode>("light");
-  const [accent, setAccent] = useState("");
-  const [keySet, setKeySet] = useState(false);
 
   useEffect(() => { const t = initTheme(); setMode(t.mode); setAccent(t.accent); }, []);
   // Start the standing watcher for inter-agent (headless) turns so their live
