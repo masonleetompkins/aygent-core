@@ -170,7 +170,15 @@ export function Browser() {
   const label = (t: Tab) => t.title || (t.addr.trim() ? t.addr : "New Tab");
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0, gap: 8 }}>
+    // The Browser MUST be a strictly-bounded box: the native webview is
+    // positioned over paneRef's measured rect, so if paneRef is allowed to
+    // overflow its parent (it did — the ancestor scroll container is
+    // height:100vh/overflow:auto, and height:100% + flex:1 let the page row grow
+    // to content height), its border box sweeps across the whole window and the
+    // measured rect balloons. Clamp: fill available height, never exceed it,
+    // never scroll. absolute-inset guarantees a definite height regardless of
+    // the parent's flex quirks.
+    <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", minHeight: 0, gap: 8, overflow: "hidden" }}>
       {/* TAB ROW — active tab is the inline address field. */}
       <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
         {tabs.map((t) => {
@@ -222,10 +230,10 @@ export function Browser() {
       {/* PAGE (left) + AGENT PANE (right). The native webview tracks paneRef,
           which is the LEFT region; syncBounds shrinks it by AGENT_PANE_W when
           the agent pane is open, so the pane sits BESIDE the page. */}
-      <div style={{ flex: 1, minHeight: 0, display: "flex", gap: 10 }}>
+      <div style={{ flex: 1, minHeight: 0, minWidth: 0, display: "flex", gap: 10, overflow: "hidden" }}>
         {/* THE PAGE AREA — the native webview is positioned over THIS div. */}
         <div ref={paneRef} style={{
-          flex: 1, minWidth: 0, minHeight: 0, position: "relative",
+          flex: 1, minWidth: 0, minHeight: 0, height: "100%", position: "relative",
           border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-card)",
           background: "var(--bg)", overflow: "hidden",
         }}>
