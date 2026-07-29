@@ -108,14 +108,22 @@ export function App() {
   // M1.4 parallel UI: viewing an agent no longer changes which agents RUN. We
   // still call agents_set_active (so the primary Chat pane's folder/model track
   // the viewed agent), but every agent runs in the background regardless.
-  // Click a rail chip = FOCUS the agent + ensure its pane is OPEN. It NEVER
-  // closes a pane — that was the conflicting logic (a click on an open agent
-  // both focused AND closed it). Closing is now ONLY the pane's × button, so a
-  // chip click is always predictable: bring that agent front-and-center.
+  // Click a rail chip = TOGGLE its pane: closed → open (+ focus), open → closed.
+  // (If we're not on the Chat screen, a click just brings you there + opens/
+  // focuses — it never closes from another screen, since you can't see panes.)
   function onViewAgent(a: AgentProfile) {
-    if (screen !== "chat") setScreen("chat");
-    setOpenSet((prev) => (prev.has(a.id) ? prev : new Set(prev).add(a.id)));
-    focusAgent(a);
+    if (screen !== "chat") {
+      setScreen("chat");
+      setOpenSet((prev) => (prev.has(a.id) ? prev : new Set(prev).add(a.id)));
+      focusAgent(a);
+      return;
+    }
+    if (openSet.has(a.id)) {
+      closePane(a.id); // toggle CLOSED
+    } else {
+      setOpenSet((prev) => new Set(prev).add(a.id)); // toggle OPEN
+      focusAgent(a);
+    }
   }
   function focusAgent(a: AgentProfile) {
     invoke<AgentProfile | null>("agents_set_active", { id: a.id })
