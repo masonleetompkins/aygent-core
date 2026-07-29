@@ -14,7 +14,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "unstable"] }  # 'unstable' unlocks WebviewBuilder + Window::add_child — needed to EMBED a child webview inside the main window (the in-app browser). Pinned intentionally; Tauri gates multi-webview behind this flag on 2.x.
 tauri-plugin-dialog = "2"          # native folder picker (M0.2)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
