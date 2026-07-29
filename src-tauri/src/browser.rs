@@ -964,12 +964,16 @@ pub async fn webview_open(
     // positioned at the pane rect (NOT a free-floating child window).
     let main = app.get_webview_window("main").ok_or("no main window")?;
     let builder = tauri::webview::WebviewBuilder::new(WEBVIEW_LABEL, WebviewUrl::External(parsed));
-    main.add_child(
-        builder,
-        LogicalPosition::new(x, y),
-        LogicalSize::new(width.max(1.0), height.max(1.0)),
-    )
-    .map_err(|e| format!("embed webview: {e}"))?;
+    // add_child lives on the raw Window. WebviewWindow derefs to Webview
+    // (.as_ref()), whose .window() returns that Window — public under 'unstable'.
+    main.as_ref()
+        .window()
+        .add_child(
+            builder,
+            LogicalPosition::new(x, y),
+            LogicalSize::new(width.max(1.0), height.max(1.0)),
+        )
+        .map_err(|e| format!("embed webview: {e}"))?;
     Ok(())
 }
 
