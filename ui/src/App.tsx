@@ -108,10 +108,12 @@ export function App() {
         onView={onViewAgent}
         onManage={() => setScreen("agents")}
       />
-      <div style={{ flex: 1, height: "100vh", overflowY: "auto" }}>
+      <div style={{ flex: 1, height: "100vh", overflowY: "auto", display: "flex", flexDirection: "column" }}>
         {/* The persistent daemon-status strip was dev telemetry — removed. The
-           connection state now lives as a quiet sanity-check in Settings. */}
-        <div style={{ padding: "28px 32px" }}>
+           connection state now lives as a quiet sanity-check in Settings.
+           full-height flex column so height:100% children (Chat) can fill the
+           window and pin their footer to the bottom (no dead whitespace). */}
+        <div style={{ padding: "28px 32px", flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
           {screen === "chat" && <Chat folder={folder} keySet={keySet} agentId={activeAgent?.id ?? null} />}
           {screen === "agents" && (
             <Agents
