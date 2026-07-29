@@ -515,7 +515,6 @@ fn make_executable(exe: &Path) -> Result<(), String> {
 // ===========================================================================
 
 use std::sync::Mutex;
-use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 
 /// The running headless Chromium: the child process + the port its DevTools
 /// endpoint is on. Held in Tauri state so we launch ONCE and reuse.
@@ -587,21 +586,27 @@ async fn ensure_running(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
         .map_err(|e| format!("launch chromium: {e}"))?;
 
     // Chromium prints "DevTools listening on ws://127.0.0.1:PORT/..." to stderr
-    // once the endpoint is up. We wait for that line (with a timeout) instead of
-    // racing a fixed sleep. We only need to know it's READY; the actual ws URL we
-    // fetch fresh per-target via /json.
+    // once the endpoint is up. We wait for that line instead of racing a fixed
+    // sleep. Read it on a blocking thread with std::io (avoids needing tokio's
+    // `process` feature) and bound the wait with a tokio timeout.
     let stderr = child.stderr.take().ok_or("no chromium stderr")?;
-    let ready = tokio::time::timeout(std::time::Duration::from_secs(20), async move {
-        let mut lines = TokioBufReader::new(tokio::process::ChildStderr::from_std(stderr).map_err(|e| format!("stderr adopt: {e}"))?).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if line.contains("DevTools listening on") {
-                return Ok::<(), String>(());
+    let ready = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            use std::io::{BufRead, BufReader};
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                let line = line.map_err(|e| format!("stderr read: {e}"))?;
+                if line.contains("DevTools listening on") {
+                    return Ok(());
+                }
             }
-        }
-        Err("chromium exited before DevTools was ready".into())
-    })
+            Err("chromium exited before DevTools was ready".into())
+        }),
+    )
     .await
-    .map_err(|_| "timed out waiting for Chromium DevTools".to_string())??;
+    .map_err(|_| "timed out waiting for Chromium DevTools".to_string())?
+    .map_err(|e| format!("stderr watch join: {e}"))??;
     let _ = ready;
 
     let mut guard = state.inner.lock().map_err(|_| "browser state poisoned")?;
@@ -746,7 +751,6 @@ pub async fn browser_navigate(
         }
     }
 
-    use futures_util::SinkExt;
     let _ = ws.close(None).await;
 
     if data.is_empty() {
