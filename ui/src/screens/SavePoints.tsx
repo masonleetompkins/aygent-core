@@ -62,9 +62,9 @@ export function SavePoints({ folder }: { folder: string | null }) {
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 18, maxWidth: 680 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: 680 }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
-        <h2 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>Save Points</h2>
+        <h2 style={{ fontSize: "var(--text-h1)", fontWeight: "var(--weight-heading)", margin: 0 }}>Save Points</h2>
         <span style={hint}>Rewind your folder to any earlier state.</span>
       </div>
 

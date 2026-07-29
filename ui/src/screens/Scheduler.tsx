@@ -120,9 +120,9 @@ export function Scheduler({ agentId }: { agentId: string | null }) {
 
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 18, maxWidth: 720 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: 720 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <h2 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>Scheduler</h2>
+        <h2 style={{ fontSize: "var(--text-h1)", fontWeight: "var(--weight-heading)", margin: 0 }}>Scheduler</h2>
         <div style={{ display: "flex", gap: 8 }}>
           <Button variant="secondary" onClick={refresh}>↻ Refresh</Button>
           <Button variant="secondary" onClick={togglePauseAll}>

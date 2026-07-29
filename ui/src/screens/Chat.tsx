@@ -352,10 +352,10 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
   const running = turn.status === "running";
 
   return (
-    <div style={{ display: "flex", height: "calc(100vh - 130px)", gap: 16 }}>
+    <div style={{ display: "flex", height: "calc(100vh - 130px)", gap: "var(--space-4)" }}>
       {/* MAIN CHAT COLUMN (stays centered/left; history lives on the RIGHT) */}
       <div style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0, maxWidth: 720, margin: "0 auto" }}>
-        <h2 style={{ fontSize: 22, fontWeight: 800, margin: "0 0 12px" }}>Chat</h2>
+        <h2 style={{ fontSize: "var(--text-h1)", fontWeight: "var(--weight-heading)", margin: "0 0 var(--space-3)" }}>Chat</h2>
 
         {blocked && (
           <p style={{ ...hint, marginBottom: 12 }}>

@@ -64,8 +64,8 @@ export function Connections({ agentId }: { agentId: string | null }) {
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 18, maxWidth: 680 }}>
-      <h2 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>Connections</h2>
+    <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: 680 }}>
+      <h2 style={{ fontSize: "var(--text-h1)", fontWeight: "var(--weight-heading)", margin: 0 }}>Connections</h2>
       <p style={{ ...hint, marginTop: -8 }}>
         Plug an agent into your real accounts. Tokens live in your OS keychain — never in files, never
         sent to the internet by us. The agent only gets what a connected tool returns.

@@ -97,9 +97,9 @@ export function Agents({
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 720 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: 720 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800 }}>Agents</h2>
+        <h2 style={{ margin: 0, fontSize: "var(--text-h1)", fontWeight: "var(--weight-heading)" }}>Agents</h2>
         <Button onClick={() => setCreating(true)}>+ New Agent</Button>
       </div>
       <p style={hint}>

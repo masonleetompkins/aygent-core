@@ -7,10 +7,10 @@ export function Card({ title, children, style }: { title?: string; children: Rea
   return (
     <section
       className="bg-surface border border-line rounded-card shadow-elevation"
-      style={{ padding: "20px 22px", display: "flex", flexDirection: "column", gap: "12px", ...style }}
+      style={{ padding: "var(--card-pad)", display: "flex", flexDirection: "column", gap: "var(--card-gap)", ...style }}
     >
       {title && (
-        <div style={{ fontSize: 12, letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 700, color: "var(--text-muted)" }}>
+        <div style={{ fontSize: "var(--text-caption)", letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 700, color: "var(--text-muted)" }}>
           {title}
         </div>
       )}
