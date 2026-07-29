@@ -5,18 +5,22 @@ import { Icon, type IconName } from "./Icon";
 export type ScreenId =
   | "chat" | "agents" | "tools" | "settings" | "scheduler" | "connections" | "savepoints";
 
-export interface NavItem { id: ScreenId; label: string; icon: IconName; enabled: boolean; }
+export type NavGroup = "agent" | "global";
+export interface NavItem { id: ScreenId; label: string; icon: IconName; enabled: boolean; group: NavGroup; }
 
 // Phase-1 order. Only what's built is enabled; the rest show as "soon" so the
 // product shape is visible without pretending features exist.
+// Grouped so it's clear WHAT each item affects:
+//  • "This Agent"  — scoped to the agent(s) you're viewing (its folder/history)
+//  • "Global"      — app-wide (roster, connectors, app settings)
 export const NAV: NavItem[] = [
-  { id: "chat", label: "Chat", icon: "chat", enabled: true },
-  { id: "agents", label: "Agents", icon: "agents", enabled: true },
-  { id: "tools", label: "Tools", icon: "tools", enabled: true },
-  { id: "scheduler", label: "Scheduler", icon: "scheduler", enabled: true },
-  { id: "connections", label: "Connections", icon: "connections", enabled: true },
-  { id: "savepoints", label: "Save Points", icon: "savepoints", enabled: true },
-  { id: "settings", label: "Settings", icon: "settings", enabled: true },
+  { id: "chat", label: "Chat", icon: "chat", enabled: true, group: "agent" },
+  { id: "tools", label: "Tools", icon: "tools", enabled: true, group: "agent" },
+  { id: "scheduler", label: "Scheduler", icon: "scheduler", enabled: true, group: "agent" },
+  { id: "savepoints", label: "Save Points", icon: "savepoints", enabled: true, group: "agent" },
+  { id: "agents", label: "Agents", icon: "agents", enabled: true, group: "global" },
+  { id: "connections", label: "Connections", icon: "connections", enabled: true, group: "global" },
+  { id: "settings", label: "Settings", icon: "settings", enabled: true, group: "global" },
 ];
 
 export function Sidebar({ active, onSelect }: { active: ScreenId; onSelect: (id: ScreenId) => void }) {
@@ -30,13 +34,27 @@ export function Sidebar({ active, onSelect }: { active: ScreenId; onSelect: (id:
       <div style={{ padding: "6px 10px 16px", fontWeight: 800, letterSpacing: "0.14em", fontSize: 18 }}>
         AYGENT
       </div>
-      {NAV.map((item) => (
+      <SectionLabel>This Agent</SectionLabel>
+      {NAV.filter((i) => i.group === "agent").map((item) => (
+        <NavButton key={item.id} item={item} active={active === item.id} onSelect={onSelect} />
+      ))}
+      <SectionLabel style={{ marginTop: 14 }}>Global</SectionLabel>
+      {NAV.filter((i) => i.group === "global").map((item) => (
         <NavButton key={item.id} item={item} active={active === item.id} onSelect={onSelect} />
       ))}
       <div style={{ marginTop: "auto", padding: "10px", fontSize: 11, color: "var(--text-faint)" }}>
         v0.0.1 · Phase 1
       </div>
     </nav>
+  );
+}
+
+function SectionLabel({ children, style }: { children: ReactNode; style?: React.CSSProperties }) {
+  return (
+    <div style={{
+      padding: "6px 12px 4px", fontSize: "var(--text-caption)", fontWeight: 700,
+      letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-faint)", ...style,
+    }}>{children}</div>
   );
 }
 

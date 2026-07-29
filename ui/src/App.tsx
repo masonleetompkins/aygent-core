@@ -26,6 +26,11 @@ export function App() {
   const [status, setStatus] = useState<Status>({ kind: "booting" });
   const [folder, setFolder] = useState<string | null>(null);
   const [activeAgent, setActiveAgent] = useState<AgentProfile | null>(null);
+  // Multi-agent: which agents have an OPEN chat pane (side by side). The array
+  // order = left-to-right pane order. The "active" agent (rail highlight, folder
+  // scope for This-Agent screens) is the last one you focused; open panes are
+  // additive. Empty falls back to the single active agent.
+  const [openPaneIds, setOpenPaneIds] = useState<string[]>([]);
   const [screen, setScreen] = useState<ScreenId>("chat");
   const [mode, setMode] = useState<Mode>("light");
   const [accent, setAccent] = useState("");
@@ -93,28 +98,49 @@ export function App() {
   // M1.4 parallel UI: viewing an agent no longer changes which agents RUN. We
   // still call agents_set_active (so the primary Chat pane's folder/model track
   // the viewed agent), but every agent runs in the background regardless.
+  // Click a rail chip: focus that agent (active = its folder/model). On the Chat
+  // screen, ensure it has an open pane (adds one if not already open) so you can
+  // build up a side-by-side wall of agents. Other screens just switch focus.
   function onViewAgent(a: AgentProfile) {
     invoke<AgentProfile | null>("agents_set_active", { id: a.id })
       .then((updated) => { if (updated) onActiveChange(updated); else onActiveChange(a); })
       .catch(() => onActiveChange(a));
     if (screen !== "chat") setScreen("chat");
+    setOpenPaneIds((ids) => (ids.includes(a.id) ? ids : [...ids, a.id]));
   }
+  function closePane(id: string) {
+    setOpenPaneIds((ids) => ids.filter((x) => x !== id));
+  }
+  // The panes to render: explicit open set, else fall back to the active agent.
+  const paneIds = openPaneIds.length > 0
+    ? openPaneIds
+    : (activeAgent?.id ? [activeAgent.id] : []);
 
   return (
     <div style={{ display: "flex", minHeight: "100vh" }}>
-      <Sidebar active={screen} onSelect={setScreen} />
+      {/* Agent selector is the top-level axis → far left. */}
       <AgentRail
         viewingId={activeAgent?.id ?? null}
+        openIds={paneIds}
         onView={onViewAgent}
         onManage={() => setScreen("agents")}
       />
+      <Sidebar active={screen} onSelect={setScreen} />
       <div style={{ flex: 1, height: "100vh", overflowY: "auto", display: "flex", flexDirection: "column" }}>
         {/* The persistent daemon-status strip was dev telemetry — removed. The
            connection state now lives as a quiet sanity-check in Settings.
            full-height flex column so height:100% children (Chat) can fill the
            window and pin their footer to the bottom (no dead whitespace). */}
         <div style={{ padding: "28px 32px", flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-          {screen === "chat" && <Chat folder={folder} keySet={keySet} agentId={activeAgent?.id ?? null} />}
+          {screen === "chat" && (
+            <Chat
+              keySet={keySet}
+              paneIds={paneIds}
+              activeId={activeAgent?.id ?? null}
+              onClosePane={closePane}
+              onFocusPane={(id) => { invoke<AgentProfile | null>("agents_set_active", { id }).then((u) => { if (u) onActiveChange(u); }).catch(() => {}); }}
+            />
+          )}
           {screen === "agents" && (
             <Agents
               activeId={activeAgent?.id ?? null}

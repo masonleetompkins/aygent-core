@@ -8,6 +8,7 @@ import { Button } from "../components/ui";
 import { Icon, type IconName } from "../components/Icon";
 import { Markdown } from "../components/Markdown";
 import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound } from "../lib/turns";
+import type { AgentProfile } from "../components/AgentSwitcher";
 
 type ToolLine = { name: string; path: string; ok?: boolean; detail?: string };
 type Msg =
@@ -18,7 +19,66 @@ const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 
 type ConvMeta = { id: string; title: string; updated: number; pinned: boolean; order: number };
 
-export function Chat({ folder, keySet, agentId }: { folder: string | null; keySet: boolean; agentId: string | null }) {
+// MULTI-AGENT container: renders one ChatPane per open agent, side by side, each
+// with its own name header. Focus (click a pane) sets it as the active agent so
+// This-Agent screens (Tools/SavePoints/etc) + the folder scope track it.
+export function Chat({
+  keySet, paneIds, activeId, onClosePane, onFocusPane,
+}: {
+  keySet: boolean;
+  paneIds: string[];
+  activeId: string | null;
+  onClosePane: (id: string) => void;
+  onFocusPane: (id: string) => void;
+}) {
+  const [roster, setRoster] = useState<Record<string, AgentProfile>>({});
+  useEffect(() => {
+    invoke<{ agents: AgentProfile[] }>("agents_list")
+      .then((r) => { const m: Record<string, AgentProfile> = {}; for (const a of (r.agents || [])) m[a.id] = a; setRoster(m); })
+      .catch(() => {});
+  }, [paneIds.join(",")]);
+
+  if (paneIds.length === 0) {
+    return <p style={hint}>No agent open. Pick one from the rail on the left, or create one in Agents.</p>;
+  }
+
+  return (
+    <div style={{ display: "flex", height: "100%", minHeight: 0, gap: "var(--space-4)" }}>
+      {paneIds.map((id) => (
+        <div
+          key={id}
+          onPointerDownCapture={() => { if (id !== activeId) onFocusPane(id); }}
+          style={{
+            flex: 1, minWidth: 0, display: "flex", flexDirection: "column", minHeight: 0,
+            // multi-pane: divider + subtle active outline so it's clear which
+            // agent is focused (drives This-Agent screens + folder scope).
+            border: paneIds.length > 1
+              ? `var(--border-width) solid ${id === activeId ? "var(--accent)" : "var(--line)"}`
+              : "none",
+            borderRadius: paneIds.length > 1 ? "var(--radius-card)" : 0,
+            padding: paneIds.length > 1 ? "var(--space-3)" : 0,
+          }}
+        >
+          <ChatPane
+            agent={roster[id] ?? null}
+            agentId={id}
+            folder={roster[id]?.folder_path ?? null}
+            keySet={keySet}
+            multi={paneIds.length > 1}
+            closable={paneIds.length > 1}
+            onClose={() => onClosePane(id)}
+          />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: {
+  agent: AgentProfile | null;
+  folder: string | null; keySet: boolean; agentId: string | null;
+  multi: boolean; closable: boolean; onClose: () => void;
+}) {
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   // `busy` is now DERIVED from the per-agent turn store (see `running` below),
@@ -365,17 +425,31 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
 
   return (
     <div style={{ display: "flex", height: "100%", minHeight: 0, gap: "var(--space-4)" }}>
-      {/* MAIN CHAT COLUMN (stays centered/left; history lives on the RIGHT).
-         height:100% + the column flexes so the input pins to the true bottom. */}
-      <div style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0, minHeight: 0, maxWidth: 720, margin: "0 auto" }}>
-        {/* Header: "Chat" + editable chat name underneath. */}
-        <div style={{ margin: "0 0 var(--space-3)", flexShrink: 0 }}>
-          <h2 style={{ fontSize: "var(--text-h1)", fontWeight: "var(--weight-heading)", margin: 0 }}>Chat</h2>
-          <ChatTitle
-            title={convs.find((c) => c.id === convId)?.title || ""}
-            disabled={!folder || !convId}
-            onRename={(next) => renameCurrent(next)}
-          />
+      {/* MAIN CHAT COLUMN. In multi-pane mode it flexes to share width; solo it
+         stays centered. height:100% + flex so the input pins to the bottom. */}
+      <div style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0, minHeight: 0, maxWidth: multi ? "none" : 720, margin: multi ? 0 : "0 auto" }}>
+        {/* Header: agent name (multi) or "Chat" + editable chat name underneath.
+           In multi-pane, each pane is labeled with its AGENT so you always know
+           who you're talking to; a close button removes just this pane. */}
+        <div style={{ margin: "0 0 var(--space-3)", flexShrink: 0, display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
+          <div style={{ minWidth: 0 }}>
+            <h2 style={{ fontSize: "var(--text-h1)", fontWeight: "var(--weight-heading)", margin: 0, display: "flex", alignItems: "center", gap: 8, overflow: "hidden" }}>
+              {multi && <span style={{ color: "var(--accent)", display: "flex" }}><Icon name={(agent?.icon as IconName) || "sparkles"} size={20} /></span>}
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{multi ? (agent?.name || "Agent") : "Chat"}</span>
+            </h2>
+            <ChatTitle
+              title={convs.find((c) => c.id === convId)?.title || ""}
+              disabled={!folder || !convId}
+              onRename={(next) => renameCurrent(next)}
+            />
+          </div>
+          {closable && (
+            <button
+              onClick={onClose}
+              title="Close this pane"
+              style={{ background: "none", border: "none", cursor: "pointer", padding: 4, display: "flex", color: "var(--text-muted)", flexShrink: 0 }}
+            ><Icon name="close" size={16} /></button>
+          )}
         </div>
 
         {blocked && (

@@ -18,11 +18,13 @@ type Activity = { agentId: string; kind: "turn_start" | "turn_done"; from?: stri
 
 export function AgentRail({
   viewingId,
+  openIds,
   onView,
   onManage,
   refreshKey,
 }: {
   viewingId: string | null;
+  openIds?: string[]; // agents with an OPEN chat pane (side-by-side dot)
   onView: (a: AgentProfile) => void;
   onManage: () => void;
   refreshKey?: number; // bump to force a re-list (e.g. after create/delete)
@@ -96,6 +98,7 @@ export function AgentRail({
         const viewing = a.id === viewingId;
         const busy = !!working[a.id];
         const badge = unread[a.id] || 0;
+        const open = openIds?.includes(a.id) ?? false;
         return (
           <button
             key={a.id}
@@ -118,6 +121,14 @@ export function AgentRail({
             }}
           >
             <Icon name={(a.icon as IconName) || "sparkles"} size={22} />
+            {/* open-pane indicator: a small accent dot on the left edge so you
+                can see at a glance which agents have a live side-by-side pane. */}
+            {open && !viewing && (
+              <span style={{
+                position: "absolute", left: -1, top: "50%", transform: "translateY(-50%)",
+                width: 3, height: 18, borderRadius: 2, background: "var(--accent)",
+              }} />
+            )}
             {badge > 0 && (
               <span style={{
                 position: "absolute", top: -3, right: -3, minWidth: 16, height: 16,
