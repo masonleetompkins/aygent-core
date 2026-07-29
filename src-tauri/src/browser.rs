@@ -515,9 +515,12 @@ fn make_executable(exe: &Path) -> Result<(), String> {
 // ===========================================================================
 
 use std::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 /// The running headless Chromium: the child process + the port its DevTools
-/// endpoint is on. Held in Tauri state so we launch ONCE and reuse.
+/// endpoint is on + the live CDP session (Slice 2). Held in Tauri state so we
+/// launch ONCE and reuse.
 #[derive(Default)]
 pub struct BrowserProc {
     inner: Mutex<Option<RunningBrowser>>,
@@ -526,6 +529,24 @@ pub struct BrowserProc {
 struct RunningBrowser {
     child: std::process::Child,
     port: u16,
+    /// The live CDP session pump (Slice 2). None until a page session opens.
+    session: Option<CdpSession>,
+}
+
+/// A live CDP session: a channel to SEND a request into the pump task + get its
+/// reply, plus the last-known device pixel ratio (for input coord mapping in
+/// Slice 3). The pump task owns the WebSocket; commands talk to it via `tx`.
+struct CdpSession {
+    tx: mpsc::UnboundedSender<CdpRequest>,
+    /// Bumped each session so a stale pump can't clobber a newer one.
+    id: u64,
+}
+
+/// One request to the pump: a CDP method + params + a oneshot for the result.
+struct CdpRequest {
+    method: String,
+    params: serde_json::Value,
+    reply: oneshot::Sender<Result<serde_json::Value, String>>,
 }
 
 impl BrowserProc {
@@ -610,8 +631,166 @@ async fn ensure_running(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
     let _ = ready;
 
     let mut guard = state.inner.lock().map_err(|_| "browser state poisoned")?;
-    *guard = Some(RunningBrowser { child, port });
+    *guard = Some(RunningBrowser { child, port, session: None });
     Ok(port)
+}
+
+// ---------------------------------------------------------------------------
+// SLICE 2 — LIVE SCREENCAST SESSION.
+//
+// One persistent CDP WebSocket per browser, owned by a background "pump" task.
+// The pump: (a) forwards outbound CDP requests (from commands, via a channel)
+// and routes replies back by id; (b) receives `Page.screencastFrame` events and
+// emits them to the UI as `browser:frame` Tauri events (base64 JPEG), acking
+// each so Chromium keeps streaming. This replaces Slice 1's navigate→screenshot
+// →close with a live view + is exactly the socket Slice 3 forwards input into.
+// ---------------------------------------------------------------------------
+
+/// Session generation counter so a stale pump never clobbers a newer session.
+static SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Ensure a live CDP session exists (open the persistent socket + spawn the pump
+/// + start the screencast). Idempotent: returns quickly if one is already live.
+async fn ensure_session(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>) -> Result<(), String> {
+    let port = ensure_running(app, state).await?;
+    // Already have a live session?
+    {
+        let guard = state.inner.lock().map_err(|_| "browser state poisoned")?;
+        if let Some(rb) = guard.as_ref() {
+            if rb.session.is_some() {
+                return Ok(());
+            }
+        }
+    }
+
+    let client = reqwest::Client::new();
+    let ws_url = page_ws_url(&client, port).await?;
+    use tokio_tungstenite::connect_async;
+    let (ws, _) = connect_async(&ws_url).await.map_err(|e| format!("cdp connect: {e}"))?;
+
+    let (tx, rx) = mpsc::unbounded_channel::<CdpRequest>();
+    let session_id = SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let app_handle = app.clone();
+
+    // Spawn the pump. It owns the socket for the session's life.
+    tokio::spawn(pump(ws, rx, app_handle, session_id));
+
+    // Store the session handle.
+    {
+        let mut guard = state.inner.lock().map_err(|_| "browser state poisoned")?;
+        if let Some(rb) = guard.as_mut() {
+            rb.session = Some(CdpSession { tx, id: session_id });
+        }
+    }
+
+    // Enable the domains + start the screencast (JPEG, capped size for latency).
+    session_call(state, "Page.enable", serde_json::json!({})).await?;
+    session_call(state, "Runtime.enable", serde_json::json!({})).await?;
+    session_call(
+        state,
+        "Page.startScreencast",
+        serde_json::json!({ "format": "jpeg", "quality": 60, "maxWidth": 1280, "maxHeight": 800, "everyNthFrame": 1 }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// The pump task: owns the WS, routes request/reply by id, forwards screencast
+/// frames to the UI. Ends when the socket closes or the request channel drops.
+async fn pump(
+    ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    mut rx: mpsc::UnboundedReceiver<CdpRequest>,
+    app: tauri::AppHandle,
+    _session_id: u64,
+) {
+    use futures_util::{SinkExt, StreamExt};
+    use tauri::Emitter;
+    use tokio_tungstenite::tungstenite::Message;
+    use std::collections::HashMap;
+
+    let (mut sink, mut stream) = ws.split();
+    let mut next_id: u64 = 1;
+    let mut pending: HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            // Outbound: a command wants to make a CDP call.
+            req = rx.recv() => {
+                let Some(req) = req else { break; }; // channel dropped -> session gone
+                let id = next_id; next_id += 1;
+                let frame = serde_json::json!({ "id": id, "method": req.method, "params": req.params });
+                if sink.send(Message::Text(frame.to_string().into())).await.is_err() {
+                    let _ = req.reply.send(Err("cdp socket send failed".into()));
+                    break;
+                }
+                pending.insert(id, req.reply);
+            }
+            // Inbound: a CDP reply or event.
+            msg = stream.next() => {
+                let msg = match msg {
+                    Some(Ok(Message::Text(t))) => t,
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) => break,
+                };
+                let v: serde_json::Value = match serde_json::from_str(&msg) { Ok(v) => v, Err(_) => continue };
+                if let Some(id) = v["id"].as_u64() {
+                    if let Some(reply) = pending.remove(&id) {
+                        if let Some(err) = v.get("error") {
+                            let _ = reply.send(Err(format!("cdp: {err}")));
+                        } else {
+                            let _ = reply.send(Ok(v["result"].clone()));
+                        }
+                    }
+                    continue;
+                }
+                // An event.
+                match v["method"].as_str() {
+                    Some("Page.screencastFrame") => {
+                        let data = v["params"]["data"].as_str().unwrap_or("").to_string();
+                        let session = v["params"]["sessionId"].as_i64().unwrap_or(0);
+                        let meta = v["params"]["metadata"].clone();
+                        // Emit the frame to the UI (base64 JPEG + device metrics).
+                        let _ = app.emit("browser:frame", &serde_json::json!({
+                            "data": format!("data:image/jpeg;base64,{data}"),
+                            "metadata": meta,
+                        }));
+                        // ACK so Chromium keeps streaming.
+                        let ack = serde_json::json!({ "id": next_id, "method": "Page.screencastFrameAck", "params": { "sessionId": session } });
+                        next_id += 1;
+                        let _ = sink.send(Message::Text(ack.to_string().into())).await;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Pump ending: fail any pending replies.
+    for (_, reply) in pending.drain() {
+        let _ = reply.send(Err("cdp session ended".into()));
+    }
+}
+
+/// Make a CDP call on the live session (via the pump). Opens the session first
+/// if needed is the CALLER's job (call ensure_session). Returns the result.
+async fn session_call(
+    state: &tauri::State<'_, BrowserProc>,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let tx = {
+        let guard = state.inner.lock().map_err(|_| "browser state poisoned")?;
+        let rb = guard.as_ref().ok_or("browser not running")?;
+        let sess = rb.session.as_ref().ok_or("no live browser session")?;
+        sess.tx.clone()
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(CdpRequest { method: method.to_string(), params, reply: reply_tx })
+        .map_err(|_| "cdp session gone".to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx)
+        .await
+        .map_err(|_| format!("cdp {method}: timed out"))?
+        .map_err(|_| format!("cdp {method}: no reply"))?
 }
 
 /// Fetch the CDP WebSocket URL for a fresh page target via the HTTP /json API.
@@ -642,100 +821,26 @@ async fn page_ws_url(client: &reqwest::Client, port: u16) -> Result<String, Stri
         .ok_or_else(|| "target has no webSocketDebuggerUrl".into())
 }
 
-/// Minimal CDP call over a page WebSocket: send one method + params, wait for
-/// the reply with the matching id, return its `result`. (Slice 1 does a small
-/// fixed sequence, so a per-call open/close socket is fine.)
-async fn cdp_call(
-    ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    id: u64,
-    method: &str,
-    params: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message;
-    let req = serde_json::json!({ "id": id, "method": method, "params": params });
-    ws.send(Message::Text(req.to_string().into()))
-        .await
-        .map_err(|e| format!("cdp send {method}: {e}"))?;
-    // Read frames until we get our id (skip events + other ids).
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(format!("cdp {method}: timed out"));
-        }
-        let frame = tokio::time::timeout(remaining, ws.next())
-            .await
-            .map_err(|_| format!("cdp {method}: timed out"))?;
-        let msg = match frame {
-            Some(Ok(Message::Text(t))) => t,
-            Some(Ok(Message::Close(_))) | None => return Err(format!("cdp {method}: socket closed")),
-            Some(Ok(_)) => continue, // ping/binary — ignore
-            Some(Err(e)) => return Err(format!("cdp {method} recv: {e}")),
-        };
-        let v: serde_json::Value = match serde_json::from_str(&msg) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if v["id"].as_u64() == Some(id) {
-            if let Some(err) = v.get("error") {
-                return Err(format!("cdp {method}: {err}"));
-            }
-            return Ok(v["result"].clone());
-        }
-        // else: an event or another call's reply — keep reading.
-    }
-}
-
-/// SLICE 1 — navigate to `url` and return a base64 PNG screenshot of the page.
-/// This is the first time the browser DOES something the human can SEE inside
-/// AYGENT. Also returns the final URL + page title.
+/// SLICE 2 — navigate the LIVE session to `url`. Frames stream to the UI via
+/// `browser:frame` events (started by ensure_session); this just points the
+/// page at the URL and returns the final url + title once it settles.
 #[tauri::command]
 pub async fn browser_navigate(
     app: tauri::AppHandle,
     state: tauri::State<'_, BrowserProc>,
     url: String,
 ) -> Result<serde_json::Value, String> {
-    use tokio_tungstenite::connect_async;
-
-    // Normalize a bare host into a URL (so "example.com" works).
     let url = normalize_url(&url);
+    ensure_session(&app, &state).await?;
 
-    let port = ensure_running(&app, &state).await?;
-    let client = reqwest::Client::new();
-    let ws_url = page_ws_url(&client, port).await?;
-    let (mut ws, _) = connect_async(&ws_url)
-        .await
-        .map_err(|e| format!("cdp connect: {e}"))?;
+    session_call(&state, "Page.navigate", serde_json::json!({ "url": url })).await?;
+    // Let it settle so the URL/title read is post-load. Frames are already
+    // streaming live regardless, so this delay doesn't gate what the user SEES.
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
 
-    let mut id = 1u64;
-    let mut next = || { let n = id; id += 1; n };
-
-    // Enable the domains we use.
-    cdp_call(&mut ws, next(), "Page.enable", serde_json::json!({})).await?;
-
-    // Navigate.
-    cdp_call(&mut ws, next(), "Page.navigate", serde_json::json!({ "url": url })).await?;
-
-    // Give the page a moment to render (Slice 1 is a simple settle; S2's
-    // screencast will stream live frames instead of a single settled shot).
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-
-    // Capture a PNG screenshot (base64).
-    let shot = cdp_call(
-        &mut ws,
-        next(),
-        "Page.captureScreenshot",
-        serde_json::json!({ "format": "png" }),
-    )
-    .await?;
-    let data = shot["data"].as_str().unwrap_or("").to_string();
-
-    // Read the final URL + title (best-effort).
     let (mut final_url, mut title) = (url.clone(), String::new());
-    if let Ok(r) = cdp_call(
-        &mut ws,
-        next(),
+    if let Ok(r) = session_call(
+        &state,
         "Runtime.evaluate",
         serde_json::json!({ "expression": "JSON.stringify([location.href, document.title])", "returnByValue": true }),
     )
@@ -743,24 +848,22 @@ pub async fn browser_navigate(
     {
         if let Some(s) = r["result"]["value"].as_str() {
             if let Ok(arr) = serde_json::from_str::<Vec<String>>(s) {
-                if arr.len() == 2 {
-                    final_url = arr[0].clone();
-                    title = arr[1].clone();
-                }
+                if arr.len() == 2 { final_url = arr[0].clone(); title = arr[1].clone(); }
             }
         }
     }
 
-    let _ = ws.close(None).await;
+    Ok(serde_json::json!({ "url": final_url, "title": title }))
+}
 
-    if data.is_empty() {
-        return Err("screenshot empty".into());
-    }
-    Ok(serde_json::json!({
-        "screenshot": format!("data:image/png;base64,{data}"),
-        "url": final_url,
-        "title": title,
-    }))
+/// Start (or restart) the live view without navigating — used when the UI opens
+/// the Browser tab so frames begin streaming immediately.
+#[tauri::command]
+pub async fn browser_start_view(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, BrowserProc>,
+) -> Result<(), String> {
+    ensure_session(&app, &state).await
 }
 
 /// Add https:// to a bare host; leave full URLs + about:/file: as-is-ish.
@@ -797,10 +900,12 @@ fn urlencoding_encode(s: &str) -> String {
 }
 
 /// Shut the headless browser down (frees RAM). Safe to call when not running.
+/// Dropping the session's tx ends the pump task (which closes the socket).
 #[tauri::command]
 pub fn browser_shutdown(state: tauri::State<'_, BrowserProc>) -> Result<(), String> {
     let mut guard = state.inner.lock().map_err(|_| "browser state poisoned")?;
     if let Some(mut rb) = guard.take() {
+        drop(rb.session.take()); // ends the pump
         let _ = rb.child.kill();
         let _ = rb.child.wait();
     }

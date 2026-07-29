@@ -6,6 +6,7 @@
 // screenshot for now (Slice 2 = live screencast; Slice 3 = click-into-it).
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Pill } from "../components/ui";
 import { Icon } from "../components/Icon";
 
@@ -27,8 +28,25 @@ export function Browser() {
   const [tabs, setTabs] = useState<Tab[]>([newTab()]);
   const [activeId, setActiveId] = useState<number>(() => tabs[0].id);
   const editRef = useRef<HTMLInputElement>(null);
+  // Slice 2: the live frame streamed from Chromium (base64 JPEG data URL).
+  const [frame, setFrame] = useState<string | null>(null);
 
   const active = tabs.find((t) => t.id === activeId) ?? tabs[0];
+
+  // Slice 2: start the live view + subscribe to streamed frames when the tab
+  // mounts (only once the browser is installed).
+  useEffect(() => {
+    if (installed !== true) return;
+    let un: undefined | (() => void);
+    let alive = true;
+    (async () => {
+      un = await listen<{ data: string }>("browser:frame", (e) => {
+        if (alive && e.payload?.data) setFrame(e.payload.data);
+      });
+      invoke("browser_start_view").catch(() => {});
+    })();
+    return () => { alive = false; un?.(); };
+  }, [installed]);
 
   function patch(id: number, p: Partial<Tab>) {
     setTabs((ts) => ts.map((t) => (t.id === id ? { ...t, ...p } : t)));
@@ -152,16 +170,18 @@ export function Browser() {
 
       {active.err && <Pill tone="danger">✗ {active.err}</Pill>}
 
-      {/* RENDERED PAGE for the active tab. */}
+      {/* LIVE PAGE (Slice 2): the streamed frame updates in real time. Slice 3
+          will forward clicks/keys on this surface into Chromium. */}
       <div style={{
         flex: 1, minHeight: 0, border: "var(--border-width) solid var(--line)",
         borderRadius: "var(--radius-card)", background: "var(--bg)", overflow: "auto",
-        display: "flex", flexDirection: "column",
+        display: "flex", flexDirection: "column", position: "relative",
       }}>
-        {active.page ? (
+        {frame ? (
           <img
-            src={active.page.screenshot}
-            alt={active.page.title || active.page.url}
+            src={frame}
+            alt={active.page?.title || active.page?.url || "page"}
+            draggable={false}
             style={{ width: "100%", display: "block" }}
           />
         ) : (
