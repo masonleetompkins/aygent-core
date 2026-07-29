@@ -912,6 +912,213 @@ pub async fn browser_start_view(
     ensure_session(&app, &state).await
 }
 
+// ===========================================================================
+// REAL EMBEDDED WEBVIEW (the human's actual browser).
+//
+// The screencast (above) was foggy glass — a JPEG video of a browser you can't
+// select text in. WRONG tool for a human. This is the right one: a REAL native
+// child webview (WKWebView on macOS) rendered INSIDE the AYGENT window, over the
+// Browser pane. Crisp text, native selection, hover, scroll, real DOM. YOU
+// browse in this.
+//
+// THE MAGIC — hand-off: the same webview the human browses is ALSO driveable by
+// the agent via `eval` (inject JS to click/type/read). So "hand off to agent"
+// doesn't switch surfaces — the agent acts in the exact window you're looking at
+// while you watch. Toggle back instantly; same page, same session, no reload.
+//
+// The screencast/CDP path stays for HEADLESS agent-only browsing (scheduled/
+// background). This webview is the interactive human+handoff surface.
+// ===========================================================================
+
+const WEBVIEW_LABEL: &str = "aygent-browser";
+
+/// Create the embedded browser webview if absent, positioned + sized to the
+/// Browser pane rect (CSS px from the UI). Navigates to `url`. Idempotent:
+/// re-shows + repositions an existing one.
+#[tauri::command]
+pub async fn webview_open(
+    app: tauri::AppHandle,
+    url: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    use tauri::{LogicalPosition, LogicalSize, Manager, WebviewUrl};
+    let target = normalize_url(&url);
+    let parsed = target.parse().map_err(|e| format!("bad url: {e}"))?;
+
+    if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
+        // Already exists: reposition, show, navigate.
+        let _ = wv.set_position(LogicalPosition::new(x, y));
+        let _ = wv.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
+        wv.navigate(parsed).map_err(|e| format!("navigate: {e}"))?;
+        return Ok(());
+    }
+
+    // Add a child webview to the main window at the given rect.
+    let win = app.get_window("main").ok_or("no main window")?;
+    let builder = tauri::webview::WebviewBuilder::new(WEBVIEW_LABEL, WebviewUrl::External(parsed));
+    win.add_child(
+        builder,
+        LogicalPosition::new(x, y),
+        LogicalSize::new(width.max(1.0), height.max(1.0)),
+    )
+    .map_err(|e| format!("add child webview: {e}"))?;
+    Ok(())
+}
+
+/// Reposition/resize the embedded webview to track the pane (called on layout
+/// changes / scroll). No-op if it doesn't exist.
+#[tauri::command]
+pub fn webview_set_bounds(
+    app: tauri::AppHandle,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    use tauri::{LogicalPosition, LogicalSize, Manager};
+    if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
+        let _ = wv.set_position(LogicalPosition::new(x, y));
+        let _ = wv.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
+    }
+    Ok(())
+}
+
+/// Hide the embedded webview (move it off-screen — Tauri child webviews have no
+/// hide(); shrinking to 0 is the reliable cross-version approach). Used when the
+/// user leaves the Browser tab so it doesn't float over other screens.
+#[tauri::command]
+pub fn webview_hide(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::{LogicalSize, Manager};
+    if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
+        let _ = wv.set_size(LogicalSize::new(0.0, 0.0));
+    }
+    Ok(())
+}
+
+/// Navigate the embedded webview to a URL (address bar).
+#[tauri::command]
+pub fn webview_navigate(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    use tauri::Manager;
+    let target = normalize_url(&url);
+    let parsed = target.parse().map_err(|e| format!("bad url: {e}"))?;
+    let wv = app.get_webview(WEBVIEW_LABEL).ok_or("browser not open")?;
+    wv.navigate(parsed).map_err(|e| format!("navigate: {e}"))
+}
+
+/// Close/destroy the embedded webview entirely.
+#[tauri::command]
+pub fn webview_close(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
+        let _ = wv.close();
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// THE HAND-OFF: the agent acts IN the human's webview.
+//
+// When the human hands off, this runs a small agent loop where the model's ONLY
+// tools operate on the live webview via injected JS: read the page, click by
+// text, type, scroll. The agent works in the EXACT window the human is watching
+// (same DOM, same session, same cookies) — not a separate headless browser.
+//
+// We reuse the app's existing Anthropic provider primitive. The webview eval
+// runs page-side JS + returns a result the model reads back (page text after an
+// action). This is a focused, self-contained loop — the model gets the task +
+// the current page text + the webview tools, and iterates until done.
+// ---------------------------------------------------------------------------
+
+/// Run one JS expression in the human's webview and return the JSON-stringified
+/// result. Uses a Tauri IPC round-trip: the injected script posts its result
+/// back on a one-shot channel keyed by a nonce.
+pub async fn webview_eval(app: &tauri::AppHandle, expr: &str) -> Result<String, String> {
+    use tauri::{Manager, Emitter, Listener};
+    let wv = app.get_webview(WEBVIEW_LABEL).ok_or("browser not open")?;
+    let nonce = format!("wvr_{}", SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    let tx = std::sync::Mutex::new(Some(tx));
+
+    // Listen once for the result event the injected script emits.
+    let handler = app.once(nonce.clone(), move |ev| {
+        if let Ok(mut g) = tx.lock() {
+            if let Some(sender) = g.take() {
+                let _ = sender.send(ev.payload().to_string());
+            }
+        }
+    });
+
+    // Inject: eval the expression, emit the (stringified) result back to Rust.
+    // Wrapped so an exception becomes a readable string instead of silent fail.
+    let script = format!(
+        "(async () => {{ let r; try {{ r = JSON.stringify(await (async()=>({expr}))()); }} catch(e) {{ r = 'ERR: '+ (e && e.message || e); }} \
+         if (window.__TAURI__ && window.__TAURI__.event) {{ window.__TAURI__.event.emit({nonce:?}, r); }} }})()",
+        expr = expr, nonce = nonce
+    );
+    wv.eval(&script).map_err(|e| { app.unlisten(handler); format!("eval: {e}") })?;
+
+    match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(_)) => Err("webview eval channel closed".into()),
+        Err(_) => { app.unlisten(handler); Err("webview eval timed out".into()) }
+    }
+}
+
+/// THE HAND-OFF COMMAND. The human typed a task in the prompt bar; drive the
+/// agent to do it in the live webview. Slice-thin agent loop with webview tools.
+#[tauri::command]
+pub async fn webview_agent_act(app: tauri::AppHandle, task: String) -> Result<String, String> {
+    // Read the current page so the agent knows what it's looking at.
+    let page = webview_eval(
+        &app,
+        "({title: document.title, url: location.href, text: (document.body?document.body.innerText:'').slice(0,4000)})",
+    )
+    .await
+    .unwrap_or_else(|_| "{}".into());
+
+    // For Slice-1 of the hand-off we do a DIRECT interpretation: the agent's
+    // action verbs map to webview JS. A full model-in-the-loop version routes
+    // through agent_stream; this focused version keeps the hand-off SNAPPY +
+    // self-contained (the model call is a follow-up wire-up). We interpret a few
+    // natural commands directly so the loop is real + demoable today.
+    let t = task.to_lowercase();
+    if let Some(rest) = t.strip_prefix("click ") {
+        let target = rest.trim().trim_matches('"');
+        let expr = format!(
+            "(() => {{ const t={target:?}; const els=[...document.querySelectorAll('a,button,input[type=submit],[role=button],label')]; \
+             const el=els.find(e=>(e.innerText||e.value||'').toLowerCase().includes(t)); \
+             if(!el) return 'no element matching '+t; el.click(); return 'clicked: '+(el.innerText||el.value||t).slice(0,60); }})()",
+            target = target
+        );
+        return webview_eval(&app, &expr).await.map(|r| r.trim_matches('"').to_string());
+    }
+    if t.starts_with("scroll") {
+        let _ = webview_eval(&app, "(()=>{window.scrollBy(0, window.innerHeight*0.8); return 'scrolled';})()").await;
+        return Ok("scrolled down".into());
+    }
+    if t.starts_with("summar") || t.starts_with("read") || t.starts_with("what") {
+        // Return the page text for the model layer to summarize. (Until the
+        // model call is wired, hand back the visible text so the human sees it.)
+        return Ok(format!("Current page: {page}"));
+    }
+    if let Some(rest) = t.strip_prefix("type ") {
+        let text = rest.trim().trim_matches('"');
+        let expr = format!(
+            "(() => {{ const el=document.activeElement; if(!el||!('value' in el)) return 'no focused input'; \
+             el.value={text:?}; el.dispatchEvent(new Event('input',{{bubbles:true}})); return 'typed'; }})()",
+            text = text
+        );
+        return webview_eval(&app, &expr).await.map(|r| r.trim_matches('"').to_string());
+    }
+
+    Ok(format!(
+        "I can do: click <text>, type <text>, scroll, summarize. (Full free-form agent reasoning is the next wire-up.) You asked: {task}"
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // SLICE 5 — SHARED CONTROL (the wheel).
 //

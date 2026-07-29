@@ -2684,6 +2684,8 @@ pub fn run() {
             browser_policy_get, browser_policy_set,
             browser::browser_control_status, browser::browser_take_wheel, browser::browser_release_wheel,
             set_active_agent_marker,
+            browser::webview_open, browser::webview_set_bounds, browser::webview_hide,
+            browser::webview_navigate, browser::webview_close, browser::webview_agent_act,
             openai_models, tools_list, tools_upsert, tools_delete, tools_set_enabled,
             tools_config, tools_set_config,
             savepoint_snapshot, savepoint_timeline, savepoint_rewind,
