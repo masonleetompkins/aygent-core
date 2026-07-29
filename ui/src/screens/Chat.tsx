@@ -582,10 +582,10 @@ function HistorySidebar({
 }
 
 function HistoryItem({
-  c, active, dragging, isOver, onOpen, onDelete, onPin, onPointerDown,
+  c, active, dragging, isOver, onOpen, onDelete, onRename, onPin, onPointerDown,
 }: {
   c: ConvMeta; active: boolean; dragging: boolean; isOver: boolean;
-  onOpen: () => void; onDelete: () => void; onPin: () => void;
+  onOpen: () => void; onDelete: () => void; onRename: () => void; onPin: () => void;
   onPointerDown: (e: React.PointerEvent) => void;
 }) {
   const [hover, setHover] = useState(false);

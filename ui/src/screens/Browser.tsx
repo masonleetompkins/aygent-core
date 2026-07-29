@@ -65,10 +65,13 @@ export function Browser() {
       if (r.width < 40 || r.height < 40) return;
       if (r.left <= 4 && r.top <= 4) return; // origin-hugging = not laid out yet
       const rightPane = driver === "agent" ? AGENT_PANE_W + 10 : 0; // +gap
-      invoke("webview_set_bounds", {
+      const bounds = {
         x: Math.round(r.left), y: Math.round(r.top),
         width: Math.round(Math.max(r.width - rightPane, 1)), height: Math.round(r.height),
-      }).catch(() => {});
+      };
+      // eslint-disable-next-line no-console
+      console.log("[browser] syncBounds →", bounds, "raw:", { l: r.left, t: r.top, w: r.width, h: r.height });
+      invoke("webview_set_bounds", bounds).catch(() => {});
     });
   }
 
@@ -97,11 +100,21 @@ export function Browser() {
     const el = paneRef.current;
     const r = el?.getBoundingClientRect();
     // First navigation for the pane opens/positions the webview; later ones reuse.
-    await invoke("webview_open", {
-      url,
-      x: Math.round(r?.left ?? 0), y: Math.round(r?.top ?? 0),
-      width: Math.round(r?.width ?? 800), height: Math.round(r?.height ?? 600),
-    }).catch((e) => setAgentLog((l) => [...l, `open failed: ${e}`]));
+    // Guard the OPEN rect too — the embed is BORN at this rect, so an origin-
+    // hugging / degenerate measurement here creates the child covering the whole
+    // window (the pop-out) and no later set_bounds fully recovers it. If the
+    // pane isn't laid out yet, fall back to a safe inset and let syncBounds
+    // correct it on the next frame.
+    let ox = Math.round(r?.left ?? 0), oy = Math.round(r?.top ?? 0);
+    let ow = Math.round(r?.width ?? 800), oh = Math.round(r?.height ?? 600);
+    if (ow < 40 || oh < 40 || (ox <= 4 && oy <= 4)) {
+      // Not laid out: use a conservative inset (right of sidebar, below tabs).
+      ox = 300; oy = 100; ow = 600; oh = 500;
+    }
+    // eslint-disable-next-line no-console
+    console.log("[browser] webview_open →", { x: ox, y: oy, width: ow, height: oh }, "raw:", { l: r?.left, t: r?.top, w: r?.width, h: r?.height });
+    await invoke("webview_open", { url, x: ox, y: oy, width: ow, height: oh })
+      .catch((e) => setAgentLog((l) => [...l, `open failed: ${e}`]));
     // Re-sync a beat later so the webview lands on the SETTLED rect (the agent
     // prompt bar toggling can shift the pane by a row).
     setTimeout(syncBounds, 120);
