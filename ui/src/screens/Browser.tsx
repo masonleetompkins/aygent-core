@@ -54,7 +54,16 @@ export function Browser() {
     if (!el) return;
     requestAnimationFrame(() => {
       const r = el.getBoundingClientRect();
-      if (r.width < 1 || r.height < 1) return;
+      // GUARD against the "pop-out over the UI" bug. Before layout settles,
+      // paneRef can momentarily report a rect that spans nearly the whole
+      // window (top-left origin, full width) — positioning the native webview
+      // there makes it cover the sidebar + tab row (the pop-out). The pane is
+      // ALWAYS right of the sidebar and below the tab row, so a rect that
+      // starts at the window origin is layout-not-ready: skip it (the 500ms
+      // interval + next rAF will catch the settled rect). Do NOT reject on a
+      // small width — only on an origin-hugging (chrome-covering) position.
+      if (r.width < 40 || r.height < 40) return;
+      if (r.left <= 4 && r.top <= 4) return; // origin-hugging = not laid out yet
       const rightPane = driver === "agent" ? AGENT_PANE_W + 10 : 0; // +gap
       invoke("webview_set_bounds", {
         x: Math.round(r.left), y: Math.round(r.top),
