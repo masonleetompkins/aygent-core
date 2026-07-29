@@ -948,23 +948,25 @@ pub async fn webview_open(
     let target = normalize_url(&url);
     let parsed = target.parse().map_err(|e| format!("bad url: {e}"))?;
 
-    if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
+    if let Some(wv) = app.get_webview_window(WEBVIEW_LABEL) {
         // Already exists: reposition, show, navigate.
         let _ = wv.set_position(LogicalPosition::new(x, y));
         let _ = wv.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
+        let _ = wv.show();
         wv.navigate(parsed).map_err(|e| format!("navigate: {e}"))?;
         return Ok(());
     }
 
-    // Add a child webview to the main window at the given rect.
-    let win = app.get_window("main").ok_or("no main window")?;
-    let builder = tauri::webview::WebviewBuilder::new(WEBVIEW_LABEL, WebviewUrl::External(parsed));
-    win.add_child(
-        builder,
-        LogicalPosition::new(x, y),
-        LogicalSize::new(width.max(1.0), height.max(1.0)),
-    )
-    .map_err(|e| format!("add child webview: {e}"))?;
+    // Create an embedded child WebviewWindow parented to the main window,
+    // positioned over the pane rect. (Tauri v2.11: WebviewWindow, not add_child.)
+    let main = app.get_webview_window("main").ok_or("no main window")?;
+    tauri::WebviewWindowBuilder::new(&app, WEBVIEW_LABEL, WebviewUrl::External(parsed))
+        .parent(&main).map_err(|e| format!("parent: {e}"))?
+        .decorations(false)
+        .position(x, y)
+        .inner_size(width.max(1.0), height.max(1.0))
+        .build()
+        .map_err(|e| format!("build webview: {e}"))?;
     Ok(())
 }
 
@@ -979,21 +981,20 @@ pub fn webview_set_bounds(
     height: f64,
 ) -> Result<(), String> {
     use tauri::{LogicalPosition, LogicalSize, Manager};
-    if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
+    if let Some(wv) = app.get_webview_window(WEBVIEW_LABEL) {
         let _ = wv.set_position(LogicalPosition::new(x, y));
         let _ = wv.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
     }
     Ok(())
 }
 
-/// Hide the embedded webview (move it off-screen — Tauri child webviews have no
-/// hide(); shrinking to 0 is the reliable cross-version approach). Used when the
-/// user leaves the Browser tab so it doesn't float over other screens.
+/// Hide the embedded webview when the user leaves the Browser tab so it doesn't
+/// float over other screens.
 #[tauri::command]
 pub fn webview_hide(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri::{LogicalSize, Manager};
-    if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
-        let _ = wv.set_size(LogicalSize::new(0.0, 0.0));
+    use tauri::Manager;
+    if let Some(wv) = app.get_webview_window(WEBVIEW_LABEL) {
+        let _ = wv.hide();
     }
     Ok(())
 }
@@ -1004,7 +1005,7 @@ pub fn webview_navigate(app: tauri::AppHandle, url: String) -> Result<(), String
     use tauri::Manager;
     let target = normalize_url(&url);
     let parsed = target.parse().map_err(|e| format!("bad url: {e}"))?;
-    let wv = app.get_webview(WEBVIEW_LABEL).ok_or("browser not open")?;
+    let wv = app.get_webview_window(WEBVIEW_LABEL).ok_or("browser not open")?;
     wv.navigate(parsed).map_err(|e| format!("navigate: {e}"))
 }
 
@@ -1012,7 +1013,7 @@ pub fn webview_navigate(app: tauri::AppHandle, url: String) -> Result<(), String
 #[tauri::command]
 pub fn webview_close(app: tauri::AppHandle) -> Result<(), String> {
     use tauri::Manager;
-    if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
+    if let Some(wv) = app.get_webview_window(WEBVIEW_LABEL) {
         let _ = wv.close();
     }
     Ok(())
@@ -1036,8 +1037,8 @@ pub fn webview_close(app: tauri::AppHandle) -> Result<(), String> {
 /// result. Uses a Tauri IPC round-trip: the injected script posts its result
 /// back on a one-shot channel keyed by a nonce.
 pub async fn webview_eval(app: &tauri::AppHandle, expr: &str) -> Result<String, String> {
-    use tauri::{Manager, Emitter, Listener};
-    let wv = app.get_webview(WEBVIEW_LABEL).ok_or("browser not open")?;
+    use tauri::{Manager, Listener};
+    let wv = app.get_webview_window(WEBVIEW_LABEL).ok_or("browser not open")?;
     let nonce = format!("wvr_{}", SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
     let tx = std::sync::Mutex::new(Some(tx));
