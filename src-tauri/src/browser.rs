@@ -580,6 +580,23 @@ fn emit_control(app: &tauri::AppHandle, c: &Control) {
     }));
 }
 
+/// SLICE 6 — which agent's browser profile to use. Reads the active agent id
+/// from app-data (set by agents_set_active); falls back to "default". A
+/// filesystem-safe slug so it's a valid dir name.
+fn active_browser_agent(app: &tauri::AppHandle) -> String {
+    use tauri::Manager;
+    let id = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("active_agent.txt"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".into());
+    id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
+}
+
 /// Pick a free localhost port for Chromium's DevTools endpoint.
 fn free_port() -> Result<u16, String> {
     let l = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("port: {e}"))?;
@@ -608,11 +625,15 @@ async fn ensure_running(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
     let rt = runtime_dir(app, PINNED_CFT_VERSION)?;
     let exe = mac_executable(&rt, cft_platform());
     let port = free_port()?;
-    // A jailed per-app profile dir INSIDE AYGENT's managed browser dir (never a
-    // system Chrome profile). Per-agent isolation (Atlas C) comes in a later
-    // slice; Slice 1 uses one shared profile under our own dir.
-    let profile = browser_dir(app)?.join("profile-default");
-    std::fs::create_dir_all(&profile).map_err(|e| format!("mkdir profile: {e}"))?;
+    // SLICE 6 — PER-AGENT profile isolation. The active agent's own profile dir
+    // (isolated cookies/logins) + its own jailed downloads dir, both UNDER
+    // AYGENT's managed browser dir (never a system Chrome profile). Opt-in
+    // cross-agent sharing (Atlas C) is a symlink/copy of the profile dir, spec'd
+    // separately; the default is isolation.
+    let agent = active_browser_agent(app);
+    let profile = browser_dir(app)?.join("profiles").join(&agent);
+    let downloads = profile.join("downloads");
+    std::fs::create_dir_all(&downloads).map_err(|e| format!("mkdir profile/downloads: {e}"))?;
 
     let mut child = std::process::Command::new(&exe)
         .arg("--headless=new")

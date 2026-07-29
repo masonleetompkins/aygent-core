@@ -7,7 +7,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Pill } from "../components/ui";
+import { Input, Pill } from "../components/ui";
 import { Icon } from "../components/Icon";
 
 type NavResult = { screenshot: string; url: string; title: string };
@@ -37,6 +37,7 @@ export function Browser() {
     { driver: "idle", note: "", agent_active: false }
   );
   const interactive = control.driver === "human";
+  const [showPolicy, setShowPolicy] = useState(false);
 
   const active = tabs.find((t) => t.id === activeId) ?? tabs[0];
 
@@ -240,7 +241,16 @@ export function Browser() {
         {control.note && (
           <span style={{ color: "var(--accent)", fontWeight: 600 }}>⚠ {control.note}</span>
         )}
+        <span style={{ marginLeft: "auto" }}>
+          <button onClick={() => setShowPolicy((v) => !v)}
+            style={{ fontSize: 12, padding: "3px 10px", borderRadius: "var(--radius-control)", border: "var(--border-width) solid var(--line)", background: "transparent", color: "var(--text-muted)", cursor: "pointer" }}>
+            Agent access…
+          </button>
+        </span>
       </div>
+
+      {/* SLICE 6 — per-agent domain allowlist GUI (what the AGENT may browse). */}
+      {showPolicy && <AgentAccessPanel />}
 
       {/* LIVE PAGE (Slice 2): the streamed frame updates in real time. Slice 3
           will forward clicks/keys on this surface into Chromium. */}
@@ -273,6 +283,61 @@ export function Browser() {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// SLICE 6 — the agent's browsing allowlist. The agent may ONLY visit these
+// domains (fails closed: none = no agent browsing). The HUMAN is unrestricted.
+function AgentAccessPanel() {
+  const [folder, setFolder] = useState<string | null>(null);
+  const [domains, setDomains] = useState<string[]>([]);
+  const [input, setInput] = useState("");
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    invoke<any>("agents_get_active").then((a) => {
+      const f = a?.folder_path || null;
+      setFolder(f);
+      if (f) invoke<string[]>("browser_policy_get", { folder: f }).then(setDomains).catch(() => {});
+    }).catch(() => {});
+  }, []);
+
+  async function save(next: string[]) {
+    setDomains(next);
+    if (folder) { await invoke("browser_policy_set", { folder, domains: next }).catch(() => {}); setSaved(true); setTimeout(() => setSaved(false), 1500); }
+  }
+  function add() {
+    const d = input.trim().replace(/^https?:\/\//, "").replace(/\/.*$/, "").toLowerCase();
+    if (d && !domains.includes(d)) save([...domains, d]);
+    setInput("");
+  }
+
+  return (
+    <div style={{ border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-card)", padding: 12, background: "var(--surface)", display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ fontSize: 13, fontWeight: 700 }}>Sites the agent may visit</div>
+      <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+        The agent can only browse these domains. You (the human) can go anywhere. No sites = the agent can’t browse at all.
+        {folder ? "" : " Pick an agent folder first."}
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+        {domains.map((d) => (
+          <span key={d} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "3px 10px", borderRadius: "var(--radius-pill)", border: "var(--border-width) solid var(--line)", fontSize: 12 }}>
+            {d}
+            <span onClick={() => save(domains.filter((x) => x !== d))} style={{ cursor: "pointer", opacity: 0.6 }}>×</span>
+          </span>
+        ))}
+        {domains.length === 0 && <span style={{ fontSize: 12, color: "var(--text-faint)" }}>none yet</span>}
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ flex: 1 }}>
+          <Input value={input} onChange={(e: any) => setInput(e.target.value)}
+            onKeyDown={(e: any) => { if (e.key === "Enter") add(); }}
+            placeholder="e.g. wikipedia.org" />
+        </div>
+        <button onClick={add} disabled={!folder} style={{ fontSize: 13, padding: "6px 14px", borderRadius: "var(--radius-control)", border: "var(--border-width) solid var(--accent)", background: "transparent", color: "var(--accent)", cursor: "pointer" }}>Add</button>
+      </div>
+      {saved && <span style={{ fontSize: 12, color: "var(--ok)" }}>saved</span>}
     </div>
   );
 }
