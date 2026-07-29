@@ -364,7 +364,7 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
               bubble fed by the store, so switching to a running agent shows its
               tokens + tool cards arriving mid-flight (Atlas #2), for BOTH human
               turns and headless inter-agent turns (same store slot). */}
-          {running && (
+          {running && !(msgs.length > 0 && msgs[msgs.length - 1].role === "assistant" && (msgs[msgs.length - 1] as { streaming?: boolean }).streaming) && (
             <Bubble m={{
               role: "assistant",
               text: turn.liveText,

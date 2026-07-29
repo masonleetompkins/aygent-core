@@ -1609,11 +1609,14 @@ fn exec_tool_cfg(
             if from.is_empty() || to.is_empty() {
                 return ("rename_file needs `from` and `to` paths".into(), true);
             }
-            // Source must resolve (read) + destination must resolve (write) — both jailed.
-            let src = match broker.resolve(agent_id, from, broker::Mode::Read) {
+            // Source + destination both jailed. Use the SAME scope key the other
+            // working file tools use ("default") — bug (Mason 07-28): resolving
+            // against agent_id hit an unset scope -> 'refused by jail' on files
+            // that plainly exist. read_file/write_file/list_files all use "default".
+            let src = match broker.resolve("default", from, broker::Mode::Read) {
                 Ok(p) => p, Err(e) => return (format!("source refused by jail: {e:?}"), true),
             };
-            let dst = match broker.resolve(agent_id, to, broker::Mode::Write) {
+            let dst = match broker.resolve("default", to, broker::Mode::Write) {
                 Ok(p) => p, Err(e) => return (format!("destination refused by jail: {e:?}"), true),
             };
             if !src.exists() { return (format!("'{from}' does not exist"), true); }
@@ -1629,7 +1632,7 @@ fn exec_tool_cfg(
         "delete_file" => {
             let target = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
             if target.is_empty() { return ("delete_file needs a `path`".into(), true); }
-            let real = match broker.resolve(agent_id, target, broker::Mode::Write) {
+            let real = match broker.resolve("default", target, broker::Mode::Write) {
                 Ok(p) => p, Err(e) => return (format!("refused by jail: {e:?}"), true),
             };
             if !real.exists() { return (format!("'{target}' does not exist"), true); }
