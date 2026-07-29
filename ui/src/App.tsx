@@ -161,12 +161,16 @@ export function App() {
         onManage={() => setScreen("agents")}
       />
       <Sidebar active={screen} onSelect={setScreen} />
-      <div style={{ flex: 1, height: "100vh", overflowY: "auto", display: "flex", flexDirection: "column" }}>
+      <div style={{ flex: 1, height: "100vh", minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column" }}>
         {/* The persistent daemon-status strip was dev telemetry — removed. The
            connection state now lives as a quiet sanity-check in Settings.
            full-height flex column so height:100% children (Chat) can fill the
-           window and pin their footer to the bottom (no dead whitespace). */}
-        <div style={{ padding: "28px 32px", flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+           window and pin their footer to the bottom (no dead whitespace).
+           minHeight:0 on BOTH this and the scroll parent is what lets flex
+           children actually shrink below their content size — without it, a
+           child measures its frozen intrinsic size (the Browser pane was stuck
+           at its large-window rect because this chain couldn't shrink). */}
+        <div style={{ padding: "28px 32px", flex: 1, minHeight: 0, minWidth: 0, display: "flex", flexDirection: "column" }}>
           {screen === "chat" && (
             <Chat
               keySet={keySet}

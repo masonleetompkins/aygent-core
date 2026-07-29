@@ -22,9 +22,6 @@ let TAB_SEQ = 1;
 // Width (CSS px) of the right-hand agent pane when handed off. syncBounds
 // shrinks the native webview by this + a gap so the pane sits BESIDE the page.
 const AGENT_PANE_W = 340;
-// Border width of the page pane (matches --border-width, default 1px). The OS
-// webview is inset by this so it lands inside paneRef's rounded outline.
-const PANE_BORDER = 1;
 const newTab = (): Tab => ({ id: TAB_SEQ++, addr: "", title: "New Tab", editing: true });
 
 export function Browser() {
@@ -70,15 +67,15 @@ export function Browser() {
       if (r.width < 40 || r.height < 40) return;
       if (r.left <= 4 && r.top <= 4) return; // origin-hugging = not laid out yet
       const rightPane = driver === "agent" ? AGENT_PANE_W + 10 : 0; // +gap
-      // Inset by the border width so the OS webview sits INSIDE paneRef's
-      // rounded outline instead of painting over it (the webview is an opaque
-      // native layer — anything from the pane's border-box edge inward gets
-      // covered, so we shrink to the CONTENT box).
-      const b = PANE_BORDER;
+      // Webview rect == paneRef's BORDER-BOX rect (no inset). The rounded
+      // outline is a pointer-events:none overlay rendered ON TOP of the webview,
+      // so its ~radius corner arcs mask the webview's square corners while the
+      // webview fills the whole box. Because both the webview and the overlay
+      // are driven by this SAME measured rect, they stay locked at every size.
       const bounds = {
-        x: Math.round(r.left + b), y: Math.round(r.top + b),
-        width: Math.round(Math.max(r.width - rightPane - b * 2, 1)),
-        height: Math.round(Math.max(r.height - b * 2, 1)),
+        x: Math.round(r.left), y: Math.round(r.top),
+        width: Math.round(Math.max(r.width - rightPane, 1)),
+        height: Math.round(r.height),
       };
       // Skip redundant calls — only push when the rect actually changed. Keeps
       // us from hammering set_bounds twice a second for no reason.
@@ -249,18 +246,32 @@ export function Browser() {
           which is the LEFT region; syncBounds shrinks it by AGENT_PANE_W when
           the agent pane is open, so the pane sits BESIDE the page. */}
       <div style={{ flex: 1, minHeight: 0, minWidth: 0, display: "flex", gap: 10, overflow: "hidden" }}>
-        {/* THE PAGE AREA — the native webview is positioned over THIS div. */}
+        {/* THE PAGE AREA — the native webview is positioned over THIS div.
+            The OS webview fills paneRef's FULL border-box (syncBounds sends the
+            exact rect). So paneRef itself carries NO border — an opaque native
+            layer would just cover it. Instead the accented rounded frame is a
+            pointer-events:none OVERLAY rendered on top (below), whose rounded
+            corners mask the webview's square corners. Both are driven by the
+            same measured rect, so they stay locked at every window size. */}
         <div ref={paneRef} style={{
           flex: 1, minWidth: 0, minHeight: 0, height: "100%", position: "relative",
-          border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-card)",
-          background: "var(--bg)", overflow: "hidden",
+          borderRadius: "var(--radius-card)", background: "var(--bg)", overflow: "hidden",
         }}>
           <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", fontSize: 14, pointerEvents: "none" }}>
             Click the tab to type a URL, or search.
           </div>
-          {driver === "agent" && (
-            <div style={{ position: "absolute", inset: 0, pointerEvents: "none", boxShadow: "inset 0 0 0 2px var(--accent)" }} />
-          )}
+          {/* ROUNDED FRAME OVERLAY — sits ON TOP of the native webview. Just an
+              outline + rounded corners; transparent fill, no pointer capture,
+              so clicks pass through to the page. Accent-highlighted in agent
+              mode, subtle line otherwise. This is the trick that gives the
+              square-cornered OS webview rounded corners: the arcs cover the
+              webview's corners while the center stays click-through. */}
+          <div style={{
+            position: "absolute", inset: 0, pointerEvents: "none", borderRadius: "var(--radius-card)",
+            border: driver === "agent"
+              ? "2px solid var(--accent)"
+              : "var(--border-width) solid var(--line)",
+          }} />
         </div>
 
         {/* AGENT PANE (right) — appears on hand-off. You prompt here; the agent
