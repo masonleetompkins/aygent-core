@@ -108,29 +108,32 @@ export function App() {
   // M1.4 parallel UI: viewing an agent no longer changes which agents RUN. We
   // still call agents_set_active (so the primary Chat pane's folder/model track
   // the viewed agent), but every agent runs in the background regardless.
-  // Click a rail chip = TOGGLE its pane: open if closed, close if open. This is
-  // what makes opening/closing one at a time clean. When opening (or when it's
-  // already open), focus it so the This-Agent screens + folder scope follow.
+  // Click a rail chip = FOCUS the agent + ensure its pane is OPEN. It NEVER
+  // closes a pane — that was the conflicting logic (a click on an open agent
+  // both focused AND closed it). Closing is now ONLY the pane's × button, so a
+  // chip click is always predictable: bring that agent front-and-center.
   function onViewAgent(a: AgentProfile) {
     if (screen !== "chat") setScreen("chat");
-    setOpenSet((prev) => {
-      const next = new Set(prev);
-      if (next.has(a.id)) {
-        next.delete(a.id); // toggle CLOSED
-      } else {
-        next.add(a.id);    // toggle OPEN
-        focusAgent(a);
-      }
-      return next;
-    });
+    setOpenSet((prev) => (prev.has(a.id) ? prev : new Set(prev).add(a.id)));
+    focusAgent(a);
   }
   function focusAgent(a: AgentProfile) {
     invoke<AgentProfile | null>("agents_set_active", { id: a.id })
       .then((updated) => { if (updated) onActiveChange(updated); else onActiveChange(a); })
       .catch(() => onActiveChange(a));
   }
+  // Close a pane (only via its ×). If it was the focused agent, refocus a still-
+  // open neighbor so the This-Agent screens don't track a closed pane.
   function closePane(id: string) {
-    setOpenSet((prev) => { const next = new Set(prev); next.delete(id); return next; });
+    setOpenSet((prev) => {
+      const next = new Set(prev); next.delete(id);
+      if (activeAgent?.id === id) {
+        const nextFocus = rosterOrder.find((rid) => next.has(rid));
+        if (nextFocus) invoke<AgentProfile | null>("agents_set_active", { id: nextFocus })
+          .then((u) => { if (u) onActiveChange(u); }).catch(() => {});
+      }
+      return next;
+    });
   }
   // The panes to render, ALWAYS in roster order (rail order) so pane layout is
   // stable + synced with the rail. Fall back to the active agent when none open.
