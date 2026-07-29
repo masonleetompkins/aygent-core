@@ -990,21 +990,9 @@ pub fn webview_set_bounds(
     height: f64,
 ) -> Result<(), String> {
     use tauri::{LogicalPosition, LogicalSize, Manager};
-    // Scale factor lives on Window, not Webview — pull it from the main window.
-    let scale = app
-        .get_webview_window("main")
-        .and_then(|w| w.scale_factor().ok())
-        .unwrap_or(1.0);
     if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
-        // Diagnostic: prints to the TERMINAL (Rust stdout). Frontend console.log
-        // goes to WebInspector, not here — so we log the rect we actually apply.
-        println!(
-            "[browser] set_bounds pos=({x},{y}) size=({width}x{height}) scale={scale} FOUND=true"
-        );
         let _ = wv.set_position(LogicalPosition::new(x, y));
         let _ = wv.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
-    } else {
-        println!("[browser] set_bounds pos=({x},{y}) size=({width}x{height}) FOUND=false (no webview!)");
     }
     Ok(())
 }

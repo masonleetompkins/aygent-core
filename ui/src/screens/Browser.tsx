@@ -38,6 +38,8 @@ export function Browser() {
   const editRef = useRef<HTMLInputElement>(null);
   // The div whose rect the native webview is positioned over.
   const paneRef = useRef<HTMLDivElement>(null);
+  // Last rect we pushed to Rust — dedupe so we don't re-apply an unchanged rect.
+  const lastBoundsRef = useRef<string>("");
 
   const active = tabs.find((t) => t.id === activeId) ?? tabs[0];
   function patch(id: number, p: Partial<Tab>) {
@@ -78,8 +80,11 @@ export function Browser() {
         width: Math.round(Math.max(r.width - rightPane - b * 2, 1)),
         height: Math.round(Math.max(r.height - b * 2, 1)),
       };
-      // eslint-disable-next-line no-console
-      console.log("[browser] syncBounds →", bounds, "raw:", { l: r.left, t: r.top, w: r.width, h: r.height });
+      // Skip redundant calls — only push when the rect actually changed. Keeps
+      // us from hammering set_bounds twice a second for no reason.
+      const key = `${bounds.x},${bounds.y},${bounds.width},${bounds.height}`;
+      if (key === lastBoundsRef.current) return;
+      lastBoundsRef.current = key;
       invoke("webview_set_bounds", bounds).catch(() => {});
     });
   }
@@ -91,10 +96,17 @@ export function Browser() {
     syncBounds();
     const onResize = () => syncBounds();
     window.addEventListener("resize", onResize);
-    const iv = setInterval(syncBounds, 500); // catch layout shifts cheaply
+    // Track the pane's own size changes (sidebar collapse, window resize, agent
+    // pane toggle) precisely instead of blind-polling every 500ms — the
+    // interval was firing set_bounds twice a second forever + spamming logs.
+    let ro: ResizeObserver | undefined;
+    if (paneRef.current && "ResizeObserver" in window) {
+      ro = new ResizeObserver(() => syncBounds());
+      ro.observe(paneRef.current);
+    }
     return () => {
       window.removeEventListener("resize", onResize);
-      clearInterval(iv);
+      ro?.disconnect();
       invoke("webview_hide").catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
