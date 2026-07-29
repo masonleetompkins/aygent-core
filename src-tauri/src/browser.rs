@@ -524,6 +524,23 @@ use tokio::sync::oneshot;
 #[derive(Default)]
 pub struct BrowserProc {
     inner: Mutex<Option<RunningBrowser>>,
+    /// SLICE 5 — who's driving the shared page: "human" | "agent" | "idle".
+    /// The human ALWAYS wins: taking the wheel preempts the agent instantly.
+    control: Mutex<Control>,
+}
+
+/// Shared-control state (Slice 5). `driver` is the wheel; `agent_wants` is set
+/// when the agent is mid-task (so the UI can show "agent working" / offer grab).
+#[derive(Clone)]
+pub struct Control {
+    pub driver: String,       // "human" | "agent" | "idle"
+    pub note: String,         // e.g. "agent hit a login — take the wheel"
+    pub agent_active: bool,   // an agent browser task is in progress
+}
+impl Default for Control {
+    fn default() -> Self {
+        Self { driver: "idle".into(), note: String::new(), agent_active: false }
+    }
 }
 
 struct RunningBrowser {
@@ -551,8 +568,16 @@ struct CdpRequest {
 
 impl BrowserProc {
     pub fn new() -> Self {
-        Self { inner: Mutex::new(None) }
+        Self { inner: Mutex::new(None), control: Mutex::new(Control::default()) }
     }
+}
+
+/// Emit the current control state to the UI (Slice 5 "who's driving" HUD).
+fn emit_control(app: &tauri::AppHandle, c: &Control) {
+    use tauri::Emitter;
+    let _ = app.emit("browser:control", &serde_json::json!({
+        "driver": c.driver, "note": c.note, "agent_active": c.agent_active,
+    }));
 }
 
 /// Pick a free localhost port for Chromium's DevTools endpoint.
@@ -866,6 +891,71 @@ pub async fn browser_start_view(
     ensure_session(&app, &state).await
 }
 
+// ---------------------------------------------------------------------------
+// SLICE 5 — SHARED CONTROL (the wheel).
+//
+// One page, two possible drivers. The HUMAN ALWAYS WINS: taking the wheel sets
+// driver=human immediately, which the agent tools check + refuse to act while
+// it's held. The agent claims the wheel (driver=agent) only when idle/agent;
+// if it hits a login/CAPTCHA it releases + sets a note so the UI can prompt the
+// human. Every change emits `browser:control` so the HUD shows who's driving.
+// ---------------------------------------------------------------------------
+
+/// Current control state, for the UI HUD on mount.
+#[tauri::command]
+pub fn browser_control_status(state: tauri::State<'_, BrowserProc>) -> Result<serde_json::Value, String> {
+    let c = state.control.lock().map_err(|_| "control poisoned")?;
+    Ok(serde_json::json!({ "driver": c.driver, "note": c.note, "agent_active": c.agent_active }))
+}
+
+/// HUMAN takes the wheel — preempts the agent immediately.
+#[tauri::command]
+pub fn browser_take_wheel(app: tauri::AppHandle, state: tauri::State<'_, BrowserProc>) -> Result<(), String> {
+    let mut c = state.control.lock().map_err(|_| "control poisoned")?;
+    c.driver = "human".into();
+    c.note = String::new();
+    emit_control(&app, &c);
+    Ok(())
+}
+
+/// HUMAN releases the wheel back to idle (agent may resume).
+#[tauri::command]
+pub fn browser_release_wheel(app: tauri::AppHandle, state: tauri::State<'_, BrowserProc>) -> Result<(), String> {
+    let mut c = state.control.lock().map_err(|_| "control poisoned")?;
+    c.driver = "idle".into();
+    c.note = String::new();
+    emit_control(&app, &c);
+    Ok(())
+}
+
+/// True if the HUMAN currently holds the wheel (agent must not act).
+fn human_has_wheel(state: &tauri::State<'_, BrowserProc>) -> bool {
+    state.control.lock().map(|c| c.driver == "human").unwrap_or(false)
+}
+
+/// Agent claims the wheel for a task. Refused (false) if the human holds it.
+fn agent_claim(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>) -> bool {
+    let mut c = match state.control.lock() { Ok(c) => c, Err(_) => return false };
+    if c.driver == "human" { return false; }
+    c.driver = "agent".into();
+    c.agent_active = true;
+    c.note = String::new();
+    emit_control(app, &c);
+    true
+}
+
+/// Agent releases the wheel (task done, or handing off). `handoff_note` non-empty
+/// => the agent wants the human (login/CAPTCHA); UI surfaces it.
+fn agent_release(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>, handoff_note: &str) {
+    if let Ok(mut c) = state.control.lock() {
+        c.agent_active = false;
+        // Don't stomp the human if they grabbed the wheel mid-task.
+        if c.driver == "agent" { c.driver = if handoff_note.is_empty() { "idle".into() } else { "human".into() }; }
+        c.note = handoff_note.to_string();
+        emit_control(app, &c);
+    }
+}
+
 // ===========================================================================
 // SLICE 3 — HUMAN INPUT FORWARDING.
 //
@@ -1050,6 +1140,40 @@ pub fn agent_tool_schemas() -> Vec<serde_json::Value> {
 /// per-agent domain policy. `allowed_domains`: the agent's allowlist (empty =
 /// nothing allowed — fail closed). Returns (text, is_error).
 pub async fn agent_tool(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, BrowserProc>,
+    name: &str,
+    input: &serde_json::Value,
+    allowed_domains: &[String],
+) -> (String, bool) {
+    // SLICE 5: the human ALWAYS wins the wheel. If they're driving, the agent
+    // must not act — tell it plainly so it waits/hands back.
+    if human_has_wheel(state) {
+        return ("the human is currently driving the browser — wait for them to release the wheel before acting".into(), true);
+    }
+    // Claim the wheel for this action (refused only if the human grabbed it in
+    // the race window).
+    if !agent_claim(app, state) {
+        return ("the human just took the browser — not acting".into(), true);
+    }
+    let out = agent_tool_inner(app, state, name, input, allowed_domains).await;
+    // On a login/CAPTCHA-ish failure, hand off to the human with a note.
+    let handoff = if out.1 && looks_like_handoff(&out.0) {
+        "the agent hit a login or verification wall — take the wheel to continue"
+    } else { "" };
+    agent_release(app, state, handoff);
+    out
+}
+
+/// Heuristic: does an agent tool result look like it needs a human (login/
+/// CAPTCHA/verification)? Used to auto-offer the hand-off.
+fn looks_like_handoff(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    l.contains("captcha") || l.contains("not a robot") || l.contains("sign in")
+        || l.contains("log in") || l.contains("login") || l.contains("verify") || l.contains("unusual traffic")
+}
+
+async fn agent_tool_inner(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, BrowserProc>,
     name: &str,

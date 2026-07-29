@@ -32,7 +32,11 @@ export function Browser() {
   const [frame, setFrame] = useState<string | null>(null);
   // Slice 3: the frame element, so clicks/keys map to page coords + forward in.
   const frameRef = useRef<HTMLImageElement>(null);
-  const [interactive, setInteractive] = useState(false); // human is driving
+  // Slice 5: shared-control state (who's driving + hand-off note).
+  const [control, setControl] = useState<{ driver: string; note: string; agent_active: boolean }>(
+    { driver: "idle", note: "", agent_active: false }
+  );
+  const interactive = control.driver === "human";
 
   const active = tabs.find((t) => t.id === activeId) ?? tabs[0];
 
@@ -42,13 +46,18 @@ export function Browser() {
     if (installed !== true) return;
     let un: undefined | (() => void);
     let alive = true;
+    let unCtl: undefined | (() => void);
     (async () => {
       un = await listen<{ data: string }>("browser:frame", (e) => {
         if (alive && e.payload?.data) setFrame(e.payload.data);
       });
+      unCtl = await listen<any>("browser:control", (e) => {
+        if (alive && e.payload) setControl(e.payload);
+      });
       invoke("browser_start_view").catch(() => {});
+      invoke<any>("browser_control_status").then((c) => alive && c && setControl(c)).catch(() => {});
     })();
-    return () => { alive = false; un?.(); };
+    return () => { alive = false; un?.(); unCtl?.(); };
   }, [installed]);
 
   function patch(id: number, p: Partial<Tab>) {
@@ -83,7 +92,8 @@ export function Browser() {
   function onFrameClick(e: React.MouseEvent) {
     const c = normCoords(e);
     if (!c) return;
-    setInteractive(true);
+    // Slice 5: interacting = the human takes the wheel (preempts the agent).
+    if (control.driver !== "human") invoke("browser_take_wheel").catch(() => {});
     frameRef.current?.focus();
     invoke("browser_click", { fx: c.fx, fy: c.fy, button: "left" }).catch(() => {});
   }
@@ -206,6 +216,31 @@ export function Browser() {
       </div>
 
       {active.err && <Pill tone="danger">✗ {active.err}</Pill>}
+
+      {/* SLICE 5 — WHO'S DRIVING HUD + hand-off. */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 13 }}>
+        <span style={{
+          display: "inline-flex", alignItems: "center", gap: 6, padding: "3px 10px",
+          borderRadius: "var(--radius-pill)", fontWeight: 700,
+          border: "var(--border-width) solid var(--line)",
+          color: control.driver === "human" ? "var(--accent)" : control.driver === "agent" ? "var(--ok)" : "var(--text-faint)",
+        }}>
+          <span style={{
+            width: 8, height: 8, borderRadius: "50%",
+            background: control.driver === "human" ? "var(--accent)" : control.driver === "agent" ? "var(--ok)" : "var(--text-faint)",
+          }} />
+          {control.driver === "human" ? "You're driving" : control.driver === "agent" ? "Agent driving" : "Idle"}
+        </span>
+        {control.driver === "human" && (
+          <button onClick={() => invoke("browser_release_wheel").catch(() => {})}
+            style={{ fontSize: 12, padding: "3px 10px", borderRadius: "var(--radius-control)", border: "var(--border-width) solid var(--line)", background: "transparent", color: "var(--text-muted)", cursor: "pointer" }}>
+            Give control back to agent
+          </button>
+        )}
+        {control.note && (
+          <span style={{ color: "var(--accent)", fontWeight: 600 }}>⚠ {control.note}</span>
+        )}
+      </div>
 
       {/* LIVE PAGE (Slice 2): the streamed frame updates in real time. Slice 3
           will forward clicks/keys on this surface into Chromium. */}
