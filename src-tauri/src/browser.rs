@@ -948,10 +948,12 @@ pub async fn webview_open(
     let target = normalize_url(&url);
     let parsed = target.parse().map_err(|e| format!("bad url: {e}"))?;
 
-    // Existing EMBEDDED child webview? reposition + navigate. Retrieved via
-    // get_webview_window (the only getter AppHandle exposes); it wraps the
-    // embedded webview + derefs to it for navigate/set_position/etc.
-    if let Some(wv) = app.get_webview_window(WEBVIEW_LABEL) {
+    // Existing EMBEDDED child webview? reposition + navigate. add_child creates
+    // a `Webview` (embedded child), NOT a `WebviewWindow` (standalone window),
+    // so it MUST be retrieved via get_webview() — get_webview_window() returns
+    // None for embedded children, which silently no-op'd every reposition/hide
+    // (the pop-out + never-hides bug). Verified against tauri 2.11.5 docs.
+    if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
         let _ = wv.set_position(LogicalPosition::new(x, y));
         let _ = wv.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
         wv.navigate(parsed).map_err(|e| format!("navigate: {e}"))?;
@@ -988,7 +990,7 @@ pub fn webview_set_bounds(
     height: f64,
 ) -> Result<(), String> {
     use tauri::{LogicalPosition, LogicalSize, Manager};
-    if let Some(wv) = app.get_webview_window(WEBVIEW_LABEL) {
+    if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
         let _ = wv.set_position(LogicalPosition::new(x, y));
         let _ = wv.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
     }
@@ -1001,7 +1003,7 @@ pub fn webview_set_bounds(
 #[tauri::command]
 pub fn webview_hide(app: tauri::AppHandle) -> Result<(), String> {
     use tauri::{LogicalPosition, LogicalSize, Manager};
-    if let Some(wv) = app.get_webview_window(WEBVIEW_LABEL) {
+    if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
         let _ = wv.set_size(LogicalSize::new(0.0, 0.0));
         let _ = wv.set_position(LogicalPosition::new(-10000.0, -10000.0));
     }
@@ -1014,7 +1016,7 @@ pub fn webview_navigate(app: tauri::AppHandle, url: String) -> Result<(), String
     use tauri::Manager;
     let target = normalize_url(&url);
     let parsed = target.parse().map_err(|e| format!("bad url: {e}"))?;
-    let wv = app.get_webview_window(WEBVIEW_LABEL).ok_or("browser not open")?;
+    let wv = app.get_webview(WEBVIEW_LABEL).ok_or("browser not open")?;
     wv.navigate(parsed).map_err(|e| format!("navigate: {e}"))
 }
 
@@ -1022,7 +1024,7 @@ pub fn webview_navigate(app: tauri::AppHandle, url: String) -> Result<(), String
 #[tauri::command]
 pub fn webview_close(app: tauri::AppHandle) -> Result<(), String> {
     use tauri::Manager;
-    if let Some(wv) = app.get_webview_window(WEBVIEW_LABEL) {
+    if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
         let _ = wv.close();
     }
     Ok(())
@@ -1047,7 +1049,7 @@ pub fn webview_close(app: tauri::AppHandle) -> Result<(), String> {
 /// back on a one-shot channel keyed by a nonce.
 pub async fn webview_eval(app: &tauri::AppHandle, expr: &str) -> Result<String, String> {
     use tauri::{Manager, Listener};
-    let wv = app.get_webview_window(WEBVIEW_LABEL).ok_or("browser not open")?;
+    let wv = app.get_webview(WEBVIEW_LABEL).ok_or("browser not open")?;
     let nonce = format!("wvr_{}", SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
     let tx = std::sync::Mutex::new(Some(tx));
