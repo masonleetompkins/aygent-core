@@ -1443,17 +1443,6 @@ async fn agent_run(
                     let input = blk.get("input").cloned().unwrap_or(serde_json::json!({}));
                     let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
 
-                    // BROWSER TOOLS (Slice 4): async, driven through the CDP
-                    // session + per-agent domain policy. Intercept before the
-                    // sync broker dispatch since they need app+state+await.
-                    if browser::is_agent_tool(name) {
-                        let allowed = agent_browser_domains(&app, agent_id);
-                        let (rt, ie) = browser::agent_tool(&app, &browser_state, name, &input, &allowed).await;
-                        transcript.push_str(&format!("  ⚙ {name} → {}\n", if ie { format!("✗ {rt}") } else { "✓".to_string() }));
-                        tool_results.push(serde_json::json!({ "type": "tool_result", "tool_use_id": id, "content": rt, "is_error": ie }));
-                        continue;
-                    }
-
                     // EXECUTE THROUGH THE BROKER (jailed).
                     let (result_text, is_err) = match name {
                         "read_file" => match broker.resolve_and_open("default", path, broker::Mode::Read) {
@@ -2234,7 +2223,14 @@ async fn agent_stream(
                     // M1.4 #7: send_message is an inter-agent tool — it enqueues on
                     // the mailbox (needs db, not the broker), delivered ASYNC on
                     // the recipient's lane. Handle it here before the file-tool path.
-                    let (result_text, is_err) = if name == "send_message" {
+                    let (result_text, is_err) = if browser::is_agent_tool(&name) {
+                        // BROWSER TOOLS (Slice 4/5): async, driven through the CDP
+                        // session + per-agent domain policy + the shared-control
+                        // wheel. Policy keys off the FOLDER (same key as
+                        // agent_tools_for_full used to expose the tools).
+                        let domains = folder.as_deref().map(|f| agent_browser_domains(&app, f)).unwrap_or_default();
+                        browser::agent_tool(&app, &browser_state, &name, &input, &domains).await
+                    } else if name == "send_message" {
                         let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
                         let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
                         let r = match mailbox::send(&db, &scope_id, to, body, 0) {
