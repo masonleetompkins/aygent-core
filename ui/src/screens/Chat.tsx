@@ -5,6 +5,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Button } from "../components/ui";
+import { Icon, type IconName } from "../components/Icon";
 import { Markdown } from "../components/Markdown";
 import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound } from "../lib/turns";
 
