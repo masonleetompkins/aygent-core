@@ -2578,6 +2578,10 @@ pub fn run() {
     let drain_signal = drainer::DrainSignal::new();
     let sched_signal = scheduler::SchedSignal::new();
 
+    // BROWSER (Slice 1): the long-lived headless Chromium handle. Launched on
+    // first navigate, reused across navigations, held here as managed state.
+    let browser_proc = std::sync::Arc::new(browser::BrowserProc::new());
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(broker.clone())
@@ -2585,6 +2589,7 @@ pub fn run() {
         .manage(lanes.clone())
         .manage(drain_signal.clone())
         .manage(sched_signal.clone())
+        .manage(browser_proc.clone())
         .invoke_handler(tauri::generate_handler![
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
@@ -2592,6 +2597,7 @@ pub fn run() {
             get_selection, set_selection, detect_hardware, local_catalog, local_downloaded,
             local_download, local_delete, local_tool_capability, restore_agent_folder,
             browser::browser_status, browser::browser_install, browser::browser_launch_probe,
+            browser::browser_navigate, browser::browser_shutdown,
             openai_models, tools_list, tools_upsert, tools_delete, tools_set_enabled,
             tools_config, tools_set_config,
             savepoint_snapshot, savepoint_timeline, savepoint_rewind,

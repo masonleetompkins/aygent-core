@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import { Icon, type IconName } from "./Icon";
 
 export type ScreenId =
-  | "chat" | "agents" | "tools" | "settings" | "scheduler" | "connections" | "savepoints";
+  | "chat" | "browser" | "agents" | "tools" | "settings" | "scheduler" | "connections" | "savepoints";
 
 export type NavGroup = "agent" | "global";
 export interface NavItem { id: ScreenId; label: string; icon: IconName; enabled: boolean; group: NavGroup; }
@@ -15,6 +15,7 @@ export interface NavItem { id: ScreenId; label: string; icon: IconName; enabled:
 //  • "Global"      — app-wide (roster, connectors, app settings)
 export const NAV: NavItem[] = [
   { id: "chat", label: "Chat", icon: "chat", enabled: true, group: "agent" },
+  { id: "browser", label: "Browser", icon: "globe", enabled: true, group: "agent" },
   { id: "tools", label: "Tools", icon: "tools", enabled: true, group: "agent" },
   { id: "scheduler", label: "Scheduler", icon: "scheduler", enabled: true, group: "agent" },
   { id: "savepoints", label: "Save Points", icon: "savepoints", enabled: true, group: "agent" },

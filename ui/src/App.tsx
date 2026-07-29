@@ -6,6 +6,7 @@ import { type AgentProfile } from "./components/AgentSwitcher";
 import { Agents } from "./screens/Agents";
 import { Settings } from "./screens/Settings";
 import { Chat } from "./screens/Chat";
+import { Browser } from "./screens/Browser";
 import { SavePoints } from "./screens/SavePoints";
 import { Tools } from "./screens/Tools";
 import { Scheduler } from "./screens/Scheduler";
@@ -190,6 +191,7 @@ export function App() {
           {screen === "scheduler" && <Scheduler agentId={activeAgent?.id ?? null} />}
           {screen === "connections" && <Connections agentId={activeAgent?.id ?? null} />}
           {screen === "tools" && <Tools folder={folder} />}
+          {screen === "browser" && <Browser />}
         </div>
       </div>
     </div>

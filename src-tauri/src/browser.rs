@@ -496,3 +496,306 @@ fn make_executable(exe: &Path) -> Result<(), String> {
     std::fs::set_permissions(exe, perms).map_err(|e| format!("chmod exe: {e}"))?;
     Ok(())
 }
+
+// ===========================================================================
+// SLICE 1 — LIVE DRIVE: launch Chromium headless w/ CDP, navigate, screenshot.
+//
+// The mature CDP client (playwright-core) lives in the Node daemon per Atlas's
+// doc — that's Slice 4's home for the agent-tool surface. But for Slice 1's
+// "navigate + screenshot" proof we drive CDP DIRECTLY from Rust over the
+// DevTools WebSocket (tokio-tungstenite, already a dep). Zero new daemon
+// plumbing, zero npm, stays inside the install-nothing rule. When we build the
+// agent tools + shared control we can promote to the daemon; the process
+// lifecycle here is the same either way.
+//
+// Model: one long-lived headless Chromium child process (launched on first use,
+// reused across navigations), held in Tauri managed state. Each command opens a
+// short-lived CDP WS, does its dance (navigate / screenshot), closes. Simple +
+// robust for Slice 1; a persistent socket comes with the live screencast (S2).
+// ===========================================================================
+
+use std::sync::Mutex;
+use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
+
+/// The running headless Chromium: the child process + the port its DevTools
+/// endpoint is on. Held in Tauri state so we launch ONCE and reuse.
+#[derive(Default)]
+pub struct BrowserProc {
+    inner: Mutex<Option<RunningBrowser>>,
+}
+
+struct RunningBrowser {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl BrowserProc {
+    pub fn new() -> Self {
+        Self { inner: Mutex::new(None) }
+    }
+}
+
+/// Pick a free localhost port for Chromium's DevTools endpoint.
+fn free_port() -> Result<u16, String> {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("port: {e}"))?;
+    let p = l.local_addr().map_err(|e| format!("port addr: {e}"))?.port();
+    Ok(p)
+}
+
+/// Ensure Chromium is running headless with a CDP port; return the port.
+/// Launches on first call, reuses on subsequent calls (checks the child is
+/// still alive; relaunches if it died/crashed — crash recovery).
+async fn ensure_running(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>) -> Result<u16, String> {
+    // Fast path: already running + alive.
+    {
+        let mut guard = state.inner.lock().map_err(|_| "browser state poisoned")?;
+        if let Some(rb) = guard.as_mut() {
+            match rb.child.try_wait() {
+                Ok(None) => return Ok(rb.port), // still alive
+                _ => { *guard = None; }          // died — fall through to relaunch
+            }
+        }
+    }
+
+    if !is_installed(app) {
+        return Err("browser not installed — enable it in Settings first".into());
+    }
+    let rt = runtime_dir(app, PINNED_CFT_VERSION)?;
+    let exe = mac_executable(&rt, cft_platform());
+    let port = free_port()?;
+    // A jailed per-app profile dir INSIDE AYGENT's managed browser dir (never a
+    // system Chrome profile). Per-agent isolation (Atlas C) comes in a later
+    // slice; Slice 1 uses one shared profile under our own dir.
+    let profile = browser_dir(app)?.join("profile-default");
+    std::fs::create_dir_all(&profile).map_err(|e| format!("mkdir profile: {e}"))?;
+
+    let mut child = std::process::Command::new(&exe)
+        .arg("--headless=new")
+        .arg(format!("--remote-debugging-port={port}"))
+        // Bind DevTools to loopback only — never expose the CDP port off-box.
+        .arg("--remote-debugging-address=127.0.0.1")
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--disable-gpu")
+        // Reasonable default viewport for the screenshot.
+        .arg("--window-size=1280,800")
+        .arg("about:blank")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("launch chromium: {e}"))?;
+
+    // Chromium prints "DevTools listening on ws://127.0.0.1:PORT/..." to stderr
+    // once the endpoint is up. We wait for that line (with a timeout) instead of
+    // racing a fixed sleep. We only need to know it's READY; the actual ws URL we
+    // fetch fresh per-target via /json.
+    let stderr = child.stderr.take().ok_or("no chromium stderr")?;
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(20), async move {
+        let mut lines = TokioBufReader::new(tokio::process::ChildStderr::from_std(stderr).map_err(|e| format!("stderr adopt: {e}"))?).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.contains("DevTools listening on") {
+                return Ok::<(), String>(());
+            }
+        }
+        Err("chromium exited before DevTools was ready".into())
+    })
+    .await
+    .map_err(|_| "timed out waiting for Chromium DevTools".to_string())??;
+    let _ = ready;
+
+    let mut guard = state.inner.lock().map_err(|_| "browser state poisoned")?;
+    *guard = Some(RunningBrowser { child, port });
+    Ok(port)
+}
+
+/// Fetch the CDP WebSocket URL for a fresh page target via the HTTP /json API.
+/// We open a NEW tab (PUT /json/new) so we always have a clean page to drive,
+/// then return its webSocketDebuggerUrl.
+async fn page_ws_url(client: &reqwest::Client, port: u16) -> Result<String, String> {
+    // Create a fresh target. CfT/Chromium accepts PUT /json/new.
+    let resp = client
+        .put(format!("http://127.0.0.1:{port}/json/new"))
+        .send()
+        .await
+        .map_err(|e| format!("cdp /json/new: {e}"))?;
+    // Some builds require GET for /json/new; fall back to listing targets.
+    let target: serde_json::Value = if resp.status().is_success() {
+        resp.json().await.map_err(|e| format!("cdp new parse: {e}"))?
+    } else {
+        let list: Vec<serde_json::Value> = client
+            .get(format!("http://127.0.0.1:{port}/json"))
+            .send().await.map_err(|e| format!("cdp /json: {e}"))?
+            .json().await.map_err(|e| format!("cdp list parse: {e}"))?;
+        list.into_iter()
+            .find(|t| t["type"].as_str() == Some("page"))
+            .ok_or("no page target in Chromium")?
+    };
+    target["webSocketDebuggerUrl"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "target has no webSocketDebuggerUrl".into())
+}
+
+/// Minimal CDP call over a page WebSocket: send one method + params, wait for
+/// the reply with the matching id, return its `result`. (Slice 1 does a small
+/// fixed sequence, so a per-call open/close socket is fine.)
+async fn cdp_call(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let req = serde_json::json!({ "id": id, "method": method, "params": params });
+    ws.send(Message::Text(req.to_string().into()))
+        .await
+        .map_err(|e| format!("cdp send {method}: {e}"))?;
+    // Read frames until we get our id (skip events + other ids).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("cdp {method}: timed out"));
+        }
+        let frame = tokio::time::timeout(remaining, ws.next())
+            .await
+            .map_err(|_| format!("cdp {method}: timed out"))?;
+        let msg = match frame {
+            Some(Ok(Message::Text(t))) => t,
+            Some(Ok(Message::Close(_))) | None => return Err(format!("cdp {method}: socket closed")),
+            Some(Ok(_)) => continue, // ping/binary — ignore
+            Some(Err(e)) => return Err(format!("cdp {method} recv: {e}")),
+        };
+        let v: serde_json::Value = match serde_json::from_str(&msg) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v["id"].as_u64() == Some(id) {
+            if let Some(err) = v.get("error") {
+                return Err(format!("cdp {method}: {err}"));
+            }
+            return Ok(v["result"].clone());
+        }
+        // else: an event or another call's reply — keep reading.
+    }
+}
+
+/// SLICE 1 — navigate to `url` and return a base64 PNG screenshot of the page.
+/// This is the first time the browser DOES something the human can SEE inside
+/// AYGENT. Also returns the final URL + page title.
+#[tauri::command]
+pub async fn browser_navigate(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, BrowserProc>,
+    url: String,
+) -> Result<serde_json::Value, String> {
+    use tokio_tungstenite::connect_async;
+
+    // Normalize a bare host into a URL (so "example.com" works).
+    let url = normalize_url(&url);
+
+    let port = ensure_running(&app, &state).await?;
+    let client = reqwest::Client::new();
+    let ws_url = page_ws_url(&client, port).await?;
+    let (mut ws, _) = connect_async(&ws_url)
+        .await
+        .map_err(|e| format!("cdp connect: {e}"))?;
+
+    let mut id = 1u64;
+    let mut next = || { let n = id; id += 1; n };
+
+    // Enable the domains we use.
+    cdp_call(&mut ws, next(), "Page.enable", serde_json::json!({})).await?;
+
+    // Navigate.
+    cdp_call(&mut ws, next(), "Page.navigate", serde_json::json!({ "url": url })).await?;
+
+    // Give the page a moment to render (Slice 1 is a simple settle; S2's
+    // screencast will stream live frames instead of a single settled shot).
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+    // Capture a PNG screenshot (base64).
+    let shot = cdp_call(
+        &mut ws,
+        next(),
+        "Page.captureScreenshot",
+        serde_json::json!({ "format": "png" }),
+    )
+    .await?;
+    let data = shot["data"].as_str().unwrap_or("").to_string();
+
+    // Read the final URL + title (best-effort).
+    let (mut final_url, mut title) = (url.clone(), String::new());
+    if let Ok(r) = cdp_call(
+        &mut ws,
+        next(),
+        "Runtime.evaluate",
+        serde_json::json!({ "expression": "JSON.stringify([location.href, document.title])", "returnByValue": true }),
+    )
+    .await
+    {
+        if let Some(s) = r["result"]["value"].as_str() {
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(s) {
+                if arr.len() == 2 {
+                    final_url = arr[0].clone();
+                    title = arr[1].clone();
+                }
+            }
+        }
+    }
+
+    use futures_util::SinkExt;
+    let _ = ws.close(None).await;
+
+    if data.is_empty() {
+        return Err("screenshot empty".into());
+    }
+    Ok(serde_json::json!({
+        "screenshot": format!("data:image/png;base64,{data}"),
+        "url": final_url,
+        "title": title,
+    }))
+}
+
+/// Add https:// to a bare host; leave full URLs + about:/file: as-is-ish.
+fn normalize_url(input: &str) -> String {
+    let s = input.trim();
+    if s.is_empty() {
+        return "about:blank".into();
+    }
+    if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("about:") {
+        return s.to_string();
+    }
+    // Looks like a search rather than a host? (has spaces) — send to a search.
+    if s.contains(' ') {
+        return format!("https://duckduckgo.com/?q={}", urlencoding_encode(s));
+    }
+    format!("https://{s}")
+}
+
+/// Tiny percent-encoder for the query fallback (avoid pulling a dep just for
+/// this one call).
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b' ' => out.push_str("%20"),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Shut the headless browser down (frees RAM). Safe to call when not running.
+#[tauri::command]
+pub fn browser_shutdown(state: tauri::State<'_, BrowserProc>) -> Result<(), String> {
+    let mut guard = state.inner.lock().map_err(|_| "browser state poisoned")?;
+    if let Some(mut rb) = guard.take() {
+        let _ = rb.child.kill();
+        let _ = rb.child.wait();
+    }
+    Ok(())
+}
