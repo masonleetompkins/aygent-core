@@ -772,9 +772,12 @@ fn normalize_url(input: &str) -> String {
     if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("about:") {
         return s.to_string();
     }
-    // Looks like a search rather than a host? (has spaces) — send to a search.
-    if s.contains(' ') {
-        return format!("https://duckduckgo.com/?q={}", urlencoding_encode(s));
+    // Route to a Google search UNLESS it looks like a real host: a search if it
+    // has spaces OR has no dot (e.g. "weather", "mason tompkins"). "example.com"
+    // and "localhost:3000" still navigate.
+    let looks_like_host = !s.contains(' ') && (s.contains('.') || s.starts_with("localhost"));
+    if !looks_like_host {
+        return format!("https://www.google.com/search?q={}", urlencoding_encode(s));
     }
     format!("https://{s}")
 }

@@ -1,31 +1,32 @@
-// AYGENT — Browser screen (BROWSER-ARCH Slice 1 + tabs).
-// A real browser inside AYGENT: multiple tabs, each with its own address bar +
-// rendered page (a settled screenshot for now; Slice 2 = live screencast, Slice
-// 3 = click-into-it). The selected tab's URL IS the address field — editing the
-// address bar edits that tab; each tab shows its URL (or title) as its label.
-import { useEffect, useState } from "react";
+// AYGENT — Browser screen (BROWSER-ARCH Slice 1 + inline-tab addressing).
+// ONE row of tabs. The ACTIVE tab IS the address field: click it (when already
+// active) to edit its URL inline; type + Enter to navigate. Inactive tabs show
+// their page title — click to switch. + adds a tab, x closes. Plain text (no
+// domain) routes to a Google search. The rendered page below is a settled
+// screenshot for now (Slice 2 = live screencast; Slice 3 = click-into-it).
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Button, Input, Pill } from "../components/ui";
+import { Pill } from "../components/ui";
 import { Icon } from "../components/Icon";
 
+type NavResult = { screenshot: string; url: string; title: string };
 type Tab = {
   id: number;
-  addr: string;                 // what's in the address bar for this tab
-  page: NavResult | null;       // the rendered page (screenshot + url + title)
+  addr: string;                 // URL text for this tab (also the edit buffer)
+  page: NavResult | null;
   loading: boolean;
   err: string | null;
+  editing: boolean;             // active tab in URL-edit mode
 };
-type NavResult = { screenshot: string; url: string; title: string };
 
 let TAB_SEQ = 1;
-function newTab(): Tab {
-  return { id: TAB_SEQ++, addr: "", page: null, loading: false, err: null };
-}
+const newTab = (): Tab => ({ id: TAB_SEQ++, addr: "", page: null, loading: false, err: null, editing: true });
 
 export function Browser() {
   const [installed] = useInstalled();
   const [tabs, setTabs] = useState<Tab[]>([newTab()]);
   const [activeId, setActiveId] = useState<number>(() => tabs[0].id);
+  const editRef = useRef<HTMLInputElement>(null);
 
   const active = tabs.find((t) => t.id === activeId) ?? tabs[0];
 
@@ -48,12 +49,18 @@ export function Browser() {
     });
   }
 
-  async function go(id: number, target?: string) {
+  // Click a tab: switch to it. If it's ALREADY active, enter URL-edit mode.
+  function clickTab(id: number) {
+    if (id === activeId) { patch(id, { editing: true }); setTimeout(() => editRef.current?.select(), 0); }
+    else setActiveId(id);
+  }
+
+  async function go(id: number) {
     const tab = tabs.find((t) => t.id === id);
     if (!tab) return;
-    const url = (target ?? tab.addr).trim();
-    if (!url) return;
-    patch(id, { loading: true, err: null });
+    const url = tab.addr.trim();
+    if (!url) { patch(id, { editing: false }); return; }
+    patch(id, { loading: true, err: null, editing: false });
     try {
       const res = await invoke<NavResult>("browser_navigate", { url });
       patch(id, { page: res, addr: res.url, loading: false });
@@ -74,38 +81,58 @@ export function Browser() {
     );
   }
 
-  const tabLabel = (t: Tab) =>
-    t.page?.title || t.page?.url || (t.addr.trim() ? t.addr : "New Tab");
+  const label = (t: Tab) => t.page?.title || t.page?.url || "New Tab";
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0, gap: 10 }}>
-      {/* TAB BAR — each tab labeled by its page title/url; + adds a new one. */}
+      {/* ONE ROW: tabs. Active tab is editable inline = the address field. */}
       <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
         {tabs.map((t) => {
           const on = t.id === activeId;
+          const editing = on && t.editing;
           return (
             <div
               key={t.id}
-              onClick={() => setActiveId(t.id)}
+              onClick={() => clickTab(t.id)}
               style={{
-                display: "flex", alignItems: "center", gap: 6, maxWidth: 220,
-                padding: "6px 10px", cursor: "pointer",
+                display: "flex", alignItems: "center", gap: 7,
+                width: editing ? 340 : "auto", maxWidth: editing ? 340 : 240,
+                padding: "7px 11px", cursor: on ? "text" : "pointer",
                 borderRadius: "var(--radius-control)",
                 border: `var(--border-width) solid ${on ? "var(--accent)" : "var(--line)"}`,
                 background: on ? "var(--surface)" : "var(--bg)",
                 color: on ? "var(--text)" : "var(--text-muted)",
                 boxShadow: on ? "var(--elevation)" : "none",
+                transition: "width 0.12s ease",
               }}
             >
               {t.loading
-                ? <span style={{ width: 14, fontSize: 11 }}>…</span>
-                : <Icon name="globe" size={13} />}
-              <span style={{ fontSize: 12, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                {tabLabel(t)}
-              </span>
+                ? <span style={{ width: 15, fontSize: 12, textAlign: "center" }}>…</span>
+                : <Icon name="globe" size={14} />}
+              {editing ? (
+                <input
+                  ref={editRef}
+                  autoFocus
+                  value={t.addr}
+                  onChange={(e) => patch(t.id, { addr: e.target.value })}
+                  onKeyDown={(e) => { if (e.key === "Enter") go(t.id); if (e.key === "Escape") patch(t.id, { editing: false }); }}
+                  onBlur={() => patch(t.id, { editing: false })}
+                  onClick={(e) => e.stopPropagation()}
+                  placeholder="Enter a URL or search…"
+                  style={{
+                    flex: 1, minWidth: 0, border: "none", outline: "none",
+                    background: "transparent", color: "var(--text)", fontSize: 13,
+                    fontFamily: "inherit",
+                  }}
+                />
+              ) : (
+                <span style={{ flex: 1, fontSize: 13, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {label(t)}
+                </span>
+              )}
               <span
                 onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}
-                style={{ fontSize: 14, lineHeight: 1, opacity: 0.6, paddingLeft: 2 }}
+                style={{ fontSize: 15, lineHeight: 1, opacity: 0.55, paddingLeft: 2 }}
                 title="Close tab"
               >×</span>
             </div>
@@ -116,26 +143,11 @@ export function Browser() {
           title="New tab"
           style={{
             display: "flex", alignItems: "center", justifyContent: "center",
-            width: 30, height: 30, borderRadius: "var(--radius-control)",
+            width: 32, height: 32, borderRadius: "var(--radius-control)",
             border: "var(--border-width) dashed var(--line)", background: "transparent",
-            color: "var(--text-muted)", cursor: "pointer", fontSize: 18, lineHeight: 1,
+            color: "var(--text-muted)", cursor: "pointer", fontSize: 18, lineHeight: 1, flexShrink: 0,
           }}
         >+</button>
-      </div>
-
-      {/* ADDRESS BAR — edits the ACTIVE tab. */}
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        <div style={{ flex: 1 }}>
-          <Input
-            value={active.addr}
-            onChange={(e: any) => patch(active.id, { addr: e.target.value })}
-            onKeyDown={(e: any) => { if (e.key === "Enter") go(active.id); }}
-            placeholder="Enter a URL or search…"
-          />
-        </div>
-        <Button onClick={() => go(active.id)} disabled={active.loading || !active.addr.trim()}>
-          {active.loading ? "Loading…" : "Go"}
-        </Button>
       </div>
 
       {active.err && <Pill tone="danger">✗ {active.err}</Pill>}
@@ -157,7 +169,7 @@ export function Browser() {
             flex: 1, display: "flex", alignItems: "center", justifyContent: "center",
             color: "var(--text-faint)", fontSize: 14,
           }}>
-            {active.loading ? "Loading the page…" : "Enter a URL above to load a page."}
+            {active.loading ? "Loading the page…" : "Click the tab to type a URL, or search."}
           </div>
         )}
       </div>
