@@ -14,11 +14,14 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Input, Pill } from "../components/ui";
+import { Input } from "../components/ui";
 import { Icon } from "../components/Icon";
 
 type Tab = { id: number; addr: string; title: string; editing: boolean };
 let TAB_SEQ = 1;
+// Width (CSS px) of the right-hand agent pane when handed off. syncBounds
+// shrinks the native webview by this + a gap so the pane sits BESIDE the page.
+const AGENT_PANE_W = 340;
 const newTab = (): Tab => ({ id: TAB_SEQ++, addr: "", title: "New Tab", editing: true });
 
 export function Browser() {
@@ -43,15 +46,19 @@ export function Browser() {
   // MUST be confined to the pane rect or it covers the tab/address bar (which it
   // was doing). Measure via rAF so we read post-layout numbers, and clamp to
   // non-negative sizes.
+  // The webview tracks the LEFT region of the page area; in agent mode the
+  // right pane takes AGENT_PANE_W, so we shrink the webview to leave room — the
+  // agent prompt pane sits BESIDE the page, not over it.
   function syncBounds() {
     const el = paneRef.current;
     if (!el) return;
     requestAnimationFrame(() => {
       const r = el.getBoundingClientRect();
       if (r.width < 1 || r.height < 1) return;
+      const rightPane = driver === "agent" ? AGENT_PANE_W + 10 : 0; // +gap
       invoke("webview_set_bounds", {
         x: Math.round(r.left), y: Math.round(r.top),
-        width: Math.round(r.width), height: Math.round(r.height),
+        width: Math.round(Math.max(r.width - rightPane, 1)), height: Math.round(r.height),
       }).catch(() => {});
     });
   }
@@ -105,10 +112,10 @@ export function Browser() {
     });
   }
 
-  // THE HAND-OFF. Flip to agent: the prompt bar appears. Flip to human: you drive.
-  function toggleDriver() {
-    setDriver((d) => (d === "human" ? "agent" : "human"));
-  }
+  // THE HAND-OFF. Flip to agent: the right prompt pane opens + the webview
+  // shrinks to make room. Flip to human: pane closes, webview reclaims width.
+  // Re-sync bounds a beat after the toggle so the webview resizes with it.
+  useEffect(() => { syncBounds(); const t = setTimeout(syncBounds, 60); return () => clearTimeout(t); }, [driver]); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function runAgent() {
     const task = agentPrompt.trim();
@@ -190,47 +197,76 @@ export function Browser() {
         </div>
       </div>
 
-      {/* AGENT PROMPT BAR — appears when you hand off. You tell the agent what to
-          do; it acts in the SAME window you're looking at. */}
-      {driver === "agent" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 6, border: "var(--border-width) solid var(--accent)", borderRadius: "var(--radius-card)", padding: 10, background: "var(--surface)" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <Icon name="sparkles" size={15} />
-            <span style={{ fontSize: 13, fontWeight: 700 }}>Tell the agent what to do in this page</span>
-            <span style={{ marginLeft: "auto", fontSize: 12, color: "var(--text-faint)" }}>You’re watching — take back control anytime with “You”.</span>
+      {/* PAGE (left) + AGENT PANE (right). The native webview tracks paneRef,
+          which is the LEFT region; syncBounds shrinks it by AGENT_PANE_W when
+          the agent pane is open, so the pane sits BESIDE the page. */}
+      <div style={{ flex: 1, minHeight: 0, display: "flex", gap: 10 }}>
+        {/* THE PAGE AREA — the native webview is positioned over THIS div. */}
+        <div ref={paneRef} style={{
+          flex: 1, minWidth: 0, minHeight: 0, position: "relative",
+          border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-card)",
+          background: "var(--bg)", overflow: "hidden",
+        }}>
+          <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", fontSize: 14, pointerEvents: "none" }}>
+            Click the tab to type a URL, or search.
           </div>
-          <div style={{ display: "flex", gap: 8 }}>
-            <div style={{ flex: 1 }}>
-              <Input value={agentPrompt} onChange={(e: any) => setAgentPrompt(e.target.value)}
-                onKeyDown={(e: any) => { if (e.key === "Enter") runAgent(); }}
-                placeholder='e.g. "click the login button" or "summarize this page"' />
-            </div>
-            <button onClick={runAgent} disabled={agentBusy || !agentPrompt.trim()}
-              style={{ fontSize: 13, padding: "8px 16px", borderRadius: "var(--radius-control)", border: "var(--border-width) solid var(--accent)", background: "var(--accent)", color: "#fff", cursor: "pointer", opacity: agentBusy || !agentPrompt.trim() ? 0.5 : 1 }}>
-              {agentBusy ? "Working…" : "Act"}
-            </button>
-          </div>
-          {agentLog.length > 0 && (
-            <div style={{ maxHeight: 96, overflow: "auto", fontSize: 12, fontFamily: "ui-monospace, monospace", color: "var(--text-muted)", display: "flex", flexDirection: "column", gap: 2 }}>
-              {agentLog.slice(-6).map((l, i) => <div key={i}>{l}</div>)}
-            </div>
+          {driver === "agent" && (
+            <div style={{ position: "absolute", inset: 0, pointerEvents: "none", boxShadow: "inset 0 0 0 2px var(--accent)" }} />
           )}
         </div>
-      )}
 
-      {/* THE PAGE AREA — the native webview floats over THIS div. When the agent
-          is driving we dim + block pointer events so you don't fight it. */}
-      <div ref={paneRef} style={{
-        flex: 1, minHeight: 0, position: "relative",
-        border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-card)",
-        background: "var(--bg)", overflow: "hidden",
-      }}>
-        {/* Placeholder shown only before first navigation (webview not yet over it). */}
-        <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", fontSize: 14, pointerEvents: "none" }}>
-          Click the tab to type a URL, or search.
-        </div>
+        {/* AGENT PANE (right) — appears on hand-off. You prompt here; the agent
+            acts in the page to the left while you watch. */}
         {driver === "agent" && (
-          <div style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.04)", pointerEvents: "none", boxShadow: "inset 0 0 0 2px var(--accent)" }} />
+          <div style={{
+            width: AGENT_PANE_W, flexShrink: 0, display: "flex", flexDirection: "column", gap: 8,
+            border: "var(--border-width) solid var(--accent)", borderRadius: "var(--radius-card)",
+            padding: 12, background: "var(--surface)", minHeight: 0,
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <Icon name="sparkles" size={15} />
+              <span style={{ fontSize: 13, fontWeight: 700 }}>Agent</span>
+              <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-faint)" }}>acting in the page →</span>
+            </div>
+            <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+              Tell the agent what to do on this page. You’re watching — hit “You” anytime to take back control.
+            </div>
+
+            {/* Conversation log fills the pane. */}
+            <div style={{ flex: 1, minHeight: 0, overflow: "auto", display: "flex", flexDirection: "column", gap: 8, paddingRight: 2 }}>
+              {agentLog.length === 0 ? (
+                <div style={{ fontSize: 12, color: "var(--text-faint)", marginTop: 4 }}>
+                  Try: “click the sign-in button”, “summarize this page”, “scroll down”.
+                </div>
+              ) : agentLog.map((l, i) => {
+                const isUser = l.startsWith("▸ ");
+                return (
+                  <div key={i} style={{
+                    alignSelf: isUser ? "flex-end" : "flex-start", maxWidth: "92%",
+                    fontSize: 12.5, lineHeight: 1.4, padding: "7px 10px", borderRadius: 10,
+                    background: isUser ? "var(--accent)" : "var(--bg)",
+                    color: isUser ? "#fff" : "var(--text)",
+                    border: isUser ? "none" : "var(--border-width) solid var(--line)",
+                    whiteSpace: "pre-wrap", wordBreak: "break-word",
+                  }}>{isUser ? l.slice(2) : l}</div>
+                );
+              })}
+              {agentBusy && <div style={{ fontSize: 12, color: "var(--text-faint)" }}>working…</div>}
+            </div>
+
+            {/* Prompt input pinned to the bottom of the pane. */}
+            <div style={{ display: "flex", gap: 6 }}>
+              <div style={{ flex: 1 }}>
+                <Input value={agentPrompt} onChange={(e: any) => setAgentPrompt(e.target.value)}
+                  onKeyDown={(e: any) => { if (e.key === "Enter") runAgent(); }}
+                  placeholder="Tell the agent…" />
+              </div>
+              <button onClick={runAgent} disabled={agentBusy || !agentPrompt.trim()}
+                style={{ fontSize: 13, padding: "8px 14px", borderRadius: "var(--radius-control)", border: "none", background: "var(--accent)", color: "#fff", cursor: "pointer", opacity: agentBusy || !agentPrompt.trim() ? 0.5 : 1 }}>
+                {agentBusy ? "…" : "Act"}
+              </button>
+            </div>
+          </div>
         )}
       </div>
     </div>
