@@ -74,9 +74,11 @@ export function Pill({ children, tone = "muted" }: { children: ReactNode; tone?:
   const color = tone === "ok" ? "var(--ok)" : tone === "danger" ? "var(--danger)" : "var(--text-muted)";
   return (
     <span style={{
+      display: "inline-flex", alignItems: "center", gap: 5,
+      whiteSpace: "nowrap", width: "fit-content", alignSelf: "flex-start",
       border: `var(--border-width) solid ${color}`, color,
-      borderRadius: "var(--radius-pill)", padding: "5px 12px", fontSize: 13, fontWeight: 600,
-      boxShadow: "var(--elevation)", background: "var(--surface)",
+      borderRadius: "var(--radius-pill)", padding: "4px 12px", fontSize: 13, fontWeight: 600,
+      lineHeight: 1.4, boxShadow: "var(--elevation)", background: "var(--surface)",
     }}>
       {children}
     </span>
