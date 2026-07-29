@@ -38,12 +38,22 @@ export function Browser() {
     setTabs((ts) => ts.map((t) => (t.id === id ? { ...t, ...p } : t)));
   }
 
-  // Position the native webview over the pane rect (device-independent CSS px).
+  // Position the native webview EXACTLY over the page-area rect (CSS px). The
+  // webview is a real OS layer that paints on top of our React chrome, so it
+  // MUST be confined to the pane rect or it covers the tab/address bar (which it
+  // was doing). Measure via rAF so we read post-layout numbers, and clamp to
+  // non-negative sizes.
   function syncBounds() {
     const el = paneRef.current;
     if (!el) return;
-    const r = el.getBoundingClientRect();
-    invoke("webview_set_bounds", { x: r.left, y: r.top, width: r.width, height: r.height }).catch(() => {});
+    requestAnimationFrame(() => {
+      const r = el.getBoundingClientRect();
+      if (r.width < 1 || r.height < 1) return;
+      invoke("webview_set_bounds", {
+        x: Math.round(r.left), y: Math.round(r.top),
+        width: Math.round(r.width), height: Math.round(r.height),
+      }).catch(() => {});
+    });
   }
 
   // Mount: on leaving the tab, hide the native webview so it doesn't float over
@@ -72,8 +82,13 @@ export function Browser() {
     const r = el?.getBoundingClientRect();
     // First navigation for the pane opens/positions the webview; later ones reuse.
     await invoke("webview_open", {
-      url, x: r?.left ?? 0, y: r?.top ?? 0, width: r?.width ?? 800, height: r?.height ?? 600,
+      url,
+      x: Math.round(r?.left ?? 0), y: Math.round(r?.top ?? 0),
+      width: Math.round(r?.width ?? 800), height: Math.round(r?.height ?? 600),
     }).catch((e) => setAgentLog((l) => [...l, `open failed: ${e}`]));
+    // Re-sync a beat later so the webview lands on the SETTLED rect (the agent
+    // prompt bar toggling can shift the pane by a row).
+    setTimeout(syncBounds, 120);
   }
 
   function clickTab(id: number) {
