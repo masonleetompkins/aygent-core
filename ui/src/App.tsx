@@ -26,11 +26,18 @@ export function App() {
   const [status, setStatus] = useState<Status>({ kind: "booting" });
   const [folder, setFolder] = useState<string | null>(null);
   const [activeAgent, setActiveAgent] = useState<AgentProfile | null>(null);
-  // Multi-agent: which agents have an OPEN chat pane (side by side). The array
-  // order = left-to-right pane order. The "active" agent (rail highlight, folder
-  // scope for This-Agent screens) is the last one you focused; open panes are
-  // additive. Empty falls back to the single active agent.
-  const [openPaneIds, setOpenPaneIds] = useState<string[]>([]);
+  // Multi-agent: which agents have an OPEN chat pane (side by side). Stored as a
+  // SET (membership only) — the render ORDER is always derived from the rail's
+  // roster order (see paneIds below), so top-to-bottom in the rail == left-to-
+  // right in the panes, no matter what sequence you open them in.
+  const [openSet, setOpenSet] = useState<Set<string>>(new Set());
+  // Roster order = the canonical ordering source (same list the rail renders).
+  const [rosterOrder, setRosterOrder] = useState<string[]>([]);
+  useEffect(() => {
+    invoke<{ agents: AgentProfile[] }>("agents_list")
+      .then((r) => setRosterOrder((r.agents || []).filter((a) => !a.archived).map((a) => a.id)))
+      .catch(() => {});
+  }, [screen]);
   const [screen, setScreen] = useState<ScreenId>("chat");
   const [mode, setMode] = useState<Mode>("light");
   const [accent, setAccent] = useState("");
@@ -98,22 +105,35 @@ export function App() {
   // M1.4 parallel UI: viewing an agent no longer changes which agents RUN. We
   // still call agents_set_active (so the primary Chat pane's folder/model track
   // the viewed agent), but every agent runs in the background regardless.
-  // Click a rail chip: focus that agent (active = its folder/model). On the Chat
-  // screen, ensure it has an open pane (adds one if not already open) so you can
-  // build up a side-by-side wall of agents. Other screens just switch focus.
+  // Click a rail chip = TOGGLE its pane: open if closed, close if open. This is
+  // what makes opening/closing one at a time clean. When opening (or when it's
+  // already open), focus it so the This-Agent screens + folder scope follow.
   function onViewAgent(a: AgentProfile) {
+    if (screen !== "chat") setScreen("chat");
+    setOpenSet((prev) => {
+      const next = new Set(prev);
+      if (next.has(a.id)) {
+        next.delete(a.id); // toggle CLOSED
+      } else {
+        next.add(a.id);    // toggle OPEN
+        focusAgent(a);
+      }
+      return next;
+    });
+  }
+  function focusAgent(a: AgentProfile) {
     invoke<AgentProfile | null>("agents_set_active", { id: a.id })
       .then((updated) => { if (updated) onActiveChange(updated); else onActiveChange(a); })
       .catch(() => onActiveChange(a));
-    if (screen !== "chat") setScreen("chat");
-    setOpenPaneIds((ids) => (ids.includes(a.id) ? ids : [...ids, a.id]));
   }
   function closePane(id: string) {
-    setOpenPaneIds((ids) => ids.filter((x) => x !== id));
+    setOpenSet((prev) => { const next = new Set(prev); next.delete(id); return next; });
   }
-  // The panes to render: explicit open set, else fall back to the active agent.
-  const paneIds = openPaneIds.length > 0
-    ? openPaneIds
+  // The panes to render, ALWAYS in roster order (rail order) so pane layout is
+  // stable + synced with the rail. Fall back to the active agent when none open.
+  const paneIds = rosterOrder.filter((id) => openSet.has(id));
+  const effectivePaneIds = paneIds.length > 0
+    ? paneIds
     : (activeAgent?.id ? [activeAgent.id] : []);
 
   return (
@@ -121,7 +141,7 @@ export function App() {
       {/* Agent selector is the top-level axis → far left. */}
       <AgentRail
         viewingId={activeAgent?.id ?? null}
-        openIds={paneIds}
+        openIds={effectivePaneIds}
         onView={onViewAgent}
         onManage={() => setScreen("agents")}
       />
@@ -135,7 +155,7 @@ export function App() {
           {screen === "chat" && (
             <Chat
               keySet={keySet}
-              paneIds={paneIds}
+              paneIds={effectivePaneIds}
               activeId={activeAgent?.id ?? null}
               onClosePane={closePane}
               onFocusPane={(id) => { invoke<AgentProfile | null>("agents_set_active", { id }).then((u) => { if (u) onActiveChange(u); }).catch(() => {}); }}
