@@ -2,14 +2,16 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Input, Pill } from "../components/ui";
 import type { AgentProfile } from "../components/AgentSwitcher";
+import { Icon, AGENT_ICONS, type IconName } from "../components/Icon";
 
 // Agents management screen (§10.2): list all agent profiles, create/edit/delete,
 // and pick each agent's jailed folder + model/provider. The switcher rail is the
 // quick-switch; THIS is the full CRUD surface.
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
-const ICONS = ["🤖", "🧠", "📓", "🔬", "💼", "🎨", "📈", "🗂️", "⚙️", "🌱"];
-const COLORS = ["#5b8cff", "#22c55e", "#f59e0b", "#ec4899", "#8b5cf6", "#14b8a6", "#ef4444", "#64748b"];
+// Agent icons are SF-Symbol-style glyphs (see Icon.tsx); rendered in the
+// accent color/glow — no per-agent background color anymore (Mason's call).
+const ICONS = AGENT_ICONS;
 
 // Rank a model id most-powerful-first. Higher score = more capable = higher in
 // the dropdown. Family tier dominates; version bumps break ties (opus-5 > opus-4-8).
@@ -112,9 +114,9 @@ export function Agents({
       {agents.map((a) => (
         <Card key={a.id} style={{ flexDirection: "row", alignItems: "center", gap: 14 }}>
           <div style={{
-            width: 44, height: 44, borderRadius: 12, background: a.color, color: "#fff",
-            display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22, flexShrink: 0,
-          }}>{a.icon || "🤖"}</div>
+            width: 44, height: 44, flexShrink: 0, color: "var(--accent)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+          }}><Icon name={(a.icon as IconName) || "sparkles"} size={26} glow /></div>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <span style={{ fontWeight: 700, fontSize: 16 }}>{a.name}</span>
@@ -300,39 +302,25 @@ function AgentForm({
           <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Work, Journal, Research…" />
         </label>
 
-        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-          <label style={{ ...fieldLabel, flex: 0 }}>Icon
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              {ICONS.map((i) => {
-                const sel = icon === i;
-                return (
-                  <button key={i} onClick={() => setIcon(i)} style={{
-                    width: 36, height: 36, borderRadius: 9, fontSize: 18, cursor: "pointer",
-                    border: sel ? "2px solid var(--accent)" : "2px solid var(--line)",
-                    background: sel ? "color-mix(in srgb, var(--accent) 14%, var(--bg))" : "var(--bg)",
-                    boxShadow: sel ? "0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent)" : "none",
-                    transition: "border-color .12s, box-shadow .12s, background .12s",
-                  }}>{i}</button>
-                );
-              })}
-            </div>
-          </label>
-          <label style={{ ...fieldLabel, flex: 0 }}>Color
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              {COLORS.map((c) => {
-                const sel = color === c;
-                return (
-                  <button key={c} onClick={() => setColor(c)} title={c} style={{
-                    width: 32, height: 32, borderRadius: 8, background: c, cursor: "pointer",
-                    border: sel ? "2px solid var(--text)" : "2px solid transparent",
-                    boxShadow: sel ? "0 0 0 2px color-mix(in srgb, var(--text) 30%, transparent)" : "none",
-                    transition: "box-shadow .12s",
-                  }} />
-                );
-              })}
-            </div>
-          </label>
-        </div>
+        <label style={{ ...fieldLabel, flex: 0 }}>Icon
+          <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Shown in your accent color (set in Settings → Appearance).</span>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 4 }}>
+            {ICONS.map((i) => {
+              const sel = icon === i;
+              return (
+                <button key={i} onClick={() => setIcon(i)} title={i} style={{
+                  width: 40, height: 40, borderRadius: "var(--radius-control)", cursor: "pointer",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  color: sel ? "var(--accent)" : "var(--text-muted)",
+                  border: sel ? "var(--border-width) solid var(--accent)" : "var(--border-width) solid var(--line)",
+                  background: sel ? "color-mix(in srgb, var(--accent) 10%, var(--bg))" : "var(--bg)",
+                  boxShadow: sel ? "var(--elevation)" : "none",
+                  transition: "border-color .12s, box-shadow .12s, color .12s",
+                }}><Icon name={i} size={20} glow={sel} /></button>
+              );
+            })}
+          </div>
+        </label>
 
         <label style={fieldLabel}>Agent Folder (its jail)
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>

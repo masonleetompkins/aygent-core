@@ -176,6 +176,20 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
     } catch { /* ignore */ }
   }
 
+  // Rename a chat: prompt for a new title, persist it via conv_save (loads the
+  // full conversation first so we don't clobber msgs/history) then refresh.
+  async function renameConv(id: string) {
+    if (!folder) return;
+    const cur = convs.find((x) => x.id === id);
+    const next = window.prompt("Rename chat", cur?.title || "")?.trim();
+    if (next === undefined || next === null || next === "") return;
+    try {
+      const c = await invoke<any>("conv_load", { folder, id });
+      await invoke("conv_save", { folder, conv: { ...c, title: next } });
+      await refreshList();
+    } catch { /* ignore */ }
+  }
+
   // Persist a drop: move `srcId` to `targetId`'s slot, recompute a dense order
   // (1..n) for the whole list, and save it in one batch.
   async function commitReorder(srcId: string, targetId: string) {
@@ -349,7 +363,10 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
           </p>
         )}
 
-        <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 14, paddingRight: 6 }}>
+        {/* Messages bottom-align: newest sits just above the input, older scroll
+           up (justifyContent flex-end + margin-top auto on the list wrapper). */}
+        <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", paddingRight: 6 }}>
+          <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 14 }}>
           {msgs.length === 0 && !running && !blocked && (
             <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
           )}
@@ -358,7 +375,7 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
               to the agent you're viewing, show it as a user bubble immediately
               (before the reply streams) so you WATCH the conversation arrive. */}
           {running && getInbound(agentId) && (
-            <Bubble m={{ role: "user", text: `📨 from ${getInbound(agentId)!.fromName}: ${getInbound(agentId)!.text}` }} />
+            <Bubble m={{ role: "user", text: `from ${getInbound(agentId)!.fromName}: ${getInbound(agentId)!.text}` }} />
           )}
           {/* LIVE turn for the agent being viewed: render a trailing streaming
               bubble fed by the store, so switching to a running agent shows its
@@ -372,6 +389,7 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
               streaming: true,
             }} />
           )}
+          </div>
         </div>
 
         <div style={{ display: "flex", gap: 8, marginTop: 14, alignItems: "flex-end", position: "relative" }}>
@@ -419,7 +437,7 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
         <HistorySidebar
           convs={convs} activeId={convId} busy={running} dragId={dragId} overId={overId}
           listElRef={listElRef}
-          onNew={newConv} onOpen={openConv} onDelete={deleteConv}
+          onNew={newConv} onOpen={openConv} onDelete={deleteConv} onRename={renameConv}
           onPin={togglePin} onPointerDragStart={startPointerDrag}
         />
       )}
@@ -428,12 +446,13 @@ export function Chat({ folder, keySet, agentId }: { folder: string | null; keySe
 }
 
 function HistorySidebar({
-  convs, activeId, busy, dragId, overId, listElRef, onNew, onOpen, onDelete, onPin, onPointerDragStart,
+  convs, activeId, busy, dragId, overId, listElRef, onNew, onOpen, onDelete, onRename, onPin, onPointerDragStart,
 }: {
   convs: ConvMeta[]; activeId: string | null; busy: boolean;
   dragId: string | null; overId: string | null;
   listElRef: React.RefObject<HTMLDivElement>;
   onNew: () => void; onOpen: (id: string) => void; onDelete: (id: string) => void;
+  onRename: (id: string) => void;
   onPin: (id: string) => void;
   onPointerDragStart: (id: string, e: React.PointerEvent) => void;
 }) {
@@ -451,7 +470,7 @@ function HistorySidebar({
           <HistoryItem
             key={c.id} c={c} active={c.id === activeId}
             dragging={dragId === c.id} isOver={overId === c.id && dragId !== null && dragId !== c.id}
-            onOpen={() => onOpen(c.id)} onDelete={() => onDelete(c.id)} onPin={() => onPin(c.id)}
+            onOpen={() => onOpen(c.id)} onDelete={() => onDelete(c.id)} onRename={() => onRename(c.id)} onPin={() => onPin(c.id)}
             onPointerDown={(e) => onPointerDragStart(c.id, e)}
           />
         ))}

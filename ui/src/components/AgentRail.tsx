@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { AgentProfile } from "./AgentSwitcher";
+import { Icon, type IconName } from "./Icon";
 
 // AGENT RAIL (M1.4 parallel UI) — a persistent secondary sidebar of ALL agents.
 // Replaces the "switch the one active agent" model: agents all run in parallel
@@ -102,20 +103,21 @@ export function AgentRail({
             title={`${a.name}${a.model ? ` · ${a.model}` : ""}${busy ? " · working…" : ""}`}
             style={{
               position: "relative",
-              width: 42, height: 42, borderRadius: viewing ? 14 : 21,
-              border: viewing ? `2px solid ${a.color}` : "2px solid transparent",
-              background: viewing ? a.color : "var(--bg)",
-              color: viewing ? "#fff" : "var(--text)",
-              boxShadow: busy
-                ? `0 0 0 3px ${a.color}66`
-                : viewing ? `0 0 0 3px ${a.color}22` : "none",
+              width: 42, height: 42, borderRadius: "var(--radius-control)",
+              // NO background color fill — the SF-symbol itself carries the
+              // accent color + glow (Mason's call). Viewing = accent outline +
+              // accent-tinted icon; idle = quiet muted icon.
+              border: viewing ? "var(--border-width) solid var(--accent)" : "var(--border-width) solid transparent",
+              background: "transparent",
+              color: viewing ? "var(--accent)" : "var(--text-muted)",
+              boxShadow: viewing ? "var(--elevation)" : "none",
               animation: busy ? "aygentPulse 1.1s ease-in-out infinite" : "none",
-              fontSize: 20, cursor: "pointer",
+              cursor: "pointer",
               display: "flex", alignItems: "center", justifyContent: "center",
-              transition: "border-radius .15s ease, background .15s ease",
+              transition: "border .15s ease, color .15s ease, box-shadow .15s ease",
             }}
           >
-            {a.icon || "🤖"}
+            <Icon name={(a.icon as IconName) || "sparkles"} size={22} glow={viewing || busy} />
             {badge > 0 && (
               <span style={{
                 position: "absolute", top: -3, right: -3, minWidth: 16, height: 16,
@@ -132,11 +134,11 @@ export function AgentRail({
         onClick={onManage}
         title="Manage agents"
         style={{
-          width: 42, height: 42, borderRadius: 21, border: "2px dashed var(--line)",
-          background: "transparent", color: "var(--text-muted)", fontSize: 24,
-          lineHeight: 1, cursor: "pointer",
+          width: 42, height: 42, borderRadius: "var(--radius-pill)", border: "var(--border-width) dashed var(--line)",
+          background: "transparent", color: "var(--text-muted)", cursor: "pointer",
+          display: "flex", alignItems: "center", justifyContent: "center",
         }}
-      >+</button>
+      ><Icon name="plus" size={18} /></button>
 
       {/* keyframes for the working pulse (scoped-ish via a style tag) */}
       <style>{`@keyframes aygentPulse { 0%,100% { box-shadow: 0 0 0 3px var(--pulse-a, rgba(91,140,255,.3)); } 50% { box-shadow: 0 0 0 6px rgba(91,140,255,.12); } }`}</style>
