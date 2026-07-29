@@ -7,6 +7,7 @@
 use rusqlite::params; // scheduler_list/scheduler_runs read-only queries
 
 mod agents;
+mod browser;
 mod broker;
 mod broker_ws;
 mod catalog;
@@ -2590,6 +2591,7 @@ pub fn run() {
             agent_stream, reveal_in_finder, get_selected_model, set_selected_model,
             get_selection, set_selection, detect_hardware, local_catalog, local_downloaded,
             local_download, local_delete, local_tool_capability, restore_agent_folder,
+            browser::browser_status, browser::browser_install, browser::browser_launch_probe,
             openai_models, tools_list, tools_upsert, tools_delete, tools_set_enabled,
             tools_config, tools_set_config,
             savepoint_snapshot, savepoint_timeline, savepoint_rewind,
