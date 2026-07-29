@@ -22,6 +22,9 @@ let TAB_SEQ = 1;
 // Width (CSS px) of the right-hand agent pane when handed off. syncBounds
 // shrinks the native webview by this + a gap so the pane sits BESIDE the page.
 const AGENT_PANE_W = 340;
+// Border width of the page pane (matches --border-width, default 1px). The OS
+// webview is inset by this so it lands inside paneRef's rounded outline.
+const PANE_BORDER = 1;
 const newTab = (): Tab => ({ id: TAB_SEQ++, addr: "", title: "New Tab", editing: true });
 
 export function Browser() {
@@ -65,9 +68,15 @@ export function Browser() {
       if (r.width < 40 || r.height < 40) return;
       if (r.left <= 4 && r.top <= 4) return; // origin-hugging = not laid out yet
       const rightPane = driver === "agent" ? AGENT_PANE_W + 10 : 0; // +gap
+      // Inset by the border width so the OS webview sits INSIDE paneRef's
+      // rounded outline instead of painting over it (the webview is an opaque
+      // native layer — anything from the pane's border-box edge inward gets
+      // covered, so we shrink to the CONTENT box).
+      const b = PANE_BORDER;
       const bounds = {
-        x: Math.round(r.left), y: Math.round(r.top),
-        width: Math.round(Math.max(r.width - rightPane, 1)), height: Math.round(r.height),
+        x: Math.round(r.left + b), y: Math.round(r.top + b),
+        width: Math.round(Math.max(r.width - rightPane - b * 2, 1)),
+        height: Math.round(Math.max(r.height - b * 2, 1)),
       };
       // eslint-disable-next-line no-console
       console.log("[browser] syncBounds →", bounds, "raw:", { l: r.left, t: r.top, w: r.width, h: r.height });
