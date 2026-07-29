@@ -105,11 +105,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // Active @mention query state: { query, matches, sel, start } or null.
   const [mention, setMention] = useState<{ query: string; matches: typeof allAgents; sel: number; start: number } | null>(null);
 
-  // #3 auto-grow: resize the textarea to fit its content, capped at 50vh.
+  // #3 auto-grow: single-line by default, grows with content up to a sane cap.
+  // Reset to auto first so it can SHRINK too; when empty, scrollHeight collapses
+  // to one line. Cap ~200px (~8 lines), not 50vh (that let an empty box balloon
+  // to half the window inside the flex column). Mason 07-28.
   useEffect(() => {
     const ta = taRef.current; if (!ta) return;
     ta.style.height = "auto";
-    ta.style.height = Math.min(ta.scrollHeight, Math.floor(window.innerHeight * 0.5)) + "px";
+    ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
   }, [input]);
 
   // #4 detect an @mention token at the caret and surface matching agents.
@@ -518,7 +521,11 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
             placeholder={blocked ? "Set up folder + key in Settings first…" : "Message your agent…  (@ to call another agent)"}
             style={{
               flex: 1, resize: "none", overflowY: "auto",
-              maxHeight: "50vh", minHeight: 42, lineHeight: 1.5,
+              // fixed single-line start; JS auto-grow adjusts height up to 200px.
+              // NO flex-stretch on height: alignItems:flex-end on the row + a set
+              // height keep it compact instead of filling the column.
+              height: 44, maxHeight: 200, lineHeight: 1.5,
+              boxSizing: "border-box",
               background: "var(--bg)", border: "var(--border-width) solid var(--line)",
               borderRadius: "var(--radius-control)", color: "var(--text)", padding: "10px 12px",
               fontSize: 15, fontFamily: "inherit",
