@@ -16,6 +16,27 @@
   --radius-pill: 999px;
   --border-width: 1.5px;
 
+  /* ---- SPACING SCALE (4px base) — use these, not ad-hoc px. Consistent
+     rhythm is 80% of "looks designed." ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  /* ---- TYPE SCALE — deliberate hierarchy, not per-component guesses. ---- */
+  --text-h1: 22px;      /* screen title */
+  --text-h2: 16px;      /* card / section heading */
+  --text-body: 14px;    /* default body + controls */
+  --text-caption: 12px; /* hints, meta, sub-labels */
+  --weight-bold: 700;
+  --weight-heading: 800;
+
+  /* ---- DENSITY — one card padding + one internal gap, everywhere. ---- */
+  --card-pad: 16px;
+  --card-gap: 10px;
+
   /* ---- LIGHT MODE (default) ---- */
   --bg: #ffffff;
   --surface: #ffffff;

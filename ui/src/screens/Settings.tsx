@@ -90,18 +90,18 @@ export function Settings({
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 18, maxWidth: 620 }}>
-      <h2 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>Settings</h2>
+    <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: 620 }}>
+      <h2 style={{ fontSize: "var(--text-h1)", fontWeight: "var(--weight-heading)", margin: 0 }}>Settings</h2>
 
-      {/* APPEARANCE — at the top (Mason cleanup #1). */}
+      {/* APPEARANCE — at the top. */}
       <Card title="Appearance">
-        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-          <span style={{ fontSize: 14, fontWeight: 600, width: 90 }}>Mode</span>
+        <div style={{ display: "flex", gap: "var(--space-2)", alignItems: "center" }}>
+          <span style={{ fontSize: "var(--text-body)", fontWeight: 600, width: 90 }}>Mode</span>
           <Button variant={mode === "light" ? "primary" : "secondary"} onClick={() => onTheme("light", accent)}>◐ Light</Button>
           <Button variant={mode === "dark" ? "primary" : "secondary"} onClick={() => onTheme("dark", accent)}>◑ Dark</Button>
         </div>
-        <div style={{ display: "flex", gap: 12, alignItems: "center", marginTop: 4 }}>
-          <span style={{ fontSize: 14, fontWeight: 600, width: 90 }}>Accent</span>
+        <div style={{ display: "flex", gap: "var(--space-3)", alignItems: "center", marginTop: "var(--space-1)" }}>
+          <span style={{ fontSize: "var(--text-body)", fontWeight: 600, width: 90 }}>Accent</span>
           <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
             {ACCENT_SWATCHES.map((c) => (
               <button key={c || "default"} onClick={() => onTheme(mode, c)} title={c || "default (black/white)"}
@@ -141,22 +141,22 @@ export function Settings({
         {!agentId ? (
           <p style={{ ...hint, color: "var(--text-faint)" }}>Pick an agent in the rail to configure its memory.</p>
         ) : (
-          <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 14, fontWeight: 600 }}>
+          <label style={{ display: "flex", gap: "var(--space-2)", alignItems: "center", fontSize: "var(--text-body)", fontWeight: 600 }}>
             <input type="checkbox" checked={autoRemember} onChange={(e) => toggleAutoRemember(e.target.checked)} />
             Auto-remember from conversation
           </label>
         )}
       </Card>
 
-      {/* SAVE POINTS (renamed from SAVE POINTs 2026-07-28 — full rename). */}
+      {/* SAVE POINTS */}
       <Card title="Save Points">
         <p style={hint}>Every change your agent makes is a Save Point so you can rewind. Keep history for a window, then it prunes automatically.</p>
         {!folder ? (
           <p style={{ ...hint, color: "var(--text-faint)" }}>Pick an agent with a folder to configure Save Points.</p>
         ) : (
           <>
-            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-              <span style={{ fontSize: 14, fontWeight: 600, width: 90 }}>Keep for</span>
+            <div style={{ display: "flex", alignItems: "center", gap: "var(--space-3)" }}>
+              <span style={{ fontSize: "var(--text-body)", fontWeight: 600, width: 90 }}>Keep for</span>
               <input
                 type="range" min={1} max={90} value={retention}
                 onChange={(e) => setRetention(Number(e.target.value))}
@@ -164,11 +164,11 @@ export function Settings({
                 onTouchEnd={(e) => saveRetention(Number((e.target as HTMLInputElement).value))}
                 style={{ flex: 1, accentColor: "var(--accent)" }}
               />
-              <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 14, fontWeight: 700, width: 64, textAlign: "right" }}>
+              <span style={{ fontFamily: "ui-monospace, monospace", fontSize: "var(--text-body)", fontWeight: 700, width: 64, textAlign: "right" }}>
                 {retention} day{retention === 1 ? "" : "s"}
               </span>
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)", marginTop: "var(--space-1)" }}>
               {!confirmPurge ? (
                 <Button variant="secondary" onClick={() => setConfirmPurge(true)}>Purge all history…</Button>
               ) : (
