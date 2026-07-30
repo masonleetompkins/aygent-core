@@ -944,9 +944,22 @@ pub async fn webview_open(
     width: f64,
     height: f64,
 ) -> Result<(), String> {
-    use tauri::{LogicalPosition, LogicalSize, Manager, WebviewUrl};
+    use tauri::{Manager, PhysicalPosition, PhysicalSize, WebviewUrl};
     let target = normalize_url(&url);
     let parsed = target.parse().map_err(|e| format!("bad url: {e}"))?;
+
+    // THE FIX (BROWSER-WEBVIEW-HANDOFF): on this platform, add_child +
+    // set_position/set_size treat the value we pass as PHYSICAL pixels for the
+    // child's placement in the parent NSView, but the frontend measures the pane
+    // rect in CSS/LOGICAL px. On a Retina (2x) display that mismatch placed the
+    // child at logical-treated-as-physical — up + left by exactly the DPR factor
+    // (proven: SENT (316,73) -> APPLIED (632,146) = 2x, scale reported 1 but the
+    // real device DPR is 2). So we convert logical->physical ourselves using the
+    // TRUE scale factor and pass Physical{Position,Size}. scale is read live, so
+    // this is correct at 1x, 2x, and any window size — zero hardcoded pixels.
+    let scale = physical_scale(&app);
+    let (px, py) = (x * scale, y * scale);
+    let (pw, ph) = ((width.max(1.0)) * scale, (height.max(1.0)) * scale);
 
     // Existing EMBEDDED child webview? reposition + navigate. add_child creates
     // a `Webview` (embedded child), NOT a `WebviewWindow` (standalone window),
@@ -954,8 +967,8 @@ pub async fn webview_open(
     // None for embedded children, which silently no-op'd every reposition/hide
     // (the pop-out + never-hides bug). Verified against tauri 2.11.5 docs.
     if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
-        let _ = wv.set_position(LogicalPosition::new(x, y));
-        let _ = wv.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
+        let _ = wv.set_position(PhysicalPosition::new(px, py));
+        let _ = wv.set_size(PhysicalSize::new(pw.max(1.0), ph.max(1.0)));
         wv.navigate(parsed).map_err(|e| format!("navigate: {e}"))?;
         return Ok(());
     }
@@ -972,11 +985,23 @@ pub async fn webview_open(
         .window()
         .add_child(
             builder,
-            LogicalPosition::new(x, y),
-            LogicalSize::new(width.max(1.0), height.max(1.0)),
+            PhysicalPosition::new(px, py),
+            PhysicalSize::new(pw.max(1.0), ph.max(1.0)),
         )
         .map_err(|e| format!("embed webview: {e}"))?;
     Ok(())
+}
+
+/// The TRUE device scale factor (DPR) of the main window — read live so the
+/// logical(CSS px)->physical conversion is correct on Retina (2x), 1x, and
+/// external monitors of any DPR. Never hardcoded. Falls back to 1.0 (logical ==
+/// physical) if the window can't be read, which is the correct 1x behavior.
+fn physical_scale(app: &tauri::AppHandle) -> f64 {
+    use tauri::Manager;
+    app.get_webview_window("main")
+        .and_then(|w| w.scale_factor().ok())
+        .filter(|s| *s > 0.0)
+        .unwrap_or(1.0)
 }
 
 /// Reposition/resize the embedded webview to track the pane (called on layout
@@ -988,56 +1013,25 @@ pub fn webview_set_bounds(
     y: f64,
     width: f64,
     height: f64,
-    // Parent content-area height the FRONTEND measured `y` against, sent so the
-    // Y-flip is deterministic instead of racing wry's live parent height.
-    // Accepted even if wry re-flips internally — keeping the arg makes the invoke
-    // signature stable and lets us switch to a manual flip if the race persists.
-    parent_height: Option<f64>,
+    // Parent content-area height the FRONTEND measured `y` against. No longer
+    // used for a manual Y-flip (the real bug was DPR, not a flip race) but kept
+    // in the signature so the invoke contract stays stable + the frontend need
+    // not change its call shape.
+    #[allow(unused_variables)] parent_height: Option<f64>,
 ) -> Result<(), String> {
-    use tauri::{LogicalPosition, LogicalSize, Manager};
+    use tauri::{Manager, PhysicalPosition, PhysicalSize};
     if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
-        // --- EMPIRICAL DELTA PROBE (BROWSER-WEBVIEW-HANDOFF step 2) ----------
-        // Log what JS asked for, apply it, then read back where the webview
-        // ACTUALLY landed. Everything in Tauri readbacks is PHYSICAL px, so we
-        // convert to logical via the main window's scale factor to compare
-        // apples-to-apples with the LOGICAL x/y the frontend sent (CSS px).
-        let win_scale = app
-            .get_webview_window("main")
-            .and_then(|w| w.scale_factor().ok())
-            .unwrap_or(-1.0);
-
-        // Parent (main webview) RAW PHYSICAL size (no division) so we can see the
-        // real numbers wry works in.
-        let parent_phys = app
-            .get_webview("main")
-            .and_then(|m| m.size().ok())
-            .map(|s| (s.width, s.height));
-
-        let _ = wv.set_position(LogicalPosition::new(x, y));
-        let _ = wv.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
-
-        // Read back the applied position/size RAW PHYSICAL (no division). If
-        // set_position(Logical(x)) lands at physical x, DPR was NOT applied; if
-        // it lands at x*dpr, it WAS. This disambiguates the scale bug directly.
-        let applied_phys_pos = wv.position().ok().map(|p| (p.x, p.y));
-        let applied_phys_size = wv.size().ok().map(|s| (s.width, s.height));
-
-        eprintln!(
-            "[aygent][browser][DELTA] win_scale={win_scale} \
-             | SENT_LOGICAL pos=({x:.1},{y:.1}) size=({:.1},{:.1}) parentHeight(JS)={:?} \
-             | APPLIED_PHYSICAL pos={:?} size={:?} \
-             | parent_PHYSICAL={:?} \
-             | ratio_pos=({:.3},{:.3})",
-            width.max(1.0),
-            height.max(1.0),
-            parent_height,
-            applied_phys_pos,
-            applied_phys_size,
-            parent_phys,
-            applied_phys_pos.map(|(px, _)| px as f64 / x.max(1.0)).unwrap_or(f64::NAN),
-            applied_phys_pos.map(|(_, py)| py as f64 / y.max(1.0)).unwrap_or(f64::NAN),
-        );
-        // --------------------------------------------------------------------
+        // THE FIX: convert the frontend's LOGICAL (CSS px) rect to PHYSICAL px
+        // using the true DPR, because add_child/set_position place the child in
+        // the parent NSView's PHYSICAL coordinate space on this platform. Read
+        // live — correct at 1x, 2x, any window size. (See webview_open for the
+        // full diagnosis.)
+        let scale = physical_scale(&app);
+        let _ = wv.set_position(PhysicalPosition::new(x * scale, y * scale));
+        let _ = wv.set_size(PhysicalSize::new(
+            (width.max(1.0)) * scale,
+            (height.max(1.0)) * scale,
+        ));
     }
     Ok(())
 }
