@@ -22,6 +22,9 @@ let TAB_SEQ = 1;
 // Width (CSS px) of the right-hand agent pane when handed off. syncBounds
 // shrinks the native webview by this + a gap so the pane sits BESIDE the page.
 const AGENT_PANE_W = 340;
+// Inset (CSS px) the webview sits inside paneRef by, so it lands INSIDE the
+// rounded accent frame's border rather than flush to the square border-box.
+const FRAME_INSET = 3;
 const newTab = (): Tab => ({ id: TAB_SEQ++, addr: "", title: "New Tab", editing: true });
 
 export function Browser() {
@@ -76,10 +79,15 @@ export function Browser() {
       // outline is a pointer-events:none overlay rendered ON TOP of the webview,
       // so its ~radius corner arcs mask the webview's square corners while the
       // webview fills the whole box.
+      // Inset the webview by the frame's border so it sits INSIDE the rounded
+      // accent frame (which is drawn on paneRef's border-box). FRAME_INSET is
+      // the border width; keeping it here (not a magic px in Rust) ties it to
+      // the actual frame styling. The rounded corners are masked by the overlay.
+      const inset = FRAME_INSET;
       const bounds = {
-        x: Math.round(r.left), y: Math.round(r.top),
-        width: Math.round(Math.max(r.width - rightPane, 1)),
-        height: Math.round(r.height),
+        x: Math.round(r.left + inset), y: Math.round(r.top + inset),
+        width: Math.round(Math.max(r.width - rightPane - inset * 2, 1)),
+        height: Math.round(Math.max(r.height - inset * 2, 1)),
         // Content-area size the rect was measured against — Rust uses this to
         // compute the native titlebar inset at runtime (THE fix).
         clientWidth, clientHeight,
