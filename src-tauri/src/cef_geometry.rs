@@ -83,14 +83,16 @@ define_class!(
 
 impl AygentCefWrapper {
     fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
-        let this = Self::alloc(mtm);
-        // objc2 0.6: send the inherited `initWithFrame:` init-family message
-        // DIRECTLY to the allocated instance (NOT via super — super init trips
-        // MethodFamily<3>/MsgSendSuper bounds). The init-family message on
-        // Allocated<Self> returns Retained<Self> and runs NSView's designated
-        // initializer up the chain. This is the standard objc2 custom-view init.
-        let this: Retained<Self> = unsafe { msg_send![this, initWithFrame: frame] };
+        // BULLETPROOF init (no init-family super, no MethodFamily<3> trap):
+        // objc2 0.6 REFUSES an init-family message (initWithFrame:) via super on
+        // a define_class! subclass. Both super forms + a direct init-family send
+        // fought the borrow/retain checker. So we DON'T use initWithFrame: at
+        // all. NSView's plain `init` (NSObject family) works for a subclass and
+        // returns Retained<Self>; we then position it with setFrame: afterward.
+        // `init` is a standard objc2 message with no init-family super issue.
+        let this: Retained<Self> = unsafe { msg_send![Self::alloc(mtm), init] };
         unsafe {
+            this.setFrame(frame);
             this.setWantsLayer(true);
             if let Some(layer) = this.layer() {
                 // Lowered zPosition so it composites BEHIND the main webview.
