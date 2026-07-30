@@ -13,6 +13,7 @@
 // resize + hide it when you leave the tab.
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Input } from "../components/ui";
 import { Icon } from "../components/Icon";
@@ -44,6 +45,11 @@ export function Browser() {
   const [agentPrompt, setAgentPrompt] = useState("");
   const [agentBusy, setAgentBusy] = useState(false);
   const [agentLog, setAgentLog] = useState<string[]>([]);
+  // SHARED-CONTROL state, mirrored from Rust `browser:control` events. When the
+  // agent hits a wall (login/CAPTCHA/verification) it releases the wheel with a
+  // non-empty `note` — that's the BLOCKED signal that pulses the You/Agent
+  // toggle so the human knows to intervene.
+  const [blockedNote, setBlockedNote] = useState<string>("");
   const editRef = useRef<HTMLInputElement>(null);
   // The div whose rect the native webview is positioned over.
   const paneRef = useRef<HTMLDivElement>(null);
@@ -255,6 +261,29 @@ export function Browser() {
   // shrinks to make room. Flip to human: pane closes, webview reclaims width.
   // Re-sync bounds a beat after the toggle so the webview resizes with it.
   useEffect(() => { syncBounds(); const t = setTimeout(syncBounds, 60); return () => clearTimeout(t); }, [driver]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // LISTEN for shared-control changes from Rust. A non-empty `note` means the
+  // agent got blocked and wants the human -> pulse the toggle + show the note.
+  // Taking the wheel (You) clears it.
+  useEffect(() => {
+    let un: undefined | (() => void);
+    listen<{ driver: string; note: string; agent_active: boolean }>("browser:control", (ev) => {
+      const note = ev.payload?.note ?? "";
+      setBlockedNote(note);
+      // If the agent handed back to the human, reflect that in the toggle.
+      if (note && ev.payload?.driver === "human") setDriver("human");
+    }).then((f) => { un = f; }).catch(() => {});
+    return () => { un?.(); };
+  }, []);
+
+  // Flipping to "You" = human takes the wheel; clears any blocked pulse.
+  useEffect(() => {
+    if (driver === "human" && blockedNote) {
+      invoke("browser_take_wheel").catch(() => {});
+      setBlockedNote("");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [driver]);
 
   async function runAgent() {
     const task = agentPrompt.trim();
