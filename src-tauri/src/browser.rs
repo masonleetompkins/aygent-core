@@ -720,11 +720,21 @@ static SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// it operates in the exact page the human is watching. -1 = none/unknown.
 static ACTIVE_TAB_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 
-/// Frontend reports which tab is active (called on switch/open). Lets the agent
-/// tools target the visible tab.
+/// The visible tab's current URL (reported by the frontend). Used for the host
+/// pre-check so same-site actions don't prompt — the CDP read path can lag or
+/// point at about:blank, so the UI's own knowledge of where the tab is is the
+/// authoritative "current page" for permission purposes.
+static ACTIVE_TAB_URL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Frontend reports which tab is active + its URL (called on switch/open/nav).
+/// Lets the agent tools target the visible tab AND lets the host pre-check know
+/// what page the human is actually on.
 #[tauri::command]
-pub fn set_active_browser_tab(tab_id: i64) {
+pub fn set_active_browser_tab(tab_id: i64, url: Option<String>) {
     ACTIVE_TAB_ID.store(tab_id, std::sync::atomic::Ordering::SeqCst);
+    if let Some(u) = url {
+        if let Ok(mut g) = ACTIVE_TAB_URL.lock() { *g = u; }
+    }
 }
 
 /// FIRE-AND-FORGET action in the ACTIVE tab's embedded webview. `wv.eval()`
@@ -1762,9 +1772,14 @@ fn host_of(url: &str) -> String {
 }
 
 /// The host the ACTIVE tab is currently showing (always allowed for the agent,
-/// since the human navigated there and is watching). Read via CDP so it works
-/// on external pages. Empty if unreadable.
+/// since the human navigated there and is watching). Prefer the UI-reported URL
+/// (authoritative for where the human is); fall back to a CDP read.
 async fn active_tab_host(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>) -> String {
+    // UI-reported URL wins — it's the page the human actually navigated to.
+    if let Ok(g) = ACTIVE_TAB_URL.lock() {
+        let h = host_of(&normalize_url(&g));
+        if !h.is_empty() { return h; }
+    }
     match active_tab_page_info_cdp(app, state).await {
         Ok((_t, url)) => host_of(&url),
         Err(_) => String::new(),

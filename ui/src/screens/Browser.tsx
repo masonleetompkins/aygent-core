@@ -297,8 +297,14 @@ export function Browser() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [driver]);
 
-  // Tell Rust which tab is active so the agent tools act on the VISIBLE tab.
-  useEffect(() => { invoke("set_active_browser_tab", { tabId: activeId }).catch(() => {}); }, [activeId]);
+  // Tell Rust which tab is active AND its current URL, so the agent tools act on
+  // the VISIBLE tab and the host pre-check matches the page you're actually on
+  // (otherwise it reads the empty CDP session and prompts even for same-site).
+  useEffect(() => {
+    const cur = tabs.find((t) => t.id === activeId);
+    invoke("set_active_browser_tab", { tabId: activeId, url: cur?.addr || "" }).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId, tabs]);
 
   // PENDING PERMISSION REQUEST from the agent (new host / blocked action).
   // { id, action, detail } -> render the Allow/Deny/Take Control card.
@@ -443,36 +449,8 @@ export function Browser() {
           <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", fontSize: 14, pointerEvents: "none" }}>
             Click the tab to type a URL, or search.
           </div>
-          {/* AGENT PERMISSION CARD — the agent wants to do something outside
-              what the human already navigated to (a new host). Pulses the
-              toggle + shows Allow / Deny / Take Control. Floats over the page,
-              centered, above the webview. */}
-          {permReq && (
-            <div style={{
-              position: "absolute", left: "50%", top: 24, transform: "translateX(-50%)", zIndex: 60,
-              width: "min(440px, 90%)", background: "var(--surface)", border: "2px solid var(--accent)",
-              borderRadius: "var(--radius-card)", boxShadow: "var(--elevation)", padding: 16,
-            }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                <Icon name="sparkles" size={15} />
-                <span style={{ fontSize: 13, fontWeight: 800 }}>The agent needs your OK</span>
-              </div>
-              <div style={{ fontSize: 13, color: "var(--text)", marginBottom: 4 }}>
-                It wants to <b>{permReq.action}</b>.
-              </div>
-              <div style={{ fontSize: 11.5, color: "var(--text-muted)", marginBottom: 12, wordBreak: "break-all" }}>
-                {permReq.detail}
-              </div>
-              <div style={{ display: "flex", gap: 8 }}>
-                <button onClick={() => answerPerm("allow")}
-                  style={{ flex: 1, fontSize: 13, fontWeight: 700, padding: "8px 0", borderRadius: "var(--radius-control)", border: "none", background: "var(--accent)", color: "#fff", cursor: "pointer" }}>Allow</button>
-                <button onClick={() => answerPerm("deny")}
-                  style={{ flex: 1, fontSize: 13, fontWeight: 700, padding: "8px 0", borderRadius: "var(--radius-control)", border: "var(--border-width) solid var(--line)", background: "var(--bg)", color: "var(--text)", cursor: "pointer" }}>Deny</button>
-                <button onClick={() => answerPerm("take")}
-                  style={{ flex: 1.3, fontSize: 13, fontWeight: 700, padding: "8px 0", borderRadius: "var(--radius-control)", border: "var(--border-width) solid var(--accent)", background: "var(--bg)", color: "var(--accent)", cursor: "pointer" }}>Take Control</button>
-              </div>
-            </div>
-          )}
+          {/* (Permission prompt moved INTO the Agent panel — answer inline
+              without switching to You.) */}
           {/* ROUNDED FRAME OVERLAY — sits ON TOP of the native webview. Just an
               outline + rounded corners; transparent fill, no pointer capture,
               so clicks pass through to the page. Accent-highlighted in agent
@@ -503,6 +481,30 @@ export function Browser() {
             <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
               Tell the agent what to do on this page. You’re watching — hit “You” anytime to take back control.
             </div>
+
+            {/* INLINE PERMISSION PROMPT — the agent wants to do something outside
+                the current site. Answer right here (Allow/Deny/Take Control),
+                no need to switch to You. */}
+            {permReq && (
+              <div style={{
+                border: "2px solid var(--accent)", borderRadius: "var(--radius-control)",
+                padding: 10, background: "var(--bg)", display: "flex", flexDirection: "column", gap: 8,
+              }}>
+                <div style={{ fontSize: 12.5, fontWeight: 700 }}>Needs your OK</div>
+                <div style={{ fontSize: 12, color: "var(--text)" }}>
+                  The agent wants to <b>{permReq.action}</b>.
+                </div>
+                <div style={{ fontSize: 11, color: "var(--text-muted)", wordBreak: "break-all" }}>{permReq.detail}</div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button onClick={() => answerPerm("allow")}
+                    style={{ flex: 1, fontSize: 12, fontWeight: 700, padding: "6px 0", borderRadius: "var(--radius-control)", border: "none", background: "var(--accent)", color: "#fff", cursor: "pointer" }}>Allow</button>
+                  <button onClick={() => answerPerm("deny")}
+                    style={{ flex: 1, fontSize: 12, fontWeight: 700, padding: "6px 0", borderRadius: "var(--radius-control)", border: "var(--border-width) solid var(--line)", background: "var(--surface)", color: "var(--text)", cursor: "pointer" }}>Deny</button>
+                  <button onClick={() => answerPerm("take")}
+                    style={{ flex: 1.2, fontSize: 12, fontWeight: 700, padding: "6px 0", borderRadius: "var(--radius-control)", border: "var(--border-width) solid var(--accent)", background: "var(--surface)", color: "var(--accent)", cursor: "pointer" }}>Take Control</button>
+                </div>
+              </div>
+            )}
 
             {/* Conversation log fills the pane. */}
             <div style={{ flex: 1, minHeight: 0, overflow: "auto", display: "flex", flexDirection: "column", gap: 8, paddingRight: 2 }}>
