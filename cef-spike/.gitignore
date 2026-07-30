@@ -1,0 +1,10 @@
+# Throwaway spike — keep the heavy stuff out of git.
+
+# Full upstream cef-rs checkout created by bootstrap.sh (multi-hundred MB w/ build).
+vendor/
+
+# Rust build output (multi-GB with CEF).
+target/
+
+# The exported CEF framework lives in ~/.local/share/cef (outside repo) — noted here
+# for clarity; it is not under this folder so nothing to ignore, but do NOT commit it.
