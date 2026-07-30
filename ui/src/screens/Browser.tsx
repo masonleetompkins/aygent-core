@@ -76,6 +76,18 @@ export function Browser() {
   type HistEntry = { url: string; title: string; ts: number };
   const [history, setHistory] = useState<HistEntry[]>([]);
   const [panel, setPanel] = useState<null | "history" | "downloads">(null);
+  // OVERLAY-VS-NATIVE-WEBVIEW FIX (Atlas). The visible tab is a REAL native
+  // WKWebView layer that paints ON TOP of ALL DOM chrome wherever it overlaps
+  // the page-area rect — z-index is powerless against it. So the History /
+  // Downloads drop panel (which drops DOWN into the page area) was getting
+  // COVERED and Mason couldn't see it. Fix: while ANY drop panel is open, HIDE
+  // the active tab's native webview (nothing left to cover the panel); on close
+  // we re-show + reposition it. `panelRef` lets syncBounds / observer / timeout
+  // closures read the CURRENT panel state so they never re-front the webview
+  // over an open panel. GUARANTEE: every re-show path is gated on `!panelRef`,
+  // and closing the panel (or leaving the screen) always restores the webview.
+  const panelRef = useRef<null | "history" | "downloads">(panel);
+  panelRef.current = panel;
   type DlEntry = { name: string; size: number; mtime: number };
   const [downloads, setDownloads] = useState<DlEntry[]>([]);
   const pushHistory = (url: string, title?: string) => {
@@ -124,6 +136,11 @@ export function Browser() {
   // right pane takes AGENT_PANE_W, so we shrink the webview to leave room — the
   // agent prompt pane sits BESIDE the page, not over it.
   function syncBounds() {
+    // A drop panel (History/Downloads) is open — the native webview is hidden so
+    // the panel is visible. Don't reposition/re-front it now; the panel-close
+    // effect re-shows + re-syncs. (Guards the ResizeObserver/resize/timeout
+    // callers that would otherwise re-front the webview over an open panel.)
+    if (panelRef.current) return;
     const el = paneRef.current;
     if (!el) return;
     // DOUBLE rAF: read AFTER React commit + browser layout/paint, so r.top and
@@ -321,6 +338,37 @@ export function Browser() {
   // shrinks to make room. Flip to human: pane closes, webview reclaims width.
   // Re-sync bounds a beat after the toggle so the webview resizes with it.
   useEffect(() => { syncBounds(); const t = setTimeout(syncBounds, 60); return () => clearTimeout(t); }, [driver]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // DROP-PANEL VISIBILITY (Atlas overlay fix). The native WKWebView paints on
+  // top of DOM wherever it overlaps the page rect, so an open History/Downloads
+  // panel would be COVERED. While a panel is open we HIDE all tab webviews
+  // (nothing left to cover the panel); when it closes we re-show + reposition
+  // the active tab's webview. This effect is the SINGLE owner of "panel drives
+  // webview visibility", and its cleanup guarantees the webview is never left
+  // stuck hidden — on unmount (leave screen) the mount effect's cleanup already
+  // hides everything, and on panel-close here we restore the active tab.
+  useEffect(() => {
+    if (installed !== true) return;
+    if (panel) {
+      // Panel open: hide EVERY tab's native layer so the DOM panel shows.
+      invoke("webview_hide_others", { keep: null }).catch(() => {});
+      return;
+    }
+    // Panel closed: re-front the active tab's webview if it has a page, at its
+    // correct rect. `panelRef` is already null here, so syncBounds runs.
+    const cur = tabs.find((t) => t.id === activeIdRef.current);
+    if (cur?.opened) {
+      invoke("webview_hide_others", { keep: cur.id }).catch(() => {});
+      syncBounds();
+      setTimeout(syncBounds, 60);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panel, installed]);
+
+  // If the user switches tabs or flips the driver while a panel is open, close
+  // the panel first so we never leave a webview re-fronted over a stale panel
+  // (and so the panel-visibility effect above can cleanly restore the webview).
+  useEffect(() => { setPanel(null); }, [activeId, driver]);
 
   // LISTEN for shared-control changes from Rust. A non-empty `note` means the
   // agent got blocked and wants the human -> pulse the toggle + show the note.
