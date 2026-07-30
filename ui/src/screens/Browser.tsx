@@ -44,11 +44,6 @@ export function Browser() {
   const [agentPrompt, setAgentPrompt] = useState("");
   const [agentBusy, setAgentBusy] = useState(false);
   const [agentLog, setAgentLog] = useState<string[]>([]);
-  // ON-SCREEN DEBUG LOG (devtools is disabled in this build, so we surface the
-  // ground-truth events right in the pane). Newest last; capped.
-  const [dbg, setDbg] = useState<string[]>([]);
-  const dlog = (m: string) =>
-    setDbg((d) => [...d.slice(-7), `${new Date().toLocaleTimeString()} ${m}`]);
   const editRef = useRef<HTMLInputElement>(null);
   // The div whose rect the native webview is positioned over.
   const paneRef = useRef<HTMLDivElement>(null);
@@ -163,10 +158,7 @@ export function Browser() {
   async function go(id: number, rawUrl?: string) {
     const tab = tabs.find((t) => t.id === id);
     const url = (rawUrl ?? tab?.addr ?? "").trim();
-    // eslint-disable-next-line no-console
-    console.log("[browser] go() fired", { id, rawUrl, tabAddr: tab?.addr, resolvedUrl: url });
-    dlog(`go() id=${id} raw="${rawUrl ?? ""}" addr="${tab?.addr ?? ""}" -> "${url}"`);
-    if (!url) { dlog("go() BAILED: empty url"); patch(id, { editing: false }); return; }
+    if (!url) { patch(id, { editing: false }); return; }
     // Make sure the stored addr reflects what we're navigating to.
     patch(id, { addr: url });
     patch(id, { editing: false, title: url });
@@ -185,20 +177,15 @@ export function Browser() {
       // Not laid out: use a conservative inset (right of sidebar, below tabs).
       ox = 300; oy = 100; ow = 600; oh = 500;
     }
-    // eslint-disable-next-line no-console
-    console.log("[browser] webview_open →", { x: ox, y: oy, width: ow, height: oh }, "raw:", { l: r?.left, t: r?.top, w: r?.width, h: r?.height });
     const clientWidth = Math.round(document.documentElement.clientWidth);
     const clientHeight = Math.round(document.documentElement.clientHeight);
-    dlog(`webview_open x=${ox} y=${oy} w=${ow} h=${oh} rawRect=(${Math.round(r?.left ?? -1)},${Math.round(r?.top ?? -1)} ${Math.round(r?.width ?? -1)}x${Math.round(r?.height ?? -1)})`);
     try {
       await invoke("webview_open", { url, x: ox, y: oy, width: ow, height: oh, clientWidth, clientHeight, radius: WEB_RADIUS, tabId: id });
-      dlog("webview_open OK");
     } catch (e) {
-      dlog(`webview_open ERR: ${e}`);
       setAgentLog((l) => [...l, `open failed: ${e}`]);
     }
     // This tab's webview is now the active surface — hide the others.
-    invoke("webview_hide_others", { keep: id }).catch((e) => dlog(`hide_others ERR: ${e}`));
+    invoke("webview_hide_others", { keep: id }).catch(() => {});
     patch(id, { opened: true });
     // Re-sync a beat later so the webview lands on the SETTLED rect (the agent
     // prompt bar toggling can shift the pane by a row).
@@ -220,13 +207,17 @@ export function Browser() {
   }
 
   function clickTab(id: number) {
-    // Dead simple: clicking a tab activates it AND opens its own address field.
-    // Every tab click = "I want to work in THIS tab", so focus its editor. This
-    // is the fix for typing landing in the wrong tab, without the fragile
-    // `opened` conditionals that broke first-tab editing.
-    setActiveId(id);
-    patch(id, { editing: true });
-    setTimeout(() => editRef.current?.select(), 0);
+    // Browser-standard tab behavior:
+    //  - Click an INACTIVE tab  -> just switch to it (no editor).
+    //  - Click the ACTIVE tab   -> open its address field to type a new URL.
+    //  - A fresh unopened tab (no page yet) opens its editor so you can type.
+    const tab = tabs.find((t) => t.id === id);
+    const wasActive = id === activeId;
+    if (!wasActive) setActiveId(id);
+    if (wasActive || !tab?.opened) {
+      patch(id, { editing: true });
+      setTimeout(() => editRef.current?.select(), 0);
+    }
   }
   function addTab() { const t = newTab(); setTabs((ts) => [...ts, t]); setActiveId(t.id); }
   function closeTab(id: number) {
@@ -324,15 +315,15 @@ export function Browser() {
                 <input ref={editRef} autoFocus value={t.addr}
                   onChange={(e) => patch(t.id, { addr: e.target.value })}
                   onKeyDown={(e) => {
-                    // eslint-disable-next-line no-console
-                    console.log("[browser] keydown", e.key, "value=", e.currentTarget.value);
-                    if (e.key === "Enter") { dlog(`keydown ENTER value="${e.currentTarget.value}"`); e.preventDefault(); go(t.id, e.currentTarget.value); }
+                    if (e.key === "Enter") { e.preventDefault(); go(t.id, e.currentTarget.value); }
                     if (e.key === "Escape") patch(t.id, { editing: false });
                   }}
-                  // Commit on blur too (clicking away / focus loss), so Enter
-                  // isn't the only way to navigate. If there's a URL, GO instead
-                  // of just dropping edit mode — and don't let a blur-race eat it.
-                  onBlur={(e) => { const v = e.currentTarget.value.trim(); if (v) go(t.id, v); else patch(t.id, { editing: false }); }}
+                  // Blur (click away / clicking another tab / clicking the page)
+                  // just EXITS edit mode — it does NOT navigate. Enter is how you
+                  // commit a URL. This is what makes clicking the page close the
+                  // editor and clicking another tab switch cleanly on the first
+                  // click (blur closed the editor; the tab's own onClick switches).
+                  onBlur={() => patch(t.id, { editing: false })}
                   onClick={(e) => e.stopPropagation()}
                   placeholder="Enter a URL or search…"
                   style={{ flex: 1, minWidth: 0, border: "none", outline: "none", background: "transparent", color: "var(--text)", fontSize: 13, fontFamily: "inherit" }} />
@@ -376,19 +367,6 @@ export function Browser() {
           <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", fontSize: 14, pointerEvents: "none" }}>
             Click the tab to type a URL, or search.
           </div>
-          {/* ON-SCREEN DEBUG STRIP — devtools is disabled in this build, so we
-              show the last few ground-truth events right here. Pointer-events
-              off so it never blocks the page. Remove once fixed. */}
-          {dbg.length > 0 && (
-            <div style={{
-              position: "absolute", left: 8, top: 8, right: 8, zIndex: 50,
-              pointerEvents: "none", fontFamily: "monospace", fontSize: 11,
-              color: "#0f0", background: "rgba(0,0,0,0.82)", padding: "6px 8px",
-              borderRadius: 6, whiteSpace: "pre-wrap", lineHeight: 1.5,
-            }}>
-              {dbg.map((l, i) => <div key={i}>{l}</div>)}
-            </div>
-          )}
           {/* ROUNDED FRAME OVERLAY — sits ON TOP of the native webview. Just an
               outline + rounded corners; transparent fill, no pointer capture,
               so clicks pass through to the page. Accent-highlighted in agent
