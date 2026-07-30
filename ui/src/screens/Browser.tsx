@@ -497,6 +497,28 @@ export function Browser() {
     setBlockedNote("");
   }
 
+  // ENGINE-CEF OVERLAY HIT-TEST (Atrium's hard-won lesson). Under the CEF
+  // engine the visible browser is a native Chromium view behind a transparent
+  // React punchout. macOS routes clicks by SUBVIEW ORDER, not zPosition, so any
+  // React overlay drawn OVER the browser (permission card, History/Downloads
+  // panel, the agent pane, a blocked-note banner) would be click-through unless
+  // we tell the native CEF wrapper to DECLINE hit-testing. We compute a single
+  // DERIVED overlay-open predicate from React state (NOT a manual increment/
+  // decrement counter — Atrium's counter drifted and permanently broke clicks;
+  // a derived boolean from the source-of-truth state can't drift) and push it
+  // to Rust as `set_browser_hittest(enabled)`. enabled=false => browser
+  // declines so clicks fall through to React. No-op under the WKWebView engine
+  // (the command is a no-op there), so this is always safe to run.
+  const overlayOpen =
+    panel !== null ||
+    permReq !== null ||
+    driver === "agent" ||
+    blockedNote !== "";
+  useEffect(() => {
+    // enabled = browser RECEIVES clicks; so enabled = NOT overlayOpen.
+    invoke("set_browser_hittest", { enabled: !overlayOpen }).catch(() => {});
+  }, [overlayOpen]);
+
   // BROWSER CHROME CONTROLS (ITEM 3). Back / Forward / Refresh drive the visible
   // tab's engine-native WebKit history via webview_history. After a nav we
   // re-poll the page info so the tab title + session history stay current.

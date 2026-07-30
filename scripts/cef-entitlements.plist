@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AYGENT CEF entitlements (Phase 1). These match Chromium/CEF's documented
+     macOS requirements: the JIT + unsigned-executable-memory entitlements are
+     REQUIRED for V8's JIT to run inside the sandbox, and disable-library-
+     validation lets the helper apps load the CEF framework. dyld-environment-
+     variables lets the @rpath/DYLD resolution find the framework. This is the
+     ad-hoc/local Phase-1 set; a Phase-2 Developer-ID + notarized build uses the
+     same keys plus a real signing identity + a hardened-runtime notarization. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+  <true/>
+</dict>
+</plist>

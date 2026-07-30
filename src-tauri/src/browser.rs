@@ -170,7 +170,13 @@ pub fn agent_downloads_dir(app: &tauri::AppHandle) -> PathBuf {
     let _ = std::fs::create_dir_all(&dir);
     // Canonicalize to a real, symlink-resolved absolute path; if canonicalize
     // fails (shouldn't, we just made it) keep the plain path.
-    std::fs::canonicalize(&dir).unwrap_or(dir)
+    let resolved = std::fs::canonicalize(&dir).unwrap_or(dir);
+    // ENGINE-CEF: keep CEF's DownloadHandler destination in sync with the
+    // active agent's downloads dir, so native CEF downloads land in the SAME
+    // place the WKWebView path used. Cheap + idempotent.
+    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
+    crate::cef_engine::set_downloads_dir(resolved.clone());
+    resolved
 }
 
 /// Where the unzipped Chromium runtime lands: <browser>/chromium/<version>/.
@@ -721,6 +727,19 @@ fn free_port() -> Result<u16, String> {
 /// Launches on first call, reuses on subsequent calls (checks the child is
 /// still alive; relaunches if it died/crashed â€” crash recovery).
 async fn ensure_running(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>) -> Result<u16, String> {
+    // ENGINE-CEF UNIFICATION: when the CEF engine is live, the agent CDP client
+    // must attach to the SAME Chromium the human sees — CEF's remote-debugging
+    // port — instead of launching a SEPARATE headless Chrome-for-Testing. This
+    // is the two-browser desync kill: human + agent act in the exact same tab,
+    // natively. We DON'T spawn/track a child here in that case; the port is
+    // owned by the CEF engine (cef_engine::init).
+    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
+    {
+        if let Some(port) = crate::cef_engine::cdp_port() {
+            eprintln!("[aygent][cef] ensure_running -> CEF CDP port {port} (unified)");
+            return Ok(port);
+        }
+    }
     // Fast path: already running + alive.
     {
         let mut guard = state.inner.lock().map_err(|_| "browser state poisoned")?;
@@ -872,6 +891,39 @@ pub fn current_agent_url() -> String {
 /// nav-step whose host is a real non-search destination is SATISFIED.
 pub fn current_agent_host() -> String {
     host_of(&current_agent_url())
+}
+
+// ---------------------------------------------------------------------------
+// PER-TAB URL TRACKING (engine-cef). CEF's DisplayHandler reports address/title
+// changes per Browser; we map Browser -> tab in cef_engine, then call back here
+// so the tab-strip label + the permission host pre-check + the mirror-visible
+// path all read the SAME per-tab url the WKWebView path tracked via
+// on_page_load. Harmless when engine-cef is off (nothing calls these).
+// ---------------------------------------------------------------------------
+static TAB_URLS: std::sync::Mutex<Option<std::collections::HashMap<i64, String>>> =
+    std::sync::Mutex::new(None);
+
+/// Record the latest committed main-frame url for a tab (called by cef_engine's
+/// DisplayHandler.on_address_change). Also updates the single ACTIVE_TAB_URL if
+/// this is the active tab, so the permission host pre-check stays correct.
+pub fn note_active_tab_url(tab_id: i64, url: &str) {
+    if let Ok(mut g) = TAB_URLS.lock() {
+        g.get_or_insert_with(std::collections::HashMap::new)
+            .insert(tab_id, url.to_string());
+    }
+    if ACTIVE_TAB_ID.load(std::sync::atomic::Ordering::SeqCst) == tab_id {
+        if let Ok(mut g) = ACTIVE_TAB_URL.lock() { *g = url.to_string(); }
+    }
+}
+
+/// The last committed url for a tab ("" if unknown). Used by cef_engine's
+/// title-change handler to upgrade the matching history entry's title.
+pub fn last_tab_url(tab_id: i64) -> String {
+    TAB_URLS
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(&tab_id).cloned()))
+        .unwrap_or_default()
 }
 
 /// Heuristic: is `host` a search-engine / launcher host (i.e. NOT yet a real
@@ -1668,6 +1720,41 @@ pub async fn webview_open(
     let pos = tauri::LogicalPosition::new(x, y);
     let size = tauri::LogicalSize::new(width.max(1.0), height.max(1.0));
 
+    // ============================================================
+    // ENGINE-CEF PATH (Phase 1). When the CEF engine is live, the VISIBLE
+    // surface is a native Chromium browser embedded via the punchout wrapper
+    // (cef_geometry) — NOT a wry child webview. Create/ensure the wrapper NSView
+    // parented behind the transparent React pane, then create/navigate the CEF
+    // browser into it. Everything below (add_child, DL bridge JS, on_page_load)
+    // is the WKWebView fallback, compiled when engine-cef is OFF.
+    // ============================================================
+    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
+    if crate::cef_engine::is_ready() {
+        let tid = tab_id.unwrap_or(-1);
+        // Resolve the parent window (same robust lookup as the wry path).
+        let parent_window: tauri::Window = app
+            .get_window("main")
+            .or_else(|| app.windows().into_values().next())
+            .or_else(|| app.get_webview_window("main").map(|wv| wv.as_ref().window()))
+            .or_else(|| app.webviews().into_values().next().map(|wv| wv.window()))
+            .ok_or_else(|| "no main window".to_string())?;
+        // Make the React webview transparent so the wrapper shows through the
+        // pane div (idempotent).
+        if let Some(wv) = app.webviews().into_values().next() {
+            crate::cef_geometry::set_main_webview_transparent(&wv);
+        }
+        let content_h = client_height.filter(|v| *v > 0.0).unwrap_or(height + y);
+        let ptr = crate::cef_geometry::ensure_wrapper(&parent_window, tid, (x, y, width, height));
+        let parent_ptr = ptr.unwrap_or(std::ptr::null_mut());
+        crate::cef_geometry::set_wrapper_hidden(tid, false);
+        crate::cef_geometry::front_wrapper(tid);
+        crate::cef_geometry::place_wrapper(tid, x, y, width, height, Some(content_h));
+        note_active_tab_url(tid, &target);
+        crate::cef_engine::create_or_navigate(tid, target.clone(), parent_ptr, 0, 0, width as i32, height as i32);
+        eprintln!("[aygent][cef] webview_open (CEF) tab={tid} url={target}");
+        return Ok(());
+    }
+
     // Existing EMBEDDED child webview for THIS tab? reposition + navigate.
     // add_child creates a `Webview` (embedded child), retrieved via
     // get_webview() (not get_webview_window(), None for embedded children).
@@ -1945,6 +2032,14 @@ pub fn webview_set_bounds(
     tab_id: Option<i64>,
 ) -> Result<(), String> {
     use tauri::Manager;
+    // ENGINE-CEF: place the punchout wrapper (not a wry child) for this tab.
+    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
+    if crate::cef_engine::is_ready() {
+        let content_h = client_height.or(parent_height);
+        crate::cef_geometry::place_wrapper(tab_id.unwrap_or(-1), x, y, width, height, content_h);
+        let _ = (client_width, radius);
+        return Ok(());
+    }
     if let Some(wv) = app.get_webview(&tab_label(tab_id)) {
         let _ = client_width;
         let content_h = client_height.or(parent_height);
@@ -2001,6 +2096,11 @@ fn bring_child_to_front(wv: &tauri::Webview) {
 #[tauri::command]
 pub fn webview_hide(app: tauri::AppHandle, tab_id: Option<i64>) -> Result<(), String> {
     use tauri::Manager;
+    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
+    if crate::cef_engine::is_ready() {
+        crate::cef_geometry::set_wrapper_hidden(tab_id.unwrap_or(-1), true);
+        return Ok(());
+    }
     if let Some(wv) = app.get_webview(&tab_label(tab_id)) {
         #[cfg(target_os = "macos")]
         set_child_hidden(&wv, true);
@@ -2020,6 +2120,12 @@ pub fn webview_hide(app: tauri::AppHandle, tab_id: Option<i64>) -> Result<(), St
 #[tauri::command]
 pub fn webview_hide_others(app: tauri::AppHandle, keep: Option<i64>) -> Result<(), String> {
     use tauri::Manager;
+    // ENGINE-CEF: hide every tab's wrapper except `keep`, and front `keep`.
+    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
+    if crate::cef_engine::is_ready() {
+        crate::cef_geometry::hide_others_and_front(keep);
+        return Ok(());
+    }
     let keep_label = keep.map(|id| tab_label(Some(id)));
     for (label, wv) in app.webviews() {
         if !label.starts_with(WEBVIEW_LABEL) { continue; }
@@ -2044,6 +2150,15 @@ pub fn webview_hide_others(app: tauri::AppHandle, keep: Option<i64>) -> Result<(
 pub fn webview_navigate(app: tauri::AppHandle, url: String, tab_id: Option<i64>) -> Result<(), String> {
     use tauri::Manager;
     let target = normalize_url(&url);
+    // ENGINE-CEF: drive the CEF browser's main frame.
+    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
+    if crate::cef_engine::is_ready() {
+        let tid = tab_id.unwrap_or(-1);
+        crate::history::record(&app, &target, "");
+        note_active_tab_url(tid, &target);
+        crate::cef_engine::navigate(tid, target.clone());
+        return Ok(());
+    }
     let parsed = target.parse().map_err(|e| format!("bad url: {e}"))?;
     let wv = app.get_webview(&tab_label(tab_id)).ok_or("browser not open")?;
     // PERSISTENT HISTORY: record the explicit target immediately (title empty;
@@ -2098,6 +2213,13 @@ pub async fn webview_page_info(app: tauri::AppHandle, tab_id: Option<i64>) -> Re
 #[tauri::command]
 pub fn webview_close(app: tauri::AppHandle, tab_id: Option<i64>) -> Result<(), String> {
     use tauri::Manager;
+    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
+    if crate::cef_engine::is_ready() {
+        let tid = tab_id.unwrap_or(-1);
+        crate::cef_engine::close_tab(tid);
+        crate::cef_geometry::remove_wrapper(tid);
+        return Ok(());
+    }
     if let Some(wv) = app.get_webview(&tab_label(tab_id)) {
         let _ = wv.close();
     }
@@ -2109,6 +2231,19 @@ pub fn webview_close(app: tauri::AppHandle, tab_id: Option<i64>) -> Result<(), S
 #[tauri::command]
 pub fn webview_history(app: tauri::AppHandle, action: String, tab_id: Option<i64>) -> Result<(), String> {
     use tauri::Manager;
+    // ENGINE-CEF: back/forward/reload on the CEF browser (native).
+    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
+    if crate::cef_engine::is_ready() {
+        let tid = tab_id.unwrap_or(-1);
+        match action.as_str() {
+            "back" => crate::cef_engine::go_back(tid),
+            "forward" => crate::cef_engine::go_forward(tid),
+            "reload" => crate::cef_engine::reload(tid),
+            other => return Err(format!("unknown history action: {other}")),
+        }
+        eprintln!("[aygent][cef] webview_history action={action} tab={tid}");
+        return Ok(());
+    }
     let wv = app.get_webview(&tab_label(tab_id)).ok_or("browser not open")?;
     let js = match action.as_str() {
         "back" => "history.back()",
@@ -3684,6 +3819,51 @@ fn urlencoding_encode(s: &str) -> String {
         }
     }
     out
+}
+
+// ===========================================================================
+// ENGINE-CEF FRONTEND-FACING COMMANDS. Registered unconditionally in lib.rs so
+// the FE can call them regardless of build; they are NO-OPS when the CEF engine
+// isn't active (feature off OR not yet initialized), so the WKWebView UI is
+// unaffected.
+// ===========================================================================
+
+/// OVERLAY HIT-TEST TOGGLE (Atrium's hard-won lesson). The FE calls this with
+/// `enabled=false` whenever ANY React overlay is drawn over the browser
+/// (permission card, History/Downloads panel, agent pane, any modal) so the CEF
+/// wrapper DECLINES hit-testing and clicks fall through to React; `enabled=true`
+/// when nothing overlays the browser. Driven by Browser.tsx's overlay REGISTRY
+/// (a Set, never a counter). No-op unless the CEF engine is live.
+#[tauri::command]
+pub fn set_browser_hittest(enabled: bool) -> Result<(), String> {
+    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
+    {
+        crate::cef_geometry::set_hittest_enabled(enabled);
+    }
+    #[cfg(not(all(target_os = "macos", feature = "engine-cef")))]
+    {
+        let _ = enabled;
+    }
+    Ok(())
+}
+
+/// Which engine backs the VISIBLE browser surface: "cef" | "wkwebview". The FE
+/// uses this to decide whether to draw the rounded-corner overlay border (CEF
+/// clips its own layer) and for diagnostics. Always answers.
+#[tauri::command]
+pub fn browser_engine_info() -> Result<serde_json::Value, String> {
+    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
+    {
+        let ready = crate::cef_engine::is_ready();
+        return Ok(serde_json::json!({
+            "engine": if ready { "cef" } else { "wkwebview" },
+            "cefFeature": true,
+            "cefReady": ready,
+            "cdpPort": crate::cef_engine::cdp_port(),
+        }));
+    }
+    #[allow(unreachable_code)]
+    Ok(serde_json::json!({ "engine": "wkwebview", "cefFeature": false, "cefReady": false }))
 }
 
 /// Shut the headless browser down (frees RAM). Safe to call when not running.
