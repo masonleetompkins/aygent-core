@@ -45,7 +45,9 @@ that EXACT framework-export + bundle recipe.
 ## Prerequisites (same as the Phase-0 spike)
 
 - Apple Silicon Mac, Xcode CLT (`xcode-select --install`), Rust ≥ 1.85,
-  `brew install cmake`, ~3–4 GB free disk.
+  **`brew install cmake ninja`** (BOTH — cef-dll-sys builds CEF's C wrapper via
+  CMake + the Ninja generator; missing Ninja = `CMake was unable to find a build
+  program corresponding to "Ninja"`), ~3–4 GB free disk.
 
 ---
 
