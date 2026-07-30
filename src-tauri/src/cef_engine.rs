@@ -133,46 +133,46 @@ fn app() -> Option<&'static AppHandle> {
 // ============================================================================
 // INIT — one-time bring-up. Call from lib.rs setup on the MAIN thread.
 // ============================================================================
-pub fn init(app_handle: AppHandle, downloads_dir: std::path::PathBuf) {
+/// EARLY init — MUST be called at the very top of run(), BEFORE tauri::Builder
+/// takes over the macOS app lifecycle. On macOS CefInitialize has to run before
+/// NSApp's run loop starts; calling it from Tauri's setup (which fires inside
+/// applicationDidFinishLaunching, AFTER tao created + started NSApp) makes
+/// CefInitialize return 0 and panic in a non-unwinding Obj-C frame (the crash we
+/// hit). This does the framework load + execute_process + CefInitialize; the
+/// AppHandle-dependent wiring is done later in attach_app().
+///
+/// Returns true if CEF initialized (engine usable), false on failure — NEVER
+/// panics, so a CEF failure degrades gracefully instead of aborting the app.
+pub fn init_early() -> bool {
     if CEF_READY.load(Ordering::SeqCst) {
-        return;
+        return true;
     }
-    let _ = APP.set(app_handle);
-    let _ = DOWNLOADS_DIR.set(Mutex::new(downloads_dir));
-
     // Load the CEF framework (browser-process resolver: ../Frameworks).
-    let library = {
-        let loader =
-            library_loader::LibraryLoader::new(&std::env::current_exe().unwrap(), false);
-        assert!(loader.load(), "[aygent][cef] framework load failed");
-        loader
-    };
+    let loader =
+        library_loader::LibraryLoader::new(&std::env::current_exe().unwrap(), false);
+    if !loader.load() {
+        eprintln!("[aygent][cef] framework load FAILED — browser will fall back");
+        return false;
+    }
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
 
     let port = free_port();
     CEF_CDP_PORT.store(port, Ordering::SeqCst);
-    eprintln!("[aygent][cef] init: remote-debugging-port={port}");
+    eprintln!("[aygent][cef] init_early: remote-debugging-port={port}");
 
     let args = Args::new();
-
-    // Browser process: execute_process returns -1 for the browser process.
     let mut app_obj = AygentApp::new(port);
+    // Browser process: execute_process returns -1 for the browser process.
     let ret = execute_process(Some(args.as_main_args()), Some(&mut app_obj), std::ptr::null_mut());
     if ret != -1 {
-        // We are somehow in a subprocess path in the main binary — should never
-        // happen because subprocesses re-exec aygent_helper, but bail cleanly.
         eprintln!("[aygent][cef] execute_process returned {ret} in main binary (unexpected)");
-        return;
+        return false;
     }
 
-    // Settings: multi_threaded_message_loop so CEF runs its OWN loop and does
-    // NOT need to own Wry's main run loop (see module header — the hard seam).
     let settings = Settings {
         no_sandbox: !cfg!(feature = "sandbox") as _,
         multi_threaded_message_loop: 1,
         external_message_pump: 0,
-        // Remote debugging so the agent CDP client attaches to the SAME
-        // Chromium the human sees (human+agent unification).
         remote_debugging_port: port as _,
         ..Default::default()
     };
@@ -183,11 +183,24 @@ pub fn init(app_handle: AppHandle, downloads_dir: std::path::PathBuf) {
         Some(&mut app_obj),
         std::ptr::null_mut(),
     );
-    assert_eq!(ok, 1, "[aygent][cef] initialize failed");
+    if ok != 1 {
+        eprintln!("[aygent][cef] CefInitialize returned {ok} (expected 1) — CEF unavailable, browser falls back to WKWebView path");
+        return false;
+    }
 
-    let _ = CEF_KEEPALIVE.set(CefKeepAlive { _library: library });
+    let _ = CEF_KEEPALIVE.set(CefKeepAlive { _library: loader });
     CEF_READY.store(true, Ordering::SeqCst);
     eprintln!("[aygent][cef] initialize OK — engine ready (multi_threaded_message_loop)");
+    true
+}
+
+/// LATE wiring — stash the AppHandle + downloads dir once Tauri is up (called
+/// from setup). No CEF lifecycle calls here, so it's safe inside
+/// applicationDidFinishLaunching.
+pub fn attach_app(app_handle: AppHandle, downloads_dir: std::path::PathBuf) {
+    let _ = APP.set(app_handle);
+    let _ = DOWNLOADS_DIR.set(Mutex::new(downloads_dir));
+    eprintln!("[aygent][cef] attach_app: AppHandle + downloads dir wired (cef_ready={})", CEF_READY.load(Ordering::SeqCst));
 }
 
 /// Shutdown CEF cleanly (best-effort). Called on app exit.

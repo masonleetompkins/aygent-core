@@ -3166,6 +3166,21 @@ pub fn persist_inbox_error(db: &writer::Db, agent_id: &str, msg: &mailbox::Messa
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // ENGINE-CEF (Phase 1): initialize CEF FIRST — before tauri::Builder builds
+    // + starts NSApp. On macOS CefInitialize must run before the app run loop;
+    // doing it in Tauri's setup (inside applicationDidFinishLaunching) makes it
+    // fail (returns 0) and abort in a non-unwinding Obj-C frame. init_early()
+    // does the framework load + execute_process + CefInitialize and NEVER
+    // panics (returns false on failure → the browser degrades instead of
+    // crashing the whole app). The AppHandle-dependent wiring happens later in
+    // setup via cef_engine::attach_app().
+    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
+    {
+        eprintln!("[aygent][cef] run(): init_early BEFORE tauri::Builder");
+        let ok = cef_engine::init_early();
+        eprintln!("[aygent][cef] init_early -> {ok}");
+    }
+
     let state = Arc::new(DaemonState {
         ws_token: mint_ws_token(),
         ..Default::default()
@@ -3242,13 +3257,13 @@ pub fn run() {
             memory_get_auto_remember, memory_set_auto_remember
         ])
         .setup(move |_app| {
-            // ENGINE-CEF (Phase 1): bring CEF up FIRST, on the main thread, in
-            // setup — the Chromium browser process + framework must init before
-            // any tab creates a browser. Uses multi_threaded_message_loop so it
-            // does NOT contend for Wry's run loop (see cef_engine module header).
-            // Downloads default to the app-data browser dir until an agent
-            // folder is restored, at which point browser.rs re-points it via
-            // cef_engine::set_downloads_dir(agent_downloads_dir).
+            // ENGINE-CEF (Phase 1): CEF was ALREADY initialized at the top of
+            // run() (init_early), BEFORE tauri::Builder — CefInitialize must run
+            // before NSApp's run loop starts, so it CANNOT go here (setup fires
+            // inside applicationDidFinishLaunching, after tao started NSApp; that
+            // ordering made CefInitialize return 0 and abort in a non-unwinding
+            // Obj-C frame). Here we only do the LATE wiring: stash the AppHandle
+            // + downloads dir so handlers can emit events + save downloads.
             #[cfg(all(target_os = "macos", feature = "engine-cef"))]
             {
                 use tauri::Manager;
@@ -3256,8 +3271,7 @@ pub fn run() {
                     .map(|d| d.join("browser").join("downloads"))
                     .unwrap_or_else(|_| std::env::temp_dir());
                 let _ = std::fs::create_dir_all(&dl);
-                eprintln!("[aygent][cef] setup: initializing CEF engine…");
-                cef_engine::init(_app.handle().clone(), dl);
+                cef_engine::attach_app(_app.handle().clone(), dl);
             }
 
             // M1.1: bring up the SQLite state spine + single-writer actor, then
