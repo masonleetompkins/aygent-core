@@ -447,9 +447,10 @@ fn sanitize(raw: &str) -> String {
 // we look up which tab it belongs to.
 
 // CEF Browser::identifier() is a u64.
-static BROWSER_TAB: OnceLock<Mutex<HashMap<u64, i64>>> = OnceLock::new();
+// Key = CEF Browser::identifier(), which returns i32.
+static BROWSER_TAB: OnceLock<Mutex<HashMap<i32, i64>>> = OnceLock::new();
 
-fn browser_tab_map() -> &'static Mutex<HashMap<u64, i64>> {
+fn browser_tab_map() -> &'static Mutex<HashMap<i32, i64>> {
     BROWSER_TAB.get_or_init(|| Mutex::new(HashMap::new()))
 }
 

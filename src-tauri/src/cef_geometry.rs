@@ -84,7 +84,13 @@ define_class!(
 impl AygentCefWrapper {
     fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
         let this = Self::alloc(mtm);
-        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        // objc2 0.6: an init-family super message on an Allocated<Self> must go
+        // through the NSView superclass explicitly so the retain-semantics /
+        // MsgSendSuper bounds resolve (a bare `super(this)` init doesn't satisfy
+        // MethodFamily<3>). Use the typed super receiver.
+        let this: Retained<Self> = unsafe {
+            msg_send![super(this, NSView), initWithFrame: frame]
+        };
         unsafe {
             this.setWantsLayer(true);
             if let Some(layer) = this.layer() {
