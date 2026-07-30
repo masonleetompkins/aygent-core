@@ -964,7 +964,7 @@ pub async fn webview_open(
     // get_webview_window(), which returns None for embedded children).
     if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
         #[cfg(target_os = "macos")]
-        place_child_exact(&wv, x, y, width, height);
+        place_child_exact(&wv, x, y, width, height, client_height);
         #[cfg(not(target_os = "macos"))]
         {
             let _ = wv.set_position(pos);
@@ -987,7 +987,7 @@ pub async fn webview_open(
     // Immediately pin the freshly-created child to the exact measured rect via
     // AppKit — add_child's own placement is what we stopped trusting.
     #[cfg(target_os = "macos")]
-    place_child_exact(&wv, x, y, width, height);
+    place_child_exact(&wv, x, y, width, height, client_height);
     #[cfg(not(target_os = "macos"))]
     let _ = wv;
     Ok(())
@@ -1085,11 +1085,13 @@ pub fn webview_set_bounds(
 ) -> Result<(), String> {
     use tauri::Manager;
     if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
-        let _ = (client_width, client_height, parent_height);
+        let _ = client_width;
+        let content_h = client_height.or(parent_height);
         #[cfg(target_os = "macos")]
-        place_child_exact(&wv, x, y, width, height);
+        place_child_exact(&wv, x, y, width, height, content_h);
         #[cfg(not(target_os = "macos"))]
         {
+            let _ = content_h;
             let _ = wv.set_position(tauri::LogicalPosition::new(x, y));
             let _ = wv.set_size(tauri::LogicalSize::new(width.max(1.0), height.max(1.0)));
         }
