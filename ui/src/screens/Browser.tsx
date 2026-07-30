@@ -59,6 +59,13 @@ export function Browser() {
   // reads the CURRENT active tab, not a stale closure value.
   const activeIdRef = useRef<number>(activeId);
   activeIdRef.current = activeId;
+  // Same trick for `driver`: syncBounds runs inside a double-rAF callback whose
+  // closure captured driver at render time. On the flip to "agent" the effect
+  // fires syncBounds BEFORE a re-render rebinds the closure, so it read the OLD
+  // driver and never shrank the webview (page stayed full-width, clipped behind
+  // the agent panel). Read driver from a ref so syncBounds always sees current.
+  const driverRef = useRef<"human" | "agent">(driver);
+  driverRef.current = driver;
 
   const active = tabs.find((t) => t.id === activeId) ?? tabs[0];
   function patch(id: number, p: Partial<Tab>) {
@@ -93,7 +100,7 @@ export function Browser() {
       const parentHeight = Math.round(document.documentElement.clientHeight);
       const clientWidth = Math.round(document.documentElement.clientWidth);
       const clientHeight = parentHeight;
-      const rightPane = driver === "agent" ? AGENT_PANE_W + 10 : 0; // +gap
+      const rightPane = driverRef.current === "agent" ? AGENT_PANE_W + 10 : 0; // +gap
       // Webview rect == paneRef's BORDER-BOX rect (no inset). The rounded
       // outline is a pointer-events:none overlay rendered ON TOP of the webview,
       // so its ~radius corner arcs mask the webview's square corners while the
