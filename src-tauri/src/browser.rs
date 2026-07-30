@@ -1,18 +1,18 @@
-// AYGENT — In-app browser provisioning, SLICE 0: THE GATE.
+// AYGENT â€” In-app browser provisioning, SLICE 0: THE GATE.
 //
 // Atlas's BROWSER-ARCH north star (projects/aygent/BROWSER-ARCH.md). Slice 0 is
 // the make-or-break: prove AYGENT can, on a clean Mac with the user having
 // installed NOTHING, obtain a real Chromium and LAUNCH it as our own child
-// process — no Homebrew, no npm, no terminal, no Gatekeeper block.
+// process â€” no Homebrew, no npm, no terminal, no Gatekeeper block.
 //
 // The install-nothing solution (Mason's load-bearing rule + his "would I have to
-// host the file?" test → NO): we fetch Google's OFFICIAL, version-pinned
+// host the file?" test â†’ NO): we fetch Google's OFFICIAL, version-pinned
 // **Chrome for Testing** build from Google's own CDN
-// (storage.googleapis.com/chrome-for-testing-public/...) — the exact same
+// (storage.googleapis.com/chrome-for-testing-public/...) â€” the exact same
 // "upstream hosts it, we just fetch it" model as the GGUF weights local models
 // already download. Zero hosting/bandwidth cost on us. This mirrors
 // `local_download` in lib.rs precisely (streamed download + progress events +
-// atomic .part→final rename), then adds the three macOS-specific steps that make
+// atomic .partâ†’final rename), then adds the three macOS-specific steps that make
 // the launch actually work without a user install:
 //
 //   1. UNZIP the CfT archive into AYGENT's managed browser dir.
@@ -26,7 +26,7 @@
 //
 // SLICE 0 SCOPE = provision + LAUNCH (headless, --dump-dom of about:blank or a
 // version probe) and confirm the process starts and the CDP port opens. It does
-// NOT yet drive pages, mirror, or expose agent tools — those are Slices 1+.
+// NOT yet drive pages, mirror, or expose agent tools â€” those are Slices 1+.
 //
 // `BrowserRuntime` trait keeps the door open to a BUNDLED browser later (Atlas's
 // fallback if Apple ever walls the download path); v1 default = download.
@@ -68,7 +68,7 @@ fn cft_platform() -> &'static str {
 /// with the major version matching our pinned Chrome-for-Testing build so the
 /// UA and the actual engine agree (a mismatch is itself a detection signal).
 /// Chrome-for-Testing's default UA contains "HeadlessChrome/<ver>" when run
-/// headless — that is the #1 tell, so we override it everywhere.
+/// headless â€” that is the #1 tell, so we override it everywhere.
 ///
 /// Platform token: CfT only ships macOS builds for us today, and Mason runs on
 /// a Mac, so we present a Mac desktop Chrome UA. The `Intel Mac OS X` token is
@@ -101,7 +101,7 @@ fn pinned_zip_url() -> String {
 }
 
 /// AYGENT's managed browser dir: <app_data>/browser. Everything browser-related
-/// (the unzipped Chromium, later per-agent profiles) lives UNDER here — inside
+/// (the unzipped Chromium, later per-agent profiles) lives UNDER here â€” inside
 /// the app's own sandboxed data, never a system install location.
 pub fn browser_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     use tauri::Manager;
@@ -116,7 +116,7 @@ pub fn browser_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 /// Where the unzipped Chromium runtime lands: <browser>/chromium/<version>/.
 /// Version-scoped so a future upgrade can download the new one alongside, verify
-/// it, then flip — never leaving the user without a working browser mid-upgrade.
+/// it, then flip â€” never leaving the user without a working browser mid-upgrade.
 fn runtime_dir(app: &tauri::AppHandle, version: &str) -> Result<PathBuf, String> {
     Ok(browser_dir(app)?.join("chromium").join(version))
 }
@@ -183,7 +183,7 @@ struct Resolved {
 
 /// Pull Google's last-known-good JSON and extract, for our platform's chrome
 /// build: (url, version, sha256). This is the single source of truth for BOTH
-/// the URL and the integrity hash — so we always have a hash to check.
+/// the URL and the integrity hash â€” so we always have a hash to check.
 async fn lkg_chrome_for_platform(
     client: &reqwest::Client,
 ) -> Result<Resolved, String> {
@@ -226,7 +226,7 @@ async fn lkg_chrome_for_platform(
 async fn resolve_download(client: &reqwest::Client) -> Result<Resolved, String> {
     // Try to find our PINNED version in the LKG JSON's history so we can pin the
     // hash too. The LKG endpoint only lists CURRENT stable, so if our pin isn't
-    // current we just take current stable (with its hash) — the pinned URL might
+    // current we just take current stable (with its hash) â€” the pinned URL might
     // still 200 from the CDN, but without a trustworthy published hash we prefer
     // the version we CAN verify. Integrity beats staying on an exact pin.
     let current = lkg_chrome_for_platform(client).await?;
@@ -240,8 +240,8 @@ async fn resolve_download(client: &reqwest::Client) -> Result<Resolved, String> 
     if !current.sha256.is_empty() {
         return Ok(current);
     }
-    // No hash available at all (JSON shape changed?) — last resort, pinned URL,
-    // hash empty (caller will WARN, not silently trust — see verify step).
+    // No hash available at all (JSON shape changed?) â€” last resort, pinned URL,
+    // hash empty (caller will WARN, not silently trust â€” see verify step).
     Ok(Resolved {
         url: pinned_zip_url(),
         version: PINNED_CFT_VERSION.to_string(),
@@ -275,7 +275,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
-/// SLICE 0 — download + provision Chrome for Testing, emitting progress on
+/// SLICE 0 â€” download + provision Chrome for Testing, emitting progress on
 /// `channel` (identical UX to `local_download`). Returns the launchable
 /// executable path. If already installed, returns immediately.
 #[tauri::command]
@@ -308,7 +308,7 @@ pub async fn browser_install(app: tauri::AppHandle, channel: String) -> Result<S
         version
     ));
 
-    // --- DOWNLOAD (streamed, progress events, atomic .part→final) -----------
+    // --- DOWNLOAD (streamed, progress events, atomic .partâ†’final) -----------
     let resp = client
         .get(&url)
         .header("Accept", "*/*")
@@ -346,7 +346,7 @@ pub async fn browser_install(app: tauri::AppHandle, channel: String) -> Result<S
     // Honors the contract's "SHA-256 verify". If CfT gave us a hash, the archive
     // MUST match or we abort + delete it (never extract an unverified binary).
     // If no hash was resolvable (JSON shape change), we emit a WARN rather than
-    // silently trusting — HTTPS transport integrity still applies, but we flag it.
+    // silently trusting â€” HTTPS transport integrity still applies, but we flag it.
     if !expected_sha.is_empty() {
         let _ = app.emit(&channel, &serde_json::json!({ "phase": "verify" }));
         let zip_for_hash = zip_path.clone();
@@ -395,7 +395,7 @@ pub async fn browser_install(app: tauri::AppHandle, channel: String) -> Result<S
 
     if !exe.is_file() {
         return Err(format!(
-            "provisioned but executable missing at {} — CfT layout may have changed",
+            "provisioned but executable missing at {} â€” CfT layout may have changed",
             exe.display()
         ));
     }
@@ -404,17 +404,17 @@ pub async fn browser_install(app: tauri::AppHandle, channel: String) -> Result<S
     Ok(exe.to_string_lossy().to_string())
 }
 
-/// SLICE 0 GATE — launch the provisioned Chromium as OUR child process and
+/// SLICE 0 GATE â€” launch the provisioned Chromium as OUR child process and
 /// confirm it actually runs with no install + no Gatekeeper block. We do the
 /// cheapest possible proof: `--version` (prints the build + exits 0). If that
 /// returns cleanly, the whole install-nothing thesis holds; if macOS blocked it,
-/// we get a Gatekeeper error here and know Slice 0 failed (→ consider bundled).
+/// we get a Gatekeeper error here and know Slice 0 failed (â†’ consider bundled).
 ///
 /// Returns the version string Chromium reports (proof it launched).
 #[tauri::command]
 pub async fn browser_launch_probe(app: tauri::AppHandle) -> Result<String, String> {
     if !is_installed(&app) {
-        return Err("browser not installed — run browser_install first".into());
+        return Err("browser not installed â€” run browser_install first".into());
     }
     let rt = runtime_dir(&app, PINNED_CFT_VERSION)?;
     let exe = mac_executable(&rt, cft_platform());
@@ -520,10 +520,10 @@ fn make_executable(exe: &Path) -> Result<(), String> {
 }
 
 // ===========================================================================
-// SLICE 1 — LIVE DRIVE: launch Chromium headless w/ CDP, navigate, screenshot.
+// SLICE 1 â€” LIVE DRIVE: launch Chromium headless w/ CDP, navigate, screenshot.
 //
 // The mature CDP client (playwright-core) lives in the Node daemon per Atlas's
-// doc — that's Slice 4's home for the agent-tool surface. But for Slice 1's
+// doc â€” that's Slice 4's home for the agent-tool surface. But for Slice 1's
 // "navigate + screenshot" proof we drive CDP DIRECTLY from Rust over the
 // DevTools WebSocket (tokio-tungstenite, already a dep). Zero new daemon
 // plumbing, zero npm, stays inside the install-nothing rule. When we build the
@@ -546,7 +546,7 @@ use tokio::sync::oneshot;
 #[derive(Default)]
 pub struct BrowserProc {
     inner: Mutex<Option<RunningBrowser>>,
-    /// SLICE 5 — who's driving the shared page: "human" | "agent" | "idle".
+    /// SLICE 5 â€” who's driving the shared page: "human" | "agent" | "idle".
     /// The human ALWAYS wins: taking the wheel preempts the agent instantly.
     control: Mutex<Control>,
     /// PERMISSION REQUESTS: when the agent wants to do something outside what the
@@ -572,7 +572,7 @@ pub struct PermState {
 #[derive(Clone)]
 pub struct Control {
     pub driver: String,       // "human" | "agent" | "idle"
-    pub note: String,         // e.g. "agent hit a login — take the wheel"
+    pub note: String,         // e.g. "agent hit a login â€” take the wheel"
     pub agent_active: bool,   // an agent browser task is in progress
 }
 impl Default for Control {
@@ -622,7 +622,7 @@ fn emit_control(app: &tauri::AppHandle, c: &Control) {
     }));
 }
 
-/// SLICE 6 — which agent's browser profile to use. Reads the active agent id
+/// SLICE 6 â€” which agent's browser profile to use. Reads the active agent id
 /// from app-data (set by agents_set_active); falls back to "default". A
 /// filesystem-safe slug so it's a valid dir name.
 fn active_browser_agent(app: &tauri::AppHandle) -> String {
@@ -648,7 +648,7 @@ fn free_port() -> Result<u16, String> {
 
 /// Ensure Chromium is running headless with a CDP port; return the port.
 /// Launches on first call, reuses on subsequent calls (checks the child is
-/// still alive; relaunches if it died/crashed — crash recovery).
+/// still alive; relaunches if it died/crashed â€” crash recovery).
 async fn ensure_running(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>) -> Result<u16, String> {
     // Fast path: already running + alive.
     {
@@ -656,18 +656,18 @@ async fn ensure_running(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
         if let Some(rb) = guard.as_mut() {
             match rb.child.try_wait() {
                 Ok(None) => return Ok(rb.port), // still alive
-                _ => { *guard = None; }          // died — fall through to relaunch
+                _ => { *guard = None; }          // died â€” fall through to relaunch
             }
         }
     }
 
     if !is_installed(app) {
-        return Err("browser not installed — enable it in Settings first".into());
+        return Err("browser not installed â€” enable it in Settings first".into());
     }
     let rt = runtime_dir(app, PINNED_CFT_VERSION)?;
     let exe = mac_executable(&rt, cft_platform());
     let port = free_port()?;
-    // SLICE 6 — PER-AGENT profile isolation. The active agent's own profile dir
+    // SLICE 6 â€” PER-AGENT profile isolation. The active agent's own profile dir
     // (isolated cookies/logins) + its own jailed downloads dir, both UNDER
     // AYGENT's managed browser dir (never a system Chrome profile). Opt-in
     // cross-agent sharing (Atlas C) is a symlink/copy of the profile dir, spec'd
@@ -694,7 +694,7 @@ async fn ensure_running(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
     let mut child = std::process::Command::new(&exe)
         .arg("--headless=new")
         .arg(format!("--remote-debugging-port={port}"))
-        // Bind DevTools to loopback only — never expose the CDP port off-box.
+        // Bind DevTools to loopback only â€” never expose the CDP port off-box.
         .arg("--remote-debugging-address=127.0.0.1")
         .arg(format!("--user-data-dir={}", profile.display()))
         .arg("--no-first-run")
@@ -751,14 +751,14 @@ async fn ensure_running(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
 }
 
 // ---------------------------------------------------------------------------
-// SLICE 2 — LIVE SCREENCAST SESSION.
+// SLICE 2 â€” LIVE SCREENCAST SESSION.
 //
 // One persistent CDP WebSocket per browser, owned by a background "pump" task.
 // The pump: (a) forwards outbound CDP requests (from commands, via a channel)
 // and routes replies back by id; (b) receives `Page.screencastFrame` events and
 // emits them to the UI as `browser:frame` Tauri events (base64 JPEG), acking
-// each so Chromium keeps streaming. This replaces Slice 1's navigate→screenshot
-// →close with a live view + is exactly the socket Slice 3 forwards input into.
+// each so Chromium keeps streaming. This replaces Slice 1's navigateâ†’screenshot
+// â†’close with a live view + is exactly the socket Slice 3 forwards input into.
 // ---------------------------------------------------------------------------
 
 /// Session generation counter so a stale pump never clobbers a newer session.
@@ -770,7 +770,7 @@ static SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 static ACTIVE_TAB_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 
 /// The visible tab's current URL (reported by the frontend). Used for the host
-/// pre-check so same-site actions don't prompt — the CDP read path can lag or
+/// pre-check so same-site actions don't prompt â€” the CDP read path can lag or
 /// point at about:blank, so the UI's own knowledge of where the tab is is the
 /// authoritative "current page" for permission purposes.
 static ACTIVE_TAB_URL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
@@ -789,7 +789,7 @@ pub fn set_active_browser_tab(tab_id: i64, url: Option<String>) {
 /// The current active-tab URL as last mirrored from the authoritative CDP page
 /// (see `mirror_visible_to_cdp`). Used by `agent_run`'s step-overrun guard to
 /// decide, DETERMINISTICALLY, whether a "click/open the result" step has already
-/// navigated off the search page onto its destination — so the loop can require
+/// navigated off the search page onto its destination â€” so the loop can require
 /// step_done instead of tolerating a second, wandering click. Returns "" if the
 /// tab URL is unknown.
 pub fn current_agent_url() -> String {
@@ -806,7 +806,7 @@ pub fn current_agent_host() -> String {
 /// Heuristic: is `host` a search-engine / launcher host (i.e. NOT yet a real
 /// destination)? Used ONLY to decide whether a "click the result" step has
 /// actually landed somewhere. This is deliberately NOT the brittle old
-/// `left_google` turn-gate — it never forbids or forces navigation; it only
+/// `left_google` turn-gate â€” it never forbids or forces navigation; it only
 /// helps recognize that a nav-step's GOAL is met once the page is off search.
 pub fn is_search_host(host: &str) -> bool {
     let h = host.trim().to_ascii_lowercase();
@@ -820,7 +820,7 @@ pub fn is_search_host(host: &str) -> bool {
 /// FIRE-AND-FORGET action in the ACTIVE tab's embedded webview. `wv.eval()`
 /// runs JS with NO return channel; on EXTERNAL pages (google.com etc) the page
 /// has no `window.__TAURI__` to emit a result back, so ANY round-trip stalls.
-/// For actions (click/type/navigate) we don't need a value — run + assume
+/// For actions (click/type/navigate) we don't need a value â€” run + assume
 /// success. Returns Ok(()) once the eval is dispatched.
 pub fn active_tab_run(app: &tauri::AppHandle, expr: &str) -> Result<(), String> {
     use tauri::Manager;
@@ -833,10 +833,10 @@ pub fn active_tab_run(app: &tauri::AppHandle, expr: &str) -> Result<(), String> 
     wv.eval(&script).map_err(|e| format!("eval: {e}"))
 }
 
-/// READ a value from the AUTHORITATIVE agent page — the CDP session. This is
+/// READ a value from the AUTHORITATIVE agent page â€” the CDP session. This is
 /// THE desync fix (Problem 1): the CDP session is now the SINGLE SOURCE OF
 /// TRUTH the agent both ACTS ON and READS FROM. We NO LONGER mirror the CDP
-/// page to a frontend-reported URL here — the old code did that and it dragged
+/// page to a frontend-reported URL here â€” the old code did that and it dragged
 /// every read back to a stale google.com the frontend last reported, so the
 /// agent never "saw" it had navigated (the loop). Now: the CDP page is wherever
 /// the agent's own actions (browser_open/click/type below) drove it; reads just
@@ -868,7 +868,7 @@ async fn cdp_current_url(state: &tauri::State<'_, BrowserProc>) -> String {
 
 /// SINGLE-SOURCE-OF-TRUTH SYNC (Problem 1 fix). After the agent navigates the
 /// AUTHORITATIVE CDP page, drag the VISIBLE WKWebView to that same url so the
-/// human watches where the agent actually went — and store it as ACTIVE_TAB_URL
+/// human watches where the agent actually went â€” and store it as ACTIVE_TAB_URL
 /// for the permission host pre-check. Direction is ALWAYS CDP -> visible (never
 /// visible -> CDP), which is what breaks the old tug-of-war desync loop.
 async fn mirror_visible_to_cdp(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>) {
@@ -887,7 +887,7 @@ async fn mirror_visible_to_cdp(app: &tauri::AppHandle, state: &tauri::State<'_, 
     }
 }
 
-/// Read the active tab's (title, url) — from the VISIBLE embedded webview via a
+/// Read the active tab's (title, url) â€” from the VISIBLE embedded webview via a
 /// Ensure a live CDP session exists (open the persistent socket + spawn the pump
 /// + start the screencast). Idempotent: returns quickly if one is already live.
 async fn ensure_session(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>) -> Result<(), String> {
@@ -927,10 +927,10 @@ async fn ensure_session(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
     session_call(state, "Runtime.enable", serde_json::json!({})).await?;
     // DOM domain: required for DOM.getContentQuads (used by the trusted-click
     // target resolver to get the click point in the exact coord space CDP
-    // Input.* uses — DPR-safe). Best-effort; the resolver falls back to the
+    // Input.* uses â€” DPR-safe). Best-effort; the resolver falls back to the
     // rect center if DOM is unavailable.
     let _ = session_call(state, "DOM.enable", serde_json::json!({})).await;
-    // FINGERPRINT HARDENING (#2) — done ONCE per session, right after the
+    // FINGERPRINT HARDENING (#2) â€” done ONCE per session, right after the
     // domains are enabled and BEFORE any real navigation, so it applies to the
     // very first document too.
     apply_fingerprint_hardening(state).await;
@@ -1069,7 +1069,7 @@ async fn page_ws_url(client: &reqwest::Client, port: u16) -> Result<String, Stri
         .ok_or_else(|| "target has no webSocketDebuggerUrl".into())
 }
 
-/// SLICE 2 — navigate the LIVE session to `url`. Frames stream to the UI via
+/// SLICE 2 â€” navigate the LIVE session to `url`. Frames stream to the UI via
 /// `browser:frame` events (started by ensure_session); this just points the
 /// page at the URL and returns the final url + title once it settles.
 #[tauri::command]
@@ -1082,9 +1082,11 @@ pub async fn browser_navigate(
     ensure_session(&app, &state).await?;
 
     session_call(&state, "Page.navigate", serde_json::json!({ "url": url })).await?;
-    // Let it settle so the URL/title read is post-load. Frames are already
-    // streaming live regardless, so this delay doesn't gate what the user SEES.
-    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    // PERF (ITEM 2): was a FIXED 900ms sleep regardless of how fast the page
+    // loaded. Replace with the event-equivalent readyState wait so the URL/title
+    // read fires as soon as the DOM is ready (typically far under 900ms) and
+    // still caps out on a slow page. Frames stream live regardless.
+    wait_for_cdp_load(&state).await;
 
     let (mut final_url, mut title) = (url.clone(), String::new());
     if let Ok(r) = session_call(
@@ -1104,7 +1106,7 @@ pub async fn browser_navigate(
     Ok(serde_json::json!({ "url": final_url, "title": title }))
 }
 
-/// Start (or restart) the live view without navigating — used when the UI opens
+/// Start (or restart) the live view without navigating â€” used when the UI opens
 /// the Browser tab so frames begin streaming immediately.
 #[tauri::command]
 pub async fn browser_start_view(
@@ -1117,15 +1119,15 @@ pub async fn browser_start_view(
 // ===========================================================================
 // REAL EMBEDDED WEBVIEW (the human's actual browser).
 //
-// The screencast (above) was foggy glass — a JPEG video of a browser you can't
+// The screencast (above) was foggy glass â€” a JPEG video of a browser you can't
 // select text in. WRONG tool for a human. This is the right one: a REAL native
 // child webview (WKWebView on macOS) rendered INSIDE the AYGENT window, over the
 // Browser pane. Crisp text, native selection, hover, scroll, real DOM. YOU
 // browse in this.
 //
-// THE MAGIC — hand-off: the same webview the human browses is ALSO driveable by
+// THE MAGIC â€” hand-off: the same webview the human browses is ALSO driveable by
 // the agent via `eval` (inject JS to click/type/read). So "hand off to agent"
-// doesn't switch surfaces — the agent acts in the exact window you're looking at
+// doesn't switch surfaces â€” the agent acts in the exact window you're looking at
 // while you watch. Toggle back instantly; same page, same session, no reload.
 //
 // The screencast/CDP path stays for HEADLESS agent-only browsing (scheduled/
@@ -1160,7 +1162,7 @@ pub async fn webview_open(
     // signature for compatibility but no longer used: the pane rect is already
     // in the SAME content-coordinate space add_child uses, so we pass it through
     // exactly. (Every titlebar/DPR/inset correction we tried broke it a new way
-    // — there was no offset to correct.)
+    // â€” there was no offset to correct.)
     client_width: Option<f64>,
     client_height: Option<f64>,
     // Corner radius (CSS px) to round the WKWebView's own CALayer, so the OS
@@ -1203,7 +1205,7 @@ pub async fn webview_open(
     // WINDOW (not WebviewWindow/AppHandle). Getting the parent WINDOW:
     // get_webview_window("main") returns None once child webviews exist (the
     // registry entry "main" is the parent WEBVIEW, and after children the
-    // lookup can miss) — which is exactly why tab 2 failed with "no main
+    // lookup can miss) â€” which is exactly why tab 2 failed with "no main
     // window" while tab 1 succeeded. Get the parent Window robustly: prefer
     // the windows() map (keyed by window label), falling back to any existing
     // child webview's own .window() (all children share the same parent
@@ -1221,7 +1223,7 @@ pub async fn webview_open(
         .map_err(|e| { eprintln!("[aygent][browser] add_child FAILED: {e}"); format!("embed webview: {e}") })?;
     eprintln!("[aygent][browser] webview_open add_child OK label={label}");
     // Immediately pin the freshly-created child to the exact measured rect via
-    // AppKit — add_child's own placement is what we stopped trusting.
+    // AppKit â€” add_child's own placement is what we stopped trusting.
     #[cfg(target_os = "macos")]
     place_child_exact(&wv, x, y, width, height, client_height, radius);
     #[cfg(not(target_os = "macos"))]
@@ -1231,7 +1233,7 @@ pub async fn webview_open(
 
 /// GROUND-TRUTH PLACEMENT (macOS): set the child webview's NSView frame
 /// DIRECTLY against the window contentView's live bounds. We do NOT trust
-/// wry's child-positioning math — every attempt to pre-correct for it
+/// wry's child-positioning math â€” every attempt to pre-correct for it
 /// (titlebar inset, DPR, frame inset) broke a new way because we were
 /// guessing its reference frame. Here there is nothing to guess: AppKit
 /// tells us the content area, we convert top-left CSS coords to AppKit
@@ -1279,7 +1281,7 @@ fn place_child_exact(wv: &tauri::Webview, x: f64, y: f64, w: f64, h: f64, conten
         // KEY FIX: the parent NSView spans the FULL WINDOW (incl. titlebar),
         // but the frontend's y is measured from the CONTENT area top (below the
         // titlebar). Flip against the CONTENT height (client_height from JS),
-        // not the parent's full height — otherwise the webview rides up over the
+        // not the parent's full height â€” otherwise the webview rides up over the
         // tabs by exactly the titlebar height. NSVIEW log proved parent_h=720
         // while content=688. Fall back to parent_h if JS didn't send it.
         let flip_h = content_h.filter(|v| *v > 0.0).unwrap_or(parent_h);
@@ -1295,7 +1297,7 @@ fn place_child_exact(wv: &tauri::Webview, x: f64, y: f64, w: f64, h: f64, conten
 
         // MINIMAL INTERVENTION: place ONLY the outer container (the view sitting
         // directly under contentView). Do NOT touch the inner WKWebView frame
-        // and do NOT clear autoresizing — doing both is what broke rendering
+        // and do NOT clear autoresizing â€” doing both is what broke rendering
         // (blank page). The WKWebView tracks its container via its own
         // autoresizing mask; we only correct WHERE the container sits. wry still
         // sized it via set_size before this call; we override position + size on
@@ -1303,7 +1305,7 @@ fn place_child_exact(wv: &tauri::Webview, x: f64, y: f64, w: f64, h: f64, conten
         target.setFrame(NSRect::new(NSPoint::new(x, oy), NSSize::new(w, h)));
         let _ = NSAutoresizingMaskOptions::empty();
 
-        // PREMIUM ROUNDED CORNERS — the proper native way: round the WKWebView's
+        // PREMIUM ROUNDED CORNERS â€” the proper native way: round the WKWebView's
         // OWN backing CALayer so the OS clips the web content itself to a
         // rounded rect. No DOM inset, sizes match the pane EXACTLY; the DOM
         // frame overlay then overlaps only the corner pixels for the accent
@@ -1361,7 +1363,7 @@ pub fn webview_set_bounds(
 }
 
 /// Hide the embedded webview when the user leaves the Browser tab so it doesn't
-/// float over other screens. Embedded child webviews have no hide() — shrink to
+/// float over other screens. Embedded child webviews have no hide() â€” shrink to
 /// zero + move off-screen (reliable across versions).
 /// Set NSView `hidden` on a tab's webview (macOS). Atlas P0: hiding by
 /// setHidden removes the view from hit-testing (no leaked clicks) + drops it
@@ -1516,11 +1518,11 @@ pub fn webview_history(app: tauri::AppHandle, action: String, tab_id: Option<i64
 // When the human hands off, this runs a small agent loop where the model's ONLY
 // tools operate on the live webview via injected JS: read the page, click by
 // text, type, scroll. The agent works in the EXACT window the human is watching
-// (same DOM, same session, same cookies) — not a separate headless browser.
+// (same DOM, same session, same cookies) â€” not a separate headless browser.
 //
 // We reuse the app's existing Anthropic provider primitive. The webview eval
 // runs page-side JS + returns a result the model reads back (page text after an
-// action). This is a focused, self-contained loop — the model gets the task +
+// action). This is a focused, self-contained loop â€” the model gets the task +
 // the current page text + the webview tools, and iterates until done.
 // ---------------------------------------------------------------------------
 
@@ -1612,7 +1614,7 @@ pub async fn webview_agent_act(app: tauri::AppHandle, task: String) -> Result<St
 }
 
 // ---------------------------------------------------------------------------
-// SLICE 5 — SHARED CONTROL (the wheel).
+// SLICE 5 â€” SHARED CONTROL (the wheel).
 //
 // One page, two possible drivers. The HUMAN ALWAYS WINS: taking the wheel sets
 // driver=human immediately, which the agent tools check + refuse to act while
@@ -1628,7 +1630,7 @@ pub fn browser_control_status(state: tauri::State<'_, BrowserProc>) -> Result<se
     Ok(serde_json::json!({ "driver": c.driver, "note": c.note, "agent_active": c.agent_active }))
 }
 
-/// HUMAN takes the wheel — preempts the agent immediately.
+/// HUMAN takes the wheel â€” preempts the agent immediately.
 #[tauri::command]
 pub fn browser_take_wheel(app: tauri::AppHandle, state: tauri::State<'_, BrowserProc>) -> Result<(), String> {
     let mut c = state.control.lock().map_err(|_| "control poisoned")?;
@@ -1677,7 +1679,7 @@ fn agent_release(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>, 
 }
 
 // ===========================================================================
-// SLICE 3 — HUMAN INPUT FORWARDING.
+// SLICE 3 â€” HUMAN INPUT FORWARDING.
 //
 // The UI captures clicks/keys/scroll on the live frame, maps the coordinates
 // into PAGE space (the frame is scaled to fit the pane; the UI sends normalized
@@ -1711,11 +1713,11 @@ async fn viewport_size(state: &tauri::State<'_, BrowserProc>) -> Result<(f64, f6
 
 /// Apply anti-detection to the live CDP session. Called ONCE per session in
 /// ensure_session after Page.enable/Runtime.enable. Two parts:
-///   (a) Network.setUserAgentOverride — force a normal desktop Chrome UA (no
+///   (a) Network.setUserAgentOverride â€” force a normal desktop Chrome UA (no
 ///       "HeadlessChrome") on the CDP page's own requests, matching the launch
 ///       --user-agent so page-JS `navigator.userAgent` and the network layer
 ///       agree.
-///   (b) Page.addScriptToEvaluateOnNewDocument — runs BEFORE any page script on
+///   (b) Page.addScriptToEvaluateOnNewDocument â€” runs BEFORE any page script on
 ///       every new document, so it patches the automation fingerprint the
 ///       instant the page loads (webdriver, plugins, languages, chrome runtime,
 ///       and any leftover cdc_/webdriver props).
@@ -1832,7 +1834,7 @@ async fn apply_fingerprint_hardening(state: &tauri::State<'_, BrowserProc>) {
 }
 
 /// A tiny randomized delay (ms range inclusive) so sub-actions are not
-/// instantaneous — uniform timing is itself a bot signal. No rand crate dep:
+/// instantaneous â€” uniform timing is itself a bot signal. No rand crate dep:
 /// derive jitter from the nanosecond clock.
 async fn human_delay(min_ms: u64, max_ms: u64) {
     let span = max_ms.saturating_sub(min_ms).max(1);
@@ -1850,9 +1852,9 @@ async fn human_delay(min_ms: u64, max_ms: u64) {
 struct ClickTarget {
     x: f64,
     y: f64,
-    /// The nearest clickable ancestor's tag (a/button/…) we actually target.
+    /// The nearest clickable ancestor's tag (a/button/â€¦) we actually target.
     tag: String,
-    /// If the target (or an ancestor) is/inside an <a>, its resolved href —
+    /// If the target (or an ancestor) is/inside an <a>, its resolved href â€”
     /// used as a navigation fallback if the trusted click produced no nav.
     href: Option<String>,
     /// Diagnostics: the page's reported DPR + scroll + inner viewport.
@@ -1866,8 +1868,8 @@ struct ClickTarget {
 }
 
 /// Find an element by visible text, resolve it to the nearest CLICKABLE ancestor
-/// (`el.closest('a,button,[role=button],…') || el`), scroll it into view, and
-/// return the exact point to click — computed from `DOM.getContentQuads`, which
+/// (`el.closest('a,button,[role=button],â€¦') || el`), scroll it into view, and
+/// return the exact point to click â€” computed from `DOM.getContentQuads`, which
 /// returns quads in the SAME coordinate space CDP `Input.dispatchMouseEvent`
 /// expects (CSS px relative to the layout viewport). This sidesteps all
 /// CSS-vs-device-px / DPR guesswork that plagues pure `getBoundingClientRect`
@@ -1887,16 +1889,16 @@ async fn element_center_by_text(
     //    everything.
     // DETERMINISTIC FIRST-RESULT TARGETING (spec #3). When the request text is a
     // "first result" / "first link" intent, we must click the FIRST ORGANIC
-    // result — not the first element whose text merely contains a word, and NOT
+    // result â€” not the first element whose text merely contains a word, and NOT
     // an ad. On a Google SERP the first organic result's link is the first
     // `a:has(h3)` inside the main results container (#rso, falling back to
     // #search / #center_col). We pick that <a> directly. If the page isn't a
     // recognizable SERP, we fall back to the ordinary first anchor with an h3,
-    // then to normal text matching — so this never regresses non-Google pages.
+    // then to normal text matching â€” so this never regresses non-Google pages.
     // `force_first_result` (from the dedicated browser_click_first_result tool
     // OR the agent_run override on a first-result plan step) makes the
     // deterministic first-organic-anchor path AUTHORITATIVE regardless of the
-    // model-supplied `want` text — this is the fix for the bug where a
+    // model-supplied `want` text â€” this is the fix for the bug where a
     // model-passed label like "Claude: Sign in" routed to the broad text-match
     // path and clicked a <div> tweet embed instead of the real first result.
     let first_result_intent = force_first_result || {
@@ -1907,7 +1909,7 @@ async fn element_center_by_text(
             || w == "top result"
     };
     // When we're FORCING the first-result path, the text-match fallback (which
-    // is what produced the wrong <div>) must be DISABLED — if no organic anchor
+    // is what produced the wrong <div>) must be DISABLED â€” if no organic anchor
     // is found we return None (honest "no first result") rather than clicking
     // whatever element merely contained the label text.
     let disable_text_fallback = force_first_result;
@@ -1965,7 +1967,7 @@ async fn element_center_by_text(
     };
 
     // 1b) SETTLE AFTER SCROLL (bug fix). The locate eval called
-    //     scrollIntoView() but read the rect in the SAME synchronous tick — and
+    //     scrollIntoView() but read the rect in the SAME synchronous tick â€” and
     //     step 3's getContentQuads is a SEPARATE CDP call that reads the CURRENT
     //     (possibly still-settling) layout. That desync produced the observed
     //     scroll=(0,1713)/y=356 mismatch that clicked a tweet embed instead of
@@ -2008,7 +2010,7 @@ async fn element_center_by_text(
     // ANCHOR-REQUIRED GUARD (bug fix, first-result path). The observed failure
     // resolved a <div> with href=None and clicked a tweet embed. When we FORCE
     // the first-result path the target MUST be a real organic <a> with an http
-    // href — anything else means our selector matched a non-link, so we REFUSE
+    // href â€” anything else means our selector matched a non-link, so we REFUSE
     // (return None -> honest "no first result") rather than click a wrong box.
     if force_first_result {
         let is_anchor = tag == "a";
@@ -2021,7 +2023,7 @@ async fn element_center_by_text(
         }
     }
 
-    // 3) Ask CDP for the element's content quads — SAME coord space as Input.*.
+    // 3) Ask CDP for the element's content quads â€” SAME coord space as Input.*.
     //    A quad is [x1,y1, x2,y2, x3,y3, x4,y4]; its center is the mean of the
     //    x's and y's. If quads are empty (element off-screen after scroll, or a
     //    zero-box wrapper), fall back to the rect center from the eval above.
@@ -2046,7 +2048,7 @@ async fn element_center_by_text(
             }
         }
         Err(e) => {
-            // DOM domain may not be enabled on this build/path — the rect
+            // DOM domain may not be enabled on this build/path â€” the rect
             // fallback still works, just note it.
             eprintln!("[aygent][browser][CLICK] getContentQuads err (rect fallback): {e}");
         }
@@ -2094,7 +2096,7 @@ async fn typeable_field_center(
     if coords.len() == 2 { Ok(Some((coords[0], coords[1]))) } else { Ok(None) }
 }
 
-/// TRUSTED mouse click at ABSOLUTE CSS-px coords (x,y) via CDP Input.* — the
+/// TRUSTED mouse click at ABSOLUTE CSS-px coords (x,y) via CDP Input.* â€” the
 /// events carry isTrusted:true. Adds a short human-like approach: 2-3
 /// intermediate mouseMoved points toward the target before press/release, plus
 /// small randomized delays. This is the shape a real pointer produces.
@@ -2117,7 +2119,7 @@ async fn trusted_click_at(
             serde_json::json!({ "type": "mouseMoved", "x": mx, "y": my, "button": "none", "buttons": 0 }),
         )
         .await?;
-        human_delay(15, 45).await;
+        human_delay(6, 18).await; // PERF: trimmed 15-45ms approach steps
     }
     // Settle on the exact target.
     session_call(
@@ -2126,7 +2128,7 @@ async fn trusted_click_at(
         serde_json::json!({ "type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0 }),
     )
     .await?;
-    human_delay(30, 90).await;
+    human_delay(15, 40).await; // PERF: trimmed pre-press hover dwell
     // Press.
     session_call(
         state,
@@ -2134,7 +2136,7 @@ async fn trusted_click_at(
         serde_json::json!({ "type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1 }),
     )
     .await?;
-    human_delay(40, 110).await; // dwell time of a real press
+    human_delay(20, 55).await; // PERF: trimmed press dwell (still a real dwell)
     // Release.
     session_call(
         state,
@@ -2168,12 +2170,13 @@ fn char_key_fields(c: char) -> (i64, String, String) {
 
 /// TRUSTED per-character typing into the focused element via CDP
 /// Input.dispatchKeyEvent (keyDown with `text` -> keyUp), with small randomized
-/// inter-key delays so timing looks human. isTrusted:true, real key events —
+/// inter-key delays so timing looks human. isTrusted:true, real key events â€”
 /// unlike el.value=... which fires nothing trusted.
 async fn trusted_type(
     state: &tauri::State<'_, BrowserProc>,
     text: &str,
 ) -> Result<(), String> {
+    let t0 = std::time::Instant::now();
     for c in text.chars() {
         let (vk, key, ch) = char_key_fields(c);
         // keyDown carrying `text` inserts the character as a trusted input.
@@ -2192,9 +2195,13 @@ async fn trusted_type(
             up["nativeVirtualKeyCode"] = vk.into();
         }
         session_call(state, "Input.dispatchKeyEvent", up).await?;
-        human_delay(40, 120).await; // per-key human cadence
+        // PERF (ITEM 2): per-key cadence trimmed 40-120ms -> 12-35ms. Still
+        // jittered + non-uniform (keeps the human-typing signal), but ~3-4x
+        // faster: a 12-char query drops from ~1s to ~0.3s of typing delay.
+        human_delay(12, 35).await;
     }
-    eprintln!("[aygent][browser][INPUT] trusted type of {} chars", text.chars().count());
+    eprintln!("[aygent][browser][PERF] trusted type of {} chars in {}ms (trimmed per-key cadence)",
+        text.chars().count(), t0.elapsed().as_millis());
     Ok(())
 }
 
@@ -2206,7 +2213,7 @@ fn text_unmod(c: char) -> String {
 }
 
 /// TRUSTED Enter keypress via CDP Input.dispatchKeyEvent (keyDown+keyUp,
-/// windowsVirtualKeyCode 13). Real navigation trigger — not form.submit().
+/// windowsVirtualKeyCode 13). Real navigation trigger â€” not form.submit().
 async fn trusted_enter(state: &tauri::State<'_, BrowserProc>) -> Result<(), String> {
     let down = serde_json::json!({
         "type": "keyDown", "key": "Enter", "code": "Enter",
@@ -2318,14 +2325,14 @@ pub async fn browser_key(
 }
 
 // ===========================================================================
-// SLICE 4 — AGENT BROWSER TOOLS.
+// SLICE 4 â€” AGENT BROWSER TOOLS.
 //
 // The agent drives the SAME browser the human sees (frames keep streaming, so
 // the human watches the agent work). Tools are mediated through the CDP session
 // exactly like the human's input, plus a per-agent DOMAIN POLICY (mirrors
 // web.rs's SSRF posture): the agent may only navigate to allowlisted hosts;
 // file:// / localhost / internal are hard-blocked. The human tier is unrestricted
-// (Slice 3) — that split is the whole point (human gets past what the agent can't).
+// (Slice 3) â€” that split is the whole point (human gets past what the agent can't).
 //
 // One async entry point `agent_tool` that the turn loop calls for any browser_*
 // tool. Returns (result_text, is_error) like exec_tool.
@@ -2346,19 +2353,19 @@ pub fn is_agent_tool(name: &str) -> bool {
 // HARD-STOP SENTINELS (Mason's 5-point spec #5).
 //
 // A tool result whose text STARTS WITH one of these tokens is a machine-
-// detectable signal that the agent turn must END IMMEDIATELY — it is NOT a
+// detectable signal that the agent turn must END IMMEDIATELY â€” it is NOT a
 // normal recoverable tool error the model should react to. `agent_run` checks
 // the result text of every browser tool call against these prefixes and, on a
 // match, BREAKS the loop with a clear final message (never feeding the result
 // back to the model). This is how DENY / TAKE-CONTROL propagate up from the
 // permission dialog through `agent_tool` to the loop without any signature
-// churn (no compiler on Windows — a text sentinel is the lowest-risk vehicle).
+// churn (no compiler on Windows â€” a text sentinel is the lowest-risk vehicle).
 //
 //   __DENIED__   -> the human clicked Deny on the permission dialog.
 //   __TAKEOVER__ -> the human clicked Take Control (driver flipped to human).
 //
 // Both carry a human-readable tail after the token for the transcript/log.
-// Keep these EXACT — `agent_run` string-matches the prefixes.
+// Keep these EXACT â€” `agent_run` string-matches the prefixes.
 pub const STOP_DENIED: &str = "__DENIED__";
 pub const STOP_TAKEOVER: &str = "__TAKEOVER__";
 
@@ -2386,14 +2393,14 @@ pub fn agent_tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "browser_click_text",
-            "description": "Click the first visible element (link/button) whose text contains the given string. Use this to click a SPECIFIC named link/button by its label. Do NOT use this to click 'the first result' — use browser_click_first_result for that.",
+            "description": "Click the first visible element (link/button) whose text contains the given string. Use this to click a SPECIFIC named link/button by its label. Do NOT use this to click 'the first result' â€” use browser_click_first_result for that.",
             "input_schema": { "type": "object", "properties": {
                 "text": { "type": "string", "description": "visible text of the element to click" }
             }, "required": ["text"] }
         }),
         serde_json::json!({
             "name": "browser_click_first_result",
-            "description": "Click the FIRST ORGANIC search result on a results page (Google/Bing/etc). Takes NO arguments — it deterministically targets the first real result link (skips ads). ALWAYS use this for any 'click the first result / first link / top result' step; never guess result text with browser_click_text.",
+            "description": "Click the FIRST ORGANIC search result on a results page (Google/Bing/etc). Takes NO arguments â€” it deterministically targets the first real result link (skips ads). ALWAYS use this for any 'click the first result / first link / top result' step; never guess result text with browser_click_text.",
             "input_schema": { "type": "object", "properties": {} }
         }),
         serde_json::json!({
@@ -2414,7 +2421,7 @@ pub fn agent_tool_schemas() -> Vec<serde_json::Value> {
 
 /// Execute an agent browser tool against the live session, enforcing the
 /// per-agent domain policy. `allowed_domains`: the agent's allowlist (empty =
-/// nothing allowed — fail closed). Returns (text, is_error).
+/// nothing allowed â€” fail closed). Returns (text, is_error).
 pub async fn agent_tool(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, BrowserProc>,
@@ -2423,20 +2430,20 @@ pub async fn agent_tool(
     allowed_domains: &[String],
 ) -> (String, bool) {
     // SLICE 5: the human ALWAYS wins the wheel. If they're driving, the agent
-    // must not act — tell it plainly so it waits/hands back.
+    // must not act â€” tell it plainly so it waits/hands back.
     if human_has_wheel(state) {
-        return ("the human is currently driving the browser — wait for them to release the wheel before acting".into(), true);
+        return ("the human is currently driving the browser â€” wait for them to release the wheel before acting".into(), true);
     }
     // Claim the wheel for this action (refused only if the human grabbed it in
     // the race window).
     if !agent_claim(app, state) {
-        return ("the human just took the browser — not acting".into(), true);
+        return ("the human just took the browser â€” not acting".into(), true);
     }
     let out = agent_tool_inner(app, state, name, input, allowed_domains).await;
 
     // HARD STOP (spec #5): if the human clicked Deny or Take Control, the inner
     // tool returned a sentinel result. Do NOT mirror, do NOT run the handoff
-    // heuristic, do NOT re-home the wheel via the generic release path — just
+    // heuristic, do NOT re-home the wheel via the generic release path â€” just
     // propagate the sentinel straight up so `agent_run` ends the turn. On
     // TAKEOVER the driver was already flipped to human in browser_permission_answer
     // + request_permission; we re-assert it here and emit control so the toggle
@@ -2450,11 +2457,11 @@ pub async fn agent_tool(
                 c.note = String::new();
                 emit_control(app, &c);
             }
-            eprintln!("[aygent][browser][PERM] TAKEOVER propagating up — driver=human, ending turn");
+            eprintln!("[aygent][browser][PERM] TAKEOVER propagating up â€” driver=human, ending turn");
         } else {
             // DENY: agent stops driving; hand the wheel back to idle.
             agent_release(app, state, "");
-            eprintln!("[aygent][browser][PERM] DENY propagating up — ending turn");
+            eprintln!("[aygent][browser][PERM] DENY propagating up â€” ending turn");
         }
         return out;
     }
@@ -2468,7 +2475,7 @@ pub async fn agent_tool(
     }
     // On a login/CAPTCHA-ish failure, hand off to the human with a note.
     let handoff = if out.1 && looks_like_handoff(&out.0) {
-        "the agent hit a login or verification wall — take the wheel to continue"
+        "the agent hit a login or verification wall â€” take the wheel to continue"
     } else { "" };
     agent_release(app, state, handoff);
     out
@@ -2489,7 +2496,7 @@ fn host_of(url: &str) -> String {
 /// since the human navigated there and is watching). Prefer the UI-reported URL
 /// (authoritative for where the human is); fall back to a CDP read.
 async fn active_tab_host(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>) -> String {
-    // UI-reported URL wins — it's the page the human actually navigated to.
+    // UI-reported URL wins â€” it's the page the human actually navigated to.
     if let Ok(g) = ACTIVE_TAB_URL.lock() {
         let h = host_of(&normalize_url(&g));
         if !h.is_empty() { return h; }
@@ -2589,7 +2596,7 @@ pub fn browser_permission_answer(
 /// IMPORTANT: this must NOT fire on incidental page CONTENT (e.g. a Google
 /// result titled "Claude: Sign in", or any page that merely MENTIONS sign-in).
 /// It previously matched bare "sign in"/"login", which flipped the wheel to the
-/// human the instant the agent read a search page containing those words — the
+/// human the instant the agent read a search page containing those words â€” the
 /// exact bug where clicking Allow bounced control back to You. Now we only fire
 /// on STRONG blocker signals: an explicit tool ERROR string we control, a
 /// CAPTCHA/robot check, or Google's rate-limit wall. Generic auth words in page
@@ -2612,7 +2619,7 @@ async fn agent_tool_inner(
     allowed_domains: &[String],
 ) -> (String, bool) {
     // SINGLE SOURCE OF TRUTH (Problem 1 fix). ALL agent actions AND reads run
-    // against the CDP session's page — the SAME page. Actions used to fire into
+    // against the CDP session's page â€” the SAME page. Actions used to fire into
     // the VISIBLE WKWebView via wv.eval() while reads hit a SEPARATE headless
     // Chromium; those two desynced constantly (act on page A, read stale page B,
     // loop forever). Now: navigate/click/type all go through CDP, reads read the
@@ -2630,16 +2637,16 @@ async fn agent_tool_inner(
                 match ans.as_str() {
                     "allow" => {
                         if let Ok(mut p) = state.perm.lock() { p.granted_hosts.insert(host.clone()); }
-                        eprintln!("[aygent][browser][PERM] ALLOW open {host} — continuing");
+                        eprintln!("[aygent][browser][PERM] ALLOW open {host} â€” continuing");
                     }
                     // HARD STOP (spec #5): Take Control ends the turn; driver=human.
                     "take" => {
-                        eprintln!("[aygent][browser][PERM] TAKE open {host} — hard stop");
+                        eprintln!("[aygent][browser][PERM] TAKE open {host} â€” hard stop");
                         return (format!("{STOP_TAKEOVER} the human took the wheel to handle opening {host} themselves."), true);
                     }
-                    // HARD STOP (spec #5): Deny ends the turn immediately — no retry, no wander.
+                    // HARD STOP (spec #5): Deny ends the turn immediately â€” no retry, no wander.
                     _ => {
-                        eprintln!("[aygent][browser][PERM] DENY open {host} — hard stop");
+                        eprintln!("[aygent][browser][PERM] DENY open {host} â€” hard stop");
                         return (format!("{STOP_DENIED} the human denied opening {host}."), true);
                     }
                 }
@@ -2668,15 +2675,15 @@ async fn agent_tool_inner(
             // wheel to the human.
             let ans = request_permission(app, state, &format!("click \"{want}\""), &format!("The agent wants to click the link/button: {want}")).await;
             match ans.as_str() {
-                "allow" => { eprintln!("[aygent][browser][PERM] ALLOW click {want:?} — continuing"); }
+                "allow" => { eprintln!("[aygent][browser][PERM] ALLOW click {want:?} â€” continuing"); }
                 // HARD STOP (spec #5): Take Control ends the turn; driver=human.
                 "take" => {
-                    eprintln!("[aygent][browser][PERM] TAKE click {want:?} — hard stop");
+                    eprintln!("[aygent][browser][PERM] TAKE click {want:?} â€” hard stop");
                     return (format!("{STOP_TAKEOVER} the human took the wheel to click '{want}' themselves."), true);
                 }
-                // HARD STOP (spec #5): Deny ends the turn immediately — no retry, no wander.
+                // HARD STOP (spec #5): Deny ends the turn immediately â€” no retry, no wander.
                 _ => {
-                    eprintln!("[aygent][browser][PERM] DENY click {want:?} — hard stop");
+                    eprintln!("[aygent][browser][PERM] DENY click {want:?} â€” hard stop");
                     return (format!("{STOP_DENIED} the human denied clicking '{want}'."), true);
                 }
             }
@@ -2685,7 +2692,7 @@ async fn agent_tool_inner(
             // coords via a CDP Runtime.evaluate (scrolling it into view), then
             // (b) dispatch a REAL CDP mouse click at those coords
             // (mouseMoved x3 approach -> mousePressed -> mouseReleased). The
-            // events carry isTrusted:true — indistinguishable from a human click.
+            // events carry isTrusted:true â€” indistinguishable from a human click.
             eprintln!("[aygent][browser][INPUT] browser_click_text want={want:?}");
             let target = match element_center_by_text(app, state, want, false).await {
                 Ok(Some(c)) => c,
@@ -2702,9 +2709,9 @@ async fn agent_tool_inner(
                 target.scroll_x, target.scroll_y, target.inner_w, target.inner_h, target.href
             );
             // Capture the URL + a coarse DOM signature BEFORE the click so we can
-            // tell — HONESTLY — whether the click actually did anything.
+            // tell â€” HONESTLY â€” whether the click actually did anything.
             let url_before = cdp_current_url(state).await;
-            human_delay(60, 150).await;
+            human_delay(25, 60).await; // PERF: trimmed pre-action pause
             if let Err(e) = trusted_click_at(state, target.x, target.y).await {
                 return (format!("trusted click dispatch failed: {e}"), true);
             }
@@ -2713,12 +2720,12 @@ async fn agent_tool_inner(
             let mut navigated = url_after != url_before && url_after.starts_with("http");
             // FALLBACK: the trusted click landed but produced no navigation and
             // we DO have a resolved <a> href (classic search-result case). Rather
-            // than lie with a false ✓, navigate the authoritative CDP page to
-            // that href so the human still gets the result — still no el.click().
+            // than lie with a false âœ“, navigate the authoritative CDP page to
+            // that href so the human still gets the result â€” still no el.click().
             if !navigated {
                 if let Some(href) = target.href.as_deref() {
                     if href.starts_with("http") && href != url_before {
-                        eprintln!("[aygent][browser][CLICK] trusted click produced NO nav — href fallback -> {href}");
+                        eprintln!("[aygent][browser][CLICK] trusted click produced NO nav â€” href fallback -> {href}");
                         if session_call(state, "Page.navigate", serde_json::json!({ "url": href })).await.is_ok() {
                             wait_for_cdp_load(state).await;
                             url_after = cdp_current_url(state).await;
@@ -2739,7 +2746,7 @@ async fn agent_tool_inner(
                 // checklist must NOT tick this step off.
                 (
                     format!(
-                        "clicked '{want}' (trusted mouse event dispatched on <{}> at ({:.0},{:.0})) but the page did NOT navigate or change — the target may be wrong or the link needs a different action. Still on: {title} ({url}).",
+                        "clicked '{want}' (trusted mouse event dispatched on <{}> at ({:.0},{:.0})) but the page did NOT navigate or change â€” the target may be wrong or the link needs a different action. Still on: {title} ({url}).",
                         target.tag, target.x, target.y
                     ),
                     true,
@@ -2749,20 +2756,20 @@ async fn agent_tool_inner(
         // DETERMINISTIC FIRST-RESULT CLICK (bug fix, ITEM 1). A dedicated,
         // TEXT-FREE tool: it ALWAYS targets the first ORGANIC result anchor
         // (first `a:has(h3)` inside #rso/#search/#center_col with a real http
-        // href, skipping ads) — the model cannot mis-route it to a text-match
+        // href, skipping ads) â€” the model cannot mis-route it to a text-match
         // that lands on a <div>/tweet embed. The plan/prompt steers first-result
         // steps here, and agent_run also OVERRIDES browser_click_text to this
         // path on a first-result step (belt + suspenders).
         "browser_click_first_result" => {
             let ans = request_permission(app, state, "click the first result", "The agent wants to click the first organic search result link.").await;
             match ans.as_str() {
-                "allow" => { eprintln!("[aygent][browser][PERM] ALLOW click first-result — continuing"); }
+                "allow" => { eprintln!("[aygent][browser][PERM] ALLOW click first-result â€” continuing"); }
                 "take" => {
-                    eprintln!("[aygent][browser][PERM] TAKE click first-result — hard stop");
+                    eprintln!("[aygent][browser][PERM] TAKE click first-result â€” hard stop");
                     return (format!("{STOP_TAKEOVER} the human took the wheel to click the first result themselves."), true);
                 }
                 _ => {
-                    eprintln!("[aygent][browser][PERM] DENY click first-result — hard stop");
+                    eprintln!("[aygent][browser][PERM] DENY click first-result â€” hard stop");
                     return (format!("{STOP_DENIED} the human denied clicking the first result."), true);
                 }
             }
@@ -2779,7 +2786,7 @@ async fn agent_tool_inner(
                 target.scroll_x, target.scroll_y, target.inner_w, target.inner_h, target.href
             );
             let url_before = cdp_current_url(state).await;
-            human_delay(60, 120).await;
+            human_delay(25, 55).await; // PERF: trimmed pre-action pause
             if let Err(e) = trusted_click_at(state, target.x, target.y).await {
                 return (format!("trusted click dispatch failed: {e}"), true);
             }
@@ -2792,7 +2799,7 @@ async fn agent_tool_inner(
             if !navigated {
                 if let Some(href) = target.href.as_deref() {
                     if href.starts_with("http") && href != url_before {
-                        eprintln!("[aygent][browser][CLICK] first-result trusted click produced NO nav — href fallback -> {href}");
+                        eprintln!("[aygent][browser][CLICK] first-result trusted click produced NO nav â€” href fallback -> {href}");
                         if session_call(state, "Page.navigate", serde_json::json!({ "url": href })).await.is_ok() {
                             wait_for_cdp_load(state).await;
                             url_after = cdp_current_url(state).await;
@@ -2816,14 +2823,14 @@ async fn agent_tool_inner(
             let submit = input.get("submit").and_then(|b| b.as_bool()).unwrap_or(false);
             if text.is_empty() { return ("browser_type_text needs `text`".into(), true); }
             // TRUSTED TYPING (#1). Instead of el.value=... (fires no trusted
-            // input events — flagged), we:
+            // input events â€” flagged), we:
             //   (a) locate the target field's center coords + REAL-click it to
             //       focus (trusted mouse click),
             //   (b) type per-character via CDP Input.dispatchKeyEvent
             //       (keyDown+keyUp, `text` carries the glyph) with 40-120ms
             //       human-cadence delays,
             //   (c) on submit, press a REAL Enter (windowsVirtualKeyCode 13) via
-            //       Input.dispatchKeyEvent — not form.submit(). requestSubmit()
+            //       Input.dispatchKeyEvent â€” not form.submit(). requestSubmit()
             //       is kept ONLY as a fallback if the Enter path caused no nav.
             eprintln!("[aygent][browser][INPUT] browser_type_text submit={submit} text_len={}", text.len());
             let field = match typeable_field_center(app, state).await {
@@ -2831,18 +2838,18 @@ async fn agent_tool_inner(
                 Ok(None) => return ("no typeable field found on this page".into(), true),
                 Err(e) => return (format!("type locate failed: {e}"), true),
             };
-            human_delay(60, 150).await;
+            human_delay(25, 60).await; // PERF: trimmed pre-action pause
             if let Err(e) = trusted_click_at(state, field.0, field.1).await {
                 return (format!("focus-click failed: {e}"), true);
             }
-            human_delay(60, 150).await;
+            human_delay(25, 60).await; // PERF: trimmed pre-action pause
             if let Err(e) = trusted_type(state, text).await {
                 return (format!("trusted type failed: {e}"), true);
             }
             if submit {
                 // Capture the url before Enter so we can tell if it navigated.
                 let url_before = cdp_current_url(state).await;
-                human_delay(60, 150).await;
+                human_delay(25, 60).await; // PERF: trimmed pre-action pause
                 if let Err(e) = trusted_enter(state).await {
                     return (format!("Enter dispatch failed: {e}"), true);
                 }
@@ -2852,7 +2859,7 @@ async fn agent_tool_inner(
                 // (some SPA search boxes rely on form submit), try
                 // requestSubmit()/submit() on the field's form as a last resort.
                 if url_after == url_before {
-                    eprintln!("[aygent][browser][INPUT] Enter yielded no nav — requestSubmit() fallback");
+                    eprintln!("[aygent][browser][INPUT] Enter yielded no nav â€” requestSubmit() fallback");
                     let _ = active_tab_read(app, state,
                         "(()=>{ const el=document.activeElement; const f=el&&el.form; if(f){ try{ if(f.requestSubmit) f.requestSubmit(); else f.submit(); }catch(e){} } return 'OK'; })()").await;
                     wait_for_cdp_load(state).await;
@@ -2874,19 +2881,33 @@ async fn agent_tool_inner(
 /// until 'complete' (or a bounded timeout). Replaces the old fixed-sleep guesses
 /// so a slow page doesn't get read half-loaded (a source of stale reads).
 async fn wait_for_cdp_load(state: &tauri::State<'_, BrowserProc>) {
-    // Small initial delay so the navigation has actually begun before we poll.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    for _ in 0..24 { // up to ~6s (24 * 250ms)
+    // PERF (ITEM 2): this is an EVENT-EQUIVALENT wait â€” it proceeds the instant
+    // the page reports interactive/complete rather than sleeping a fixed time.
+    // We poll document.readyState on a TIGHT cadence (was 300ms warmup + 250ms
+    // poll + 200ms tail = >=500ms floor even on instant loads) and now break as
+    // soon as the DOM is at least `interactive` (usable/readable) â€” capped so a
+    // slow page can't hang. Typical saving on a fast SERP: ~400-600ms/nav.
+    let t0 = std::time::Instant::now();
+    // Brief warmup so the navigation has actually begun before the first poll.
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    let mut settled = "";
+    for _ in 0..60 { // up to ~6s (60 * ~100ms) â€” same cap, finer granularity.
         let ready = session_call(state, "Runtime.evaluate",
             serde_json::json!({ "expression": "document.readyState", "returnByValue": true })).await
             .ok()
             .and_then(|r| r["result"]["value"].as_str().map(|s| s.to_string()))
             .unwrap_or_default();
-        if ready == "complete" { break; }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        // `interactive` means the DOM is parsed + usable (readable/clickable);
+        // we don't need to block for every subresource (`complete`) before the
+        // agent can read/act. Break early on interactive OR complete.
+        if ready == "complete" { settled = "complete"; break; }
+        if ready == "interactive" { settled = "interactive"; break; }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    // Tiny settle for post-load JS (SPA route paints, etc).
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Tiny settle for post-load JS (SPA route paints, etc). Trimmed from 200ms.
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    eprintln!("[aygent][browser][PERF] wait_for_cdp_load: readyState={} in {}ms (event-equivalent poll, not fixed sleep)",
+        if settled.is_empty() { "timeout" } else { settled }, t0.elapsed().as_millis());
 }
 
 /// Read the ACTIVE tab's (title, visible text) via CDP Runtime.evaluate (works
