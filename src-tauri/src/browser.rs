@@ -1509,7 +1509,40 @@ pub fn webview_history(app: tauri::AppHandle, action: String, tab_id: Option<i64
         "reload" => "location.reload()",
         other => return Err(format!("unknown history action: {other}")),
     };
+    // ITEM 3 [NAV] logging: back/forward/refresh on the visible tab's webview.
+    eprintln!("[aygent][browser][NAV] webview_history action={action} tab={:?} (engine-native WebKit history)", tab_id);
     wv.eval(js).map_err(|e| format!("history {action}: {e}"))
+}
+
+/// ITEM 3 (Downloads). List the files in the ACTIVE agent's jailed downloads
+/// directory (`<app_data>/browser/profiles/<agent>/downloads`) so the Browser
+/// view can show a Downloads panel. Returns each file's name, byte size, and
+/// modified-time (unix seconds), newest first. Missing dir => empty list (not
+/// an error) so a fresh profile just shows "no downloads yet".
+#[tauri::command]
+pub fn browser_downloads_list(app: tauri::AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    let agent = active_browser_agent(&app);
+    let dir = browser_dir(&app)?.join("profiles").join(&agent).join("downloads");
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(Vec::new()), // no dir yet -> no downloads
+    };
+    let mut out: Vec<(u64, serde_json::Value)> = Vec::new();
+    for entry in rd.flatten() {
+        let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
+        if !meta.is_file() { continue; }
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Skip Chromium's in-progress temp files so the panel shows finished ones.
+        if name.ends_with(".crdownload") || name.ends_with(".part") { continue; }
+        let size = meta.len();
+        let mtime = meta.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        out.push((mtime, serde_json::json!({ "name": name, "size": size, "mtime": mtime })));
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    Ok(out.into_iter().map(|(_, v)| v).collect())
 }
 
 // ---------------------------------------------------------------------------

@@ -1700,17 +1700,20 @@ async fn agent_run(
                     // first-result step ALWAYS uses the anchor-required first-
                     // organic-result selector, never the broad text-match that
                     // clicked a <div>/tweet embed in the observed bug.
-                    let (name, input): (&str, serde_json::Value) = {
-                        let cur_step_txt = steps.get(next_step).map(|s| s.as_str()).unwrap_or("");
-                        if name == "browser_click_text" && step_is_first_result(cur_step_txt) {
-                            eprintln!("[aygent][browser][STEP] OVERRIDE browser_click_text -> browser_click_first_result on first-result step {}/{} (ignoring model text {:?})",
-                                next_step + 1, steps.len(),
-                                input.get("text").and_then(|t| t.as_str()).unwrap_or(""));
-                            ("browser_click_first_result", serde_json::json!({}))
-                        } else {
-                            (name, input)
-                        }
-                    };
+                    // NOTE: we do NOT move the original `input` here (a later
+                    // borrow, `path`, still references it for the file tools).
+                    // We compute an OVERRIDE (name, input) only when firing the
+                    // first-result path, and select which to pass below.
+                    let first_result_override = name == "browser_click_text"
+                        && step_is_first_result(steps.get(next_step).map(|s| s.as_str()).unwrap_or(""));
+                    if first_result_override {
+                        eprintln!("[aygent][browser][STEP] OVERRIDE browser_click_text -> browser_click_first_result on first-result step {}/{} (ignoring model text {:?})",
+                            next_step + 1, steps.len(),
+                            input.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+                    }
+                    let name: &str = if first_result_override { "browser_click_first_result" } else { name };
+                    let override_input = serde_json::json!({});
+                    let input: &serde_json::Value = if first_result_override { &override_input } else { &input };
                     // EXECUTE THROUGH THE BROKER (jailed) — or the browser tools
                     // (act on the VISIBLE tab + per-agent domain policy + wheel).
                     let (result_text, is_err) = if browser::is_agent_tool(name) {
@@ -1763,7 +1766,7 @@ async fn agent_run(
                             // permission flow governs new hosts; current tab host
                             // is pre-allowed. Pass empty.
                             let domains: Vec<String> = Vec::new();
-                            let out = browser::agent_tool(&app, &browser_state, name, &input, &domains).await;
+                            let out = browser::agent_tool(&app, &browser_state, name, input, &domains).await;
 
                             // ==========================================================
                             // HARD STOP (Mason's spec #5): Deny / Take Control.
@@ -3201,7 +3204,7 @@ pub fn run() {
             browser::browser_control_status, browser::browser_take_wheel, browser::browser_release_wheel,
             set_active_agent_marker,
             browser::webview_open, browser::webview_set_bounds, browser::webview_hide,
-            browser::webview_hide_others, browser::webview_history,
+            browser::webview_hide_others, browser::webview_history, browser::browser_downloads_list,
             browser::webview_navigate, browser::webview_close, browser::webview_agent_act,
             browser::webview_page_info,
             browser::set_active_browser_tab, browser::browser_permission_answer,

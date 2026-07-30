@@ -68,6 +68,31 @@ export function Browser() {
   // non-empty `note` — that's the BLOCKED signal that pulses the You/Agent
   // toggle so the human knows to intervene.
   const [blockedNote, setBlockedNote] = useState<string>("");
+  // BROWSER CHROME CONTROLS (ITEM 3). Session browsing history (visited URLs,
+  // newest last) + which drop panel is open + the downloads listing pulled from
+  // Rust on demand. History is tracked FE-side from each committed navigation
+  // (go() + the title/url poll) — engine-native back/forward still works via
+  // webview_history; this list is the "show me where I've been" affordance.
+  type HistEntry = { url: string; title: string; ts: number };
+  const [history, setHistory] = useState<HistEntry[]>([]);
+  const [panel, setPanel] = useState<null | "history" | "downloads">(null);
+  type DlEntry = { name: string; size: number; mtime: number };
+  const [downloads, setDownloads] = useState<DlEntry[]>([]);
+  const pushHistory = (url: string, title?: string) => {
+    const u = (url || "").trim();
+    if (!u || !/^https?:/i.test(u)) return;
+    setHistory((h) => {
+      // De-dupe consecutive repeats (a reload / title backfill shouldn't spam).
+      if (h.length && h[h.length - 1].url === u) {
+        if (title && title !== h[h.length - 1].title) {
+          const copy = h.slice(); copy[copy.length - 1] = { ...copy[copy.length - 1], title };
+          return copy;
+        }
+        return h;
+      }
+      return [...h, { url: u, title: title || u, ts: Date.now() }].slice(-200);
+    });
+  };
   const editRef = useRef<HTMLInputElement>(null);
   // The div whose rect the native webview is positioned over.
   const paneRef = useRef<HTMLDivElement>(null);
@@ -198,6 +223,7 @@ export function Browser() {
     // Make sure the stored addr reflects what we're navigating to.
     patch(id, { addr: url });
     patch(id, { editing: false, title: url });
+    pushHistory(url); // ITEM 3: record the navigation in session history
     const el = paneRef.current;
     const r = el?.getBoundingClientRect();
     // First navigation for the pane opens/positions the webview; later ones reuse.
@@ -235,6 +261,10 @@ export function Browser() {
       try {
         const doc = await invoke<{ title?: string; url?: string }>("webview_page_info", { tabId: id });
         const real = (doc?.title || "").trim();
+        const realUrl = (doc?.url || "").trim();
+        // ITEM 3: record where we actually landed (covers in-page link clicks +
+        // agent navigations that didn't go through go()), and backfill the title.
+        if (realUrl) pushHistory(realUrl, real || undefined);
         if (real) { patch(id, { title: real }); return; }
       } catch { /* webview not ready yet */ }
       if (tries < 6) setTimeout(pollTitle, 400);
@@ -342,6 +372,41 @@ export function Browser() {
     setPermReq(null);
     setBlockedNote("");
   }
+
+  // BROWSER CHROME CONTROLS (ITEM 3). Back / Forward / Refresh drive the visible
+  // tab's engine-native WebKit history via webview_history. After a nav we
+  // re-poll the page info so the tab title + session history stay current.
+  const canNav = active?.opened === true;
+  async function navHistory(action: "back" | "forward" | "reload") {
+    if (!canNav) return;
+    try { await invoke("webview_history", { action, tabId: active.id }); }
+    catch (e) { console.error("webview_history", action, e); }
+    // Give the WebKit history nav a beat, then refresh title/url + history list.
+    setTimeout(async () => {
+      try {
+        const doc = await invoke<{ title?: string; url?: string }>("webview_page_info", { tabId: active.id });
+        const real = (doc?.title || "").trim();
+        const realUrl = (doc?.url || "").trim();
+        if (real) patch(active.id, { title: real });
+        if (realUrl) { patch(active.id, { addr: realUrl }); pushHistory(realUrl, real || undefined); }
+      } catch { /* not ready */ }
+    }, 350);
+  }
+  async function openDownloads() {
+    if (panel === "downloads") { setPanel(null); return; }
+    try {
+      const list = await invoke<DlEntry[]>("browser_downloads_list");
+      setDownloads(Array.isArray(list) ? list : []);
+    } catch (e) { console.error("browser_downloads_list", e); setDownloads([]); }
+    setPanel("downloads");
+  }
+  function navTo(url: string) {
+    // Navigate the active tab to a history entry.
+    go(active.id, url);
+    setPanel(null);
+  }
+  const fmtSize = (n: number) =>
+    n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : n >= 1e3 ? `${(n / 1e3).toFixed(0)} KB` : `${n} B`;
 
   async function runAgent() {
     const task = agentPrompt.trim();
@@ -482,11 +547,31 @@ export function Browser() {
         <button onClick={addTab} title="New tab"
           style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 32, height: 32, borderRadius: "var(--radius-control)", border: "var(--border-width) dashed var(--line)", background: "transparent", color: "var(--text-muted)", cursor: "pointer", fontSize: 18, lineHeight: 1, flexShrink: 0 }}>+</button>
 
-        {/* THE HAND-OFF TOGGLE — the centerpiece. Pulses when the agent is
-            blocked (blockedNote set) so the human knows to intervene. */}
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+        {/* BROWSER CHROME CONTROLS (ITEM 3) + THE HAND-OFF TOGGLE. The nav
+            controls (Back / Forward / Refresh / History / Downloads) sit BESIDE
+            the You/Agent toggle, which stays where it is. The toggle pulses when
+            the agent is blocked (blockedNote set) so the human knows to step in. */}
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8, position: "relative" }}>
+          {/* Nav cluster */}
+          <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+            <button title="Back" onClick={() => navHistory("back")} disabled={!canNav} style={navBtnStyle(false, !canNav)}>
+              <Icon name="arrow-left" size={15} />
+            </button>
+            <button title="Forward" onClick={() => navHistory("forward")} disabled={!canNav} style={navBtnStyle(false, !canNav)}>
+              <Icon name="arrow-right" size={15} />
+            </button>
+            <button title="Refresh" onClick={() => navHistory("reload")} disabled={!canNav} style={navBtnStyle(false, !canNav)}>
+              <Icon name="refresh" size={15} />
+            </button>
+            <button title="History" onClick={() => setPanel(panel === "history" ? null : "history")} style={navBtnStyle(panel === "history", false)}>
+              <Icon name="clock" size={15} />
+            </button>
+            <button title="Downloads" onClick={openDownloads} style={navBtnStyle(panel === "downloads", false)}>
+              <Icon name="download" size={15} />
+            </button>
+          </div>
           {blockedNote && (
-            <span style={{ fontSize: 11, color: "var(--accent)", fontWeight: 700, maxWidth: 220, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={blockedNote}>
+            <span style={{ fontSize: 11, color: "var(--accent)", fontWeight: 700, maxWidth: 200, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={blockedNote}>
               ⚠ {blockedNote}
             </span>
           )}
@@ -497,6 +582,53 @@ export function Browser() {
             <button onClick={() => setDriver("agent")}
               style={segStyle(driver === "agent")}>Agent</button>
           </div>
+
+          {/* HISTORY / DOWNLOADS drop panel — anchored under the control cluster. */}
+          {panel && (
+            <div style={{
+              position: "absolute", top: "calc(100% + 6px)", right: 0, zIndex: 50,
+              width: 340, maxHeight: 360, overflowY: "auto",
+              background: "var(--surface)", border: "var(--border-width) solid var(--line)",
+              borderRadius: "var(--radius-card)", boxShadow: "var(--elevation)", padding: 8,
+            }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "2px 4px 8px" }}>
+                <Icon name={panel === "history" ? "clock" : "download"} size={14} />
+                <span style={{ fontSize: 12.5, fontWeight: 700 }}>
+                  {panel === "history" ? "History" : "Downloads"}
+                </span>
+                <span onClick={() => setPanel(null)} title="Close"
+                  style={{ marginLeft: "auto", cursor: "pointer", fontSize: 15, lineHeight: 1, opacity: 0.6 }}>×</span>
+              </div>
+              {panel === "history" ? (
+                history.length === 0 ? (
+                  <div style={{ fontSize: 12, color: "var(--text-muted)", padding: "6px 4px" }}>No pages visited yet.</div>
+                ) : (
+                  [...history].reverse().map((h, i) => (
+                    <div key={`${h.url}-${h.ts}-${i}`} onClick={() => navTo(h.url)}
+                      style={{ padding: "6px 6px", borderRadius: "var(--radius-control)", cursor: "pointer", display: "flex", flexDirection: "column", gap: 1 }}
+                      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg)")}
+                      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                      <span style={{ fontSize: 12.5, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{h.title}</span>
+                      <span style={{ fontSize: 11, color: "var(--text-muted)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{h.url}</span>
+                    </div>
+                  ))
+                )
+              ) : (
+                downloads.length === 0 ? (
+                  <div style={{ fontSize: 12, color: "var(--text-muted)", padding: "6px 4px" }}>No downloads yet.</div>
+                ) : (
+                  downloads.map((d, i) => (
+                    <div key={`${d.name}-${i}`}
+                      style={{ padding: "6px 6px", borderRadius: "var(--radius-control)", display: "flex", alignItems: "center", gap: 8 }}>
+                      <Icon name="download" size={14} />
+                      <span style={{ flex: 1, fontSize: 12.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={d.name}>{d.name}</span>
+                      <span style={{ fontSize: 11, color: "var(--text-muted)", flexShrink: 0 }}>{fmtSize(d.size)}</span>
+                    </div>
+                  ))
+                )
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -691,6 +823,20 @@ function segStyle(on: boolean): React.CSSProperties {
     fontSize: 12, fontWeight: 700, padding: "6px 14px", border: "none", cursor: "pointer",
     background: on ? "var(--accent)" : "transparent",
     color: on ? "#fff" : "var(--text-muted)",
+  };
+}
+
+// Browser nav-control button (ITEM 3): square icon button matching the tab-row
+// affordances. `active` = a panel it toggles is open; `disabled` = no page yet.
+function navBtnStyle(active: boolean, disabled: boolean): React.CSSProperties {
+  return {
+    display: "flex", alignItems: "center", justifyContent: "center",
+    width: 30, height: 30, borderRadius: "var(--radius-control)",
+    border: `var(--border-width) solid ${active ? "var(--accent)" : "var(--line)"}`,
+    background: active ? "var(--surface)" : "transparent",
+    color: disabled ? "var(--text-muted)" : active ? "var(--accent)" : "var(--text)",
+    cursor: disabled ? "default" : "pointer",
+    opacity: disabled ? 0.4 : 1, flexShrink: 0, padding: 0,
   };
 }
 

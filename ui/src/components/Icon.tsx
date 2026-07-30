@@ -11,7 +11,9 @@ export type IconName =
   | "sparkles" | "brain" | "bolt" | "book" | "flask" | "briefcase" | "palette"
   | "chart" | "leaf" | "compass" | "rocket" | "star" | "terminal" | "globe"
   // ui affordances
-  | "plus" | "trash" | "pencil" | "pin" | "pin-fill" | "close";
+  | "plus" | "trash" | "pencil" | "pin" | "pin-fill" | "close"
+  // browser nav controls
+  | "arrow-left" | "arrow-right" | "refresh" | "clock" | "download";
 
 // The curated set offered as agent icons (order = swatch order in the picker).
 export const AGENT_ICONS: IconName[] = [
@@ -44,6 +46,11 @@ const PATHS: Record<IconName, JSX.Element> = {
   terminal: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M7 9l3 3-3 3M13 15h4" /></>,
   globe: <><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18" /></>,
 
+  "arrow-left": <path d="M19 12H5M12 19l-7-7 7-7" />,
+  "arrow-right": <path d="M5 12h14M12 5l7 7-7 7" />,
+  refresh: <path d="M20 11a8 8 0 1 0-.9 4.5M20 5v6h-6" />,
+  clock: <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>,
+  download: <path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14" />,
   plus: <path d="M12 5v14M5 12h14" />,
   trash: <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m-9 0l1 13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1l1-13" />,
   pencil: <path d="M4 20l4-1 11-11a2 2 0 0 0-3-3L5 16z" />,
