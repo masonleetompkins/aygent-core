@@ -10,6 +10,22 @@ rust-version = "1.77"
 name = "aygent_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# ENGINE-CEF (Phase 1): the CEF multi-process browser needs a SEPARATE helper
+# executable (the GPU/Renderer/Plugin subprocesses re-exec THIS binary path).
+# It re-execs into `execute_process` and does nothing else. Only built when the
+# `engine-cef` feature is on; a plain build never compiles it. bundle metadata
+# below tells `bundle-cef-app` its name.
+[[bin]]
+name = "aygent_helper"
+path = "src/bin/aygent_helper.rs"
+required-features = ["engine-cef"]
+
+# `bundle-cef-app` (from the cef crate's build-util) reads this to know which bin
+# is the CEF helper + where the mac resources live. Only used by the CEF bundle
+# step; inert for a normal build.
+[package.metadata.cef.bundle]
+helper_name = "aygent_helper"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -41,6 +57,18 @@ sha2 = "0.10"                      # BROWSER Slice 0: verify the downloaded Chro
 urlencoding = "2"                   # (unused placeholder removed if not needed) — kept minimal
 dirs = "6"                          # BROWSER downloads: resolve the user's ~/Downloads (WebKit-download-friendly dir) for the on_download destination. Already in the tree via wry (v6.0.0 in Cargo.lock); declared direct so browser.rs uses dirs::download_dir()/home_dir() without lock churn.
 
+# ENGINE-CEF (Phase 1). OPTIONAL + off by default (see [features].engine-cef).
+# Pinned to the EXACT tag Phase-0's cef-spike proved on Mason's Mac
+# (export-cef-dir-v151.0.0+151.3.11 => CEF 151.3.11 / Chromium 151.x). Pulled
+# from crates.io by version; `build-util` gives us `bundle-cef-app` + the macOS
+# bundle layout logic (build_util::mac) our build script reuses. This is the
+# ONLY new heavy dep; it never compiles unless `--features engine-cef` is set.
+# NOTE: cef needs a recent toolchain (edition 2024 in its examples) but the
+# `cef` LIBRARY crate itself compiles on our edition 2021 workspace; only the
+# helper bin + bundler use its build-util. Cargo.lock will gain cef + its deps
+# the first time Mason builds WITH the feature (expected; commit that lock).
+cef = { version = "=151.0.0", features = ["build-util", "sandbox"], optional = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"                        # atomic openat/O_NOFOLLOW fd layer (M0.2c)
 
@@ -49,8 +77,10 @@ libc = "0.2"                        # atomic openat/O_NOFOLLOW fd layer (M0.2c)
 # NSView frame against the LIVE window contentView (ground truth), instead of
 # trusting wry's child-positioning math (titlebar/flip mismatches burned us).
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSResponder", "NSGraphics"] }
-objc2-foundation = { version = "0.3", features = ["NSGeometry"] }
+objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSResponder", "NSGraphics", "NSApplication", "NSEvent"] }
+# NSValue -> NSNumber (setDrawsBackground KVC), NSString -> ns_string! macro:
+# both needed by cef_geometry's punchout (engine-cef). Harmless when unused.
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSValue", "NSString"] }
 # CALayer for premium rounded corners on the WKWebView's own backing layer
 # (cornerRadius + masksToBounds). Already in the tree via tauri/wry; declare it
 # directly so NSView::layer()'s CALayer methods are in scope.
@@ -58,6 +88,13 @@ objc2-quartz-core = { version = "0.3", features = ["CALayer", "objc2-core-founda
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+# ENGINE-CEF (Phase 1 kill-switch). OFF by default so a plain `cargo tauri build`
+# still compiles the working WKWebView browser and never pulls the ~170MB CEF
+# framework. Mason builds WITH `--features engine-cef` to get the native
+# Chromium browser surface. When OFF, all `#[cfg(feature = "engine-cef")]` code
+# is excluded and the WKWebView path is used verbatim. This is the instant
+# revert: drop the feature flag and the old engine is back.
+engine-cef = ["dep:cef"]
 # LOCAL-MODEL GPU acceleration. macOS builds turn on Metal; a CUDA PC build can
 # opt in. Kept as features so a headless/CI build can compile CPU-only.
 metal = ["llama-cpp-2/metal"]

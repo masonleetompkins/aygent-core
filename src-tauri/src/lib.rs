@@ -8,6 +8,13 @@ use rusqlite::params; // scheduler_list/scheduler_runs read-only queries
 
 mod agents;
 mod browser;
+// ENGINE-CEF (Phase 1): native Chromium visible-surface + punchout geometry.
+// Both are #![cfg(all(target_os = "macos", feature = "engine-cef"))] internally,
+// so declaring them unconditionally is inert unless the feature is on + macOS.
+#[cfg(all(target_os = "macos", feature = "engine-cef"))]
+mod cef_engine;
+#[cfg(all(target_os = "macos", feature = "engine-cef"))]
+mod cef_geometry;
 mod broker;
 mod broker_ws;
 mod history;
@@ -3211,6 +3218,7 @@ pub fn run() {
             browser::webview_navigate, browser::webview_close, browser::webview_agent_act,
             browser::webview_page_info,
             browser::set_active_browser_tab, browser::browser_permission_answer,
+            browser::set_browser_hittest, browser::browser_engine_info,
             openai_models, tools_list, tools_upsert, tools_delete, tools_set_enabled,
             tools_config, tools_set_config,
             savepoint_snapshot, savepoint_timeline, savepoint_rewind,
@@ -3234,6 +3242,24 @@ pub fn run() {
             memory_get_auto_remember, memory_set_auto_remember
         ])
         .setup(move |_app| {
+            // ENGINE-CEF (Phase 1): bring CEF up FIRST, on the main thread, in
+            // setup — the Chromium browser process + framework must init before
+            // any tab creates a browser. Uses multi_threaded_message_loop so it
+            // does NOT contend for Wry's run loop (see cef_engine module header).
+            // Downloads default to the app-data browser dir until an agent
+            // folder is restored, at which point browser.rs re-points it via
+            // cef_engine::set_downloads_dir(agent_downloads_dir).
+            #[cfg(all(target_os = "macos", feature = "engine-cef"))]
+            {
+                use tauri::Manager;
+                let dl = _app.handle().path().app_data_dir()
+                    .map(|d| d.join("browser").join("downloads"))
+                    .unwrap_or_else(|_| std::env::temp_dir());
+                let _ = std::fs::create_dir_all(&dl);
+                eprintln!("[aygent][cef] setup: initializing CEF engine…");
+                cef_engine::init(_app.handle().clone(), dl);
+            }
+
             // M1.1: bring up the SQLite state spine + single-writer actor, then
             // run the one-time JSON→SQLite import. Do this synchronously in
             // setup so every command that follows sees a ready DB. A failure
