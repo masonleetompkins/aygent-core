@@ -74,26 +74,33 @@ export DYLD_FALLBACK_LIBRARY_PATH="${DYLD_FALLBACK_LIBRARY_PATH:-}:$CEF_PATH:$CE
 #     binary, which will NOT have the CEF framework injected. For CEF you must
 #     run the BUNDLED .app (helpers + framework), so use the release-ish bundle
 #     path below, OR inject into the dev .app. Recommended: build the bundle.
+#
+#     ⚠️ CRITICAL: `cargo tauri` MUST be run from the src-tauri/ dir (where
+#     Cargo.toml + tauri.conf.json live). Running it from the repo root gives
+#     `could not find Cargo.toml` AND mangles beforeBuildCommand's `--prefix ui`
+#     into `ui/ui/package.json`. So cd into src-tauri FIRST. All target/ +
+#     scripts/ paths below are written RELATIVE TO src-tauri/ (../scripts, etc).
+cd ~/Documents/aygent/src-tauri
 cargo tauri build --features engine-cef --debug
 
-#    The bundled app lands at (debug):
-#      src-tauri/target/debug/bundle/macos/AYGENT.app
-#    Release: drop --debug -> src-tauri/target/release/bundle/macos/AYGENT.app
+#    The bundled app lands at (debug, relative to src-tauri/):
+#      target/debug/bundle/macos/AYGENT.app
+#    Release: drop --debug -> target/release/bundle/macos/AYGENT.app
 
 # 3b. Build the helper bin explicitly (tauri build may not build extra [[bin]]s
-#     with required-features unless asked):
+#     with required-features unless asked). Still in src-tauri/:
 cargo build --features engine-cef --bin aygent_helper           # debug
 #   (release:  cargo build --release --features engine-cef --bin aygent_helper)
 
 # 4. INJECT the CEF framework + 5 helper .apps into the bundle + ad-hoc sign.
-#    (debug paths shown; swap debug->release for a release build)
-bash scripts/cef-bundle.sh \
-  "src-tauri/target/debug/bundle/macos/AYGENT.app" \
-  "src-tauri/target/debug"
+#    Run from src-tauri/; the script + paths are relative to it.
+bash ../scripts/cef-bundle.sh \
+  "target/debug/bundle/macos/AYGENT.app" \
+  "target/debug"
 
 # 5. RUN. Launch the binary DIRECTLY (not `open`) so you see the [aygent][cef]
 #    stderr logs — paste those back if anything fails.
-"src-tauri/target/debug/bundle/macos/AYGENT.app/Contents/MacOS/AYGENT"
+"target/debug/bundle/macos/AYGENT.app/Contents/MacOS/AYGENT"
 ```
 
 **Kill-switch (back to WKWebView instantly):** build with NO feature —
