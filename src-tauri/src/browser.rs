@@ -1338,103 +1338,48 @@ fn download_event(app: &tauri::AppHandle, event: tauri::webview::DownloadEvent<'
             let final_dest = final_dir.join(&final_name);
 
             // ============================================================
-            // ROOT-CAUSE PROBE + FIX (Atlas, 2026-07-30) for the recurring
-            // `sandbox_extension_issue_file failed for : 2 (No such file or
-            // directory)` with an EMPTY path before the colon.
+            // THE FIX (2026-07-30, after 4 destination-theory failures).
             //
-            // Verified against wry 0.55.1 SOURCE (src/wkwebview/download.rs +
-            // navigation.rs). Ground truth of the flow:
-            //   * navigation_policy(): a right-click "Save Image" is NOT a
-            //     navigation with shouldPerformDownload — so on_navigation
-            //     returning `true` does NOT swallow it. Nav-intercept is NOT
-            //     the cause (hypothesis #1 disproven by source).
-            //   * The WKDownload's delegate calls download_policy(), which calls
-            //     OUR started_fn (this arm). Whatever we put in `*destination`
-            //     is wrapped as `NSURL fileURLWithPath` and handed to WebKit's
-            //     completion handler. Our mutation IS honored (hypothesis #2
-            //     disproven: [DL] begin prints, so started_fn ran + returned).
-            //   * Therefore the empty-path sandbox error is WebKit's NETWORKING
-            //     XPC process failing to MINT a sandbox extension for the write
-            //     location — an app-sandbox/entitlement limitation, not our path
-            //     string. We must (a) prove the path is real+writable from OUR
-            //     process, and (b) A/B whether overriding the destination at all
-            //     is what breaks it vs WebKit's own default (~/Downloads).
+            // Verified from wry 0.55.1 source: on_navigation does NOT swallow
+            // the download, and *destination IS honored by WebKit. So the
+            // recurring `sandbox_extension_issue_file failed for : 2` is WebKit's
+            // sandboxed NETWORKING process failing to MINT a write extension for
+            // ANY custom destination we hand it (Library/.., ~/Downloads/AYGENT,
+            // /var/folders temp — all failed identically).
             //
-            // AYGENT_DL_MODE env var (set on Mason's run to A/B WITHOUT a
-            // recompile-per-theory):
-            //   unset | "temp"    -> write to OS temp, move on Finished (current)
-            //   "default"         -> DO NOT override *destination; let WebKit use
-            //                        its own ~/Downloads. If THIS works while temp
-            //                        fails, the ACT of overriding is the bug.
-            //   "final"           -> write DIRECTLY to <agentFolder>/downloads
-            //                        (skip temp+move). Tests the agent dir.
+            // The one location WebKit's networking sandbox RELIABLY holds a
+            // write extension for is its OWN DEFAULT download dir (~/Downloads).
+            // So: DO NOT override *destination at all — let WebKit download to
+            // ~/Downloads (sandbox-blessed), then OUR non-sandboxed process MOVES
+            // the finished file into <agentFolder>/downloads/. WebKit never has
+            // to touch a custom path, so the extension error can't fire.
+            //
+            // We predict WebKit's default path (~/Downloads/<final_name>, with
+            // the SAME de-dup WebKit applies) so Finished can move it even though
+            // Finished.path is empty on macOS. If Finished DOES report a path, we
+            // prefer it (source of truth for where WebKit actually wrote).
             // ============================================================
-            let mode = std::env::var("AYGENT_DL_MODE").unwrap_or_default();
+            let webkit_downloads = dirs::download_dir()
+                .unwrap_or_else(|| std::env::temp_dir());
+            // WebKit de-dups with " (1)", " (2)" too; match that so our predicted
+            // path lines up with where it actually writes.
+            let webkit_name = dedup_name(&webkit_downloads, &name);
+            let predicted_webkit_path = webkit_downloads.join(&webkit_name);
 
-            // TEMP destination candidate: OS temp dir (WebKit's networking-process
-            // sandbox usually already holds an extension for /var/folders/...).
-            let seq = SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let temp_dir = std::env::temp_dir().join("aygent-dl");
-            let _ = std::fs::create_dir_all(&temp_dir);
-            let temp_dir = std::fs::canonicalize(&temp_dir).unwrap_or(temp_dir);
-            let temp_dest = temp_dir.join(format!("{seq}-{final_name}"));
-
-            // Choose the destination WebKit will actually write to, per mode.
-            // In "default" mode we leave *destination untouched (empty PathBuf).
-            let webkit_dest: Option<PathBuf> = match mode.as_str() {
-                "default" => None,
-                "final" => {
-                    let _ = std::fs::create_dir_all(&final_dir);
-                    Some(final_dest.clone())
-                }
-                _ => Some(temp_dest.clone()), // "temp" / unset
-            };
-
-            // GROUND-TRUTH PROBE: can OUR (non-sandboxed main) process create +
-            // write the chosen destination right now? This isolates "path is
-            // bogus/parent missing" (our create fails) from "WebKit's sandbox
-            // can't get an extension for a path that is otherwise perfectly
-            // writable" (our create succeeds but WebKit still errors).
-            if let Some(dest) = webkit_dest.as_ref() {
-                let parent = dest.parent();
-                let parent_exists = parent.map(|p| p.is_dir()).unwrap_or(false);
-                let dest_str = dest.display().to_string();
-                let touch = std::fs::File::create(dest)
-                    .map(|_| { let _ = std::fs::remove_file(dest); "OK" })
-                    .unwrap_or("FAIL");
-                eprintln!(
-                    "[aygent][browser][DL] PROBE mode={mode:?} dest_bytes={} dest_str={:?} is_absolute={} parent={:?} parent_exists={} our_write_touch={}",
-                    dest_str.len(), dest_str, dest.is_absolute(),
-                    parent.map(|p| p.display().to_string()), parent_exists, touch
-                );
-            } else {
-                eprintln!(
-                    "[aygent][browser][DL] PROBE mode={mode:?} NO OVERRIDE — letting WebKit use its default (~/Downloads)"
-                );
-            }
-
-            // Remember url -> (temp/actual WebKit-write path, final agent dest)
-            // so Finished can move it (Finished.path is empty on macOS). In
-            // "default" mode we have no write path from WebKit here, so store the
-            // final dir + name and let Finished honor WebKit's reported `path`.
-            let write_path_for_map = webkit_dest.clone().unwrap_or_else(|| final_dest.clone());
+            // Map url -> (WebKit's predicted write path, our final agent dest).
+            // Finished moves predicted (or its reported path) -> final.
             if let Some(proc) = app.try_state::<BrowserProc>() {
                 if let Ok(mut m) = proc.dl_temps.lock() {
-                    m.insert(url.as_str().to_string(), (write_path_for_map.clone(), final_dest.clone()));
+                    m.insert(url.as_str().to_string(), (predicted_webkit_path.clone(), final_dest.clone()));
                 }
             }
 
             eprintln!(
-                "[aygent][browser][DL] begin url={} webkit_dest={} -> final={} (final_dir_exists={})",
-                url,
-                webkit_dest.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "<webkit-default>".into()),
-                final_dest.display(), final_dir.is_dir()
+                "[aygent][browser][DL] begin url={} webkit_default={} -> final={} (final_dir_exists={})",
+                url, predicted_webkit_path.display(), final_dest.display(), final_dir.is_dir()
             );
-            // Only override when we have a concrete path; "default" mode leaves
-            // WebKit's own destination in place (the A/B diagnostic).
-            if let Some(dest) = webkit_dest {
-                *destination = dest;
-            }
+            // DO NOT set *destination — leave WebKit's own ~/Downloads default in
+            // place. This is the whole fix: WebKit's sandbox already trusts it.
             // Notify the FE a download STARTED (so it can auto-open Downloads).
             {
                 use tauri::Emitter;
@@ -1445,11 +1390,12 @@ fn download_event(app: &tauri::AppHandle, event: tauri::webview::DownloadEvent<'
             true // allow the download
         }
         DownloadEvent::Finished { url, path, success } => {
-            // macOS: `path` is usually empty (API limitation), so recover the
-            // WebKit-write path + final dest from the map we filled in Requested.
-            // But in AYGENT_DL_MODE="default" WebKit chose its own path and may
-            // report it here — prefer a NON-EMPTY reported path over the mapped
-            // one so we move from where WebKit actually wrote.
+            // WebKit downloaded to its own ~/Downloads (we never overrode the
+            // destination). Recover our predicted ~/Downloads path + the final
+            // agent dest from the map. Prefer WebKit's reported non-empty path
+            // (source of truth) over our prediction; on macOS it's often empty,
+            // so we fall back to the predicted path (and a stem-scan of
+            // ~/Downloads if WebKit de-duped the name differently).
             let mapped = app
                 .try_state::<BrowserProc>()
                 .and_then(|proc| proc.dl_temps.lock().ok().and_then(|mut m| m.remove(url.as_str())));
@@ -1463,33 +1409,42 @@ fn download_event(app: &tauri::AppHandle, event: tauri::webview::DownloadEvent<'
             let mut final_path = String::new();
             let mut moved_ok = success;
             if success {
-                if let Some((mapped_write, final_dest)) = mapped {
-                    // Source to move FROM = WebKit's reported path if non-empty,
-                    // else the write path we stored in Requested.
-                    let temp_dest = match path.as_ref() {
+                if let Some((predicted_webkit_path, final_dest)) = mapped {
+                    // WebKit wrote the file to ~/Downloads. Source = its reported
+                    // path if non-empty (source of truth), else our predicted
+                    // ~/Downloads/<name>. If WebKit de-duped differently than we
+                    // predicted, fall back to scanning ~/Downloads for the file.
+                    let mut src = match path.as_ref() {
                         Some(p) if !p.as_os_str().is_empty() => p.clone(),
-                        _ => mapped_write,
+                        _ => predicted_webkit_path.clone(),
                     };
+                    if !src.exists() {
+                        // Predicted name missed (WebKit's de-dup differed). Look
+                        // in ~/Downloads for the newest file matching our stem.
+                        if let Some(found) = newest_matching_download(&src) {
+                            src = found;
+                        }
+                    }
                     eprintln!(
                         "[aygent][browser][DL] finished, moving from={} -> final={}",
-                        temp_dest.display(), final_dest.display()
+                        src.display(), final_dest.display()
                     );
-                    if temp_dest == final_dest {
-                        // "final" mode: WebKit already wrote to the agent dir.
-                        moved_ok = temp_dest.exists();
+                    if src == final_dest {
+                        moved_ok = src.exists();
                         if moved_ok { final_path = final_dest.display().to_string(); }
-                    } else if temp_dest.exists() {
-                        // Ensure the final dir exists (agent may have switched).
+                    } else if src.exists() {
+                        // Ensure the agent's downloads dir exists (agent may have
+                        // switched since Requested).
                         if let Some(parent) = final_dest.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        // rename() is atomic within a filesystem; temp is often
-                        // on a DIFFERENT volume (/var/folders vs the agent
-                        // folder), so fall back to copy + remove across FS.
-                        let ok = match std::fs::rename(&temp_dest, &final_dest) {
+                        // rename() is atomic within a filesystem; ~/Downloads and
+                        // the agent folder can be on different volumes, so fall
+                        // back to copy + remove across filesystems.
+                        let ok = match std::fs::rename(&src, &final_dest) {
                             Ok(()) => true,
-                            Err(_) => match std::fs::copy(&temp_dest, &final_dest) {
-                                Ok(_) => { let _ = std::fs::remove_file(&temp_dest); true }
+                            Err(_) => match std::fs::copy(&src, &final_dest) {
+                                Ok(_) => { let _ = std::fs::remove_file(&src); true }
                                 Err(e) => {
                                     eprintln!("[aygent][browser][DL] error move failed: {e}");
                                     false
@@ -1501,14 +1456,14 @@ fn download_event(app: &tauri::AppHandle, event: tauri::webview::DownloadEvent<'
                             final_path = final_dest.display().to_string();
                             eprintln!(
                                 "[aygent][browser][DL] moved {} -> {}",
-                                temp_dest.display(), final_dest.display()
+                                src.display(), final_dest.display()
                             );
                         }
                     } else {
                         moved_ok = false;
                         eprintln!(
-                            "[aygent][browser][DL] error temp file missing: {}",
-                            temp_dest.display()
+                            "[aygent][browser][DL] error webkit file missing at {} (reported={:?})",
+                            src.display(), reported
                         );
                     }
                 } else {
@@ -1529,6 +1484,42 @@ fn download_event(app: &tauri::AppHandle, event: tauri::webview::DownloadEvent<'
         }
         _ => true,
     }
+}
+
+/// WebKit may de-dup a download name differently than we predicted ("foo.png"
+/// vs "foo-1.png" vs "foo (1).png"), so if our predicted ~/Downloads path is
+/// missing at Finished, scan the download dir for the NEWEST file whose stem
+/// starts with our expected stem — that's almost certainly the one WebKit just
+/// wrote. Returns the matched path if found.
+fn newest_matching_download(predicted: &Path) -> Option<PathBuf> {
+    let dir = predicted.parent()?;
+    let stem = predicted.file_stem()?.to_string_lossy().to_string();
+    // Strip a trailing " (n)"/"-n" so "foo (1)" still matches "foo".
+    let base = stem
+        .split(|c| c == '(' || c == '-')
+        .next()
+        .unwrap_or(&stem)
+        .trim()
+        .to_string();
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = entry.path();
+        if !p.is_file() { continue; }
+        // Skip in-progress downloads.
+        if p.extension().map(|e| e == "download" || e == "crdownload").unwrap_or(false) { continue; }
+        let fname = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if !base.is_empty() && !fname.to_lowercase().starts_with(&base.to_lowercase()) { continue; }
+        let mtime = entry.metadata().ok().and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        // Only consider very-recently-written files (last 30s) to avoid grabbing
+        // an unrelated old file that happens to share the stem.
+        let recent = mtime.elapsed().map(|e| e.as_secs() < 30).unwrap_or(false);
+        if !recent { continue; }
+        if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+            best = Some((mtime, p));
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 /// De-dupe a filename against a directory so we never clobber an existing file:
