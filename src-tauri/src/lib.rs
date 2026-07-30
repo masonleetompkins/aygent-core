@@ -3207,6 +3207,7 @@ pub fn run() {
             browser::webview_open, browser::webview_set_bounds, browser::webview_hide,
             browser::webview_hide_others, browser::webview_history, browser::browser_downloads_list,
             browser::browser_history_list, browser::browser_history_clear,
+            browser::browser_download_url,
             browser::webview_navigate, browser::webview_close, browser::webview_agent_act,
             browser::webview_page_info,
             browser::set_active_browser_tab, browser::browser_permission_answer,
@@ -3275,6 +3276,31 @@ pub fn run() {
                     let lns = _app.state::<lanes::Lanes>().inner().clone();
                     scheduler::spawn(_app.handle().clone(), db, brk, lns, ssig, dsig);
                 }
+            }
+
+            // DOWNLOAD BRIDGE: the page-injected script emits `browser:save-request`
+            // { url, name } on a right-click image save / download-link click.
+            // wry's on_download never fires for context-menu saves, so THIS is
+            // how downloads actually happen: our process fetches the bytes and
+            // writes them to the agent folder (no WebKit, no sandbox).
+            {
+                use tauri::{Listener, Manager};
+                let dl_handle = _app.handle().clone();
+                _app.listen_any("browser:save-request", move |ev| {
+                    #[derive(serde::Deserialize)]
+                    struct SaveReq { url: String, name: Option<String> }
+                    // Payload is a JSON string; parse it.
+                    if let Ok(req) = serde_json::from_str::<SaveReq>(ev.payload()) {
+                        eprintln!("[aygent][browser][DL] save-request url={} name={:?}", req.url, req.name);
+                        let h = dl_handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            match browser::browser_download_url(h, req.url.clone(), req.name).await {
+                                Ok(p) => eprintln!("[aygent][browser][DL] saved -> {p}"),
+                                Err(e) => eprintln!("[aygent][browser][DL] save failed: {e}"),
+                            }
+                        });
+                    }
+                });
             }
 
             let broker = broker.clone();

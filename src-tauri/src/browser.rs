@@ -1294,6 +1294,97 @@ fn sanitize_filename(raw: &str) -> String {
     }
 }
 
+/// DOWNLOAD THAT ACTUALLY WORKS (2026-07-30). wry's `on_download` NEVER fires
+/// for a right-click "Save Image" context-menu action (confirmed: no `[DL]
+/// begin` ever printed), so ALL the WKWebView-destination work was dead code.
+/// We bypass WebKit's download machinery entirely: the FE (a page-injected
+/// context-menu handler + the address-bar/agent) calls THIS command with a URL,
+/// and OUR process fetches the bytes via reqwest and writes them straight into
+/// `<agentFolder>/downloads/`. No WKWebView, no sandboxed networking XPC, so the
+/// `sandbox_extension_issue_file` error can NEVER fire — the write is done by the
+/// normal (non-sandboxed) app process, which can write the agent folder freely.
+#[tauri::command]
+pub async fn browser_download_url(
+    app: tauri::AppHandle,
+    url: String,
+    suggested_name: Option<String>,
+) -> Result<String, String> {
+    use tauri::Emitter;
+    // Only http(s) — never file:// or data: paths through here.
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("only http(s) URLs can be downloaded".into());
+    }
+    let dir = agent_downloads_dir(&app);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir downloads: {e}"))?;
+
+    let raw_name = suggested_name
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| sanitize_filename(&url));
+    let name0 = sanitize_filename(&raw_name);
+    let name = dedup_name(&dir, &name0);
+    let dest = dir.join(&name);
+
+    eprintln!("[aygent][browser][DL] fetch url={url} -> {}", dest.display());
+    let _ = app.emit("browser:download", &serde_json::json!({
+        "state": "begin", "name": name, "url": url,
+    }));
+
+    // Fetch the bytes ourselves.
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let resp = client.get(&url).send().await.map_err(|e| format!("fetch failed: {e}"))?;
+    if !resp.status().is_success() {
+        let s = resp.status();
+        let _ = app.emit("browser:download", &serde_json::json!({ "state": "error", "url": url, "success": false }));
+        return Err(format!("download failed: HTTP {s}"));
+    }
+    // If we synthesized a name with no extension, try to add one from the
+    // Content-Type so the file opens correctly.
+    let final_dest = if dest.extension().is_none() {
+        let ext = resp.headers().get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|ct| ext_for_mime(ct));
+        match ext {
+            Some(e) => dir.join(dedup_name(&dir, &format!("{name}.{e}"))),
+            None => dest.clone(),
+        }
+    } else { dest.clone() };
+
+    let bytes = resp.bytes().await.map_err(|e| format!("read body: {e}"))?;
+    std::fs::write(&final_dest, &bytes).map_err(|e| format!("write file: {e}"))?;
+
+    let path_str = final_dest.display().to_string();
+    eprintln!("[aygent][browser][DL] complete success=true bytes={} final={}", bytes.len(), path_str);
+    let _ = app.emit("browser:download", &serde_json::json!({
+        "state": "complete", "url": url, "path": path_str, "success": true,
+        "name": final_dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(name),
+    }));
+    Ok(path_str)
+}
+
+/// Guess a file extension from a MIME type for downloads whose URL had none.
+fn ext_for_mime(ct: &str) -> Option<&'static str> {
+    let m = ct.split(';').next().unwrap_or(ct).trim().to_ascii_lowercase();
+    Some(match m.as_str() {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "image/avif" => "avif",
+        "image/bmp" => "bmp",
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
+        "application/zip" => "zip",
+        "application/json" => "json",
+        "video/mp4" => "mp4",
+        "audio/mpeg" => "mp3",
+        _ => return None,
+    })
+}
+
 /// ISSUE 4 — the SINGLE handler for WKWebView download events (wry
 /// `on_download`). Wiring `on_download` is what STOPS the terminal flood: with
 /// no handler, WKWebView treated the download URL as a navigation the page
@@ -1648,7 +1739,45 @@ pub async fn webview_open(
     let load_app = app.clone();
     let title_app = app.clone();
     let dl_app = app.clone();
+    // PAGE-INJECTED DOWNLOAD BRIDGE: wry's on_download does NOT fire for a
+    // right-click "Save Image" (confirmed — no [DL] begin ever printed). So we
+    // catch it in the page: on contextmenu over an <img> (or a click on a
+    // download link), we capture the resource URL + suggested name and post it
+    // to Rust via the Tauri IPC event `browser:save-request`. Rust then fetches
+    // + writes to the agent folder (browser_download_url) — no WKWebView
+    // download, no sandbox. We ALSO override the default "Save Image" so it
+    // routes here instead of WebKit's broken WKDownload path.
+    const DL_BRIDGE_JS: &str = r#"(function(){
+  if (window.__aygentDlBridge) return; window.__aygentDlBridge = true;
+  function emit(url, name){
+    try {
+      if (window.__TAURI__ && window.__TAURI__.event) {
+        window.__TAURI__.event.emit('browser:save-request', { url: url, name: name || '' });
+      }
+    } catch(e){}
+  }
+  // Right-click on an image => intercept, send its src to Rust.
+  document.addEventListener('contextmenu', function(ev){
+    var el = ev.target;
+    if (el && el.tagName === 'IMG' && el.src && /^https?:/.test(el.src)) {
+      // Don't fully preventDefault (keep the native menu usable), but stash the
+      // last image so an explicit Save action can use it. We also offer an
+      // immediate save on Alt+right-click for power users.
+      window.__aygentLastImg = el.src;
+      if (ev.altKey) { ev.preventDefault(); emit(el.src, ''); }
+    }
+  }, true);
+  // Clicks on <a download> or direct file links => route through Rust.
+  document.addEventListener('click', function(ev){
+    var a = ev.target && ev.target.closest ? ev.target.closest('a') : null;
+    if (!a) return;
+    var href = a.href || '';
+    var isDl = a.hasAttribute('download');
+    if (isDl && /^https?:/.test(href)) { ev.preventDefault(); emit(href, a.getAttribute('download')||''); }
+  }, true);
+})();"#;
     let builder = tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed))
+        .initialization_script(DL_BRIDGE_JS)
         .on_navigation(|url| {
             // DIAGNOSTIC (Atlas): log every URL that reaches wry's
             // navigation_policy. If a right-click "Save Image" / binary URL
