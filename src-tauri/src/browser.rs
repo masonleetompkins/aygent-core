@@ -2414,10 +2414,23 @@ pub fn browser_permission_answer(
 
 /// Heuristic: does an agent tool result look like it needs a human (login/
 /// CAPTCHA/verification)? Used to auto-offer the hand-off.
+///
+/// IMPORTANT: this must NOT fire on incidental page CONTENT (e.g. a Google
+/// result titled "Claude: Sign in", or any page that merely MENTIONS sign-in).
+/// It previously matched bare "sign in"/"login", which flipped the wheel to the
+/// human the instant the agent read a search page containing those words — the
+/// exact bug where clicking Allow bounced control back to You. Now we only fire
+/// on STRONG blocker signals: an explicit tool ERROR string we control, a
+/// CAPTCHA/robot check, or Google's rate-limit wall. Generic auth words in page
+/// text are NOT a handoff.
 fn looks_like_handoff(s: &str) -> bool {
     let l = s.to_ascii_lowercase();
-    l.contains("captcha") || l.contains("not a robot") || l.contains("sign in")
-        || l.contains("log in") || l.contains("login") || l.contains("verify") || l.contains("unusual traffic")
+    l.contains("captcha")
+        || l.contains("not a robot")
+        || l.contains("unusual traffic")
+        || l.contains("detected unusual")
+        || l.contains("verify you're human")
+        || l.contains("verify you are human")
 }
 
 async fn agent_tool_inner(
