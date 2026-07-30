@@ -1366,7 +1366,9 @@ async fn anthropic_test(prompt: String) -> Result<String, String> {
 /// transcript string of what happened (tool calls + final answer).
 #[tauri::command]
 async fn agent_run(
+    app: tauri::AppHandle,
     broker: tauri::State<'_, Arc<Broker>>,
+    browser_state: tauri::State<'_, browser::BrowserProc>,
     prompt: String,
 ) -> Result<String, String> {
     let key = keychain::get_key("anthropic")
@@ -1390,7 +1392,10 @@ async fn agent_run(
     let _mode = "folder"; // M1.4 makes this per-agent.
 
     // Tool schemas the model can call. Handlers route through the broker (jailed).
-    let tools = serde_json::json!([
+    // PLUS the browser tools (Slice 4/5) so the hand-off panel's agent can act in
+    // the VISIBLE tab — that's the whole point of this path being called from
+    // the Browser screen.
+    let mut tools = serde_json::json!([
         {
             "name": "read_file",
             "description": "Read a UTF-8 text file inside the agent folder. Path is relative to the folder root.",
@@ -1407,10 +1412,17 @@ async fn agent_run(
             "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }
         }
     ]);
+    if let Some(arr) = tools.as_array_mut() {
+        for schema in browser::agent_tool_schemas() { arr.push(schema); }
+    }
 
-    let system = "You are AYGENT, an agent that can ONLY touch files inside the user's chosen \
-        folder via your tools. You cannot run shell commands. Use read_file/write_file/list_files \
-        to do file work. Be concise.";
+    let system = "You are AYGENT, driving the in-app browser in the tab the human is watching. \
+        Use the browser tools to ACT in that page: browser_open (navigate), browser_read (see the \
+        page text), browser_click_text (click a link/button by its visible text), browser_type_text \
+        (type into a field, optionally submit). You also have read_file/write_file/list_files for \
+        the user's folder. To search Google: the page is already google.com — use browser_type_text \
+        with the query and submit:true, then browser_read to see results, then browser_click_text to \
+        click one. Act step by step; after each action, read the page to see what happened. Be concise.";
 
     let mut messages = serde_json::json!([{ "role": "user", "content": prompt }]);
     let mut transcript = String::new();
@@ -1443,8 +1455,15 @@ async fn agent_run(
                     let input = blk.get("input").cloned().unwrap_or(serde_json::json!({}));
                     let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
 
-                    // EXECUTE THROUGH THE BROKER (jailed).
-                    let (result_text, is_err) = match name {
+                    // EXECUTE THROUGH THE BROKER (jailed) — or the browser tools
+                    // (act on the VISIBLE tab + per-agent domain policy + wheel).
+                    let (result_text, is_err) = if browser::is_agent_tool(name) {
+                        // No configured allowlist here — the human-in-the-loop
+                        // permission flow (Allow/Deny/Take) governs new hosts, and
+                        // the current tab's host is always pre-allowed. Pass empty.
+                        let domains: Vec<String> = Vec::new();
+                        browser::agent_tool(&app, &browser_state, name, &input, &domains).await
+                    } else { match name {
                         "read_file" => match broker.resolve_and_open("default", path, broker::Mode::Read) {
                             Ok(mut f) => {
                                 use std::io::Read;
@@ -1484,7 +1503,7 @@ async fn agent_run(
                             Err(e) => (format!("refused by jail: {e:?}"), true),
                         },
                         other => (format!("unknown tool: {other}"), true),
-                    };
+                    } };
 
                     transcript.push_str(&format!("  ⚙ {name}({path}) → {}\n",
                         if is_err { format!("✗ {result_text}") } else { "✓".to_string() }));
