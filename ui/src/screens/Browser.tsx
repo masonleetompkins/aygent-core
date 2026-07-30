@@ -87,10 +87,19 @@ export function Browser() {
       // so its ~radius corner arcs mask the webview's square corners while the
       // webview fills the whole box.
       const inset = WEB_INSET;
+      // Derive edges from ROUNDED top/left AND rounded bottom/right, then take
+      // the difference for size. Rounding width/height independently pushes ~1px
+      // of accumulated rounding onto the bottom/right edge (the Y-flip computes
+      // the bottom as flip_h - y - h), making the bottom inset look a hair
+      // bigger than the top. Symmetric edges = symmetric insets.
+      const left = Math.round(r.left + inset);
+      const top = Math.round(r.top + inset);
+      const right = Math.round(r.right - inset - rightPane);
+      const bottom = Math.round(r.bottom - inset);
       const bounds = {
-        x: Math.round(r.left + inset), y: Math.round(r.top + inset),
-        width: Math.round(Math.max(r.width - rightPane - inset * 2, 1)),
-        height: Math.round(Math.max(r.height - inset * 2, 1)),
+        x: left, y: top,
+        width: Math.max(right - left, 1),
+        height: Math.max(bottom - top, 1),
         radius: WEB_RADIUS,
         // Content-area size the rect was measured against — Rust uses this to
         // compute the native titlebar inset at runtime (THE fix).
