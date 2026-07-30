@@ -5,6 +5,10 @@ description = "The AI agent you actually own"
 authors = ["Mason Tompkins"]
 edition = "2021"
 rust-version = "1.77"
+# Two binaries exist now (aygent + the CEF helper aygent_helper). Tauri needs to
+# know which is THE app binary or `cargo tauri build` fails with 'failed to find
+# main binary'. The helper is a subprocess, never the app entry point.
+default-run = "aygent"
 
 [lib]
 name = "aygent_lib"
