@@ -1372,17 +1372,26 @@ async fn agent_run(
     db: tauri::State<'_, writer::Db>,
     folder: Option<String>,
     prompt: String,
+    // Per-call event channel the Browser panel listens on for the live CHECKLIST
+    // (browser:agent-plan / browser:agent-step / browser:agent-done). Optional so
+    // older callers still work; when absent we just skip the UI emits.
+    channel: Option<String>,
 ) -> Result<String, String> {
+    use tauri::Emitter;
     let key = keychain::get_key("anthropic")
         .map_err(|_| "no anthropic key set — add one first".to_string())?;
     let models = provider::anthropic_list_models(&key).await?;
-    // MODEL: use the agent's CONFIGURED model (per-folder Settings picker). Only
-    // if none is set do we auto-pick (prefer sonnet for real reasoning; browser
-    // hand-off needs it). This fixes the bug where agent_run ignored the config
-    // and always ran sonnet.
-    let configured = folder.as_deref().and_then(|f| {
-        agent_for_folder(&db, f).ok().and_then(|aid| repo::load_settings(&db, &aid).ok()).map(|s| s.model)
-    }).filter(|m| !m.trim().is_empty());
+    // MODEL: use the agent's CONFIGURED model (per-folder Settings picker). The
+    // Browser panel passes folder:null, so resolve the ACTIVE agent's folder
+    // Rust-side (agent_for_folder("") falls back to the active agent id) and read
+    // ITS configured model. Only if none is set do we auto-pick (prefer sonnet).
+    // This fixes the bug where the hand-off always ran a fallback model because
+    // folder:null skipped the config lookup entirely.
+    let resolved_agent = agent_for_folder(&db, folder.as_deref().unwrap_or("")).ok();
+    let configured = resolved_agent.as_ref()
+        .and_then(|aid| repo::load_settings(&db, aid).ok())
+        .map(|s| s.model)
+        .filter(|m| !m.trim().is_empty());
     let model = match configured {
         Some(m) => m,
         None => models
@@ -1393,7 +1402,16 @@ async fn agent_run(
             .or_else(|| models.first().cloned())
             .ok_or_else(|| "account returned no usable models".to_string())?,
     };
-    eprintln!("[aygent][browser][AGENT] model={model} (configured={:?})", folder);
+    eprintln!("[aygent][browser][AGENT] model={model} (folder={:?} agent={:?})", folder, resolved_agent);
+
+    // Helper: emit a checklist event to the FE if a channel was provided.
+    let emit_ev = |kind: &str, payload: serde_json::Value| {
+        if let Some(ch) = channel.as_deref() {
+            let mut p = payload;
+            if let Some(obj) = p.as_object_mut() { obj.insert("kind".into(), serde_json::json!(kind)); }
+            let _ = app.emit(ch, &p);
+        }
+    };
 
     // M0.2b: capability model. In Folder Mode (the M0.3 default) the granted
     // caps are {fs.read, fs.write, net.http, mcp.net}. The file tools below need
@@ -1426,8 +1444,13 @@ async fn agent_run(
             "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }
         },
         {
+            "name": "step_done",
+            "description": "Call this the INSTANT you finish one step of your plan. Pass the step's number (1-based). This checks the step off in the human's live checklist. Calling step_done for the FINAL step ENDS your turn. Advance the plan one step at a time — do not skip or repeat.",
+            "input_schema": { "type": "object", "properties": { "step": { "type": "integer", "description": "1-based number of the step you just completed" } }, "required": ["step"] }
+        },
+        {
             "name": "task_complete",
-            "description": "Call this the INSTANT the user's task is done. This ENDS your turn. You MUST call this when finished — do not keep acting. Provide a one-sentence summary of what you accomplished.",
+            "description": "Call this to STOP EARLY if the task is fully done before all plan steps are needed. Provide a one-sentence summary. Normally you finish by calling step_done on the last step instead.",
             "input_schema": { "type": "object", "properties": { "summary": { "type": "string", "description": "one-sentence summary of what you did" } }, "required": ["summary"] }
         }
     ]);
@@ -1447,33 +1470,72 @@ async fn agent_run(
         (e.g. the title of the first result). The human approves each click.\n\
         - After EACH tool call, the tool returns the current page title + URL. TRUST IT. If the URL \
         changed to the destination you intended, the action SUCCEEDED.\n\n\
-        WHEN TO STOP (CRITICAL — you MUST do this):\n\
-        - The MOMENT the task is satisfied, call the `task_complete` tool with a one-sentence \
-        summary. This ENDS your turn. It is the ONLY correct way to finish. Do not just write text \
-        — you must CALL task_complete.\n\
-        - 'Click the first result' is COMPLETE the instant the page navigates to that result's site. \
-        As soon as a tool result shows you are OFF the Google results page and ON the destination \
-        (e.g. url is claude.ai, not google.com), call task_complete immediately.\n\
-        - NEVER re-open Google or re-run a search after you've already clicked into a result. If you \
-        already searched and clicked, you are done — call task_complete.\n\
-        - If a tool result shows you are already on the target site, that IS success — call \
-        task_complete right away.\n\n\
-        Be concise. Prefer the FEWEST tool calls. Always finish by calling task_complete.";
+        HOW TO FINISH (CRITICAL — follow your PLAN):\n\
+        - You were given an ordered PLAN. Execute it ONE STEP AT A TIME, in order.\n\
+        - The INSTANT you finish a step, call `step_done` with that step's number. This checks it off \
+        in the human's live checklist. Do NOT move to the next step's actions until you've marked the \
+        current one done.\n\
+        - Reads are AUTHORITATIVE: after each tool call the result shows the current page title + URL. \
+        TRUST IT. If the URL is the destination you intended, that step SUCCEEDED — mark it done.\n\
+        - 'Click the first result' is DONE the instant the page navigates off the results page onto \
+        the destination. Mark it done. NEVER re-search or re-open Google after a step is done.\n\
+        - Calling step_done on the LAST step ENDS your turn. That is how you finish. You do not need \
+        task_complete unless you're stopping early.\n\n\
+        Be concise. Prefer the FEWEST tool calls. Advance the checklist; don't loop.";
 
-    let mut messages = serde_json::json!([{ "role": "user", "content": prompt }]);
+    // =====================================================================
+    // PLAN-FIRST (Problem 2 — the visible checklist Mason has asked for 4×).
+    // Before ANY action, make ONE model call that decomposes the task into an
+    // ordered list of concrete, checkable steps. We render it live in the Agent
+    // panel and check each off as it completes. The checklist STRUCTURALLY
+    // prevents the old re-search loop: if the plan is ["type query + submit",
+    // "click first result"] and step 2 is checked, there is no "search again"
+    // step to fall into — when every step is checked the turn ENDS.
+    // =====================================================================
+    let plan_system = "You are a browsing task planner. Decompose the user's task into the SHORTEST \
+        ordered list of concrete browser steps needed to finish it. Each step is one short imperative \
+        phrase (e.g. \"type 'claude' in the search box and submit\", \"click the first result\", \"read \
+        the page\"). Do NOT include steps for opening the browser (it's already open) or for reporting \
+        back. Prefer 1-4 steps. Reply with ONLY a JSON array of strings, nothing else.";
+    let plan_msgs = serde_json::json!([{ "role": "user", "content": prompt }]);
+    let no_tools = serde_json::json!([]);
+    let mut steps: Vec<String> = Vec::new();
+    if let Ok(resp) = provider::anthropic_turn(&key, &model, plan_system, &plan_msgs, &no_tools).await {
+        let text = resp.get("content").and_then(|c| c.as_array())
+            .map(|arr| arr.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join(""))
+            .unwrap_or_default();
+        steps = parse_plan_steps(&text);
+    }
+    if steps.is_empty() {
+        // Fallback plan so the checklist always renders + the loop still ends.
+        steps = vec!["Do the task on the current page".to_string(), "Confirm it's done".to_string()];
+    }
+    eprintln!("[aygent][browser][PLAN] {} steps: {:?}", steps.len(), steps);
+    emit_ev("plan", serde_json::json!({ "steps": steps }));
+
+    // Tell the model its own plan + that it must advance it explicitly.
+    let plan_note = {
+        let listed = steps.iter().enumerate()
+            .map(|(i, s)| format!("{}. {}", i + 1, s)).collect::<Vec<_>>().join("\n");
+        format!("Your plan (execute in order, one at a time):\n{listed}\n\nAfter you FINISH each step, \
+            call `step_done` with its number. When the LAST step is done, calling step_done for it \
+            ends the turn — you do NOT also need task_complete (but you may call task_complete to stop early).")
+    };
+
+    let mut messages = serde_json::json!([{ "role": "user", "content": format!("{prompt}\n\n{plan_note}") }]);
     let mut transcript = String::new();
     transcript.push_str(&format!("[{model}]\n"));
 
-    // HARD COMPLETION GUARD (don't trust the model to self-terminate): once the
-    // agent has left Google (clicked into a destination), re-opening Google or
-    // re-searching is almost always a loop, not intent. Track whether we've
-    // navigated off Google; if so, refuse a Google re-open/search and tell the
-    // model it's done. Also count browser actions to end runaway loops.
-    let mut left_google = false;
+    // Checklist progress. `next_step` is the 0-based index of the next unchecked
+    // step; when it reaches steps.len() every step is checked => DONE.
+    let mut next_step: usize = 0;
     let mut browser_actions = 0u32;
+    // Iteration cap scales with plan size (each step may need a couple tool
+    // calls) but stays bounded so a misbehaving model can't spin forever.
+    let max_iters = (steps.len() * 4).clamp(8, 24);
 
     // Agent loop: cap iterations so a misbehaving model can't spin forever.
-    for _ in 0..8 {
+    for _ in 0..max_iters {
         let resp = provider::anthropic_turn(&key, &model, system, &messages, &tools).await?;
         let content = resp.get("content").and_then(|c| c.as_array()).cloned().unwrap_or_default();
         let stop = resp.get("stop_reason").and_then(|s| s.as_str()).unwrap_or("");
@@ -1499,13 +1561,47 @@ async fn agent_run(
                     let input = blk.get("input").cloned().unwrap_or(serde_json::json!({}));
                     let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
 
-                    // TASK_COMPLETE: the model signals it's done. End the turn
-                    // DETERMINISTICALLY (no heuristic guessing about "did it
-                    // leave Google"). This is the clear STOP event.
+                    // STEP_DONE: the model checked a plan step off. Emit the
+                    // checkmark to the FE. When the LAST step is checked, END the
+                    // turn DETERMINISTICALLY — the checklist is what structurally
+                    // stops the old re-search loop (no unchecked step left => no
+                    // "search again" to fall into).
+                    if name == "step_done" {
+                        // Accept the number the model gave, but advance monotonically
+                        // so a repeated/skipped number can't stall or overshoot.
+                        let claimed = input.get("step").and_then(|s| s.as_i64()).unwrap_or(0);
+                        let idx = if claimed >= 1 { (claimed as usize).saturating_sub(1).max(next_step) } else { next_step };
+                        let idx = idx.min(steps.len().saturating_sub(1));
+                        next_step = idx + 1;
+                        eprintln!("[aygent][browser][STEP] {}/{} done: {}", next_step, steps.len(),
+                            steps.get(idx).map(|s| s.as_str()).unwrap_or(""));
+                        emit_ev("step", serde_json::json!({ "index": idx, "done": next_step, "total": steps.len() }));
+                        transcript.push_str(&format!("  ✓ step {}/{}: {}\n", next_step, steps.len(),
+                            steps.get(idx).map(|s| s.as_str()).unwrap_or("")));
+                        if next_step >= steps.len() {
+                            // ALL steps checked => turn COMPLETE, deterministically.
+                            eprintln!("[aygent][browser][DONE] all {} steps complete", steps.len());
+                            emit_ev("done", serde_json::json!({ "total": steps.len() }));
+                            transcript.push_str("\n✓ all steps complete\n");
+                            return Ok(transcript);
+                        }
+                        // Not the last step — ack it and let the model continue.
+                        tool_results.push(serde_json::json!({
+                            "type": "tool_result", "tool_use_id": id,
+                            "content": format!("step {} checked off. Now do step {} of {}: {}",
+                                next_step, next_step + 1, steps.len(),
+                                steps.get(next_step).map(|s| s.as_str()).unwrap_or("")),
+                            "is_error": false
+                        }));
+                        continue;
+                    }
+                    // TASK_COMPLETE: the model signals it's done EARLY. End the
+                    // turn DETERMINISTICALLY. This is the explicit STOP event.
                     if name == "task_complete" {
                         let summary = input.get("summary").and_then(|s| s.as_str()).unwrap_or("done");
                         transcript.push_str(&format!("\n✓ {summary}\n"));
-                        eprintln!("[aygent][browser][AGENT] task_complete: {summary}");
+                        eprintln!("[aygent][browser][DONE] task_complete: {summary}");
+                        emit_ev("done", serde_json::json!({ "total": steps.len(), "summary": summary }));
                         return Ok(transcript);
                     }
                     // EXECUTE THROUGH THE BROKER (jailed) — or the browser tools
@@ -1513,15 +1609,14 @@ async fn agent_run(
                     let (result_text, is_err) = if browser::is_agent_tool(name) {
                         browser_actions += 1;
                         // Hard backstop only: too many actions = force a stop.
-                        // Real termination is the model calling task_complete.
-                        if browser_actions > 12 {
-                            ("You've taken many actions without finishing. Call task_complete now with a summary of what you accomplished.".to_string(), true)
+                        // Real termination is checking off the last plan step.
+                        if browser_actions > (steps.len() as u32 * 4).clamp(8, 20) {
+                            ("You've taken many actions without finishing your plan. Call step_done for the remaining steps, or task_complete with a summary.".to_string(), true)
                         } else {
                             // No configured allowlist — the human-in-the-loop
                             // permission flow governs new hosts; current tab host
                             // is pre-allowed. Pass empty.
                             let domains: Vec<String> = Vec::new();
-                            let _ = left_google; // (retired heuristic)
                             browser::agent_tool(&app, &browser_state, name, &input, &domains).await
                         }
                     } else { match name {
@@ -1590,7 +1685,41 @@ async fn agent_run(
         break; // final answer reached
     }
 
+    // Loop ended without an explicit step_done/task_complete (model gave a final
+    // answer, or the iteration cap hit). Emit a terminal `done` so the FE stops
+    // the "working" spinner + marks the checklist finished deterministically.
+    eprintln!("[aygent][browser][DONE] loop ended (steps {}/{})", next_step, steps.len());
+    emit_ev("done", serde_json::json!({ "total": steps.len(), "partial": next_step < steps.len() }));
     Ok(transcript)
+}
+
+/// Parse the planner model's reply into an ordered list of step strings. The
+/// planner is told to return ONLY a JSON array of strings, but models sometimes
+/// wrap it in prose or a ```json fence — so we extract the first [...] slice and
+/// parse that, falling back to line-splitting if JSON parse fails. Steps are
+/// trimmed, de-numbered, and capped so a runaway plan can't blow the loop.
+fn parse_plan_steps(text: &str) -> Vec<String> {
+    let clean = |s: &str| -> String {
+        // Strip a leading list marker like "1. ", "- ", "* ".
+        let t = s.trim().trim_matches('"').trim();
+        let t = t.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')' || c == '-' || c == '*' || c == ' ');
+        t.trim().to_string()
+    };
+    // Prefer the JSON array slice.
+    if let (Some(a), Some(b)) = (text.find('['), text.rfind(']')) {
+        if b > a {
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(&text[a..=b]) {
+                let v: Vec<String> = arr.into_iter().map(|s| clean(&s)).filter(|s| !s.is_empty()).collect();
+                if !v.is_empty() { return v.into_iter().take(8).collect(); }
+            }
+        }
+    }
+    // Fallback: split lines that look like steps.
+    let v: Vec<String> = text.lines()
+        .map(clean)
+        .filter(|s| !s.is_empty() && s.len() > 2)
+        .collect();
+    v.into_iter().take(8).collect()
 }
 
 // --- STREAMING agent loop (Phase 1) ----------------------------------------

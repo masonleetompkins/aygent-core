@@ -45,6 +45,12 @@ export function Browser() {
   const [agentPrompt, setAgentPrompt] = useState("");
   const [agentBusy, setAgentBusy] = useState(false);
   const [agentLog, setAgentLog] = useState<string[]>([]);
+  // LIVE CHECKLIST (Problem 2). The agent plans the task into ordered steps up
+  // front; we render them here and check each off as `browser:agent-*` events
+  // arrive. `checklist` = the step labels; `stepsDone` = how many are checked.
+  const [checklist, setChecklist] = useState<string[]>([]);
+  const [stepsDone, setStepsDone] = useState<number>(0);
+  const [planDone, setPlanDone] = useState<boolean>(false);
   // SHARED-CONTROL state, mirrored from Rust `browser:control` events. When the
   // agent hits a wall (login/CAPTCHA/verification) it releases the wheel with a
   // non-empty `note` — that's the BLOCKED signal that pulses the You/Agent
@@ -331,18 +337,48 @@ export function Browser() {
     setAgentBusy(true);
     setAgentLog((l) => [...l, `▸ ${task}`]);
     setAgentPrompt("");
+    // Reset the checklist for this run.
+    setChecklist([]);
+    setStepsDone(0);
+    setPlanDone(false);
+
+    // Per-run event channel: the agent emits its PLAN + STEP checkmarks + DONE
+    // here (Problem 2). We render them live in the panel. Unlisten when the run
+    // resolves so channels don't stack across runs.
+    const channel = `agent-run-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+    let un: undefined | (() => void);
     try {
-      // REAL model-in-the-loop agent. It uses the browser tools
-      // (browser_open/read/click_text/type_text) which now act on the VISIBLE
-      // active tab. The agent asks permission for new hosts (Allow/Deny/Take)
-      // and hands off on login/CAPTCHA walls (pulse). Prime it toward the page.
+      un = await listen<any>(channel, (ev) => {
+        const p = ev.payload || {};
+        if (p.kind === "plan" && Array.isArray(p.steps)) {
+          setChecklist(p.steps as string[]);
+          setStepsDone(0);
+          setPlanDone(false);
+        } else if (p.kind === "step") {
+          // `done` = how many steps are now checked (1-based count).
+          if (typeof p.done === "number") setStepsDone(p.done);
+        } else if (p.kind === "done") {
+          if (typeof p.total === "number") setStepsDone(p.total);
+          setPlanDone(true);
+        }
+      });
+    } catch { /* channel listen best-effort */ }
+
+    try {
+      // REAL model-in-the-loop agent. It PLANS the task into a checklist, then
+      // drives the browser via CDP (single source of truth — acts + reads the
+      // SAME page, no desync). It asks permission for new hosts (Allow/Deny/
+      // Take) and hands off on login/CAPTCHA walls (pulse). Prime it toward the
+      // page. folder:null => Rust resolves the ACTIVE agent + its configured model.
       const cur = tabs.find((t) => t.id === activeId);
       const primed = `You are driving the in-app browser in the tab the human is watching (currently: ${cur?.addr || cur?.title || "a page"}). Use the browser tools to act in THAT page. Task: ${task}`;
-      const res = await invoke<string>("agent_run", { prompt: primed, folder: null });
+      const res = await invoke<string>("agent_run", { prompt: primed, folder: null, channel });
       setAgentLog((l) => [...l, res]);
+      setPlanDone(true);
     } catch (e) {
       setAgentLog((l) => [...l, `✗ ${e}`]);
     } finally {
+      un?.();
       setAgentBusy(false);
     }
   }
@@ -503,6 +539,45 @@ export function Browser() {
                   <button onClick={() => answerPerm("take")}
                     style={{ flex: 1.2, fontSize: 12, fontWeight: 700, padding: "6px 0", borderRadius: "var(--radius-control)", border: "var(--border-width) solid var(--accent)", background: "var(--surface)", color: "var(--accent)", cursor: "pointer" }}>Take Control</button>
                 </div>
+              </div>
+            )}
+
+            {/* LIVE CHECKLIST (Problem 2) — the agent's plan, rendered up front
+                with checkmarks that fill in as each step completes. When every
+                step is checked the turn ends deterministically (no re-search
+                loop, because there's no unchecked "search again" step). */}
+            {checklist.length > 0 && (
+              <div style={{
+                border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)",
+                padding: 10, background: "var(--bg)", display: "flex", flexDirection: "column", gap: 6,
+              }}>
+                <div style={{ fontSize: 11.5, fontWeight: 700, color: "var(--text-muted)", display: "flex", alignItems: "center", gap: 6 }}>
+                  <span>Plan</span>
+                  <span style={{ marginLeft: "auto", fontWeight: 600, color: "var(--text-faint)" }}>
+                    {Math.min(stepsDone, checklist.length)}/{checklist.length}
+                  </span>
+                </div>
+                {checklist.map((s, i) => {
+                  const done = i < stepsDone;
+                  const active = i === stepsDone && !planDone && agentBusy;
+                  return (
+                    <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 12.5, lineHeight: 1.35 }}>
+                      <span style={{
+                        flexShrink: 0, width: 16, height: 16, borderRadius: 4, marginTop: 1,
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        fontSize: 11, fontWeight: 800,
+                        border: `1.5px solid ${done ? "var(--accent)" : active ? "var(--accent)" : "var(--line)"}`,
+                        background: done ? "var(--accent)" : "transparent",
+                        color: done ? "#fff" : "var(--accent)",
+                      }}>{done ? "✓" : active ? "•" : ""}</span>
+                      <span style={{
+                        color: done ? "var(--text-muted)" : "var(--text)",
+                        textDecoration: done ? "line-through" : "none",
+                        opacity: done ? 0.75 : 1,
+                      }}>{s}</span>
+                    </div>
+                  );
+                })}
               </div>
             )}
 
