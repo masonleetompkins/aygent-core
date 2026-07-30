@@ -950,6 +950,9 @@ pub async fn webview_open(
     // — there was no offset to correct.)
     client_width: Option<f64>,
     client_height: Option<f64>,
+    // Corner radius (CSS px) to round the WKWebView's own CALayer, so the OS
+    // clips the page to a rounded rect matching the UI frame.
+    radius: Option<f64>,
 ) -> Result<(), String> {
     use tauri::{Manager, WebviewUrl};
     let target = normalize_url(&url);
@@ -964,7 +967,7 @@ pub async fn webview_open(
     // get_webview_window(), which returns None for embedded children).
     if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
         #[cfg(target_os = "macos")]
-        place_child_exact(&wv, x, y, width, height, client_height);
+        place_child_exact(&wv, x, y, width, height, client_height, radius);
         #[cfg(not(target_os = "macos"))]
         {
             let _ = wv.set_position(pos);
@@ -987,7 +990,7 @@ pub async fn webview_open(
     // Immediately pin the freshly-created child to the exact measured rect via
     // AppKit — add_child's own placement is what we stopped trusting.
     #[cfg(target_os = "macos")]
-    place_child_exact(&wv, x, y, width, height, client_height);
+    place_child_exact(&wv, x, y, width, height, client_height, radius);
     #[cfg(not(target_os = "macos"))]
     let _ = wv;
     Ok(())
@@ -1002,9 +1005,10 @@ pub async fn webview_open(
 /// bottom-left coords ourselves, and we place the view. All values live,
 /// nothing hardcoded.
 #[cfg(target_os = "macos")]
-fn place_child_exact(wv: &tauri::Webview, x: f64, y: f64, w: f64, h: f64, content_h: Option<f64>) {
+fn place_child_exact(wv: &tauri::Webview, x: f64, y: f64, w: f64, h: f64, content_h: Option<f64>, radius: Option<f64>) {
     let w = w.max(1.0);
     let h = h.max(1.0);
+    let radius = radius.unwrap_or(0.0).max(0.0);
     let _ = wv.with_webview(move |pw| unsafe {
         use objc2::rc::Retained;
         use objc2::Message;
@@ -1065,6 +1069,24 @@ fn place_child_exact(wv: &tauri::Webview, x: f64, y: f64, w: f64, h: f64, conten
         // the container only.
         target.setFrame(NSRect::new(NSPoint::new(x, oy), NSSize::new(w, h)));
         let _ = NSAutoresizingMaskOptions::empty();
+
+        // PREMIUM ROUNDED CORNERS — the proper native way: round the WKWebView's
+        // OWN backing CALayer so the OS clips the web content itself to a
+        // rounded rect. No DOM inset, sizes match the pane EXACTLY; the DOM
+        // frame overlay then overlaps only the corner pixels for the accent
+        // border. We round the actual web-content view (`raw`) AND the outer
+        // container so nothing square peeks past the arc. wantsLayer=true
+        // guarantees a layer is backing the view (WKWebView is layer-backed,
+        // but set it defensively on any wrapper too).
+        if radius > 0.0 {
+            for v in [view as &NSView, &*target] {
+                v.setWantsLayer(true);
+                if let Some(layer) = v.layer() {
+                    layer.setCornerRadius(radius);
+                    layer.setMasksToBounds(true);
+                }
+            }
+        }
     });
 }
 
@@ -1089,7 +1111,7 @@ pub fn webview_set_bounds(
         let _ = client_width;
         let content_h = client_height.or(parent_height);
         #[cfg(target_os = "macos")]
-        place_child_exact(&wv, x, y, width, height, content_h);
+        place_child_exact(&wv, x, y, width, height, content_h, radius);
         #[cfg(not(target_os = "macos"))]
         {
             let _ = content_h;

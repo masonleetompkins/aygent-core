@@ -22,13 +22,12 @@ let TAB_SEQ = 1;
 // Width (CSS px) of the right-hand agent pane when handed off. syncBounds
 // shrinks the native webview by this + a gap so the pane sits BESIDE the page.
 const AGENT_PANE_W = 340;
-// The native WKWebView paints ABOVE the DOM, so a DOM overlay can't mask its
-// square corners. Instead we INSET the webview so its square corners fall
-// INSIDE the rounded frame's radius (--radius-card=14) — the frame draws at the
-// pane edge, the webview sits tucked within it, corners hidden behind the arcs.
-// This gives the premium "fit inside the rounded box" look for real.
+// --radius-card. The native WKWebView's OWN CALayer is rounded to this in Rust
+// (cornerRadius + masksToBounds) so the OS clips the page to a rounded rect —
+// sizes match the pane EXACTLY (no inset), and the DOM frame overlaps only the
+// corner pixels for the accent border. Sent to Rust so the radius is single-
+// sourced from the theme.
 const FRAME_RADIUS = 14;
-const WEB_INSET = FRAME_RADIUS; // px each side
 const newTab = (): Tab => ({ id: TAB_SEQ++, addr: "", title: "New Tab", editing: true });
 
 export function Browser() {
@@ -83,11 +82,11 @@ export function Browser() {
       // outline is a pointer-events:none overlay rendered ON TOP of the webview,
       // so its ~radius corner arcs mask the webview's square corners while the
       // webview fills the whole box.
-      const inset = WEB_INSET;
       const bounds = {
-        x: Math.round(r.left + inset), y: Math.round(r.top + inset),
-        width: Math.round(Math.max(r.width - rightPane - inset * 2, 1)),
-        height: Math.round(Math.max(r.height - inset * 2, 1)),
+        x: Math.round(r.left), y: Math.round(r.top),
+        width: Math.round(Math.max(r.width - rightPane, 1)),
+        height: Math.round(r.height),
+        radius: FRAME_RADIUS,
         // Content-area size the rect was measured against — Rust uses this to
         // compute the native titlebar inset at runtime (THE fix).
         clientWidth, clientHeight,
@@ -143,9 +142,8 @@ export function Browser() {
     // window (the pop-out) and no later set_bounds fully recovers it. If the
     // pane isn't laid out yet, fall back to a safe inset and let syncBounds
     // correct it on the next frame.
-    const inset = WEB_INSET;
-    let ox = Math.round((r?.left ?? 0) + inset), oy = Math.round((r?.top ?? 0) + inset);
-    let ow = Math.round(Math.max((r?.width ?? 800) - inset * 2, 1)), oh = Math.round(Math.max((r?.height ?? 600) - inset * 2, 1));
+    let ox = Math.round(r?.left ?? 0), oy = Math.round(r?.top ?? 0);
+    let ow = Math.round(r?.width ?? 800), oh = Math.round(r?.height ?? 600);
     if (ow < 40 || oh < 40 || (ox <= 4 && oy <= 4)) {
       // Not laid out: use a conservative inset (right of sidebar, below tabs).
       ox = 300; oy = 100; ow = 600; oh = 500;
@@ -154,7 +152,7 @@ export function Browser() {
     console.log("[browser] webview_open →", { x: ox, y: oy, width: ow, height: oh }, "raw:", { l: r?.left, t: r?.top, w: r?.width, h: r?.height });
     const clientWidth = Math.round(document.documentElement.clientWidth);
     const clientHeight = Math.round(document.documentElement.clientHeight);
-    await invoke("webview_open", { url, x: ox, y: oy, width: ow, height: oh, clientWidth, clientHeight })
+    await invoke("webview_open", { url, x: ox, y: oy, width: ow, height: oh, clientWidth, clientHeight, radius: FRAME_RADIUS })
       .catch((e) => setAgentLog((l) => [...l, `open failed: ${e}`]));
     // Re-sync a beat later so the webview lands on the SETTLED rect (the agent
     // prompt bar toggling can shift the pane by a row).
