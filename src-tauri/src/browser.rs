@@ -1030,11 +1030,23 @@ fn place_child_exact(wv: &tauri::Webview, x: f64, y: f64, w: f64, h: f64) {
             target = sup;
         }
 
-        // contentView spans EXACTLY the area below the titlebar — the same
-        // coordinate space getBoundingClientRect measures in, except AppKit's
-        // origin is bottom-left (unless flipped). Convert explicitly.
-        let cb = content.bounds();
-        let oy = if content.isFlipped() { y } else { cb.size.height - y - h };
+        // The frame we set lives in the coordinate space of target.superview
+        // (the direct parent), NOT contentView per se. Flip against the PARENT's
+        // flip state + the PARENT's height. If the parent is flipped, top-left
+        // y is used directly; otherwise convert to bottom-left.
+        let parent = target.superview();
+        let (parent_flipped, parent_h) = match &parent {
+            Some(p) => (p.isFlipped(), p.bounds().size.height),
+            None => (content.isFlipped(), content.bounds().size.height),
+        };
+        let oy = if parent_flipped { y } else { parent_h - y - h };
+
+        eprintln!(
+            "[aygent][browser][NSVIEW] in=({x:.0},{y:.0} {w:.0}x{h:.0}) \
+             content_flipped={} parent_flipped={parent_flipped} parent_h={parent_h:.0} \
+             => frame=({x:.0},{oy:.0} {w:.0}x{h:.0})",
+            content.isFlipped(),
+        );
 
         // Pin it: no autoresizing drift between our explicit placements
         // (ResizeObserver re-fires set_bounds on every layout change).
