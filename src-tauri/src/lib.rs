@@ -1511,7 +1511,7 @@ async fn agent_run(
         steps = vec!["Do the task on the current page".to_string(), "Confirm it's done".to_string()];
     }
     eprintln!("[aygent][browser][PLAN] {} steps: {:?}", steps.len(), steps);
-    emit_ev("plan", serde_json::json!({ "steps": steps }));
+    emit_ev("plan", serde_json::json!({ "steps": steps.clone() }));
 
     // Tell the model its own plan + that it must advance it explicitly.
     let plan_note = {
