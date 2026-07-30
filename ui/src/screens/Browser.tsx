@@ -44,6 +44,11 @@ export function Browser() {
   const [agentPrompt, setAgentPrompt] = useState("");
   const [agentBusy, setAgentBusy] = useState(false);
   const [agentLog, setAgentLog] = useState<string[]>([]);
+  // ON-SCREEN DEBUG LOG (devtools is disabled in this build, so we surface the
+  // ground-truth events right in the pane). Newest last; capped.
+  const [dbg, setDbg] = useState<string[]>([]);
+  const dlog = (m: string) =>
+    setDbg((d) => [...d.slice(-7), `${new Date().toLocaleTimeString()} ${m}`]);
   const editRef = useRef<HTMLInputElement>(null);
   // The div whose rect the native webview is positioned over.
   const paneRef = useRef<HTMLDivElement>(null);
@@ -160,7 +165,8 @@ export function Browser() {
     const url = (rawUrl ?? tab?.addr ?? "").trim();
     // eslint-disable-next-line no-console
     console.log("[browser] go() fired", { id, rawUrl, tabAddr: tab?.addr, resolvedUrl: url });
-    if (!url) { patch(id, { editing: false }); return; }
+    dlog(`go() id=${id} raw="${rawUrl ?? ""}" addr="${tab?.addr ?? ""}" -> "${url}"`);
+    if (!url) { dlog("go() BAILED: empty url"); patch(id, { editing: false }); return; }
     // Make sure the stored addr reflects what we're navigating to.
     patch(id, { addr: url });
     patch(id, { editing: false, title: prettyTitle(url) });
@@ -314,7 +320,7 @@ export function Browser() {
                   onKeyDown={(e) => {
                     // eslint-disable-next-line no-console
                     console.log("[browser] keydown", e.key, "value=", e.currentTarget.value);
-                    if (e.key === "Enter") { e.preventDefault(); go(t.id, e.currentTarget.value); }
+                    if (e.key === "Enter") { dlog(`keydown ENTER value="${e.currentTarget.value}"`); e.preventDefault(); go(t.id, e.currentTarget.value); }
                     if (e.key === "Escape") patch(t.id, { editing: false });
                   }}
                   // Commit on blur too (clicking away / focus loss), so Enter
@@ -364,6 +370,19 @@ export function Browser() {
           <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", fontSize: 14, pointerEvents: "none" }}>
             Click the tab to type a URL, or search.
           </div>
+          {/* ON-SCREEN DEBUG STRIP — devtools is disabled in this build, so we
+              show the last few ground-truth events right here. Pointer-events
+              off so it never blocks the page. Remove once fixed. */}
+          {dbg.length > 0 && (
+            <div style={{
+              position: "absolute", left: 8, top: 8, right: 8, zIndex: 50,
+              pointerEvents: "none", fontFamily: "monospace", fontSize: 11,
+              color: "#0f0", background: "rgba(0,0,0,0.82)", padding: "6px 8px",
+              borderRadius: 6, whiteSpace: "pre-wrap", lineHeight: 1.5,
+            }}>
+              {dbg.map((l, i) => <div key={i}>{l}</div>)}
+            </div>
+          )}
           {/* ROUNDED FRAME OVERLAY — sits ON TOP of the native webview. Just an
               outline + rounded corners; transparent fill, no pointer capture,
               so clicks pass through to the page. Accent-highlighted in agent
