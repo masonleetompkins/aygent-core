@@ -1233,7 +1233,36 @@ pub async fn webview_open(
         .or_else(|| app.webviews().into_values().next().map(|wv| wv.window()))
         .ok_or_else(|| { eprintln!("[aygent][browser] NO PARENT WINDOW found via any path"); "no main window".to_string() })?;
     eprintln!("[aygent][browser] parent window resolved label={}", parent_window.label());
-    let builder = tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed));
+
+    // ============================================================
+    // PERSISTENT HISTORY — THE ROOT FIX (Atlas).
+    //
+    // The OLD capture points (mirror_visible_to_cdp / webview_page_info /
+    // webview_navigate) only fired for AGENT navigation or the FE's explicit
+    // address-bar `go()` -> page-info poll. HUMAN browsing — typing a URL, and
+    // especially clicking an in-page LINK or hitting a REDIRECT — navigates the
+    // WKWebView entirely INSIDE WebKit with ZERO Rust involvement, so
+    // history::record was never called and the History panel stayed EMPTY.
+    //
+    // THE ROBUST SOURCE: WebviewBuilder::on_navigation. Tauri (wry) invokes this
+    // closure for EVERY navigation of THIS child webview — human typed URL,
+    // in-page link click, JS/HTTP redirect, back/forward, AND agent-driven
+    // wv.navigate() from the mirror. It is the single choke point that observes
+    // ALL navigations regardless of who triggered them. We return `true` to
+    // ALLOW every navigation (this is purely an observer; we never cancel).
+    //
+    // Title is unknown at navigation-start, so we record an empty title here;
+    // the existing webview_page_info poll + mirror backfill upgrade the title
+    // in place via history::record's title-upgrade path once the page settles.
+    // ============================================================
+    let nav_app = app.clone();
+    let builder = tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed))
+        .on_navigation(move |url| {
+            let u = url.as_str();
+            eprintln!("[aygent][browser][HIST] on_navigation fired url={u}");
+            crate::history::record(&nav_app, u, "");
+            true // observer only — never cancel a navigation
+        });
     let wv = parent_window
         .add_child(builder, pos, size)
         .map_err(|e| { eprintln!("[aygent][browser] add_child FAILED: {e}"); format!("embed webview: {e}") })?;

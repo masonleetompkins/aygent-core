@@ -72,10 +72,16 @@ fn load_from_disk(app: &tauri::AppHandle) -> Vec<HistEntry> {
         Ok(p) => p,
         Err(_) => return Vec::new(),
     };
-    std::fs::read_to_string(&path)
+    let loaded: Vec<HistEntry> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|t| serde_json::from_str::<Vec<HistEntry>>(&t).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    eprintln!(
+        "[aygent][browser][HIST] load-from-disk path={} count={}",
+        path.display(),
+        loaded.len()
+    );
+    loaded
 }
 
 /// Persist the current Vec to disk (whole-file write; it's small and capped).
@@ -113,6 +119,7 @@ fn with_history<T>(app: &tauri::AppHandle, f: impl FnOnce(&mut Vec<HistEntry>) -
 pub fn record(app: &tauri::AppHandle, url: &str, title: &str) {
     let url = url.trim();
     if url.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
+        eprintln!("[aygent][browser][HIST] record SKIP (non-http url) url={url:?}");
         return;
     }
     let title = title.trim().to_string();
@@ -129,6 +136,8 @@ pub fn record(app: &tauri::AppHandle, url: &str, title: &str) {
                     let snapshot = entries.clone();
                     eprintln!("[aygent][browser][HIST] title update url={url} title={title:?}");
                     save_to_disk(app, &snapshot);
+                } else {
+                    eprintln!("[aygent][browser][HIST] record DEDUP (same-url, no title change) url={url}");
                 }
                 return;
             }
@@ -153,6 +162,7 @@ pub fn list(app: &tauri::AppHandle) -> Vec<HistEntry> {
     with_history(app, |entries| {
         let mut out = entries.clone();
         out.reverse(); // stored oldest-first -> return newest-first
+        eprintln!("[aygent][browser][HIST] browser_history_list -> returning {} entries", out.len());
         out
     })
 }

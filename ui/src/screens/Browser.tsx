@@ -97,6 +97,7 @@ export function Browser() {
   const refreshHistory = async () => {
     try {
       const list = await invoke<HistEntry[]>("browser_history_list");
+      console.log("[aygent][browser][HIST] browser_history_list ->", Array.isArray(list) ? list.length : 0, "entries");
       setHistory(Array.isArray(list) ? list : []);
     } catch (e) { console.error("browser_history_list", e); setHistory([]); }
   };
