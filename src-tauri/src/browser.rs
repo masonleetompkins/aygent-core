@@ -943,9 +943,11 @@ pub async fn webview_open(
     y: f64,
     width: f64,
     height: f64,
-    // Content-area size (documentElement.clientWidth/Height) the frontend rect
-    // was measured against. Used to compute the native titlebar inset at
-    // runtime (see resolve_child_bounds). Optional so the invoke stays tolerant.
+    // Content-area size the frontend measured against. Kept in the invoke
+    // signature for compatibility but no longer used: the pane rect is already
+    // in the SAME content-coordinate space add_child uses, so we pass it through
+    // exactly. (Every titlebar/DPR/inset correction we tried broke it a new way
+    // — there was no offset to correct.)
     client_width: Option<f64>,
     client_height: Option<f64>,
 ) -> Result<(), String> {
@@ -953,14 +955,21 @@ pub async fn webview_open(
     let target = normalize_url(&url);
     let parsed = target.parse().map_err(|e| format!("bad url: {e}"))?;
 
-    let (pos, size) = resolve_child_bounds(&app, x, y, width, height, client_width, client_height);
+    let _ = (client_width, client_height);
+    let pos = tauri::LogicalPosition::new(x, y);
+    let size = tauri::LogicalSize::new(width.max(1.0), height.max(1.0));
 
     // Existing EMBEDDED child webview? reposition + navigate. add_child creates
     // a `Webview` (embedded child), retrieved via get_webview() (not
     // get_webview_window(), which returns None for embedded children).
     if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
-        let _ = wv.set_position(pos);
-        let _ = wv.set_size(size);
+        #[cfg(target_os = "macos")]
+        place_child_exact(&wv, x, y, width, height);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = wv.set_position(pos);
+            let _ = wv.set_size(size);
+        }
         wv.navigate(parsed).map_err(|e| format!("navigate: {e}"))?;
         return Ok(());
     }
@@ -970,70 +979,73 @@ pub async fn webview_open(
     // the main WebviewWindow via .window().
     let main = app.get_webview_window("main").ok_or("no main window")?;
     let builder = tauri::webview::WebviewBuilder::new(WEBVIEW_LABEL, WebviewUrl::External(parsed));
-    main.as_ref()
+    let wv = main
+        .as_ref()
         .window()
         .add_child(builder, pos, size)
         .map_err(|e| format!("embed webview: {e}"))?;
+    // Immediately pin the freshly-created child to the exact measured rect via
+    // AppKit — add_child's own placement is what we stopped trusting.
+    #[cfg(target_os = "macos")]
+    place_child_exact(&wv, x, y, width, height);
+    #[cfg(not(target_os = "macos"))]
+    let _ = wv;
     Ok(())
 }
 
-/// THE FIX (Atlas): wry positions a child webview relative to the PARENT WINDOW
-/// top-left — which is ABOVE the native macOS titlebar — while the frontend's
-/// getBoundingClientRect measures from the web CONTENT area, BELOW the titlebar.
-/// That constant gap (the titlebar height, ~28pt) is why the child rode too high
-/// + slightly left. We measure that inset at RUNTIME (no hardcoded px): it's the
-/// difference between the window's logical inner size and the content client
-/// size the frontend reported. Add the inset to the pane origin; keep size as-is.
-///
-/// scale_factor() is unreliable here (reports 1.0 on a 2x display), so we derive
-/// the true backing scale from physical_inner_width / logical_content_width and
-/// convert manually. Everything stays in LOGICAL points (child frame math is in
-/// points; feeding physical shrank the child — the failed attempt B).
-fn resolve_child_bounds(
-    app: &tauri::AppHandle,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    client_width: Option<f64>,
-    client_height: Option<f64>,
-) -> (tauri::LogicalPosition<f64>, tauri::LogicalSize<f64>) {
-    use tauri::{LogicalPosition, LogicalSize, Manager};
-    let size = LogicalSize::new(width.max(1.0), height.max(1.0));
+/// GROUND-TRUTH PLACEMENT (macOS): set the child webview's NSView frame
+/// DIRECTLY against the window contentView's live bounds. We do NOT trust
+/// wry's child-positioning math — every attempt to pre-correct for it
+/// (titlebar inset, DPR, frame inset) broke a new way because we were
+/// guessing its reference frame. Here there is nothing to guess: AppKit
+/// tells us the content area, we convert top-left CSS coords to AppKit
+/// bottom-left coords ourselves, and we place the view. All values live,
+/// nothing hardcoded.
+#[cfg(target_os = "macos")]
+fn place_child_exact(wv: &tauri::Webview, x: f64, y: f64, w: f64, h: f64) {
+    let w = w.max(1.0);
+    let h = h.max(1.0);
+    let _ = wv.with_webview(move |pw| unsafe {
+        use objc2::rc::Retained;
+        use objc2::Message;
+        use objc2_app_kit::{NSAutoresizingMaskOptions, NSView};
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
 
-    // Need the content size the rect was measured against to derive the inset.
-    let (cw, ch) = match (client_width, client_height) {
-        (Some(cw), Some(ch)) if cw > 0.0 && ch > 0.0 => (cw, ch),
-        // No content size sent → can't compute inset; pass rect through as-is.
-        _ => return (LogicalPosition::new(x, y), size),
-    };
+        let raw: *mut NSView = pw.inner().cast();
+        if raw.is_null() {
+            return;
+        }
+        let view: &NSView = &*raw;
+        let Some(window) = view.window() else { return };
+        let Some(content) = window.contentView() else { return };
 
-    let Some(win) = app.get_webview_window("main") else {
-        return (LogicalPosition::new(x, y), size);
-    };
-    let phys = match win.inner_size() {
-        Ok(s) => s,
-        Err(_) => return (LogicalPosition::new(x, y), size),
-    };
+        // wry may wrap the WKWebView in a container view; the frame that
+        // matters is the ancestor sitting DIRECTLY inside contentView.
+        let mut target: Retained<NSView> = view.retain();
+        loop {
+            let Some(sup) = target.superview() else { break };
+            if Retained::as_ptr(&sup) == Retained::as_ptr(&content) {
+                break;
+            }
+            target = sup;
+        }
 
-    // True backing scale: physical inner width / logical content width. Robust
-    // even when scale_factor() lies. (content width == window logical width for
-    // a standard window.)
-    let scale = if phys.width > 0 {
-        (phys.width as f64 / cw).round().max(1.0)
-    } else {
-        win.scale_factor().unwrap_or(1.0).max(1.0)
-    };
+        // contentView spans EXACTLY the area below the titlebar — the same
+        // coordinate space getBoundingClientRect measures in, except AppKit's
+        // origin is bottom-left (unless flipped). Convert explicitly.
+        let cb = content.bounds();
+        let oy = if content.isFlipped() { y } else { cb.size.height - y - h };
 
-    let win_logical_w = phys.width as f64 / scale;
-    let win_logical_h = phys.height as f64 / scale;
+        // Pin it: no autoresizing drift between our explicit placements
+        // (ResizeObserver re-fires set_bounds on every layout change).
+        target.setAutoresizingMask(NSAutoresizingMaskOptions::empty());
+        target.setFrame(NSRect::new(NSPoint::new(x, oy), NSSize::new(w, h)));
 
-    // Runtime-measured insets: gap between window box and content box.
-    // top_inset == native titlebar height. left_inset ~0 for a standard window.
-    let top_inset = (win_logical_h - ch).max(0.0);
-    let left_inset = ((win_logical_w - cw) / 2.0).max(0.0);
-
-    (LogicalPosition::new(x + left_inset, y + top_inset), size)
+        // If there IS a wrapper, make the WKWebView fill it exactly.
+        if Retained::as_ptr(&target) != (raw as *const NSView) {
+            view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)));
+        }
+    });
 }
 
 /// Reposition/resize the embedded webview to track the pane (called on layout
@@ -1054,10 +1066,14 @@ pub fn webview_set_bounds(
 ) -> Result<(), String> {
     use tauri::Manager;
     if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
-        let ch = client_height.or(parent_height);
-        let (pos, size) = resolve_child_bounds(&app, x, y, width, height, client_width, ch);
-        let _ = wv.set_position(pos);
-        let _ = wv.set_size(size);
+        let _ = (client_width, client_height, parent_height);
+        #[cfg(target_os = "macos")]
+        place_child_exact(&wv, x, y, width, height);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = wv.set_position(tauri::LogicalPosition::new(x, y));
+            let _ = wv.set_size(tauri::LogicalSize::new(width.max(1.0), height.max(1.0)));
+        }
     }
     Ok(())
 }

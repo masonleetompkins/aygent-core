@@ -44,8 +44,12 @@ urlencoding = "2"                   # (unused placeholder removed if not needed)
 libc = "0.2"                        # atomic openat/O_NOFOLLOW fd layer (M0.2c)
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# scoped-bookmark + security-scoped resource access goes through objc2 bindings;
-# added when we wire bookmark persistence (deferred Phase-1 polish).
+# Direct AppKit access: the embedded browser webview is placed by setting its
+# NSView frame against the LIVE window contentView (ground truth), instead of
+# trusting wry's child-positioning math (titlebar/flip mismatches burned us).
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSResponder", "NSGraphics"] }
+objc2-foundation = { version = "0.3", features = ["NSGeometry"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
