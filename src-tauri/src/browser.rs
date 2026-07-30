@@ -114,35 +114,62 @@ pub fn browser_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// The directory downloads land in for the ACTIVE agent.
+/// The ROOT folder of the currently-active agent — the folder shown at boot as
+/// `agent folder restored: <path>`. This is the authoritative source: the PATH
+/// BROKER holds one scope per agent (registered from each agent's
+/// `folder_path`, see `register_all_agent_scopes`) PLUS a `"default"` scope
+/// that always points at the active agent's folder (set by `agents_set_active`
+/// / `restore_agent_folder`). We ask the broker for the active agent's root
+/// first, then fall back to `"default"`. Never hardcoded.
 ///
-/// WHY NOT under `<app_data>/browser/profiles/<agent>/downloads` anymore:
-/// on macOS WKWebView performs the actual file write in its OWN sandboxed
-/// networking XPC process, which must be granted a *sandbox extension* for the
-/// destination's parent dir. `~/Library/Application Support/<bundle-id>/...` is
-/// NOT a location that process is implicitly permitted to write, and issuing an
-/// extension for a just-created deep path in a bundle container fails with
-/// `sandbox_extension_issue_file failed for : 2 (No such file or directory)`
-/// (the empty path = WebKit couldn't canonicalize/resolve the destination).
-///
-/// `~/Downloads` IS a WebKit-download-friendly location (it's what wry itself
-/// defaults to via `dirs::download_dir()`), so we nest a per-agent subfolder
-/// under it: `~/Downloads/AYGENT/<agent>`. We `create_dir_all` it (so the dir
-/// EXISTS before WebKit tries to issue the extension) and canonicalize it (so
-/// WebKit gets a real, symlink-resolved absolute path — no empty/relative path).
-///
-/// Falls back to the OS Downloads dir, then the app_data browser dir, then the
-/// process CWD, so a destination is ALWAYS a real existing directory.
-pub fn agent_downloads_dir(app: &tauri::AppHandle) -> PathBuf {
+/// Returns `None` only when no folder has been picked yet (no scope registered).
+pub fn agent_folder_root(app: &tauri::AppHandle) -> Option<PathBuf> {
+    use tauri::Manager;
+    let broker = app.try_state::<std::sync::Arc<crate::broker::Broker>>()?;
     let agent = active_browser_agent(app);
-    let base = dirs::download_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
-        .or_else(|| browser_dir(app).ok())
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let dir = base.join("AYGENT").join(&agent);
+    broker
+        .root_for(&agent)
+        .or_else(|_| broker.root_for("default"))
+        .ok()
+}
+
+/// The directory downloads land in for the ACTIVE agent: a `downloads/` folder
+/// at the ROOT of the active agent's own folder
+/// (e.g. `/Users/masontompkins/Aygent/Copywriter/downloads`). Mason's explicit
+/// direction: the agent works in its own workspace, so it should have immediate
+/// access to what it downloads, and the human knows exactly where to look.
+///
+/// This is the FINAL destination. It is NOT necessarily where WebKit writes —
+/// see `download_event`: WKWebView's sandboxed networking XPC process needs a
+/// sandbox extension for the write dir, which deep/new paths can't reliably get
+/// (`sandbox_extension_issue_file failed for : 2`). So the download WRITE goes
+/// to the OS temp dir (always extension-granted) and OUR process moves the file
+/// here on `Finished`. The move is done by the MAIN app process (a normal user
+/// dir it can write freely), never by WebKit's networking sandbox — sidestepping
+/// the extension issue entirely. `browser_downloads_list` and the headless-CDP
+/// agent-download path (a separate Chromium process, not under WebKit's
+/// networking sandbox) both use this dir directly.
+///
+/// Falls back to `~/Downloads/AYGENT/<agent>` (the legacy location) ONLY if no
+/// agent folder is picked yet, then the app_data browser dir, then the process
+/// CWD, so a destination is ALWAYS a real existing directory.
+pub fn agent_downloads_dir(app: &tauri::AppHandle) -> PathBuf {
+    let dir = match agent_folder_root(app) {
+        Some(root) => root.join("downloads"),
+        None => {
+            // No agent folder picked yet — keep the old ~/Downloads/AYGENT/<agent>
+            // behaviour so downloads still land SOMEWHERE real.
+            let agent = active_browser_agent(app);
+            let base = dirs::download_dir()
+                .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+                .or_else(|| browser_dir(app).ok())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            base.join("AYGENT").join(&agent)
+        }
+    };
     let _ = std::fs::create_dir_all(&dir);
-    // Canonicalize so WebKit's networking process gets a fully-resolved path;
-    // if canonicalize fails (shouldn't, we just made it) keep the plain path.
+    // Canonicalize to a real, symlink-resolved absolute path; if canonicalize
+    // fails (shouldn't, we just made it) keep the plain path.
     std::fs::canonicalize(&dir).unwrap_or(dir)
 }
 
@@ -587,6 +614,17 @@ pub struct BrowserProc {
     /// `browser_permission_answer`. Keyed by request id. Also tracks the set of
     /// hosts the human has granted THIS session (so a granted host stays allowed).
     perm: Mutex<PermState>,
+    /// DOWNLOADS (sandbox-safe temp-then-move). WKWebView performs the file
+    /// WRITE in its own sandboxed networking XPC process, which needs a sandbox
+    /// extension for the destination's parent dir. Deep/new dirs (bundle
+    /// containers, ~/Downloads/AYGENT) trip `sandbox_extension_issue_file`. So
+    /// in `Requested` we point WebKit at the OS temp dir (which its networking
+    /// process ALWAYS holds an extension for) and remember, keyed by download
+    /// URL, both the temp path WebKit is writing to AND the final destination
+    /// under the agent folder's `downloads/`. In `Finished` OUR process (not
+    /// WebKit's sandbox) MOVES the temp file to the agent folder. `path` in
+    /// `Finished` is empty on macOS, so this map is how we recover the file.
+    dl_temps: Mutex<std::collections::HashMap<String, (PathBuf, PathBuf)>>,
 }
 
 /// Pending-permission plumbing. `pending` maps request-id -> the reply channel
@@ -642,6 +680,7 @@ impl BrowserProc {
             inner: Mutex::new(None),
             control: Mutex::new(Control::default()),
             perm: Mutex::new(PermState::default()),
+            dl_temps: Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -986,8 +1025,11 @@ async fn ensure_session(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
     // form, so try Browser.setDownloadBehavior then fall back. Never fatal.
     {
         // SAME dir the visible WKWebView on_download handler + browser_downloads_list
-        // use (now ~/Downloads/AYGENT/<agent>), so agent-driven downloads land in
-        // the panel too. agent_downloads_dir already create_dir_all's + canonicalizes.
+        // use (now <agentFolder>/downloads), so agent-driven downloads land in the
+        // panel too. The headless CDP Chromium is a SEPARATE process (not under
+        // WebKit's networking sandbox), so it can write the agent folder directly
+        // — no temp-then-move needed here. agent_downloads_dir create_dir_all's +
+        // canonicalizes.
         let dir = agent_downloads_dir(app);
         let dl = dir.display().to_string();
         let params = serde_json::json!({ "behavior": "allow", "downloadPath": dl });
@@ -1264,64 +1306,155 @@ fn sanitize_filename(raw: &str) -> String {
 ///
 /// A download URL therefore NEVER touches history or the tab label (on_page_load
 /// only fires for committed PAGE loads, and a download is not one).
+///
+/// SANDBOX-SAFE TEMP-THEN-MOVE (the fix for the recurring
+/// `sandbox_extension_issue_file failed for : 2 (No such file or directory)`):
+/// WKWebView performs the WRITE in its sandboxed networking XPC process
+/// (com.apple.WebKit.Networking), which must hold a sandbox EXTENSION for the
+/// destination's parent dir. Deep/newly-created paths (bundle containers,
+/// ~/Downloads/AYGENT, and — not assumed safe — even the agent folder) can fail
+/// to get one. The OS temp dir (`std::env::temp_dir()`, e.g. /var/folders/...)
+/// is a location that process ALWAYS has an extension for. So on `Requested` we
+/// point WebKit at temp, and on `Finished` OUR process (the main app, a normal
+/// user process that can write the agent folder freely) MOVES the finished file
+/// into `<agentFolder>/downloads/`. The write and the final destination are
+/// decoupled — WebKit's sandbox never touches the agent folder.
 fn download_event(app: &tauri::AppHandle, event: tauri::webview::DownloadEvent<'_>) -> bool {
     use tauri::webview::DownloadEvent;
+    use tauri::Manager;
     match event {
         DownloadEvent::Requested { url, destination } => {
             // Derive a filename from the URL (wry 0.55.1's `Requested` does NOT
             // expose WebKit's suggestedFilename — only `url` + `destination` — so
             // we synthesize one; `sanitize_filename` falls back to a unique
             // `download-N` if the URL has no usable last path segment).
-            let mut name = sanitize_filename(url.as_str());
-            // Route into the active agent's downloads dir under ~/Downloads
-            // (a WebKit-download-sandbox-friendly location that ALWAYS exists),
-            // the SAME dir browser_downloads_list scans, so it shows in the panel.
-            let dir = agent_downloads_dir(app);
-            // De-dupe: never let WebKit clobber an existing file (and appending a
-            // counter also sidesteps any stale-path edge cases).
-            let mut target = dir.join(&name);
-            if target.exists() {
-                let (stem, ext) = match name.rsplit_once('.') {
-                    Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
-                    _ => (name.clone(), String::new()),
-                };
-                let mut n = 1u32;
-                loop {
-                    let cand = dir.join(format!("{stem} ({n}){ext}"));
-                    if !cand.exists() { name = format!("{stem} ({n}){ext}"); target = cand; break; }
-                    n += 1;
+            let name = sanitize_filename(url.as_str());
+
+            // FINAL destination = the active agent folder's `downloads/` dir.
+            // Compute (+ de-dupe) it NOW so the FE can show where it's going,
+            // but WebKit does NOT write here — our Finished handler moves it here.
+            let final_dir = agent_downloads_dir(app);
+            let final_name = dedup_name(&final_dir, &name);
+            let final_dest = final_dir.join(&final_name);
+
+            // TEMP destination WebKit ACTUALLY writes to: the OS temp dir, which
+            // WebKit's networking-process sandbox already holds an extension for.
+            // Namespace under an `aygent-dl` subdir + a unique seq so concurrent
+            // downloads never collide, and canonicalize so WebKit gets a real
+            // absolute path (never empty/relative — the empty-path bug).
+            let seq = SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let temp_dir = std::env::temp_dir().join("aygent-dl");
+            let _ = std::fs::create_dir_all(&temp_dir);
+            let temp_dir = std::fs::canonicalize(&temp_dir).unwrap_or(temp_dir);
+            let temp_dest = temp_dir.join(format!("{seq}-{final_name}"));
+
+            // Remember url -> (temp WebKit writes, final agent-folder dest) so
+            // Finished can move it (Finished.path is empty on macOS).
+            if let Some(proc) = app.try_state::<BrowserProc>() {
+                if let Ok(mut m) = proc.dl_temps.lock() {
+                    m.insert(url.as_str().to_string(), (temp_dest.clone(), final_dest.clone()));
                 }
             }
-            // Log the FULL destination path we hand to WebKit. If this ever shows
-            // an empty/relative path or a non-existent dir, THAT is the bug — this
-            // line is what proves the sandbox-extension failure is gone.
+
             eprintln!(
-                "[aygent][browser][DL] begin name={name} dir_exists={} url={} -> dest={}",
-                dir.is_dir(), url, target.display()
+                "[aygent][browser][DL] begin url={} temp_dest={} -> final={} (final_dir_exists={})",
+                url, temp_dest.display(), final_dest.display(), final_dir.is_dir()
             );
-            *destination = target;
+            *destination = temp_dest;
             // Notify the FE a download STARTED (so it can auto-open Downloads).
             {
                 use tauri::Emitter;
                 let _ = app.emit("browser:download", &serde_json::json!({
-                    "state": "begin", "name": name, "url": url.as_str(),
+                    "state": "begin", "name": final_name, "url": url.as_str(),
                 }));
             }
             true // allow the download
         }
         DownloadEvent::Finished { url, path, success } => {
-            // macOS: `path` is documented as always empty (API limitation), so
-            // don't rely on it — the file is at the destination we set above.
-            let p = path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
-            eprintln!("[aygent][browser][DL] complete success={success} url={url} path={p}");
+            // macOS: `path` is empty (API limitation), so recover the temp file
+            // + final dest from the map we filled in Requested.
+            let mapped = app
+                .try_state::<BrowserProc>()
+                .and_then(|proc| proc.dl_temps.lock().ok().and_then(|mut m| m.remove(url.as_str())));
+
+            let mut final_path = String::new();
+            let mut moved_ok = success;
+            if success {
+                if let Some((temp_dest, final_dest)) = mapped {
+                    eprintln!(
+                        "[aygent][browser][DL] finished, moving temp={} -> final={}",
+                        temp_dest.display(), final_dest.display()
+                    );
+                    if temp_dest.exists() {
+                        // Ensure the final dir exists (agent may have switched).
+                        if let Some(parent) = final_dest.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        // rename() is atomic within a filesystem; temp is often
+                        // on a DIFFERENT volume (/var/folders vs the agent
+                        // folder), so fall back to copy + remove across FS.
+                        let ok = match std::fs::rename(&temp_dest, &final_dest) {
+                            Ok(()) => true,
+                            Err(_) => match std::fs::copy(&temp_dest, &final_dest) {
+                                Ok(_) => { let _ = std::fs::remove_file(&temp_dest); true }
+                                Err(e) => {
+                                    eprintln!("[aygent][browser][DL] error move failed: {e}");
+                                    false
+                                }
+                            },
+                        };
+                        moved_ok = ok;
+                        if ok {
+                            final_path = final_dest.display().to_string();
+                            eprintln!(
+                                "[aygent][browser][DL] moved {} -> {}",
+                                temp_dest.display(), final_dest.display()
+                            );
+                        }
+                    } else {
+                        moved_ok = false;
+                        eprintln!(
+                            "[aygent][browser][DL] error temp file missing: {}",
+                            temp_dest.display()
+                        );
+                    }
+                } else {
+                    // No mapping (shouldn't happen) — honor any path WebKit gave.
+                    final_path = path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                }
+            }
+
+            eprintln!(
+                "[aygent][browser][DL] complete success={moved_ok} url={url} final={final_path}"
+            );
             use tauri::Emitter;
             let _ = app.emit("browser:download", &serde_json::json!({
-                "state": if success { "complete" } else { "error" },
-                "url": url.as_str(), "path": p, "success": success,
+                "state": if moved_ok { "complete" } else { "error" },
+                "url": url.as_str(), "path": final_path, "success": moved_ok,
             }));
             true
         }
         _ => true,
+    }
+}
+
+/// De-dupe a filename against a directory so we never clobber an existing file:
+/// `foo.png` -> `foo (1).png` -> `foo (2).png` … Returns the name to use.
+fn dedup_name(dir: &Path, name: &str) -> String {
+    if !dir.join(name).exists() {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (name.to_string(), String::new()),
+    };
+    let mut n = 1u32;
+    loop {
+        let cand = format!("{stem} ({n}){ext}");
+        if !dir.join(&cand).exists() {
+            return cand;
+        }
+        n += 1;
     }
 }
 
@@ -1766,13 +1899,13 @@ pub fn webview_history(app: tauri::AppHandle, action: String, tab_id: Option<i64
 }
 
 /// ITEM 3 (Downloads). List the files in the ACTIVE agent's downloads directory
-/// (`~/Downloads/AYGENT/<agent>` — see `agent_downloads_dir` for WHY it moved
-/// off the app_data path: WKWebView's sandboxed networking process can't get a
-/// write extension there) so the Browser view can show a Downloads panel.
+/// (`<agentFolder>/downloads` — see `agent_downloads_dir`) so the Browser view
+/// can show a Downloads panel. If the active agent changes, this reads the
+/// CURRENT agent's folder (agent_downloads_dir resolves it live via the broker).
 /// Returns each file's name, byte size, and modified-time (unix seconds),
 /// newest first. Missing dir => empty list (not an error) so a fresh profile
 /// just shows "no downloads yet". Reads the SAME dir the on_download handler
-/// and the CDP agent-download path write to.
+/// moves finished files into and the CDP agent-download path writes to.
 #[tauri::command]
 pub fn browser_downloads_list(app: tauri::AppHandle) -> Result<Vec<serde_json::Value>, String> {
     let dir = agent_downloads_dir(&app);
