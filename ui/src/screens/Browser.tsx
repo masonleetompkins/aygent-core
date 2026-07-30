@@ -151,11 +151,16 @@ export function Browser() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [installed]);
 
-  async function go(id: number) {
+  // `rawUrl` (from the input's live value on Enter) takes precedence over the
+  // tabs-closure addr, which can be one keystroke stale under React batching —
+  // that staleness made Enter read an empty url and silently bail ("nothing
+  // happens"). Fall back to the tab's stored addr for programmatic calls.
+  async function go(id: number, rawUrl?: string) {
     const tab = tabs.find((t) => t.id === id);
-    if (!tab) return;
-    const url = tab.addr.trim();
+    const url = (rawUrl ?? tab?.addr ?? "").trim();
     if (!url) { patch(id, { editing: false }); return; }
+    // Make sure the stored addr reflects what we're navigating to.
+    patch(id, { addr: url });
     patch(id, { editing: false, title: prettyTitle(url) });
     const el = paneRef.current;
     const r = el?.getBoundingClientRect();
@@ -304,7 +309,7 @@ export function Browser() {
               {editing ? (
                 <input ref={editRef} autoFocus value={t.addr}
                   onChange={(e) => patch(t.id, { addr: e.target.value })}
-                  onKeyDown={(e) => { if (e.key === "Enter") go(t.id); if (e.key === "Escape") patch(t.id, { editing: false }); }}
+                  onKeyDown={(e) => { if (e.key === "Enter") go(t.id, e.currentTarget.value); if (e.key === "Escape") patch(t.id, { editing: false }); }}
                   onBlur={() => patch(t.id, { editing: false })}
                   onClick={(e) => e.stopPropagation()}
                   placeholder="Enter a URL or search…"
