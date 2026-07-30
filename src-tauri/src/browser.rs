@@ -749,15 +749,19 @@ pub async fn active_tab_eval(app: &tauri::AppHandle, expr: &str) -> Result<Strin
          if (window.__TAURI__ && window.__TAURI__.event) {{ window.__TAURI__.event.emit({nonce:?}, r); }} }})()",
         expr = expr, nonce = nonce
     );
+    eprintln!("[aygent][browser][EVAL] tab={id} expr={:.80}", expr);
     wv.eval(&script).map_err(|e| { app.unlisten(handler); format!("eval: {e}") })?;
-    match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
+    // 6s (not 15) so a post-navigation page where __TAURI__ isn't ready yet
+    // fails FAST instead of stalling the agent for 15s per call (looked like an
+    // endless "working...").
+    match tokio::time::timeout(std::time::Duration::from_secs(6), rx).await {
         Ok(Ok(v)) => {
-            // Payload is a JSON string wrapping our JSON-stringified result.
             let inner: String = serde_json::from_str(&v).unwrap_or(v);
+            eprintln!("[aygent][browser][EVAL] tab={id} OK -> {:.100}", inner);
             Ok(inner)
         }
         Ok(Err(_)) => Err("active tab eval channel closed".into()),
-        Err(_) => { app.unlisten(handler); Err("active tab eval timed out".into()) }
+        Err(_) => { app.unlisten(handler); eprintln!("[aygent][browser][EVAL] tab={id} TIMED OUT"); Err("active tab eval timed out (page may still be loading)".into()) }
     }
 }
 
