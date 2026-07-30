@@ -285,19 +285,47 @@ export function Browser() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [driver]);
 
+  // Tell Rust which tab is active so the agent tools act on the VISIBLE tab.
+  useEffect(() => { invoke("set_active_browser_tab", { tabId: activeId }).catch(() => {}); }, [activeId]);
+
+  // PENDING PERMISSION REQUEST from the agent (new host / blocked action).
+  // { id, action, detail } -> render the Allow/Deny/Take Control card.
+  const [permReq, setPermReq] = useState<{ id: string; action: string; detail: string } | null>(null);
+  useEffect(() => {
+    let un: undefined | (() => void);
+    listen<{ id: string; action: string; detail: string }>("browser:permission-request", (ev) => {
+      if (ev.payload?.id) setPermReq(ev.payload);
+    }).then((f) => { un = f; }).catch(() => {});
+    return () => { un?.(); };
+  }, []);
+
+  function answerPerm(answer: "allow" | "deny" | "take") {
+    if (!permReq) return;
+    invoke("browser_permission_answer", { id: permReq.id, answer, grantHost: permReq.detail }).catch(() => {});
+    if (answer === "take") setDriver("human");
+    setPermReq(null);
+    setBlockedNote("");
+  }
+
   async function runAgent() {
     const task = agentPrompt.trim();
     if (!task || agentBusy) return;
     setAgentBusy(true);
     setAgentLog((l) => [...l, `▸ ${task}`]);
+    setAgentPrompt("");
     try {
-      const res = await invoke<string>("webview_agent_act", { task });
+      // REAL model-in-the-loop agent. It uses the browser tools
+      // (browser_open/read/click_text/type_text) which now act on the VISIBLE
+      // active tab. The agent asks permission for new hosts (Allow/Deny/Take)
+      // and hands off on login/CAPTCHA walls (pulse). Prime it toward the page.
+      const cur = tabs.find((t) => t.id === activeId);
+      const primed = `You are driving the in-app browser in the tab the human is watching (currently: ${cur?.addr || cur?.title || "a page"}). Use the browser tools to act in THAT page. Task: ${task}`;
+      const res = await invoke<string>("agent_run", { prompt: primed });
       setAgentLog((l) => [...l, res]);
     } catch (e) {
       setAgentLog((l) => [...l, `✗ ${e}`]);
     } finally {
       setAgentBusy(false);
-      setAgentPrompt("");
     }
   }
 
@@ -367,9 +395,16 @@ export function Browser() {
         <button onClick={addTab} title="New tab"
           style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 32, height: 32, borderRadius: "var(--radius-control)", border: "var(--border-width) dashed var(--line)", background: "transparent", color: "var(--text-muted)", cursor: "pointer", fontSize: 18, lineHeight: 1, flexShrink: 0 }}>+</button>
 
-        {/* THE HAND-OFF TOGGLE — the centerpiece. */}
+        {/* THE HAND-OFF TOGGLE — the centerpiece. Pulses when the agent is
+            blocked (blockedNote set) so the human knows to intervene. */}
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
-          <div style={{ display: "flex", borderRadius: "var(--radius-control)", overflow: "hidden", border: "var(--border-width) solid var(--line)" }}>
+          {blockedNote && (
+            <span style={{ fontSize: 11, color: "var(--accent)", fontWeight: 700, maxWidth: 220, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={blockedNote}>
+              ⚠ {blockedNote}
+            </span>
+          )}
+          <div className={blockedNote ? "aygent-blocked-pulse" : undefined}
+            style={{ display: "flex", borderRadius: "var(--radius-control)", overflow: "hidden", border: `var(--border-width) solid ${blockedNote ? "var(--accent)" : "var(--line)"}` }}>
             <button onClick={() => setDriver("human")}
               style={segStyle(driver === "human")}>You</button>
             <button onClick={() => setDriver("agent")}
@@ -396,6 +431,36 @@ export function Browser() {
           <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", fontSize: 14, pointerEvents: "none" }}>
             Click the tab to type a URL, or search.
           </div>
+          {/* AGENT PERMISSION CARD — the agent wants to do something outside
+              what the human already navigated to (a new host). Pulses the
+              toggle + shows Allow / Deny / Take Control. Floats over the page,
+              centered, above the webview. */}
+          {permReq && (
+            <div style={{
+              position: "absolute", left: "50%", top: 24, transform: "translateX(-50%)", zIndex: 60,
+              width: "min(440px, 90%)", background: "var(--surface)", border: "2px solid var(--accent)",
+              borderRadius: "var(--radius-card)", boxShadow: "var(--elevation)", padding: 16,
+            }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                <Icon name="sparkles" size={15} />
+                <span style={{ fontSize: 13, fontWeight: 800 }}>The agent needs your OK</span>
+              </div>
+              <div style={{ fontSize: 13, color: "var(--text)", marginBottom: 4 }}>
+                It wants to <b>{permReq.action}</b>.
+              </div>
+              <div style={{ fontSize: 11.5, color: "var(--text-muted)", marginBottom: 12, wordBreak: "break-all" }}>
+                {permReq.detail}
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => answerPerm("allow")}
+                  style={{ flex: 1, fontSize: 13, fontWeight: 700, padding: "8px 0", borderRadius: "var(--radius-control)", border: "none", background: "var(--accent)", color: "#fff", cursor: "pointer" }}>Allow</button>
+                <button onClick={() => answerPerm("deny")}
+                  style={{ flex: 1, fontSize: 13, fontWeight: 700, padding: "8px 0", borderRadius: "var(--radius-control)", border: "var(--border-width) solid var(--line)", background: "var(--bg)", color: "var(--text)", cursor: "pointer" }}>Deny</button>
+                <button onClick={() => answerPerm("take")}
+                  style={{ flex: 1.3, fontSize: 13, fontWeight: 700, padding: "8px 0", borderRadius: "var(--radius-control)", border: "var(--border-width) solid var(--accent)", background: "var(--bg)", color: "var(--accent)", cursor: "pointer" }}>Take Control</button>
+              </div>
+            </div>
+          )}
           {/* ROUNDED FRAME OVERLAY — sits ON TOP of the native webview. Just an
               outline + rounded corners; transparent fill, no pointer capture,
               so clicks pass through to the page. Accent-highlighted in agent

@@ -527,6 +527,22 @@ pub struct BrowserProc {
     /// SLICE 5 — who's driving the shared page: "human" | "agent" | "idle".
     /// The human ALWAYS wins: taking the wheel preempts the agent instantly.
     control: Mutex<Control>,
+    /// PERMISSION REQUESTS: when the agent wants to do something outside what the
+    /// human already navigated to (a NEW host), it opens a request here and
+    /// blocks on the oneshot until the human answers Allow/Deny/Take Control via
+    /// `browser_permission_answer`. Keyed by request id. Also tracks the set of
+    /// hosts the human has granted THIS session (so a granted host stays allowed).
+    perm: Mutex<PermState>,
+}
+
+/// Pending-permission plumbing. `pending` maps request-id -> the reply channel
+/// the waiting agent tool is parked on. `granted_hosts` is the session's
+/// human-approved host set (added on Allow), layered on top of "whatever host
+/// the active tab is already showing" which is always allowed.
+#[derive(Default)]
+pub struct PermState {
+    pending: std::collections::HashMap<String, oneshot::Sender<String>>,
+    granted_hosts: std::collections::HashSet<String>,
 }
 
 /// Shared-control state (Slice 5). `driver` is the wheel; `agent_wants` is set
@@ -568,7 +584,11 @@ struct CdpRequest {
 
 impl BrowserProc {
     pub fn new() -> Self {
-        Self { inner: Mutex::new(None), control: Mutex::new(Control::default()) }
+        Self {
+            inner: Mutex::new(None),
+            control: Mutex::new(Control::default()),
+            perm: Mutex::new(PermState::default()),
+        }
     }
 }
 
@@ -694,6 +714,59 @@ async fn ensure_running(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
 
 /// Session generation counter so a stale pump never clobbers a newer session.
 static SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The Browser UI's CURRENT active tab id, reported by the frontend via
+/// `set_active_browser_tab`. The agent acts on THIS tab's embedded webview so
+/// it operates in the exact page the human is watching. -1 = none/unknown.
+static ACTIVE_TAB_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+/// Frontend reports which tab is active (called on switch/open). Lets the agent
+/// tools target the visible tab.
+#[tauri::command]
+pub fn set_active_browser_tab(tab_id: i64) {
+    ACTIVE_TAB_ID.store(tab_id, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Eval JS in the ACTIVE tab's embedded webview (the one the human sees) and
+/// return the JSON-stringified result. Same IPC round-trip as `webview_eval`
+/// but targets `aygent-browser-<activeTabId>` instead of the legacy label.
+pub async fn active_tab_eval(app: &tauri::AppHandle, expr: &str) -> Result<String, String> {
+    use tauri::{Manager, Listener};
+    let id = ACTIVE_TAB_ID.load(std::sync::atomic::Ordering::SeqCst);
+    if id < 0 { return Err("no active browser tab".into()); }
+    let label = tab_label(Some(id));
+    let wv = app.get_webview(&label).ok_or("active tab has no open page")?;
+    let nonce = format!("ate_{}", SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    let tx = std::sync::Mutex::new(Some(tx));
+    let handler = app.once(nonce.clone(), move |ev| {
+        if let Ok(mut g) = tx.lock() {
+            if let Some(sender) = g.take() { let _ = sender.send(ev.payload().to_string()); }
+        }
+    });
+    let script = format!(
+        "(async () => {{ let r; try {{ r = JSON.stringify(await (async()=>({expr}))()); }} catch(e) {{ r = 'ERR: '+ (e && e.message || e); }} \
+         if (window.__TAURI__ && window.__TAURI__.event) {{ window.__TAURI__.event.emit({nonce:?}, r); }} }})()",
+        expr = expr, nonce = nonce
+    );
+    wv.eval(&script).map_err(|e| { app.unlisten(handler); format!("eval: {e}") })?;
+    match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
+        Ok(Ok(v)) => {
+            // Payload is a JSON string wrapping our JSON-stringified result.
+            let inner: String = serde_json::from_str(&v).unwrap_or(v);
+            Ok(inner)
+        }
+        Ok(Err(_)) => Err("active tab eval channel closed".into()),
+        Err(_) => { app.unlisten(handler); Err("active tab eval timed out".into()) }
+    }
+}
+
+/// Read the active tab's (title, url) from its embedded webview.
+pub async fn active_tab_page_info(app: &tauri::AppHandle) -> Result<(String, String), String> {
+    let r = active_tab_eval(app, "[document.title||'', location.href||'']").await?;
+    let arr: Vec<String> = serde_json::from_str(&r).unwrap_or_default();
+    Ok((arr.get(0).cloned().unwrap_or_default(), arr.get(1).cloned().unwrap_or_default()))
+}
 
 /// Ensure a live CDP session exists (open the persistent socket + spawn the pump
 /// + start the screencast). Idempotent: returns quickly if one is already live.
@@ -1683,6 +1756,109 @@ pub async fn agent_tool(
     out
 }
 
+/// Extract the bare host from a URL (lowercased, no scheme/port/path/creds).
+fn host_of(url: &str) -> String {
+    let lower = url.trim().to_ascii_lowercase();
+    lower
+        .split("://").last().unwrap_or("")
+        .split('/').next().unwrap_or("")
+        .split('@').last().unwrap_or("")
+        .split(':').next().unwrap_or("")
+        .to_string()
+}
+
+/// The host the ACTIVE tab is currently showing (always allowed for the agent,
+/// since the human navigated there and is watching). Empty if unreadable.
+async fn active_tab_host(app: &tauri::AppHandle) -> String {
+    match active_tab_page_info(app).await {
+        Ok((_t, url)) => host_of(&url),
+        Err(_) => String::new(),
+    }
+}
+
+/// Is `host` allowed WITHOUT asking? True if it matches the active tab's current
+/// host (human already there), a host the human granted this session, or the
+/// agent's configured allowlist.
+async fn host_preallowed(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, BrowserProc>,
+    host: &str,
+    allowed_domains: &[String],
+) -> bool {
+    if host.is_empty() { return false; }
+    let cur = active_tab_host(app).await;
+    if !cur.is_empty() && (host == cur || host.ends_with(&format!(".{cur}")) || cur.ends_with(&format!(".{host}"))) {
+        return true;
+    }
+    if let Ok(p) = state.perm.lock() {
+        if p.granted_hosts.iter().any(|g| host == g || host.ends_with(&format!(".{g}"))) {
+            return true;
+        }
+    }
+    allowed_domains.iter().any(|d| {
+        let d = d.trim().to_ascii_lowercase();
+        !d.is_empty() && (host == d || host.ends_with(&format!(".{d}")))
+    })
+}
+
+/// ASK THE HUMAN. Emit `browser:permission-request` describing what the agent
+/// wants, then PARK on a oneshot until the human answers via
+/// `browser_permission_answer`. Returns "allow" | "deny" | "take". Pulses the
+/// toggle (sets a control note). 5-min safety timeout -> "deny".
+async fn request_permission(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, BrowserProc>,
+    action: &str,
+    detail: &str,
+) -> String {
+    use tauri::Emitter;
+    let id = format!("perm_{}", SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+    let (tx, rx) = oneshot::channel::<String>();
+    if let Ok(mut p) = state.perm.lock() { p.pending.insert(id.clone(), tx); }
+    if let Ok(mut c) = state.control.lock() {
+        c.note = format!("agent wants to {action}");
+        emit_control(app, &c);
+    }
+    let _ = app.emit("browser:permission-request", &serde_json::json!({
+        "id": id, "action": action, "detail": detail,
+    }));
+    let ans = match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+        Ok(Ok(v)) => v,
+        _ => "deny".to_string(),
+    };
+    if let Ok(mut p) = state.perm.lock() { p.pending.remove(&id); }
+    ans
+}
+
+/// The human's answer to a pending permission request. `answer` = "allow" |
+/// "deny" | "take". On allow, `grant_host` (if given) is remembered for the
+/// session so the agent won't ask again for it.
+#[tauri::command]
+pub fn browser_permission_answer(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, BrowserProc>,
+    id: String,
+    answer: String,
+    grant_host: Option<String>,
+) -> Result<(), String> {
+    let tx = {
+        let mut p = state.perm.lock().map_err(|_| "perm poisoned")?;
+        if answer == "allow" {
+            if let Some(h) = grant_host.as_ref().map(|h| host_of(h)).filter(|h| !h.is_empty()) {
+                p.granted_hosts.insert(h);
+            }
+        }
+        p.pending.remove(&id)
+    };
+    if let Ok(mut c) = state.control.lock() {
+        c.note = String::new();
+        if answer == "take" { c.driver = "human".into(); }
+        emit_control(&app, &c);
+    }
+    if let Some(tx) = tx { let _ = tx.send(answer); }
+    Ok(())
+}
+
 /// Heuristic: does an agent tool result look like it needs a human (login/
 /// CAPTCHA/verification)? Used to auto-offer the hand-off.
 fn looks_like_handoff(s: &str) -> bool {
@@ -1698,83 +1874,98 @@ async fn agent_tool_inner(
     input: &serde_json::Value,
     allowed_domains: &[String],
 ) -> (String, bool) {
+    // ALL agent browser tools now act on the VISIBLE ACTIVE TAB (the embedded
+    // webview the human is watching) via active_tab_eval — same DOM, same
+    // session, same cookies. "Watch it work." No separate headless browser.
     match name {
         "browser_open" => {
             let url = normalize_url(input.get("url").and_then(|u| u.as_str()).unwrap_or(""));
-            // POLICY: agent may only navigate to allowlisted hosts; block
-            // internal/localhost/file (mirrors web.rs).
-            if let Err(e) = check_agent_url(&url, allowed_domains) {
-                return (e, true);
+            // Block internal/localhost/file always (SSRF), regardless of prompt.
+            if let Err(e) = check_internal_only(&url) { return (e, true); }
+            let host = host_of(&url);
+            // Same host as the tab / granted / allowlisted => go. NEW host =>
+            // ASK the human (Allow/Deny/Take Control) instead of refusing.
+            if !host_preallowed(app, state, &host, allowed_domains).await {
+                let ans = request_permission(app, state, &format!("open {host}"), &url).await;
+                match ans.as_str() {
+                    "allow" => { if let Ok(mut p) = state.perm.lock() { p.granted_hosts.insert(host.clone()); } }
+                    "take" => return ("the human took the wheel to handle this navigation".into(), true),
+                    _ => return (format!("the human declined opening {host}. Try a different site or ask them to do it."), true),
+                }
             }
-            if let Err(e) = ensure_session(app, state).await { return (format!("browser error: {e}"), true); }
-            if let Err(e) = session_call(state, "Page.navigate", serde_json::json!({ "url": url })).await {
-                return (format!("navigate failed: {e}"), true);
+            // Navigate the VISIBLE tab.
+            match active_tab_eval(app, &format!("(()=>{{ location.href={url:?}; return 'navigating'; }})()", url = url)).await {
+                Ok(_) => {}
+                Err(e) => return (format!("navigate failed: {e}"), true),
             }
-            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-            match read_page_text(state).await {
+            tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
+            match active_tab_page_text(app).await {
                 Ok((title, text)) => (format!("Opened. Title: {title}\n\n{text}"), false),
                 Err(e) => (format!("opened but read failed: {e}"), true),
             }
         }
-        "browser_read" => match read_page_text(state).await {
+        "browser_read" => match active_tab_page_text(app).await {
             Ok((title, text)) => (format!("Title: {title}\n\n{text}"), false),
             Err(e) => (format!("read failed: {e}"), true),
         },
         "browser_click_text" => {
             let want = input.get("text").and_then(|t| t.as_str()).unwrap_or("");
             if want.is_empty() { return ("browser_click_text needs `text`".into(), true); }
-            // Find the element's center via a DOM query, then dispatch a click there.
             let expr = format!(
-                "(() => {{ const t={:?}; const els=[...document.querySelectorAll('a,button,input[type=submit],[role=button]')]; \
-                 const el=els.find(e=>(e.innerText||e.value||'').toLowerCase().includes(t.toLowerCase())); \
-                 if(!el) return null; const r=el.getBoundingClientRect(); \
-                 return JSON.stringify([r.left+r.width/2, r.top+r.height/2]); }})()",
+                "(() => {{ const t={:?}.toLowerCase(); const els=[...document.querySelectorAll('a,button,input[type=submit],[role=button],label,[onclick]')]; \
+                 const el=els.find(e=>(e.innerText||e.value||'').toLowerCase().includes(t)); \
+                 if(!el) return 'NONE'; el.scrollIntoView({{block:'center'}}); el.click(); \
+                 return 'clicked: '+((el.innerText||el.value||t)+'').slice(0,60); }})()",
                 want
             );
-            match session_call(state, "Runtime.evaluate", serde_json::json!({ "expression": expr, "returnByValue": true })).await {
+            match active_tab_eval(app, &expr).await {
                 Ok(r) => {
-                    if let Some(s) = r["result"]["value"].as_str() {
-                        if let Ok(xy) = serde_json::from_str::<Vec<f64>>(s) {
-                            let (x, y) = (xy[0], xy[1]);
-                            for phase in ["mouseMoved", "mousePressed", "mouseReleased"] {
-                                let mut ev = serde_json::json!({ "type": phase, "x": x, "y": y, "button": "left", "clickCount": 1 });
-                                if phase == "mouseMoved" { ev["button"] = "none".into(); }
-                                if let Err(e) = session_call(state, "Input.dispatchMouseEvent", ev).await {
-                                    return (format!("click dispatch failed: {e}"), true);
-                                }
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-                            return (format!("clicked element containing '{want}'"), false);
-                        }
-                    }
-                    (format!("no clickable element found containing '{want}'"), true)
+                    let r = r.trim_matches('"');
+                    if r == "NONE" { (format!("no clickable element found containing '{want}'"), true) }
+                    else { tokio::time::sleep(std::time::Duration::from_millis(500)).await; (r.to_string(), false) }
                 }
-                Err(e) => (format!("click query failed: {e}"), true),
+                Err(e) => (format!("click failed: {e}"), true),
             }
         }
         "browser_type_text" => {
             let text = input.get("text").and_then(|t| t.as_str()).unwrap_or("");
             let submit = input.get("submit").and_then(|b| b.as_bool()).unwrap_or(false);
-            if let Err(e) = session_call(state, "Input.insertText", serde_json::json!({ "text": text })).await {
-                return (format!("type failed: {e}"), true);
+            // Type into the focused field (or the first visible text input) +
+            // fire input/change so React-y pages register it; optional Enter via
+            // a submit()/keydown so search boxes go.
+            let expr = format!(
+                "(() => {{ let el=document.activeElement; \
+                 if(!el||!('value' in el)||el===document.body){{ el=[...document.querySelectorAll('input[type=text],input[type=search],input:not([type]),textarea,input[type=email],input[type=url]')].find(e=>e.offsetParent!==null); }} \
+                 if(!el) return 'no input field found'; el.focus(); \
+                 el.value={text:?}; el.dispatchEvent(new Event('input',{{bubbles:true}})); el.dispatchEvent(new Event('change',{{bubbles:true}})); \
+                 if({submit}){{ const f=el.form; el.dispatchEvent(new KeyboardEvent('keydown',{{key:'Enter',keyCode:13,bubbles:true}})); if(f&&f.requestSubmit){{ try{{f.requestSubmit();}}catch(e){{}} }} }} \
+                 return 'typed '+({text:?}).length+' chars'+({submit}?' + Enter':''); }})()",
+                text = text, submit = submit
+            );
+            match active_tab_eval(app, &expr).await {
+                Ok(r) => { if submit { tokio::time::sleep(std::time::Duration::from_millis(900)).await; } (r.trim_matches('"').to_string(), false) }
+                Err(e) => (format!("type failed: {e}"), true),
             }
-            if submit {
-                let down = serde_json::json!({ "type": "keyDown", "key": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13, "text": "\r" });
-                let up = serde_json::json!({ "type": "keyUp", "key": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13 });
-                let _ = session_call(state, "Input.dispatchKeyEvent", down).await;
-                let _ = session_call(state, "Input.dispatchKeyEvent", up).await;
-                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-            }
-            (format!("typed {} chars{}", text.len(), if submit { " + Enter" } else { "" }), false)
         }
         "browser_screenshot" => {
-            match session_call(state, "Page.captureScreenshot", serde_json::json!({ "format": "jpeg", "quality": 60 })).await {
-                Ok(_) => ("captured a screenshot (the human sees the live view)".into(), false),
-                Err(e) => (format!("screenshot failed: {e}"), true),
+            // The human already SEES the live tab; report the current title/url.
+            match active_tab_page_info(app).await {
+                Ok((title, url)) => (format!("the human sees the live page. Title: {title} ({url})"), false),
+                Err(e) => (format!("page info failed: {e}"), true),
             }
         }
         other => (format!("unknown browser tool: {other}"), true),
     }
+}
+
+/// Read the ACTIVE tab's (title, visible text) from the embedded webview.
+async fn active_tab_page_text(app: &tauri::AppHandle) -> Result<(String, String), String> {
+    let r = active_tab_eval(
+        app,
+        "[document.title||'', (document.body?document.body.innerText:'').slice(0,8000)]",
+    ).await?;
+    let arr: Vec<String> = serde_json::from_str(&r).unwrap_or_default();
+    if arr.len() == 2 { Ok((arr[0].clone(), arr[1].clone())) } else { Err("unexpected page text shape".into()) }
 }
 
 /// Read the page title + visible text (agent's primary "sense"). Caps length so
@@ -1817,6 +2008,24 @@ fn check_agent_url(url: &str, allowed_domains: &[String]) -> Result<(), String> 
         return Err(format!(
             "refused: '{host}' is not in this agent's allowed browsing domains. Add it in the agent's browser policy to let it visit this site."
         ));
+    }
+    Ok(())
+}
+
+/// SSRF guard only (no allowlist): reject non-http(s) + internal/localhost
+/// hosts. Used by the visible-tab agent path where the human is the allowlist
+/// (they Allow/Deny new hosts), but internal targets are NEVER promptable.
+fn check_internal_only(url: &str) -> Result<(), String> {
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err("agent may only open http(s) URLs".into());
+    }
+    let host = host_of(&lower);
+    if host.is_empty() { return Err("could not parse host".into()); }
+    if host == "localhost" || host.starts_with("127.") || host.starts_with("10.")
+        || host.starts_with("192.168.") || host.ends_with(".local") || host == "0.0.0.0"
+        || host.starts_with("169.254.") {
+        return Err("refused: internal/localhost host is not allowed".into());
     }
     Ok(())
 }

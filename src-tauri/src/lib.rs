@@ -2688,6 +2688,7 @@ pub fn run() {
             browser::webview_hide_others, browser::webview_history,
             browser::webview_navigate, browser::webview_close, browser::webview_agent_act,
             browser::webview_page_info,
+            browser::set_active_browser_tab, browser::browser_permission_answer,
             openai_models, tools_list, tools_upsert, tools_delete, tools_set_enabled,
             tools_config, tools_set_config,
             savepoint_snapshot, savepoint_timeline, savepoint_rewind,
