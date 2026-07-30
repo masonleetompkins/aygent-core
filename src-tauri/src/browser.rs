@@ -1337,30 +1337,104 @@ fn download_event(app: &tauri::AppHandle, event: tauri::webview::DownloadEvent<'
             let final_name = dedup_name(&final_dir, &name);
             let final_dest = final_dir.join(&final_name);
 
-            // TEMP destination WebKit ACTUALLY writes to: the OS temp dir, which
-            // WebKit's networking-process sandbox already holds an extension for.
-            // Namespace under an `aygent-dl` subdir + a unique seq so concurrent
-            // downloads never collide, and canonicalize so WebKit gets a real
-            // absolute path (never empty/relative — the empty-path bug).
+            // ============================================================
+            // ROOT-CAUSE PROBE + FIX (Atlas, 2026-07-30) for the recurring
+            // `sandbox_extension_issue_file failed for : 2 (No such file or
+            // directory)` with an EMPTY path before the colon.
+            //
+            // Verified against wry 0.55.1 SOURCE (src/wkwebview/download.rs +
+            // navigation.rs). Ground truth of the flow:
+            //   * navigation_policy(): a right-click "Save Image" is NOT a
+            //     navigation with shouldPerformDownload — so on_navigation
+            //     returning `true` does NOT swallow it. Nav-intercept is NOT
+            //     the cause (hypothesis #1 disproven by source).
+            //   * The WKDownload's delegate calls download_policy(), which calls
+            //     OUR started_fn (this arm). Whatever we put in `*destination`
+            //     is wrapped as `NSURL fileURLWithPath` and handed to WebKit's
+            //     completion handler. Our mutation IS honored (hypothesis #2
+            //     disproven: [DL] begin prints, so started_fn ran + returned).
+            //   * Therefore the empty-path sandbox error is WebKit's NETWORKING
+            //     XPC process failing to MINT a sandbox extension for the write
+            //     location — an app-sandbox/entitlement limitation, not our path
+            //     string. We must (a) prove the path is real+writable from OUR
+            //     process, and (b) A/B whether overriding the destination at all
+            //     is what breaks it vs WebKit's own default (~/Downloads).
+            //
+            // AYGENT_DL_MODE env var (set on Mason's run to A/B WITHOUT a
+            // recompile-per-theory):
+            //   unset | "temp"    -> write to OS temp, move on Finished (current)
+            //   "default"         -> DO NOT override *destination; let WebKit use
+            //                        its own ~/Downloads. If THIS works while temp
+            //                        fails, the ACT of overriding is the bug.
+            //   "final"           -> write DIRECTLY to <agentFolder>/downloads
+            //                        (skip temp+move). Tests the agent dir.
+            // ============================================================
+            let mode = std::env::var("AYGENT_DL_MODE").unwrap_or_default();
+
+            // TEMP destination candidate: OS temp dir (WebKit's networking-process
+            // sandbox usually already holds an extension for /var/folders/...).
             let seq = SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let temp_dir = std::env::temp_dir().join("aygent-dl");
             let _ = std::fs::create_dir_all(&temp_dir);
             let temp_dir = std::fs::canonicalize(&temp_dir).unwrap_or(temp_dir);
             let temp_dest = temp_dir.join(format!("{seq}-{final_name}"));
 
-            // Remember url -> (temp WebKit writes, final agent-folder dest) so
-            // Finished can move it (Finished.path is empty on macOS).
+            // Choose the destination WebKit will actually write to, per mode.
+            // In "default" mode we leave *destination untouched (empty PathBuf).
+            let webkit_dest: Option<PathBuf> = match mode.as_str() {
+                "default" => None,
+                "final" => {
+                    let _ = std::fs::create_dir_all(&final_dir);
+                    Some(final_dest.clone())
+                }
+                _ => Some(temp_dest.clone()), // "temp" / unset
+            };
+
+            // GROUND-TRUTH PROBE: can OUR (non-sandboxed main) process create +
+            // write the chosen destination right now? This isolates "path is
+            // bogus/parent missing" (our create fails) from "WebKit's sandbox
+            // can't get an extension for a path that is otherwise perfectly
+            // writable" (our create succeeds but WebKit still errors).
+            if let Some(dest) = webkit_dest.as_ref() {
+                let parent = dest.parent();
+                let parent_exists = parent.map(|p| p.is_dir()).unwrap_or(false);
+                let dest_str = dest.display().to_string();
+                let touch = std::fs::File::create(dest)
+                    .map(|_| { let _ = std::fs::remove_file(dest); "OK" })
+                    .unwrap_or("FAIL");
+                eprintln!(
+                    "[aygent][browser][DL] PROBE mode={mode:?} dest_bytes={} dest_str={:?} is_absolute={} parent={:?} parent_exists={} our_write_touch={}",
+                    dest_str.len(), dest_str, dest.is_absolute(),
+                    parent.map(|p| p.display().to_string()), parent_exists, touch
+                );
+            } else {
+                eprintln!(
+                    "[aygent][browser][DL] PROBE mode={mode:?} NO OVERRIDE — letting WebKit use its default (~/Downloads)"
+                );
+            }
+
+            // Remember url -> (temp/actual WebKit-write path, final agent dest)
+            // so Finished can move it (Finished.path is empty on macOS). In
+            // "default" mode we have no write path from WebKit here, so store the
+            // final dir + name and let Finished honor WebKit's reported `path`.
+            let write_path_for_map = webkit_dest.clone().unwrap_or_else(|| final_dest.clone());
             if let Some(proc) = app.try_state::<BrowserProc>() {
                 if let Ok(mut m) = proc.dl_temps.lock() {
-                    m.insert(url.as_str().to_string(), (temp_dest.clone(), final_dest.clone()));
+                    m.insert(url.as_str().to_string(), (write_path_for_map.clone(), final_dest.clone()));
                 }
             }
 
             eprintln!(
-                "[aygent][browser][DL] begin url={} temp_dest={} -> final={} (final_dir_exists={})",
-                url, temp_dest.display(), final_dest.display(), final_dir.is_dir()
+                "[aygent][browser][DL] begin url={} webkit_dest={} -> final={} (final_dir_exists={})",
+                url,
+                webkit_dest.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "<webkit-default>".into()),
+                final_dest.display(), final_dir.is_dir()
             );
-            *destination = temp_dest;
+            // Only override when we have a concrete path; "default" mode leaves
+            // WebKit's own destination in place (the A/B diagnostic).
+            if let Some(dest) = webkit_dest {
+                *destination = dest;
+            }
             // Notify the FE a download STARTED (so it can auto-open Downloads).
             {
                 use tauri::Emitter;
@@ -1371,21 +1445,40 @@ fn download_event(app: &tauri::AppHandle, event: tauri::webview::DownloadEvent<'
             true // allow the download
         }
         DownloadEvent::Finished { url, path, success } => {
-            // macOS: `path` is empty (API limitation), so recover the temp file
-            // + final dest from the map we filled in Requested.
+            // macOS: `path` is usually empty (API limitation), so recover the
+            // WebKit-write path + final dest from the map we filled in Requested.
+            // But in AYGENT_DL_MODE="default" WebKit chose its own path and may
+            // report it here — prefer a NON-EMPTY reported path over the mapped
+            // one so we move from where WebKit actually wrote.
             let mapped = app
                 .try_state::<BrowserProc>()
                 .and_then(|proc| proc.dl_temps.lock().ok().and_then(|mut m| m.remove(url.as_str())));
 
+            let reported = path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+            eprintln!(
+                "[aygent][browser][DL] finished success={success} url={url} reported_path={:?} (mapped={})",
+                reported, mapped.is_some()
+            );
+
             let mut final_path = String::new();
             let mut moved_ok = success;
             if success {
-                if let Some((temp_dest, final_dest)) = mapped {
+                if let Some((mapped_write, final_dest)) = mapped {
+                    // Source to move FROM = WebKit's reported path if non-empty,
+                    // else the write path we stored in Requested.
+                    let temp_dest = match path.as_ref() {
+                        Some(p) if !p.as_os_str().is_empty() => p.clone(),
+                        _ => mapped_write,
+                    };
                     eprintln!(
-                        "[aygent][browser][DL] finished, moving temp={} -> final={}",
+                        "[aygent][browser][DL] finished, moving from={} -> final={}",
                         temp_dest.display(), final_dest.display()
                     );
-                    if temp_dest.exists() {
+                    if temp_dest == final_dest {
+                        // "final" mode: WebKit already wrote to the agent dir.
+                        moved_ok = temp_dest.exists();
+                        if moved_ok { final_path = final_dest.display().to_string(); }
+                    } else if temp_dest.exists() {
                         // Ensure the final dir exists (agent may have switched).
                         if let Some(parent) = final_dest.parent() {
                             let _ = std::fs::create_dir_all(parent);
@@ -1565,7 +1658,17 @@ pub async fn webview_open(
     let title_app = app.clone();
     let dl_app = app.clone();
     let builder = tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed))
-        .on_navigation(|_url| true) // allow-all observer; NEVER records (see on_page_load)
+        .on_navigation(|url| {
+            // DIAGNOSTIC (Atlas): log every URL that reaches wry's
+            // navigation_policy. If a right-click "Save Image" / binary URL
+            // appears here, the download went through nav policy (and we
+            // allowed it). If [DL] begin fires but the download URL never
+            // appears in a [NAV] line, the download came via WebKit's
+            // context-menu WKDownload path (didBecomeDownload) — proving the
+            // on_navigation observer is NOT intercepting/swallowing downloads.
+            eprintln!("[aygent][browser][NAV] policy url={url}");
+            true // allow-all observer; NEVER records (see on_page_load)
+        })
         .on_page_load(move |_wv, payload| {
             use tauri::webview::PageLoadEvent;
             // Only act at COMMIT (Started); Finished would double-fire per page.
