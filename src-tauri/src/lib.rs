@@ -1415,6 +1415,11 @@ async fn agent_run(
             "name": "list_files",
             "description": "List entries in a directory inside the agent folder. Path is relative to the folder root; use '.' for the root.",
             "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }
+        },
+        {
+            "name": "task_complete",
+            "description": "Call this the INSTANT the user's task is done. This ENDS your turn. You MUST call this when finished — do not keep acting. Provide a one-sentence summary of what you accomplished.",
+            "input_schema": { "type": "object", "properties": { "summary": { "type": "string", "description": "one-sentence summary of what you did" } }, "required": ["summary"] }
         }
     ]);
     if let Some(arr) = tools.as_array_mut() {
@@ -1433,16 +1438,18 @@ async fn agent_run(
         (e.g. the title of the first result). The human approves each click.\n\
         - After EACH tool call, the tool returns the current page title + URL. TRUST IT. If the URL \
         changed to the destination you intended, the action SUCCEEDED.\n\n\
-        WHEN TO STOP (critical):\n\
-        - The moment the task is satisfied, STOP calling tools and give a short final answer stating \
-        what you did and where you ended up. Do NOT keep acting.\n\
-        - 'Click the first result' is COMPLETE as soon as the page navigates to that result's site. \
-        Once you are OFF the Google results page and on the destination, you are DONE — report it.\n\
-        - NEVER re-open Google or re-run a search unless the human explicitly asks for a new search. \
-        If you already searched and clicked, the search phase is over.\n\
-        - If a tool result shows you are already on the target site, that IS success — stop.\n\n\
-        Be concise. Prefer the FEWEST tool calls. When done, one short sentence: what you did + the \
-        final page.";
+        WHEN TO STOP (CRITICAL — you MUST do this):\n\
+        - The MOMENT the task is satisfied, call the `task_complete` tool with a one-sentence \
+        summary. This ENDS your turn. It is the ONLY correct way to finish. Do not just write text \
+        — you must CALL task_complete.\n\
+        - 'Click the first result' is COMPLETE the instant the page navigates to that result's site. \
+        As soon as a tool result shows you are OFF the Google results page and ON the destination \
+        (e.g. url is claude.ai, not google.com), call task_complete immediately.\n\
+        - NEVER re-open Google or re-run a search after you've already clicked into a result. If you \
+        already searched and clicked, you are done — call task_complete.\n\
+        - If a tool result shows you are already on the target site, that IS success — call \
+        task_complete right away.\n\n\
+        Be concise. Prefer the FEWEST tool calls. Always finish by calling task_complete.";
 
     let mut messages = serde_json::json!([{ "role": "user", "content": prompt }]);
     let mut transcript = String::new();
@@ -1483,37 +1490,30 @@ async fn agent_run(
                     let input = blk.get("input").cloned().unwrap_or(serde_json::json!({}));
                     let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
 
+                    // TASK_COMPLETE: the model signals it's done. End the turn
+                    // DETERMINISTICALLY (no heuristic guessing about "did it
+                    // leave Google"). This is the clear STOP event.
+                    if name == "task_complete" {
+                        let summary = input.get("summary").and_then(|s| s.as_str()).unwrap_or("done");
+                        transcript.push_str(&format!("\n✓ {summary}\n"));
+                        eprintln!("[aygent][browser][AGENT] task_complete: {summary}");
+                        return Ok(transcript);
+                    }
                     // EXECUTE THROUGH THE BROKER (jailed) — or the browser tools
                     // (act on the VISIBLE tab + per-agent domain policy + wheel).
                     let (result_text, is_err) = if browser::is_agent_tool(name) {
                         browser_actions += 1;
-                        // COMPLETION GUARD: if the agent already left Google and
-                        // now tries to search Google or re-open it, that's a loop.
-                        // Refuse + tell it the task is done so it ends the turn.
-                        let wants_google = {
-                            let u = input.get("url").and_then(|u| u.as_str()).unwrap_or("").to_lowercase();
-                            let t = input.get("text").and_then(|t| t.as_str()).unwrap_or("").to_lowercase();
-                            name == "browser_open" && u.contains("google.")
-                                || (name == "browser_type_text" && left_google)
-                                || (name == "browser_click_text" && t == "search" && left_google)
-                        };
-                        if left_google && wants_google {
-                            ("You have already navigated off Google to the destination — the task is COMPLETE. Do NOT search again. Stop now and give a one-sentence summary of what you did.".to_string(), true)
-                        } else if browser_actions > 10 {
-                            ("You've taken many actions. Stop now and summarize what you accomplished in one sentence.".to_string(), true)
+                        // Hard backstop only: too many actions = force a stop.
+                        // Real termination is the model calling task_complete.
+                        if browser_actions > 12 {
+                            ("You've taken many actions without finishing. Call task_complete now with a summary of what you accomplished.".to_string(), true)
                         } else {
                             // No configured allowlist — the human-in-the-loop
                             // permission flow governs new hosts; current tab host
                             // is pre-allowed. Pass empty.
                             let domains: Vec<String> = Vec::new();
-                            let out = browser::agent_tool(&app, &browser_state, name, &input, &domains).await;
-                            // Mark that we've left Google once a click/open lands
-                            // us on a non-google page (result text carries the url).
-                            if !out.1 && !out.0.to_lowercase().contains("google.")
-                                && (name == "browser_click_text" || name == "browser_open") {
-                                left_google = true;
-                            }
-                            out
+                            let _ = left_google; // (retired heuristic)
+                            browser::agent_tool(&app, &browser_state, name, &input, &domains).await
                         }
                     } else { match name {
                         "read_file" => match broker.resolve_and_open("default", path, broker::Mode::Read) {
