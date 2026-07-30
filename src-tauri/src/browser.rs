@@ -764,6 +764,25 @@ pub async fn active_tab_read(
     expr: &str,
 ) -> Result<String, String> {
     ensure_session(app, state).await?;
+    // MIRROR the visible tab: the CDP session is a separate Chromium that would
+    // otherwise sit on about:blank (agent read comes back blank -> it thinks the
+    // search failed and loops). Before reading, make the CDP page match the URL
+    // the human is actually looking at, so the agent reads what you see. We only
+    // navigate when the CDP page isn't already on that URL (avoid reload churn).
+    let want = { ACTIVE_TAB_URL.lock().ok().map(|g| g.clone()).unwrap_or_default() };
+    let want = normalize_url(&want);
+    if want.starts_with("http") {
+        let here = session_call(state, "Runtime.evaluate",
+            serde_json::json!({ "expression": "location.href", "returnByValue": true })
+        ).await.ok().and_then(|r| r["result"]["value"].as_str().map(|s| s.to_string())).unwrap_or_default();
+        // Compare by host+path-ish: if the CDP page isn't on the visible URL,
+        // navigate it there and let it settle before reading.
+        if here.is_empty() || host_of(&here) != host_of(&want) {
+            eprintln!("[aygent][browser][READ] mirroring CDP -> {want} (was {here})");
+            let _ = session_call(state, "Page.navigate", serde_json::json!({ "url": want })).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
+        }
+    }
     let r = session_call(state, "Runtime.evaluate",
         serde_json::json!({ "expression": format!("JSON.stringify({expr})"), "returnByValue": true })
     ).await?;
@@ -1918,6 +1937,17 @@ async fn agent_tool_inner(
         "browser_click_text" => {
             let want = input.get("text").and_then(|t| t.as_str()).unwrap_or("");
             if want.is_empty() { return ("browser_click_text needs `text`".into(), true); }
+            // GATE THE CLICK: clicking a link navigates the page for the human,
+            // so ask before doing it (Approve/Deny/Take Control, inline in the
+            // Agent panel). This is Mason's requirement: the human confirms the
+            // click. Allow -> proceed; Deny -> stop this action; Take -> hand the
+            // wheel to the human.
+            let ans = request_permission(app, state, &format!("click \"{want}\""), &format!("The agent wants to click the link/button: {want}")).await;
+            match ans.as_str() {
+                "allow" => {}
+                "take" => return ("the human took the wheel to do this themselves".into(), true),
+                _ => return (format!("the human declined clicking '{want}'. Stopping."), true),
+            }
             // Fire the click (no return needed).
             let click = format!(
                 "const t={:?}.toLowerCase(); const els=[...document.querySelectorAll('a,button,input[type=submit],[role=button],label,[onclick],h3')]; \
