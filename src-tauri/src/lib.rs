@@ -1369,22 +1369,31 @@ async fn agent_run(
     app: tauri::AppHandle,
     broker: tauri::State<'_, Arc<Broker>>,
     browser_state: tauri::State<'_, browser::BrowserProc>,
+    db: tauri::State<'_, writer::Db>,
+    folder: Option<String>,
     prompt: String,
 ) -> Result<String, String> {
     let key = keychain::get_key("anthropic")
         .map_err(|_| "no anthropic key set — add one first".to_string())?;
     let models = provider::anthropic_list_models(&key).await?;
-    // Browser hand-off needs REAL reasoning (haiku loops: it can't reliably
-    // judge "task done, stop"). Prefer sonnet, then any non-haiku, then whatever
-    // exists. This is the model that drives the visible tab from the Agent panel.
-    let model = models
-        .iter()
-        .find(|m| m.contains("sonnet"))
-        .or_else(|| models.iter().find(|m| !m.contains("haiku")))
-        .cloned()
-        .or_else(|| models.first().cloned())
-        .ok_or_else(|| "account returned no usable models".to_string())?;
-    eprintln!("[aygent][browser][AGENT] model={model}");
+    // MODEL: use the agent's CONFIGURED model (per-folder Settings picker). Only
+    // if none is set do we auto-pick (prefer sonnet for real reasoning; browser
+    // hand-off needs it). This fixes the bug where agent_run ignored the config
+    // and always ran sonnet.
+    let configured = folder.as_deref().and_then(|f| {
+        agent_for_folder(&db, f).ok().and_then(|aid| repo::load_settings(&db, &aid).ok()).map(|s| s.model)
+    }).filter(|m| !m.trim().is_empty());
+    let model = match configured {
+        Some(m) => m,
+        None => models
+            .iter()
+            .find(|m| m.contains("sonnet"))
+            .or_else(|| models.iter().find(|m| !m.contains("haiku")))
+            .cloned()
+            .or_else(|| models.first().cloned())
+            .ok_or_else(|| "account returned no usable models".to_string())?,
+    };
+    eprintln!("[aygent][browser][AGENT] model={model} (configured={:?})", folder);
 
     // M0.2b: capability model. In Folder Mode (the M0.3 default) the granted
     // caps are {fs.read, fs.write, net.http, mcp.net}. The file tools below need

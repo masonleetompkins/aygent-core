@@ -338,7 +338,7 @@ export function Browser() {
       // and hands off on login/CAPTCHA walls (pulse). Prime it toward the page.
       const cur = tabs.find((t) => t.id === activeId);
       const primed = `You are driving the in-app browser in the tab the human is watching (currently: ${cur?.addr || cur?.title || "a page"}). Use the browser tools to act in THAT page. Task: ${task}`;
-      const res = await invoke<string>("agent_run", { prompt: primed });
+      const res = await invoke<string>("agent_run", { prompt: primed, folder: null });
       setAgentLog((l) => [...l, res]);
     } catch (e) {
       setAgentLog((l) => [...l, `✗ ${e}`]);

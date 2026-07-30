@@ -765,29 +765,43 @@ pub async fn active_tab_read(
 ) -> Result<String, String> {
     ensure_session(app, state).await?;
     // MIRROR the visible tab: the CDP session is a separate Chromium that would
-    // otherwise sit on about:blank (agent read comes back blank -> it thinks the
-    // search failed and loops). Before reading, make the CDP page match the URL
-    // the human is actually looking at, so the agent reads what you see. We only
-    // navigate when the CDP page isn't already on that URL (avoid reload churn).
+    // otherwise sit on about:blank. Sync it to ACTIVE_TAB_URL — which the AGENT
+    // ACTIONS keep up to date (see agent_tool: after every click/type/open we
+    // store the CDP page's REAL current url). This kills the old loop where a
+    // STALE google url dragged every read back to Google. Only navigate when the
+    // CDP page's host differs (avoid reload churn on same-page reads).
     let want = { ACTIVE_TAB_URL.lock().ok().map(|g| g.clone()).unwrap_or_default() };
     let want = normalize_url(&want);
-    if want.starts_with("http") {
-        let here = session_call(state, "Runtime.evaluate",
-            serde_json::json!({ "expression": "location.href", "returnByValue": true })
-        ).await.ok().and_then(|r| r["result"]["value"].as_str().map(|s| s.to_string())).unwrap_or_default();
-        // Compare by host+path-ish: if the CDP page isn't on the visible URL,
-        // navigate it there and let it settle before reading.
-        if here.is_empty() || host_of(&here) != host_of(&want) {
-            eprintln!("[aygent][browser][READ] mirroring CDP -> {want} (was {here})");
-            let _ = session_call(state, "Page.navigate", serde_json::json!({ "url": want })).await;
-            tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
-        }
+    let here = session_call(state, "Runtime.evaluate",
+        serde_json::json!({ "expression": "location.href", "returnByValue": true })
+    ).await.ok().and_then(|r| r["result"]["value"].as_str().map(|s| s.to_string())).unwrap_or_default();
+    if want.starts_with("http") && (here.is_empty() || (host_of(&here) != host_of(&want) && host_of(&here) == "" )) {
+        // Only mirror when the CDP page is truly empty/blank — NOT to override a
+        // real page the agent's own action already navigated to.
+        eprintln!("[aygent][browser][READ] mirroring CDP -> {want} (was {here})");
+        let _ = session_call(state, "Page.navigate", serde_json::json!({ "url": want })).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
     }
     let r = session_call(state, "Runtime.evaluate",
         serde_json::json!({ "expression": format!("JSON.stringify({expr})"), "returnByValue": true })
     ).await?;
     r["result"]["value"].as_str().map(|s| s.to_string())
         .ok_or_else(|| "no value from page".to_string())
+}
+
+/// After an agent ACTION, store the CDP session's REAL current url as the new
+/// ACTIVE_TAB_URL, so subsequent reads mirror to where the page ACTUALLY is
+/// (not a stale frontend value). This is what lets the agent "see" it navigated
+/// off Google to the destination.
+async fn refresh_active_url_from_cdp(state: &tauri::State<'_, BrowserProc>) {
+    if let Ok(r) = session_call(state, "Runtime.evaluate",
+        serde_json::json!({ "expression": "location.href", "returnByValue": true })).await {
+        if let Some(u) = r["result"]["value"].as_str() {
+            if u.starts_with("http") {
+                if let Ok(mut g) = ACTIVE_TAB_URL.lock() { *g = u.to_string(); }
+            }
+        }
+    }
 }
 
 /// Read the active tab's (title, url) — from the VISIBLE embedded webview via a
@@ -1771,6 +1785,13 @@ pub async fn agent_tool(
         return ("the human just took the browser — not acting".into(), true);
     }
     let out = agent_tool_inner(app, state, name, input, allowed_domains).await;
+    // After ANY action that could navigate, refresh the tracked URL from the CDP
+    // session's REAL current location. This is THE loop fix: reads then mirror to
+    // where the page ACTUALLY is (claude.ai), not the stale google.com the
+    // frontend last reported — so the agent SEES it left Google and stops.
+    if matches!(name, "browser_open" | "browser_click_text" | "browser_type_text") {
+        refresh_active_url_from_cdp(state).await;
+    }
     // On a login/CAPTCHA-ish failure, hand off to the human with a note.
     let handoff = if out.1 && looks_like_handoff(&out.0) {
         "the agent hit a login or verification wall — take the wheel to continue"
