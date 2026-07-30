@@ -894,6 +894,11 @@ async fn ensure_session(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
     // Enable the domains + start the screencast (JPEG, capped size for latency).
     session_call(state, "Page.enable", serde_json::json!({})).await?;
     session_call(state, "Runtime.enable", serde_json::json!({})).await?;
+    // DOM domain: required for DOM.getContentQuads (used by the trusted-click
+    // target resolver to get the click point in the exact coord space CDP
+    // Input.* uses — DPR-safe). Best-effort; the resolver falls back to the
+    // rect center if DOM is unavailable.
+    let _ = session_call(state, "DOM.enable", serde_json::json!({})).await;
     // FINGERPRINT HARDENING (#2) — done ONCE per session, right after the
     // domains are enabled and BEFORE any real navigation, so it applies to the
     // very first document too.
@@ -1808,39 +1813,147 @@ async fn human_delay(min_ms: u64, max_ms: u64) {
     tokio::time::sleep(std::time::Duration::from_millis(min_ms + jitter)).await;
 }
 
-/// Find an element by visible text and return its viewport-center [x,y] in CSS
-/// px (the coordinate space CDP Input.* mouse events use), AFTER scrolling it
-/// into view. Returns None if no element matches. This is the FIRST half of a
-/// TRUSTED click: we locate WHERE to click, then dispatch a real mouse click
-/// there (never el.click()).
+/// The resolved click target: the coordinate to click (in the SAME CSS-px /
+/// layout-viewport space CDP Input.* uses) plus diagnostics for the [CLICK] log
+/// and an honest post-click success check.
+struct ClickTarget {
+    x: f64,
+    y: f64,
+    /// The nearest clickable ancestor's tag (a/button/…) we actually target.
+    tag: String,
+    /// If the target (or an ancestor) is/inside an <a>, its resolved href —
+    /// used as a navigation fallback if the trusted click produced no nav.
+    href: Option<String>,
+    /// Diagnostics: the page's reported DPR + scroll + inner viewport.
+    dpr: f64,
+    scroll_x: f64,
+    scroll_y: f64,
+    inner_w: f64,
+    inner_h: f64,
+    /// Whether the coord came from getContentQuads (true) or the rect fallback.
+    via_quads: bool,
+}
+
+/// Find an element by visible text, resolve it to the nearest CLICKABLE ancestor
+/// (`el.closest('a,button,[role=button],…') || el`), scroll it into view, and
+/// return the exact point to click — computed from `DOM.getContentQuads`, which
+/// returns quads in the SAME coordinate space CDP `Input.dispatchMouseEvent`
+/// expects (CSS px relative to the layout viewport). This sidesteps all
+/// CSS-vs-device-px / DPR guesswork that plagues pure `getBoundingClientRect`
+/// math. Falls back to the rect center only if quads are empty. Returns None if
+/// no element matches. FIRST half of a TRUSTED click (never el.click()).
 async fn element_center_by_text(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, BrowserProc>,
     want: &str,
-) -> Result<Option<(f64, f64)>, String> {
-    // Runtime.evaluate returning the center coords (or null). We scroll into
-    // view first so the rect is within the viewport for the mouse event.
-    let expr = format!(
+) -> Result<Option<ClickTarget>, String> {
+    ensure_session(app, state).await?;
+    // 1) Locate the element AND resolve to the nearest clickable ancestor, then
+    //    scroll into view. Return the NODE (returnByValue:false -> objectId) so
+    //    we can ask CDP for its content quads. Also stash diagnostics + the rect
+    //    center (fallback) + href on the node object so a single eval gives us
+    //    everything.
+    let locate_fn = format!(
         "(()=>{{ const t={want:?}.toLowerCase(); \
          const els=[...document.querySelectorAll('a,button,input[type=submit],input[type=button],[role=button],label,[onclick],h3,li,span,div')]; \
-         const el=els.find(e=>{{ const s=(e.innerText||e.value||e.textContent||''); return s && s.toLowerCase().includes(t) && e.offsetParent!==null; }}); \
+         let el=els.find(e=>{{ const s=(e.innerText||e.value||e.textContent||''); return s && s.toLowerCase().includes(t) && e.offsetParent!==null; }}); \
          if(!el) return null; \
+         const clickable = el.closest('a,button,input[type=submit],input[type=button],[role=button],[onclick]') || el; \
+         el = clickable; \
          el.scrollIntoView({{block:'center',inline:'center'}}); \
          const r=el.getBoundingClientRect(); \
-         if(r.width===0||r.height===0) return null; \
-         return [r.left + r.width/2, r.top + r.height/2]; }})()",
+         const a = el.closest('a'); \
+         el.__aygentDiag = {{ \
+            tag: el.tagName.toLowerCase(), \
+            href: a ? a.href : null, \
+            rx: r.left + r.width/2, ry: r.top + r.height/2, \
+            rw: r.width, rh: r.height, \
+            dpr: window.devicePixelRatio||1, \
+            sx: window.scrollX||0, sy: window.scrollY||0, \
+            iw: window.innerWidth||0, ih: window.innerHeight||0 \
+         }}; \
+         return el; }})()",
         want = want
     );
-    let json = active_tab_read(app, state, &expr).await?;
-    if json.trim() == "null" || json.trim().is_empty() {
+    let node = session_call(
+        state,
+        "Runtime.evaluate",
+        serde_json::json!({ "expression": locate_fn, "returnByValue": false }),
+    )
+    .await?;
+    let object_id = match node["result"]["objectId"].as_str() {
+        Some(id) => id.to_string(),
+        None => return Ok(None), // matched nothing (result was null)
+    };
+
+    // 2) Pull the diagnostics we stashed on the node (returnByValue this time).
+    let diag = session_call(
+        state,
+        "Runtime.callFunctionOn",
+        serde_json::json!({
+            "objectId": object_id,
+            "functionDeclaration": "function(){ return this.__aygentDiag; }",
+            "returnByValue": true
+        }),
+    )
+    .await?;
+    let d = &diag["result"]["value"];
+    let tag = d["tag"].as_str().unwrap_or("?").to_string();
+    let href = d["href"].as_str().map(|s| s.to_string());
+    let dpr = d["dpr"].as_f64().unwrap_or(1.0);
+    let scroll_x = d["sx"].as_f64().unwrap_or(0.0);
+    let scroll_y = d["sy"].as_f64().unwrap_or(0.0);
+    let inner_w = d["iw"].as_f64().unwrap_or(0.0);
+    let inner_h = d["ih"].as_f64().unwrap_or(0.0);
+    let rect_cx = d["rx"].as_f64().unwrap_or(0.0);
+    let rect_cy = d["ry"].as_f64().unwrap_or(0.0);
+
+    // 3) Ask CDP for the element's content quads — SAME coord space as Input.*.
+    //    A quad is [x1,y1, x2,y2, x3,y3, x4,y4]; its center is the mean of the
+    //    x's and y's. If quads are empty (element off-screen after scroll, or a
+    //    zero-box wrapper), fall back to the rect center from the eval above.
+    let (mut x, mut y, mut via_quads) = (rect_cx, rect_cy, false);
+    match session_call(
+        state,
+        "DOM.getContentQuads",
+        serde_json::json!({ "objectId": object_id }),
+    )
+    .await
+    {
+        Ok(q) => {
+            if let Some(quads) = q["quads"].as_array() {
+                if let Some(first) = quads.first().and_then(|f| f.as_array()) {
+                    if first.len() == 8 {
+                        let get = |i: usize| first[i].as_f64().unwrap_or(0.0);
+                        x = (get(0) + get(2) + get(4) + get(6)) / 4.0;
+                        y = (get(1) + get(3) + get(5) + get(7)) / 4.0;
+                        via_quads = true;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            // DOM domain may not be enabled on this build/path — the rect
+            // fallback still works, just note it.
+            eprintln!("[aygent][browser][CLICK] getContentQuads err (rect fallback): {e}");
+        }
+    }
+
+    // Release the remote object so we don't leak references in the page.
+    let _ = session_call(
+        state,
+        "Runtime.releaseObject",
+        serde_json::json!({ "objectId": object_id }),
+    )
+    .await;
+
+    if x <= 0.0 && y <= 0.0 {
         return Ok(None);
     }
-    let coords: Vec<f64> = serde_json::from_str(&json).unwrap_or_default();
-    if coords.len() == 2 {
-        Ok(Some((coords[0], coords[1])))
-    } else {
-        Ok(None)
-    }
+
+    Ok(Some(ClickTarget {
+        x, y, tag, href, dpr, scroll_x, scroll_y, inner_w, inner_h, via_quads,
+    }))
 }
 
 /// Find a typeable field's viewport-center [x,y] in CSS px (scrolled into view),
@@ -2371,18 +2484,64 @@ async fn agent_tool_inner(
             // (mouseMoved x3 approach -> mousePressed -> mouseReleased). The
             // events carry isTrusted:true — indistinguishable from a human click.
             eprintln!("[aygent][browser][INPUT] browser_click_text want={want:?}");
-            let center = match element_center_by_text(app, state, want).await {
+            let target = match element_center_by_text(app, state, want).await {
                 Ok(Some(c)) => c,
                 Ok(None) => return (format!("no clickable element matching '{want}' on this page"), true),
                 Err(e) => return (format!("click locate failed: {e}"), true),
             };
+            // GROUND-TRUTH DIAGNOSTICS: paste-able terminal line showing exactly
+            // where we're about to click, the page's DPR/scroll/viewport, the
+            // resolved element tag, and whether we used getContentQuads (coord
+            // space guaranteed to match Input.*) or the rect fallback.
+            eprintln!(
+                "[aygent][browser][CLICK] want={want:?} tag=<{}> coord=({:.1},{:.1}) via_quads={} dpr={} scroll=({:.0},{:.0}) inner=({:.0}x{:.0}) href={:?}",
+                target.tag, target.x, target.y, target.via_quads, target.dpr,
+                target.scroll_x, target.scroll_y, target.inner_w, target.inner_h, target.href
+            );
+            // Capture the URL + a coarse DOM signature BEFORE the click so we can
+            // tell — HONESTLY — whether the click actually did anything.
+            let url_before = cdp_current_url(state).await;
             human_delay(60, 150).await;
-            if let Err(e) = trusted_click_at(state, center.0, center.1).await {
+            if let Err(e) = trusted_click_at(state, target.x, target.y).await {
                 return (format!("trusted click dispatch failed: {e}"), true);
             }
             wait_for_cdp_load(state).await;
+            let mut url_after = cdp_current_url(state).await;
+            let mut navigated = url_after != url_before && url_after.starts_with("http");
+            // FALLBACK: the trusted click landed but produced no navigation and
+            // we DO have a resolved <a> href (classic search-result case). Rather
+            // than lie with a false ✓, navigate the authoritative CDP page to
+            // that href so the human still gets the result — still no el.click().
+            if !navigated {
+                if let Some(href) = target.href.as_deref() {
+                    if href.starts_with("http") && href != url_before {
+                        eprintln!("[aygent][browser][CLICK] trusted click produced NO nav — href fallback -> {href}");
+                        if session_call(state, "Page.navigate", serde_json::json!({ "url": href })).await.is_ok() {
+                            wait_for_cdp_load(state).await;
+                            url_after = cdp_current_url(state).await;
+                            navigated = url_after != url_before && url_after.starts_with("http");
+                        }
+                    }
+                }
+            }
             let (title, url) = active_tab_page_info_cdp(app, state).await.unwrap_or_default();
-            (format!("clicked '{want}'. Now on: {title} ({url})"), false)
+            eprintln!(
+                "[aygent][browser][CLICK] result navigated={navigated} url_before={url_before:?} url_after={url_after:?}"
+            );
+            if navigated {
+                (format!("clicked '{want}'. Now on: {title} ({url})"), false)
+            } else {
+                // HONEST FAILURE (#4): do NOT report success. The click event
+                // fired (isTrusted) but the page did not change, so the model /
+                // checklist must NOT tick this step off.
+                (
+                    format!(
+                        "clicked '{want}' (trusted mouse event dispatched on <{}> at ({:.0},{:.0})) but the page did NOT navigate or change — the target may be wrong or the link needs a different action. Still on: {title} ({url}).",
+                        target.tag, target.x, target.y
+                    ),
+                    true,
+                )
+            }
         }
         "browser_type_text" => {
             let text = input.get("text").and_then(|t| t.as_str()).unwrap_or("");
