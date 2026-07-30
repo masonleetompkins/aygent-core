@@ -189,10 +189,16 @@ export function Browser() {
     console.log("[browser] webview_open →", { x: ox, y: oy, width: ow, height: oh }, "raw:", { l: r?.left, t: r?.top, w: r?.width, h: r?.height });
     const clientWidth = Math.round(document.documentElement.clientWidth);
     const clientHeight = Math.round(document.documentElement.clientHeight);
-    await invoke("webview_open", { url, x: ox, y: oy, width: ow, height: oh, clientWidth, clientHeight, radius: WEB_RADIUS, tabId: id })
-      .catch((e) => setAgentLog((l) => [...l, `open failed: ${e}`]));
+    dlog(`webview_open x=${ox} y=${oy} w=${ow} h=${oh} rawRect=(${Math.round(r?.left ?? -1)},${Math.round(r?.top ?? -1)} ${Math.round(r?.width ?? -1)}x${Math.round(r?.height ?? -1)})`);
+    try {
+      await invoke("webview_open", { url, x: ox, y: oy, width: ow, height: oh, clientWidth, clientHeight, radius: WEB_RADIUS, tabId: id });
+      dlog("webview_open OK");
+    } catch (e) {
+      dlog(`webview_open ERR: ${e}`);
+      setAgentLog((l) => [...l, `open failed: ${e}`]);
+    }
     // This tab's webview is now the active surface — hide the others.
-    invoke("webview_hide_others", { keep: id }).catch(() => {});
+    invoke("webview_hide_others", { keep: id }).catch((e) => dlog(`hide_others ERR: ${e}`));
     patch(id, { opened: true });
     // Re-sync a beat later so the webview lands on the SETTLED rect (the agent
     // prompt bar toggling can shift the pane by a row).
