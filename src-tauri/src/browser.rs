@@ -943,21 +943,24 @@ pub async fn webview_open(
     y: f64,
     width: f64,
     height: f64,
+    // Content-area size (documentElement.clientWidth/Height) the frontend rect
+    // was measured against. Used to compute the native titlebar inset at
+    // runtime (see resolve_child_bounds). Optional so the invoke stays tolerant.
+    client_width: Option<f64>,
+    client_height: Option<f64>,
 ) -> Result<(), String> {
-    use tauri::{LogicalPosition, LogicalSize, Manager, WebviewUrl};
+    use tauri::{Manager, WebviewUrl};
     let target = normalize_url(&url);
     let parsed = target.parse().map_err(|e| format!("bad url: {e}"))?;
 
-    // Pass the frontend's measured CSS-px rect straight through as LOGICAL.
-    // Tauri converts logical->physical internally using the window's DPR, so
-    // this is correct on Retina + 1x. (Do NOT pre-multiply by scale ourselves —
-    // that double-applied DPR and shrank the child top-left.)
+    let (pos, size) = resolve_child_bounds(&app, x, y, width, height, client_width, client_height);
+
     // Existing EMBEDDED child webview? reposition + navigate. add_child creates
     // a `Webview` (embedded child), retrieved via get_webview() (not
     // get_webview_window(), which returns None for embedded children).
     if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
-        let _ = wv.set_position(LogicalPosition::new(x, y));
-        let _ = wv.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
+        let _ = wv.set_position(pos);
+        let _ = wv.set_size(size);
         wv.navigate(parsed).map_err(|e| format!("navigate: {e}"))?;
         return Ok(());
     }
@@ -969,13 +972,68 @@ pub async fn webview_open(
     let builder = tauri::webview::WebviewBuilder::new(WEBVIEW_LABEL, WebviewUrl::External(parsed));
     main.as_ref()
         .window()
-        .add_child(
-            builder,
-            LogicalPosition::new(x, y),
-            LogicalSize::new(width.max(1.0), height.max(1.0)),
-        )
+        .add_child(builder, pos, size)
         .map_err(|e| format!("embed webview: {e}"))?;
     Ok(())
+}
+
+/// THE FIX (Atlas): wry positions a child webview relative to the PARENT WINDOW
+/// top-left — which is ABOVE the native macOS titlebar — while the frontend's
+/// getBoundingClientRect measures from the web CONTENT area, BELOW the titlebar.
+/// That constant gap (the titlebar height, ~28pt) is why the child rode too high
+/// + slightly left. We measure that inset at RUNTIME (no hardcoded px): it's the
+/// difference between the window's logical inner size and the content client
+/// size the frontend reported. Add the inset to the pane origin; keep size as-is.
+///
+/// scale_factor() is unreliable here (reports 1.0 on a 2x display), so we derive
+/// the true backing scale from physical_inner_width / logical_content_width and
+/// convert manually. Everything stays in LOGICAL points (child frame math is in
+/// points; feeding physical shrank the child — the failed attempt B).
+fn resolve_child_bounds(
+    app: &tauri::AppHandle,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    client_width: Option<f64>,
+    client_height: Option<f64>,
+) -> (tauri::LogicalPosition<f64>, tauri::LogicalSize<f64>) {
+    use tauri::{LogicalPosition, LogicalSize, Manager};
+    let size = LogicalSize::new(width.max(1.0), height.max(1.0));
+
+    // Need the content size the rect was measured against to derive the inset.
+    let (cw, ch) = match (client_width, client_height) {
+        (Some(cw), Some(ch)) if cw > 0.0 && ch > 0.0 => (cw, ch),
+        // No content size sent → can't compute inset; pass rect through as-is.
+        _ => return (LogicalPosition::new(x, y), size),
+    };
+
+    let Some(win) = app.get_webview_window("main") else {
+        return (LogicalPosition::new(x, y), size);
+    };
+    let phys = match win.inner_size() {
+        Ok(s) => s,
+        Err(_) => return (LogicalPosition::new(x, y), size),
+    };
+
+    // True backing scale: physical inner width / logical content width. Robust
+    // even when scale_factor() lies. (content width == window logical width for
+    // a standard window.)
+    let scale = if phys.width > 0 {
+        (phys.width as f64 / cw).round().max(1.0)
+    } else {
+        win.scale_factor().unwrap_or(1.0).max(1.0)
+    };
+
+    let win_logical_w = phys.width as f64 / scale;
+    let win_logical_h = phys.height as f64 / scale;
+
+    // Runtime-measured insets: gap between window box and content box.
+    // top_inset == native titlebar height. left_inset ~0 for a standard window.
+    let top_inset = (win_logical_h - ch).max(0.0);
+    let left_inset = ((win_logical_w - cw) / 2.0).max(0.0);
+
+    (LogicalPosition::new(x + left_inset, y + top_inset), size)
 }
 
 /// Reposition/resize the embedded webview to track the pane (called on layout
@@ -987,18 +1045,19 @@ pub fn webview_set_bounds(
     y: f64,
     width: f64,
     height: f64,
-    // Parent content-area height the FRONTEND measured `y` against. No longer
-    // used for a manual Y-flip (the real bug was DPR, not a flip race) but kept
-    // in the signature so the invoke contract stays stable + the frontend need
-    // not change its call shape.
-    #[allow(unused_variables)] parent_height: Option<f64>,
+    // Content-area size the frontend rect was measured against, used to compute
+    // the native titlebar inset at runtime. `parent_height` kept as an alias for
+    // client_height so the older invoke shape still works.
+    client_width: Option<f64>,
+    client_height: Option<f64>,
+    parent_height: Option<f64>,
 ) -> Result<(), String> {
-    use tauri::{LogicalPosition, LogicalSize, Manager};
+    use tauri::Manager;
     if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
-        // Pass the measured CSS-px rect straight through as LOGICAL; Tauri does
-        // the DPR conversion. No manual scale math (that shrank the child).
-        let _ = wv.set_position(LogicalPosition::new(x, y));
-        let _ = wv.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
+        let ch = client_height.or(parent_height);
+        let (pos, size) = resolve_child_bounds(&app, x, y, width, height, client_width, ch);
+        let _ = wv.set_position(pos);
+        let _ = wv.set_size(size);
     }
     Ok(())
 }

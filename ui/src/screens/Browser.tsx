@@ -69,6 +69,8 @@ export function Browser() {
       // Main webview content-area logical height == the parent NSView height
       // wry flips against. Measured in the same frame as r. No hardcoding.
       const parentHeight = Math.round(document.documentElement.clientHeight);
+      const clientWidth = Math.round(document.documentElement.clientWidth);
+      const clientHeight = parentHeight;
       const rightPane = driver === "agent" ? AGENT_PANE_W + 10 : 0; // +gap
       // Webview rect == paneRef's BORDER-BOX rect (no inset). The rounded
       // outline is a pointer-events:none overlay rendered ON TOP of the webview,
@@ -78,10 +80,13 @@ export function Browser() {
         x: Math.round(r.left), y: Math.round(r.top),
         width: Math.round(Math.max(r.width - rightPane, 1)),
         height: Math.round(r.height),
+        // Content-area size the rect was measured against — Rust uses this to
+        // compute the native titlebar inset at runtime (THE fix).
+        clientWidth, clientHeight,
         parentHeight,
       };
       // Skip redundant calls — only push when the rect actually changed.
-      const key = `${bounds.x},${bounds.y},${bounds.width},${bounds.height},${bounds.parentHeight}`;
+      const key = `${bounds.x},${bounds.y},${bounds.width},${bounds.height},${bounds.clientWidth},${bounds.clientHeight}`;
       if (key === lastBoundsRef.current) return;
       lastBoundsRef.current = key;
       invoke("webview_set_bounds", bounds).catch(() => {});
@@ -138,7 +143,9 @@ export function Browser() {
     }
     // eslint-disable-next-line no-console
     console.log("[browser] webview_open →", { x: ox, y: oy, width: ow, height: oh }, "raw:", { l: r?.left, t: r?.top, w: r?.width, h: r?.height });
-    await invoke("webview_open", { url, x: ox, y: oy, width: ow, height: oh })
+    const clientWidth = Math.round(document.documentElement.clientWidth);
+    const clientHeight = Math.round(document.documentElement.clientHeight);
+    await invoke("webview_open", { url, x: ox, y: oy, width: ow, height: oh, clientWidth, clientHeight })
       .catch((e) => setAgentLog((l) => [...l, `open failed: ${e}`]));
     // Re-sync a beat later so the webview lands on the SETTLED rect (the agent
     // prompt bar toggling can shift the pane by a row).
