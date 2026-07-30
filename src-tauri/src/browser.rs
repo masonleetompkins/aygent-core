@@ -969,8 +969,10 @@ pub async fn webview_open(
 ) -> Result<(), String> {
     use tauri::{Manager, WebviewUrl};
     let target = normalize_url(&url);
-    let parsed = target.parse().map_err(|e| format!("bad url: {e}"))?;
+    eprintln!("[aygent][browser] webview_open ENTER url={url:?} -> target={target:?} tab_id={tab_id:?} rect=({x},{y} {width}x{height})");
+    let parsed: tauri::Url = target.parse().map_err(|e| { eprintln!("[aygent][browser] webview_open BAD URL: {e}"); format!("bad url: {e}") })?;
     let label = tab_label(tab_id);
+    eprintln!("[aygent][browser] webview_open label={label} existing={}", app.get_webview(&label).is_some());
 
     let _ = (client_width, client_height);
     let pos = tauri::LogicalPosition::new(x, y);
@@ -1004,7 +1006,8 @@ pub async fn webview_open(
         .as_ref()
         .window()
         .add_child(builder, pos, size)
-        .map_err(|e| format!("embed webview: {e}"))?;
+        .map_err(|e| { eprintln!("[aygent][browser] add_child FAILED: {e}"); format!("embed webview: {e}") })?;
+    eprintln!("[aygent][browser] webview_open add_child OK label={label}");
     // Immediately pin the freshly-created child to the exact measured rect via
     // AppKit — add_child's own placement is what we stopped trusting.
     #[cfg(target_os = "macos")]
