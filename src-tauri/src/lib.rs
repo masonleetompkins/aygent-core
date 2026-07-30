@@ -1461,13 +1461,17 @@ async fn agent_run(
     let system = "You are AYGENT, driving the in-app browser in the tab the human is watching. \
         Use the browser tools to ACT in that page: browser_open (navigate to a URL), browser_read \
         (see the current page's text), browser_click_text (click a link/button by its visible text), \
-        browser_type_text (type into a field, optionally submit). You also have \
+        browser_type_text (type into a field, optionally submit), browser_click_first_result \
+        (click the FIRST organic search result — takes no arguments). You also have \
         read_file/write_file/list_files for the user's folder.\n\n\
         HOW TO WORK:\n\
         - To search Google: the page is already google.com. Call browser_type_text with the query \
         and submit:true. Then call browser_read ONCE to see the results.\n\
-        - To open a result: call browser_click_text with distinctive text from the link you want \
-        (e.g. the title of the first result). The human approves each click.\n\
+        - To open the FIRST search result: call browser_click_first_result (NO arguments) — it \
+        deterministically clicks the first real result and skips ads. NEVER use browser_click_text \
+        with a guessed title for the first result.\n\
+        - To open a SPECIFIC named link: call browser_click_text with distinctive text from that \
+        link. The human approves each click.\n\
         - After EACH tool call, the tool returns the current page title + URL. TRUST IT. If the URL \
         changed to the destination you intended, the action SUCCEEDED.\n\n\
         THE PLAN IS THE LAW (CRITICAL — do EXACTLY this, nothing else):\n\
@@ -1503,7 +1507,9 @@ async fn agent_run(
     let plan_system = "You are a browsing task planner. Decompose the user's task into the SHORTEST \
         ordered list of concrete browser steps needed to finish it. Each step is one short imperative \
         phrase (e.g. \"type 'claude' in the search box and submit\", \"click the first result\", \"read \
-        the page\"). Do NOT include steps for opening the browser (it's already open) or for reporting \
+        the page\"). For opening the top search hit, phrase the step as \"click the first result\" \
+        (the runner has a dedicated deterministic tool for it). Do NOT include steps for opening the \
+        browser (it's already open) or for reporting \
         back. Prefer 1-4 steps. Reply with ONLY a JSON array of strings, nothing else.";
     let plan_msgs = serde_json::json!([{ "role": "user", "content": prompt }]);
     let no_tools = serde_json::json!([]);
@@ -1685,6 +1691,26 @@ async fn agent_run(
                         emit_ev("done", serde_json::json!({ "total": steps.len(), "summary": summary }));
                         return Ok(transcript);
                     }
+                    // FIRST-RESULT OVERRIDE (ITEM 1, belt+suspenders). If the
+                    // CURRENT plan step is a first-result step and the model
+                    // tried to click a specific TEXT (browser_click_text with a
+                    // model-guessed label like "Claude: Sign in"), FORCE the
+                    // deterministic browser_click_first_result path instead. This
+                    // removes any dependence on the model routing correctly: a
+                    // first-result step ALWAYS uses the anchor-required first-
+                    // organic-result selector, never the broad text-match that
+                    // clicked a <div>/tweet embed in the observed bug.
+                    let (name, input): (&str, serde_json::Value) = {
+                        let cur_step_txt = steps.get(next_step).map(|s| s.as_str()).unwrap_or("");
+                        if name == "browser_click_text" && step_is_first_result(cur_step_txt) {
+                            eprintln!("[aygent][browser][STEP] OVERRIDE browser_click_text -> browser_click_first_result on first-result step {}/{} (ignoring model text {:?})",
+                                next_step + 1, steps.len(),
+                                input.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+                            ("browser_click_first_result", serde_json::json!({}))
+                        } else {
+                            (name, input)
+                        }
+                    };
                     // EXECUTE THROUGH THE BROKER (jailed) — or the browser tools
                     // (act on the VISIBLE tab + per-agent domain policy + wheel).
                     let (result_text, is_err) = if browser::is_agent_tool(name) {
@@ -1695,7 +1721,7 @@ async fn agent_run(
                         // is the code-level backstop that stops the second,
                         // wandering click that landed on the wrong site. Reads are
                         // harmless; only clicks/opens/types wander.
-                        let is_acting = matches!(name, "browser_click_text" | "browser_open" | "browser_type_text");
+                        let is_acting = matches!(name, "browser_click_text" | "browser_click_first_result" | "browser_open" | "browser_type_text");
                         if is_acting && satisfied_step == Some(next_step) {
                             let cur = steps.get(next_step).map(|s| s.as_str()).unwrap_or("(current step)");
                             eprintln!("[aygent][browser][STOP] rejected extra {name} on satisfied step {}/{}: {}",
@@ -1717,6 +1743,7 @@ async fn agent_run(
                                 "browser_open" => format!("opening {}", input.get("url").and_then(|u| u.as_str()).unwrap_or("page")),
                                 "browser_read" => "reading the page".to_string(),
                                 "browser_click_text" => format!("clicking “{}”", input.get("text").and_then(|t| t.as_str()).unwrap_or("")),
+                                "browser_click_first_result" => "clicking the first result".to_string(),
                                 "browser_type_text" => {
                                     let submit = input.get("submit").and_then(|b| b.as_bool()).unwrap_or(false);
                                     format!("typing “{}”{}", input.get("text").and_then(|t| t.as_str()).unwrap_or(""), if submit { " and submitting" } else { "" })
@@ -1875,7 +1902,7 @@ async fn agent_run(
                     let mut satisfied_now = false;
                     if browser::is_agent_tool(name)
                         && !is_err
-                        && matches!(name, "browser_click_text" | "browser_open" | "browser_type_text")
+                        && matches!(name, "browser_click_text" | "browser_click_first_result" | "browser_open" | "browser_type_text")
                         && satisfied_step != Some(next_step)
                     {
                         let cur_step_txt = steps.get(next_step).map(|s| s.as_str()).unwrap_or("");
@@ -1978,6 +2005,20 @@ fn parse_plan_steps(text: &str) -> Vec<String> {
 /// STEP IS DONE, so the loop must require step_done next instead of tolerating a
 /// second click. This keys off the ACTUAL plan step text (not hardcoded google
 /// logic) — the brittle `left_google` heuristic is NOT reintroduced.
+/// Is this plan step a "click the FIRST result / first link / top result" step?
+/// Used by the FIRST-RESULT OVERRIDE in `agent_run`: on such a step the model's
+/// browser_click_text (with a guessed label) is rewritten to the deterministic
+/// text-free `browser_click_first_result` tool, so we ALWAYS click the real
+/// first organic <a> instead of whatever text the model read off the page.
+fn step_is_first_result(step: &str) -> bool {
+    let s = step.to_ascii_lowercase();
+    (s.contains("first") && (s.contains("result") || s.contains("link") || s.contains("hit") || s.contains("listing")))
+        || s.contains("top result")
+        || s.contains("select the first")
+        || s.contains("open the first")
+        || s.contains("click the first")
+}
+
 fn step_is_nav(step: &str) -> bool {
     let s = step.to_ascii_lowercase();
     // Any verb that means "end up on a different page/destination".

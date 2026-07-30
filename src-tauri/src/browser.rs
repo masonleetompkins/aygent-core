@@ -1877,6 +1877,7 @@ async fn element_center_by_text(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, BrowserProc>,
     want: &str,
+    force_first_result: bool,
 ) -> Result<Option<ClickTarget>, String> {
     ensure_session(app, state).await?;
     // 1) Locate the element AND resolve to the nearest clickable ancestor, then
@@ -1892,15 +1893,26 @@ async fn element_center_by_text(
     // #search / #center_col). We pick that <a> directly. If the page isn't a
     // recognizable SERP, we fall back to the ordinary first anchor with an h3,
     // then to normal text matching — so this never regresses non-Google pages.
-    let first_result_intent = {
+    // `force_first_result` (from the dedicated browser_click_first_result tool
+    // OR the agent_run override on a first-result plan step) makes the
+    // deterministic first-organic-anchor path AUTHORITATIVE regardless of the
+    // model-supplied `want` text — this is the fix for the bug where a
+    // model-passed label like "Claude: Sign in" routed to the broad text-match
+    // path and clicked a <div> tweet embed instead of the real first result.
+    let first_result_intent = force_first_result || {
         let w = want.to_ascii_lowercase();
         let w = w.trim();
         (w.contains("first") && (w.contains("result") || w.contains("link") || w.contains("hit") || w.contains("listing")))
             || w == "first"
             || w == "top result"
     };
+    // When we're FORCING the first-result path, the text-match fallback (which
+    // is what produced the wrong <div>) must be DISABLED — if no organic anchor
+    // is found we return None (honest "no first result") rather than clicking
+    // whatever element merely contained the label text.
+    let disable_text_fallback = force_first_result;
     let locate_fn = format!(
-        "(()=>{{ const t={want:?}.toLowerCase(); const firstResult={first_result_intent}; \
+        "(()=>{{ const t={want:?}.toLowerCase(); const firstResult={first_result_intent}; const noTextFallback={disable_text_fallback}; \
          let el=null; \
          if(firstResult){{ \
            const containers=['#rso','#search','#center_col','#main']; \
@@ -1915,13 +1927,14 @@ async fn element_center_by_text(
              if(a.closest('[data-text-ad],[aria-label=\"Ads\"],.uEierd,.commercial-unit-desktop-top')) return false; \
              return true; \
            }}) || anchors.find(a=>a.querySelector('h3') && a.offsetParent!==null && /^https?:/i.test(a.href||'')); \
+           if(el){{ el = el.closest('a') || el; }} \
          }} \
-         if(!el){{ \
+         if(!el && !noTextFallback){{ \
            const els=[...document.querySelectorAll('a,button,input[type=submit],input[type=button],[role=button],label,[onclick],h3,li,span,div')]; \
            el=els.find(e=>{{ const s=(e.innerText||e.value||e.textContent||''); return s && s.toLowerCase().includes(t) && e.offsetParent!==null; }}); \
          }} \
          if(!el) return null; \
-         const clickable = el.closest('a,button,input[type=submit],input[type=button],[role=button],[onclick]') || el; \
+         const clickable = firstResult ? (el.closest('a') || el) : (el.closest('a,button,input[type=submit],input[type=button],[role=button],[onclick]') || el); \
          el = clickable; \
          el.scrollIntoView({{block:'center',inline:'center'}}); \
          const r=el.getBoundingClientRect(); \
@@ -1937,7 +1950,8 @@ async fn element_center_by_text(
          }}; \
          return el; }})()",
         want = want,
-        first_result_intent = first_result_intent
+        first_result_intent = first_result_intent,
+        disable_text_fallback = disable_text_fallback
     );
     let node = session_call(
         state,
@@ -1950,13 +1964,32 @@ async fn element_center_by_text(
         None => return Ok(None), // matched nothing (result was null)
     };
 
-    // 2) Pull the diagnostics we stashed on the node (returnByValue this time).
+    // 1b) SETTLE AFTER SCROLL (bug fix). The locate eval called
+    //     scrollIntoView() but read the rect in the SAME synchronous tick — and
+    //     step 3's getContentQuads is a SEPARATE CDP call that reads the CURRENT
+    //     (possibly still-settling) layout. That desync produced the observed
+    //     scroll=(0,1713)/y=356 mismatch that clicked a tweet embed instead of
+    //     the first result. We now (a) wait a beat for the scroll to settle,
+    //     then (b) RE-READ the element's rect + diagnostics from its POST-SCROLL
+    //     position, and step 3 reads getContentQuads on that same settled layout.
+    human_delay(120, 200).await;
+    // Re-scroll + re-read the rect on the settled layout so rx/ry, scroll, and
+    // the quads below all agree on ONE frame.
     let diag = session_call(
         state,
         "Runtime.callFunctionOn",
         serde_json::json!({
             "objectId": object_id,
-            "functionDeclaration": "function(){ return this.__aygentDiag; }",
+            "functionDeclaration": "function(){ \
+                this.scrollIntoView({block:'center',inline:'center'}); \
+                const r=this.getBoundingClientRect(); \
+                const a=this.closest('a'); \
+                return { \
+                  tag:this.tagName.toLowerCase(), href:a?a.href:null, \
+                  rx:r.left+r.width/2, ry:r.top+r.height/2, rw:r.width, rh:r.height, \
+                  dpr:window.devicePixelRatio||1, sx:window.scrollX||0, sy:window.scrollY||0, \
+                  iw:window.innerWidth||0, ih:window.innerHeight||0 \
+                }; }",
             "returnByValue": true
         }),
     )
@@ -1971,6 +2004,22 @@ async fn element_center_by_text(
     let inner_h = d["ih"].as_f64().unwrap_or(0.0);
     let rect_cx = d["rx"].as_f64().unwrap_or(0.0);
     let rect_cy = d["ry"].as_f64().unwrap_or(0.0);
+
+    // ANCHOR-REQUIRED GUARD (bug fix, first-result path). The observed failure
+    // resolved a <div> with href=None and clicked a tweet embed. When we FORCE
+    // the first-result path the target MUST be a real organic <a> with an http
+    // href — anything else means our selector matched a non-link, so we REFUSE
+    // (return None -> honest "no first result") rather than click a wrong box.
+    if force_first_result {
+        let is_anchor = tag == "a";
+        let has_http_href = href.as_deref().map(|h| h.starts_with("http")).unwrap_or(false);
+        if !is_anchor || !has_http_href {
+            let _ = session_call(state, "Runtime.releaseObject",
+                serde_json::json!({ "objectId": object_id })).await;
+            eprintln!("[aygent][browser][CLICK] first-result REFUSED: resolved tag=<{tag}> href={href:?} is not a real organic anchor");
+            return Ok(None);
+        }
+    }
 
     // 3) Ask CDP for the element's content quads — SAME coord space as Input.*.
     //    A quad is [x1,y1, x2,y2, x3,y3, x4,y4]; its center is the mean of the
@@ -2284,7 +2333,8 @@ pub async fn browser_key(
 
 /// Names the agent sees. Kept SMALL + robust (Atlas: favor a small set).
 pub const AGENT_TOOL_NAMES: &[&str] = &[
-    "browser_open", "browser_read", "browser_click_text", "browser_type_text", "browser_screenshot",
+    "browser_open", "browser_read", "browser_click_text", "browser_click_first_result",
+    "browser_type_text", "browser_screenshot",
 ];
 
 /// Is `name` one of our agent browser tools?
@@ -2336,10 +2386,15 @@ pub fn agent_tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "browser_click_text",
-            "description": "Click the first visible element (link/button) whose text contains the given string. Use this to click links/buttons by their label.",
+            "description": "Click the first visible element (link/button) whose text contains the given string. Use this to click a SPECIFIC named link/button by its label. Do NOT use this to click 'the first result' — use browser_click_first_result for that.",
             "input_schema": { "type": "object", "properties": {
                 "text": { "type": "string", "description": "visible text of the element to click" }
             }, "required": ["text"] }
+        }),
+        serde_json::json!({
+            "name": "browser_click_first_result",
+            "description": "Click the FIRST ORGANIC search result on a results page (Google/Bing/etc). Takes NO arguments — it deterministically targets the first real result link (skips ads). ALWAYS use this for any 'click the first result / first link / top result' step; never guess result text with browser_click_text.",
+            "input_schema": { "type": "object", "properties": {} }
         }),
         serde_json::json!({
             "name": "browser_type_text",
@@ -2408,7 +2463,7 @@ pub async fn agent_tool(
     // VISIBLE WKWebView to it (CDP -> visible), so the human watches where the
     // agent went and the permission host pre-check stays correct. This is the
     // single-source-of-truth sync that replaces the old fragile read-mirror.
-    if matches!(name, "browser_open" | "browser_click_text" | "browser_type_text") {
+    if matches!(name, "browser_open" | "browser_click_text" | "browser_click_first_result" | "browser_type_text") {
         mirror_visible_to_cdp(app, state).await;
     }
     // On a login/CAPTCHA-ish failure, hand off to the human with a note.
@@ -2632,7 +2687,7 @@ async fn agent_tool_inner(
             // (mouseMoved x3 approach -> mousePressed -> mouseReleased). The
             // events carry isTrusted:true — indistinguishable from a human click.
             eprintln!("[aygent][browser][INPUT] browser_click_text want={want:?}");
-            let target = match element_center_by_text(app, state, want).await {
+            let target = match element_center_by_text(app, state, want, false).await {
                 Ok(Some(c)) => c,
                 Ok(None) => return (format!("no clickable element matching '{want}' on this page"), true),
                 Err(e) => return (format!("click locate failed: {e}"), true),
@@ -2689,6 +2744,71 @@ async fn agent_tool_inner(
                     ),
                     true,
                 )
+            }
+        }
+        // DETERMINISTIC FIRST-RESULT CLICK (bug fix, ITEM 1). A dedicated,
+        // TEXT-FREE tool: it ALWAYS targets the first ORGANIC result anchor
+        // (first `a:has(h3)` inside #rso/#search/#center_col with a real http
+        // href, skipping ads) — the model cannot mis-route it to a text-match
+        // that lands on a <div>/tweet embed. The plan/prompt steers first-result
+        // steps here, and agent_run also OVERRIDES browser_click_text to this
+        // path on a first-result step (belt + suspenders).
+        "browser_click_first_result" => {
+            let ans = request_permission(app, state, "click the first result", "The agent wants to click the first organic search result link.").await;
+            match ans.as_str() {
+                "allow" => { eprintln!("[aygent][browser][PERM] ALLOW click first-result — continuing"); }
+                "take" => {
+                    eprintln!("[aygent][browser][PERM] TAKE click first-result — hard stop");
+                    return (format!("{STOP_TAKEOVER} the human took the wheel to click the first result themselves."), true);
+                }
+                _ => {
+                    eprintln!("[aygent][browser][PERM] DENY click first-result — hard stop");
+                    return (format!("{STOP_DENIED} the human denied clicking the first result."), true);
+                }
+            }
+            eprintln!("[aygent][browser][INPUT] browser_click_first_result (forced first-organic-anchor)");
+            // force_first_result=true -> anchor-required, no text fallback.
+            let target = match element_center_by_text(app, state, "first result", true).await {
+                Ok(Some(c)) => c,
+                Ok(None) => return ("no first organic result link found on this page (not a recognizable results page, or only ads/non-link results)".into(), true),
+                Err(e) => return (format!("first-result locate failed: {e}"), true),
+            };
+            eprintln!(
+                "[aygent][browser][CLICK] want=\"<first-result>\" tag=<{}> coord=({:.1},{:.1}) via_quads={} dpr={} scroll=({:.0},{:.0}) inner=({:.0}x{:.0}) href={:?}",
+                target.tag, target.x, target.y, target.via_quads, target.dpr,
+                target.scroll_x, target.scroll_y, target.inner_w, target.inner_h, target.href
+            );
+            let url_before = cdp_current_url(state).await;
+            human_delay(60, 120).await;
+            if let Err(e) = trusted_click_at(state, target.x, target.y).await {
+                return (format!("trusted click dispatch failed: {e}"), true);
+            }
+            wait_for_cdp_load(state).await;
+            let mut url_after = cdp_current_url(state).await;
+            let mut navigated = url_after != url_before && url_after.starts_with("http");
+            // href fallback: since the target is GUARANTEED a real <a> with an
+            // http href, this reliably navigates even if the trusted click was
+            // swallowed by an overlay.
+            if !navigated {
+                if let Some(href) = target.href.as_deref() {
+                    if href.starts_with("http") && href != url_before {
+                        eprintln!("[aygent][browser][CLICK] first-result trusted click produced NO nav — href fallback -> {href}");
+                        if session_call(state, "Page.navigate", serde_json::json!({ "url": href })).await.is_ok() {
+                            wait_for_cdp_load(state).await;
+                            url_after = cdp_current_url(state).await;
+                            navigated = url_after != url_before && url_after.starts_with("http");
+                        }
+                    }
+                }
+            }
+            let (title, url) = active_tab_page_info_cdp(app, state).await.unwrap_or_default();
+            eprintln!(
+                "[aygent][browser][CLICK] result navigated={navigated} url_before={url_before:?} url_after={url_after:?}"
+            );
+            if navigated {
+                (format!("clicked the first result. Now on: {title} ({url})"), false)
+            } else {
+                (format!("dispatched a trusted click on the first result <a> at ({:.0},{:.0}) but the page did NOT navigate. Still on: {title} ({url}).", target.x, target.y), true)
             }
         }
         "browser_type_text" => {
