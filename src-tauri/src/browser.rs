@@ -1234,6 +1234,42 @@ pub fn webview_navigate(app: tauri::AppHandle, url: String, tab_id: Option<i64>)
     wv.navigate(parsed).map_err(|e| format!("navigate: {e}"))
 }
 
+/// Read a tab's current page title + URL from its embedded webview. Used by the
+/// UI to label the tab with the REAL page title ("Google") instead of the typed
+/// address / "New Tab". Round-trips through a Tauri IPC event keyed by a nonce:
+/// inject JS that emits [title, href] back, wait (bounded) for it. If the
+/// webview isn't loaded yet the caller just retries.
+#[tauri::command]
+pub async fn webview_page_info(app: tauri::AppHandle, tab_id: Option<i64>) -> Result<serde_json::Value, String> {
+    use tauri::{Manager, Listener};
+    let wv = app.get_webview(&tab_label(tab_id)).ok_or("browser not open")?;
+    let nonce = format!("wvpi_{}", SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    let tx = std::sync::Mutex::new(Some(tx));
+    let handler = app.once(nonce.clone(), move |ev| {
+        if let Ok(mut g) = tx.lock() {
+            if let Some(sender) = g.take() { let _ = sender.send(ev.payload().to_string()); }
+        }
+    });
+    let script = format!(
+        "(() => {{ try {{ const r = JSON.stringify([document.title||'', location.href||'']); \
+         if (window.__TAURI__ && window.__TAURI__.event) window.__TAURI__.event.emit({nonce:?}, r); }} catch(e) {{}} }})()",
+        nonce = nonce
+    );
+    wv.eval(&script).map_err(|e| { app.unlisten(handler); format!("eval: {e}") })?;
+    let raw = match tokio::time::timeout(std::time::Duration::from_secs(3), rx).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(_)) => return Err("page info channel closed".into()),
+        Err(_) => { app.unlisten(handler); return Err("page info timed out".into()); }
+    };
+    // The payload is a JSON string containing a JSON-stringified array; unwrap both.
+    let inner: String = serde_json::from_str(&raw).unwrap_or(raw);
+    let arr: Vec<String> = serde_json::from_str(&inner).unwrap_or_default();
+    let title = arr.get(0).cloned().unwrap_or_default();
+    let url = arr.get(1).cloned().unwrap_or_default();
+    Ok(serde_json::json!({ "title": title, "url": url }))
+}
+
 /// Close/destroy a tab's embedded webview entirely.
 #[tauri::command]
 pub fn webview_close(app: tauri::AppHandle, tab_id: Option<i64>) -> Result<(), String> {

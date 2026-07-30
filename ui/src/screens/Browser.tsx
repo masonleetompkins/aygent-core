@@ -156,7 +156,7 @@ export function Browser() {
     if (!tab) return;
     const url = tab.addr.trim();
     if (!url) { patch(id, { editing: false }); return; }
-    patch(id, { editing: false });
+    patch(id, { editing: false, title: prettyTitle(url) });
     const el = paneRef.current;
     const r = el?.getBoundingClientRect();
     // First navigation for the pane opens/positions the webview; later ones reuse.
@@ -184,11 +184,34 @@ export function Browser() {
     // Re-sync a beat later so the webview lands on the SETTLED rect (the agent
     // prompt bar toggling can shift the pane by a row).
     setTimeout(syncBounds, 120);
+    // Read the REAL page title back from the webview once it loads, so the tab
+    // shows "Google" not "New Tab". Poll a few times because navigation is async
+    // and document.title fills in after the load settles.
+    let tries = 0;
+    const pollTitle = async () => {
+      tries++;
+      try {
+        const doc = await invoke<{ title?: string; url?: string }>("webview_page_info", { tabId: id });
+        const real = (doc?.title || "").trim();
+        if (real) { patch(id, { title: real }); return; }
+      } catch { /* webview not ready yet */ }
+      if (tries < 6) setTimeout(pollTitle, 400);
+    };
+    setTimeout(pollTitle, 400);
   }
 
   function clickTab(id: number) {
-    if (id === activeId) { patch(id, { editing: true }); setTimeout(() => editRef.current?.select(), 0); }
-    else setActiveId(id);
+    // Clicking a tab ALWAYS makes it active. If it was already active (or it's a
+    // fresh unopened tab with no page yet), drop into the inline address field
+    // so you can type a URL. This is the fix for the "typed into the wrong tab"
+    // bug: switching to tab 2 now focuses tab 2's own address field instead of
+    // leaving tab 1 in edit mode.
+    const tab = tabs.find((t) => t.id === id);
+    if (id !== activeId) setActiveId(id);
+    if (id === activeId || !tab?.opened) {
+      patch(id, { editing: true });
+      setTimeout(() => editRef.current?.select(), 0);
+    }
   }
   function addTab() { const t = newTab(); setTabs((ts) => [...ts, t]); setActiveId(t.id); }
   function closeTab(id: number) {
@@ -210,8 +233,10 @@ export function Browser() {
     const cur = tabs.find((t) => t.id === activeId);
     if (cur?.opened) {
       // Reposition + un-hide the active tab; webview_hide_others fronts it.
+      // Use cur.id (the tab we just switched TO) — activeId in this closure is
+      // fresh here, but be explicit so a re-render can't front a stale webview.
+      invoke("webview_hide_others", { keep: cur.id }).catch(() => {});
       syncBounds();
-      invoke("webview_hide_others", { keep: activeId }).catch(() => {});
       setTimeout(syncBounds, 60);
     } else {
       // Fresh tab with no page yet — hide all so the empty-state shows.
