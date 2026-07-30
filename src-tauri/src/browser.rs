@@ -992,12 +992,52 @@ pub fn webview_set_bounds(
     // Y-flip is deterministic instead of racing wry's live parent height.
     // Accepted even if wry re-flips internally — keeping the arg makes the invoke
     // signature stable and lets us switch to a manual flip if the race persists.
-    #[allow(unused_variables)] parent_height: Option<f64>,
+    parent_height: Option<f64>,
 ) -> Result<(), String> {
     use tauri::{LogicalPosition, LogicalSize, Manager};
     if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
+        // --- EMPIRICAL DELTA PROBE (BROWSER-WEBVIEW-HANDOFF step 2) ----------
+        // Log what JS asked for, apply it, then read back where the webview
+        // ACTUALLY landed. Everything in Tauri readbacks is PHYSICAL px, so we
+        // convert to logical via the main window's scale factor to compare
+        // apples-to-apples with the LOGICAL x/y the frontend sent (CSS px).
+        let scale = app
+            .get_webview_window("main")
+            .and_then(|w| w.scale_factor().ok())
+            .unwrap_or(1.0);
+
+        // Read parent (main webview) physical size → logical, so we can see if
+        // documentElement.clientHeight (what JS flipped against) matches the
+        // real wry parent NSView height wry flips against.
+        let parent_logical = app
+            .get_webview("main")
+            .and_then(|m| m.size().ok())
+            .map(|s| (s.width as f64 / scale, s.height as f64 / scale));
+
         let _ = wv.set_position(LogicalPosition::new(x, y));
         let _ = wv.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
+
+        // Read back the applied position/size (PHYSICAL) and convert to logical.
+        let applied_pos = wv.position().ok().map(|p| (p.x as f64 / scale, p.y as f64 / scale));
+        let applied_size = wv.size().ok().map(|s| (s.width as f64 / scale, s.height as f64 / scale));
+
+        let (dx, dy) = match applied_pos {
+            Some((ax, ay)) => (ax - x, ay - y),
+            None => (f64::NAN, f64::NAN),
+        };
+
+        eprintln!(
+            "[aygent][browser][DELTA] scale={scale} | SENT pos=({x:.1},{y:.1}) size=({:.1},{:.1}) parentHeight(JS)={:?} \
+             | APPLIED pos={:?} size={:?} | DELTA applied-sent=({dx:.1},{dy:.1}) \
+             | wry_parent_logical={:?}",
+            width.max(1.0),
+            height.max(1.0),
+            parent_height,
+            applied_pos,
+            applied_size,
+            parent_logical,
+        );
+        // --------------------------------------------------------------------
     }
     Ok(())
 }
