@@ -1853,10 +1853,42 @@ async fn element_center_by_text(
     //    we can ask CDP for its content quads. Also stash diagnostics + the rect
     //    center (fallback) + href on the node object so a single eval gives us
     //    everything.
+    // DETERMINISTIC FIRST-RESULT TARGETING (spec #3). When the request text is a
+    // "first result" / "first link" intent, we must click the FIRST ORGANIC
+    // result — not the first element whose text merely contains a word, and NOT
+    // an ad. On a Google SERP the first organic result's link is the first
+    // `a:has(h3)` inside the main results container (#rso, falling back to
+    // #search / #center_col). We pick that <a> directly. If the page isn't a
+    // recognizable SERP, we fall back to the ordinary first anchor with an h3,
+    // then to normal text matching — so this never regresses non-Google pages.
+    let first_result_intent = {
+        let w = want.to_ascii_lowercase();
+        let w = w.trim();
+        (w.contains("first") && (w.contains("result") || w.contains("link") || w.contains("hit") || w.contains("listing")))
+            || w == "first"
+            || w == "top result"
+    };
     let locate_fn = format!(
-        "(()=>{{ const t={want:?}.toLowerCase(); \
-         const els=[...document.querySelectorAll('a,button,input[type=submit],input[type=button],[role=button],label,[onclick],h3,li,span,div')]; \
-         let el=els.find(e=>{{ const s=(e.innerText||e.value||e.textContent||''); return s && s.toLowerCase().includes(t) && e.offsetParent!==null; }}); \
+        "(()=>{{ const t={want:?}.toLowerCase(); const firstResult={first_result_intent}; \
+         let el=null; \
+         if(firstResult){{ \
+           const containers=['#rso','#search','#center_col','#main']; \
+           let cont=null; for(const sel of containers){{ const c=document.querySelector(sel); if(c){{cont=c;break;}} }} \
+           const scope = cont || document; \
+           const anchors=[...scope.querySelectorAll('a')]; \
+           el = anchors.find(a=>{{ \
+             if(a.offsetParent===null) return false; \
+             if(!a.querySelector('h3')) return false; \
+             const h=(a.href||''); if(!/^https?:/i.test(h)) return false; \
+             if(/google\\.com\\/(search|preferences|advanced_search|intl)/i.test(h)) return false; \
+             if(a.closest('[data-text-ad],[aria-label=\"Ads\"],.uEierd,.commercial-unit-desktop-top')) return false; \
+             return true; \
+           }}) || anchors.find(a=>a.querySelector('h3') && a.offsetParent!==null && /^https?:/i.test(a.href||'')); \
+         }} \
+         if(!el){{ \
+           const els=[...document.querySelectorAll('a,button,input[type=submit],input[type=button],[role=button],label,[onclick],h3,li,span,div')]; \
+           el=els.find(e=>{{ const s=(e.innerText||e.value||e.textContent||''); return s && s.toLowerCase().includes(t) && e.offsetParent!==null; }}); \
+         }} \
          if(!el) return null; \
          const clickable = el.closest('a,button,input[type=submit],input[type=button],[role=button],[onclick]') || el; \
          el = clickable; \
@@ -1873,7 +1905,8 @@ async fn element_center_by_text(
             iw: window.innerWidth||0, ih: window.innerHeight||0 \
          }}; \
          return el; }})()",
-        want = want
+        want = want,
+        first_result_intent = first_result_intent
     );
     let node = session_call(
         state,
@@ -2228,6 +2261,32 @@ pub fn is_agent_tool(name: &str) -> bool {
     AGENT_TOOL_NAMES.contains(&name)
 }
 
+// ===========================================================================
+// HARD-STOP SENTINELS (Mason's 5-point spec #5).
+//
+// A tool result whose text STARTS WITH one of these tokens is a machine-
+// detectable signal that the agent turn must END IMMEDIATELY — it is NOT a
+// normal recoverable tool error the model should react to. `agent_run` checks
+// the result text of every browser tool call against these prefixes and, on a
+// match, BREAKS the loop with a clear final message (never feeding the result
+// back to the model). This is how DENY / TAKE-CONTROL propagate up from the
+// permission dialog through `agent_tool` to the loop without any signature
+// churn (no compiler on Windows — a text sentinel is the lowest-risk vehicle).
+//
+//   __DENIED__   -> the human clicked Deny on the permission dialog.
+//   __TAKEOVER__ -> the human clicked Take Control (driver flipped to human).
+//
+// Both carry a human-readable tail after the token for the transcript/log.
+// Keep these EXACT — `agent_run` string-matches the prefixes.
+pub const STOP_DENIED: &str = "__DENIED__";
+pub const STOP_TAKEOVER: &str = "__TAKEOVER__";
+
+/// True if a tool result string is one of the hard-stop sentinels. Used by
+/// `agent_run` after each browser tool call to end the turn deterministically.
+pub fn is_hard_stop(s: &str) -> bool {
+    s.starts_with(STOP_DENIED) || s.starts_with(STOP_TAKEOVER)
+}
+
 /// The JSON schemas fed to the model for the browser tools (added to the tool
 /// list when the browser is enabled).
 pub fn agent_tool_schemas() -> Vec<serde_json::Value> {
@@ -2288,6 +2347,32 @@ pub async fn agent_tool(
         return ("the human just took the browser — not acting".into(), true);
     }
     let out = agent_tool_inner(app, state, name, input, allowed_domains).await;
+
+    // HARD STOP (spec #5): if the human clicked Deny or Take Control, the inner
+    // tool returned a sentinel result. Do NOT mirror, do NOT run the handoff
+    // heuristic, do NOT re-home the wheel via the generic release path — just
+    // propagate the sentinel straight up so `agent_run` ends the turn. On
+    // TAKEOVER the driver was already flipped to human in browser_permission_answer
+    // + request_permission; we re-assert it here and emit control so the toggle
+    // shows "You" even if a race left it on agent. On DENY we release the wheel
+    // to idle (agent no longer driving) but keep the sentinel intact.
+    if is_hard_stop(&out.0) {
+        if out.0.starts_with(STOP_TAKEOVER) {
+            if let Ok(mut c) = state.control.lock() {
+                c.driver = "human".into();
+                c.agent_active = false;
+                c.note = String::new();
+                emit_control(app, &c);
+            }
+            eprintln!("[aygent][browser][PERM] TAKEOVER propagating up — driver=human, ending turn");
+        } else {
+            // DENY: agent stops driving; hand the wheel back to idle.
+            agent_release(app, state, "");
+            eprintln!("[aygent][browser][PERM] DENY propagating up — ending turn");
+        }
+        return out;
+    }
+
     // After ANY action that could navigate the AUTHORITATIVE CDP page, mirror the
     // VISIBLE WKWebView to it (CDP -> visible), so the human watches where the
     // agent went and the permission host pre-check stays correct. This is the
@@ -2457,9 +2542,20 @@ async fn agent_tool_inner(
             if !host_preallowed(app, state, &host, allowed_domains).await {
                 let ans = request_permission(app, state, &format!("open {host}"), &url).await;
                 match ans.as_str() {
-                    "allow" => { if let Ok(mut p) = state.perm.lock() { p.granted_hosts.insert(host.clone()); } }
-                    "take" => return ("the human took the wheel to handle this navigation".into(), true),
-                    _ => return (format!("the human declined opening {host}. Try a different site or ask them to do it."), true),
+                    "allow" => {
+                        if let Ok(mut p) = state.perm.lock() { p.granted_hosts.insert(host.clone()); }
+                        eprintln!("[aygent][browser][PERM] ALLOW open {host} — continuing");
+                    }
+                    // HARD STOP (spec #5): Take Control ends the turn; driver=human.
+                    "take" => {
+                        eprintln!("[aygent][browser][PERM] TAKE open {host} — hard stop");
+                        return (format!("{STOP_TAKEOVER} the human took the wheel to handle opening {host} themselves."), true);
+                    }
+                    // HARD STOP (spec #5): Deny ends the turn immediately — no retry, no wander.
+                    _ => {
+                        eprintln!("[aygent][browser][PERM] DENY open {host} — hard stop");
+                        return (format!("{STOP_DENIED} the human denied opening {host}."), true);
+                    }
                 }
             }
             // Navigate the AUTHORITATIVE CDP page + wait for load.
@@ -2486,9 +2582,17 @@ async fn agent_tool_inner(
             // wheel to the human.
             let ans = request_permission(app, state, &format!("click \"{want}\""), &format!("The agent wants to click the link/button: {want}")).await;
             match ans.as_str() {
-                "allow" => {}
-                "take" => return ("the human took the wheel to do this themselves".into(), true),
-                _ => return (format!("the human declined clicking '{want}'. Stopping."), true),
+                "allow" => { eprintln!("[aygent][browser][PERM] ALLOW click {want:?} — continuing"); }
+                // HARD STOP (spec #5): Take Control ends the turn; driver=human.
+                "take" => {
+                    eprintln!("[aygent][browser][PERM] TAKE click {want:?} — hard stop");
+                    return (format!("{STOP_TAKEOVER} the human took the wheel to click '{want}' themselves."), true);
+                }
+                // HARD STOP (spec #5): Deny ends the turn immediately — no retry, no wander.
+                _ => {
+                    eprintln!("[aygent][browser][PERM] DENY click {want:?} — hard stop");
+                    return (format!("{STOP_DENIED} the human denied clicking '{want}'."), true);
+                }
             }
             // TRUSTED CLICK (#1). Instead of el.click() via JS (isTrusted:false,
             // which Google flags), we (a) locate the element's viewport-center
