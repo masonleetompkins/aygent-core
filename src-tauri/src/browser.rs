@@ -114,6 +114,38 @@ pub fn browser_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// The directory downloads land in for the ACTIVE agent.
+///
+/// WHY NOT under `<app_data>/browser/profiles/<agent>/downloads` anymore:
+/// on macOS WKWebView performs the actual file write in its OWN sandboxed
+/// networking XPC process, which must be granted a *sandbox extension* for the
+/// destination's parent dir. `~/Library/Application Support/<bundle-id>/...` is
+/// NOT a location that process is implicitly permitted to write, and issuing an
+/// extension for a just-created deep path in a bundle container fails with
+/// `sandbox_extension_issue_file failed for : 2 (No such file or directory)`
+/// (the empty path = WebKit couldn't canonicalize/resolve the destination).
+///
+/// `~/Downloads` IS a WebKit-download-friendly location (it's what wry itself
+/// defaults to via `dirs::download_dir()`), so we nest a per-agent subfolder
+/// under it: `~/Downloads/AYGENT/<agent>`. We `create_dir_all` it (so the dir
+/// EXISTS before WebKit tries to issue the extension) and canonicalize it (so
+/// WebKit gets a real, symlink-resolved absolute path — no empty/relative path).
+///
+/// Falls back to the OS Downloads dir, then the app_data browser dir, then the
+/// process CWD, so a destination is ALWAYS a real existing directory.
+pub fn agent_downloads_dir(app: &tauri::AppHandle) -> PathBuf {
+    let agent = active_browser_agent(app);
+    let base = dirs::download_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+        .or_else(|| browser_dir(app).ok())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let dir = base.join("AYGENT").join(&agent);
+    let _ = std::fs::create_dir_all(&dir);
+    // Canonicalize so WebKit's networking process gets a fully-resolved path;
+    // if canonicalize fails (shouldn't, we just made it) keep the plain path.
+    std::fs::canonicalize(&dir).unwrap_or(dir)
+}
+
 /// Where the unzipped Chromium runtime lands: <browser>/chromium/<version>/.
 /// Version-scoped so a future upgrade can download the new one alongside, verify
 /// it, then flip â€” never leaving the user without a working browser mid-upgrade.
@@ -952,10 +984,11 @@ async fn ensure_session(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
     // on_download handler uses, so agent-driven downloads also populate the
     // Downloads panel. Best-effort: older builds may only accept the Page.*
     // form, so try Browser.setDownloadBehavior then fall back. Never fatal.
-    if let Ok(dir) = browser_dir(app)
-        .map(|d| d.join("profiles").join(active_browser_agent(app)).join("downloads"))
     {
-        let _ = std::fs::create_dir_all(&dir);
+        // SAME dir the visible WKWebView on_download handler + browser_downloads_list
+        // use (now ~/Downloads/AYGENT/<agent>), so agent-driven downloads land in
+        // the panel too. agent_downloads_dir already create_dir_all's + canonicalizes.
+        let dir = agent_downloads_dir(app);
         let dl = dir.display().to_string();
         let params = serde_json::json!({ "behavior": "allow", "downloadPath": dl });
         if session_call(state, "Browser.setDownloadBehavior", params.clone()).await.is_err() {
@@ -1235,22 +1268,38 @@ fn download_event(app: &tauri::AppHandle, event: tauri::webview::DownloadEvent<'
     use tauri::webview::DownloadEvent;
     match event {
         DownloadEvent::Requested { url, destination } => {
-            let name = sanitize_filename(url.as_str());
-            // Route into the active agent's jailed downloads dir (same dir
-            // browser_downloads_list scans) so the file shows in the panel.
-            match browser_dir(app)
-                .map(|d| d.join("profiles").join(active_browser_agent(app)).join("downloads"))
-            {
-                Ok(dir) => {
-                    let _ = std::fs::create_dir_all(&dir);
-                    let target = dir.join(&name);
-                    eprintln!("[aygent][browser][DL] begin name={name} url={} -> {}", url, target.display());
-                    *destination = target;
-                }
-                Err(e) => {
-                    eprintln!("[aygent][browser][DL] begin name={name} url={url} (dest error: {e}; using default)");
+            // Derive a filename from the URL (wry 0.55.1's `Requested` does NOT
+            // expose WebKit's suggestedFilename — only `url` + `destination` — so
+            // we synthesize one; `sanitize_filename` falls back to a unique
+            // `download-N` if the URL has no usable last path segment).
+            let mut name = sanitize_filename(url.as_str());
+            // Route into the active agent's downloads dir under ~/Downloads
+            // (a WebKit-download-sandbox-friendly location that ALWAYS exists),
+            // the SAME dir browser_downloads_list scans, so it shows in the panel.
+            let dir = agent_downloads_dir(app);
+            // De-dupe: never let WebKit clobber an existing file (and appending a
+            // counter also sidesteps any stale-path edge cases).
+            let mut target = dir.join(&name);
+            if target.exists() {
+                let (stem, ext) = match name.rsplit_once('.') {
+                    Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+                    _ => (name.clone(), String::new()),
+                };
+                let mut n = 1u32;
+                loop {
+                    let cand = dir.join(format!("{stem} ({n}){ext}"));
+                    if !cand.exists() { name = format!("{stem} ({n}){ext}"); target = cand; break; }
+                    n += 1;
                 }
             }
+            // Log the FULL destination path we hand to WebKit. If this ever shows
+            // an empty/relative path or a non-existent dir, THAT is the bug — this
+            // line is what proves the sandbox-extension failure is gone.
+            eprintln!(
+                "[aygent][browser][DL] begin name={name} dir_exists={} url={} -> dest={}",
+                dir.is_dir(), url, target.display()
+            );
+            *destination = target;
             // Notify the FE a download STARTED (so it can auto-open Downloads).
             {
                 use tauri::Emitter;
@@ -1716,15 +1765,17 @@ pub fn webview_history(app: tauri::AppHandle, action: String, tab_id: Option<i64
     wv.eval(js).map_err(|e| format!("history {action}: {e}"))
 }
 
-/// ITEM 3 (Downloads). List the files in the ACTIVE agent's jailed downloads
-/// directory (`<app_data>/browser/profiles/<agent>/downloads`) so the Browser
-/// view can show a Downloads panel. Returns each file's name, byte size, and
-/// modified-time (unix seconds), newest first. Missing dir => empty list (not
-/// an error) so a fresh profile just shows "no downloads yet".
+/// ITEM 3 (Downloads). List the files in the ACTIVE agent's downloads directory
+/// (`~/Downloads/AYGENT/<agent>` — see `agent_downloads_dir` for WHY it moved
+/// off the app_data path: WKWebView's sandboxed networking process can't get a
+/// write extension there) so the Browser view can show a Downloads panel.
+/// Returns each file's name, byte size, and modified-time (unix seconds),
+/// newest first. Missing dir => empty list (not an error) so a fresh profile
+/// just shows "no downloads yet". Reads the SAME dir the on_download handler
+/// and the CDP agent-download path write to.
 #[tauri::command]
 pub fn browser_downloads_list(app: tauri::AppHandle) -> Result<Vec<serde_json::Value>, String> {
-    let agent = active_browser_agent(&app);
-    let dir = browser_dir(&app)?.join("profiles").join(&agent).join("downloads");
+    let dir = agent_downloads_dir(&app);
     let rd = match std::fs::read_dir(&dir) {
         Ok(rd) => rd,
         Err(_) => return Ok(Vec::new()), // no dir yet -> no downloads

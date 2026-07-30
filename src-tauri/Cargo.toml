@@ -39,6 +39,7 @@ base64 = "0.22"                     # M1.4: decode context-doc uploads (UI reads
 zip = { version = "2", default-features = false, features = ["deflate"] }  # BROWSER Slice 0: unzip the Chrome-for-Testing archive we fetch from Google's CDN into AYGENT's managed browser dir (install-nothing). deflate-only keeps it lean; CfT zips are standard deflate.
 sha2 = "0.10"                      # BROWSER Slice 0: verify the downloaded Chrome-for-Testing zip against the per-file SHA-256 CfT publishes in its known-good JSON (integrity gate, honors the contract's "SHA-256 verify").
 urlencoding = "2"                   # (unused placeholder removed if not needed) — kept minimal
+dirs = "6"                          # BROWSER downloads: resolve the user's ~/Downloads (WebKit-download-friendly dir) for the on_download destination. Already in the tree via wry (v6.0.0 in Cargo.lock); declared direct so browser.rs uses dirs::download_dir()/home_dir() without lock churn.
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"                        # atomic openat/O_NOFOLLOW fd layer (M0.2c)
