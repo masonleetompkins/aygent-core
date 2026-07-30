@@ -786,6 +786,37 @@ pub fn set_active_browser_tab(tab_id: i64, url: Option<String>) {
     }
 }
 
+/// The current active-tab URL as last mirrored from the authoritative CDP page
+/// (see `mirror_visible_to_cdp`). Used by `agent_run`'s step-overrun guard to
+/// decide, DETERMINISTICALLY, whether a "click/open the result" step has already
+/// navigated off the search page onto its destination — so the loop can require
+/// step_done instead of tolerating a second, wandering click. Returns "" if the
+/// tab URL is unknown.
+pub fn current_agent_url() -> String {
+    ACTIVE_TAB_URL.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// The bare host of the current active-tab URL (lowercased, no scheme/path).
+/// Empty when unknown. `agent_run` keys its step-overrun guard on this: a
+/// nav-step whose host is a real non-search destination is SATISFIED.
+pub fn current_agent_host() -> String {
+    host_of(&current_agent_url())
+}
+
+/// Heuristic: is `host` a search-engine / launcher host (i.e. NOT yet a real
+/// destination)? Used ONLY to decide whether a "click the result" step has
+/// actually landed somewhere. This is deliberately NOT the brittle old
+/// `left_google` turn-gate — it never forbids or forces navigation; it only
+/// helps recognize that a nav-step's GOAL is met once the page is off search.
+pub fn is_search_host(host: &str) -> bool {
+    let h = host.trim().to_ascii_lowercase();
+    if h.is_empty() { return true; } // unknown => treat as "not a destination yet"
+    h.contains("google.") || h == "google" || h.starts_with("www.google")
+        || h.contains("bing.com") || h.contains("duckduckgo.com")
+        || h.contains("search.brave.com") || h.contains("startpage.com")
+        || h.contains("ecosia.org") || h.contains("search.yahoo")
+}
+
 /// FIRE-AND-FORGET action in the ACTIVE tab's embedded webview. `wv.eval()`
 /// runs JS with NO return channel; on EXTERNAL pages (google.com etc) the page
 /// has no `window.__TAURI__` to emit a result back, so ANY round-trip stalls.

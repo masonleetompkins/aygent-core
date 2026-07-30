@@ -44,13 +44,25 @@ export function Browser() {
   const [driver, setDriver] = useState<"human" | "agent">("human");
   const [agentPrompt, setAgentPrompt] = useState("");
   const [agentBusy, setAgentBusy] = useState(false);
-  const [agentLog, setAgentLog] = useState<string[]>([]);
-  // LIVE CHECKLIST (Problem 2). The agent plans the task into ordered steps up
-  // front; we render them here and check each off as `browser:agent-*` events
-  // arrive. `checklist` = the step labels; `stepsDone` = how many are checked.
-  const [checklist, setChecklist] = useState<string[]>([]);
-  const [stepsDone, setStepsDone] = useState<number>(0);
-  const [planDone, setPlanDone] = useState<boolean>(false);
+  // CONVERSATIONAL AGENT THREAD (Mason's Part-2 redesign). The panel is a
+  // conversation: each `Run` is [the user's prompt] followed by its REPLY —
+  // the plan/checklist that checks off live, a single transient current-action
+  // line, and a final one-line summary. We do NOT keep a growing raw tool-call
+  // list anymore; the checklist IS the meaningful progress, and `action` is an
+  // EPHEMERAL "currently doing X" line that gets overwritten each action.
+  type Run = {
+    id: string;
+    prompt: string;
+    steps: string[];      // the plan (reply to the prompt)
+    stepsDone: number;    // how many checked off
+    planDone: boolean;    // turn finished (spinner off, checklist frozen)
+    action: string;       // TRANSIENT "currently doing X" line (replaceable)
+    summary: string;      // final one-line summary when done
+    stopped?: boolean;    // deny / take / step-failed => show why, freeze
+  };
+  const [runs, setRuns] = useState<Run[]>([]);
+  const patchRun = (id: string, p: Partial<Run>) =>
+    setRuns((rs) => rs.map((r) => (r.id === id ? { ...r, ...p } : r)));
   // SHARED-CONTROL state, mirrored from Rust `browser:control` events. When the
   // agent hits a wall (login/CAPTCHA/verification) it releases the wheel with a
   // non-empty `note` — that's the BLOCKED signal that pulses the You/Agent
@@ -206,7 +218,7 @@ export function Browser() {
     try {
       await invoke("webview_open", { url, x: ox, y: oy, width: ow, height: oh, clientWidth, clientHeight, radius: WEB_RADIUS, tabId: id });
     } catch (e) {
-      setAgentLog((l) => [...l, `open failed: ${e}`]);
+      console.error("webview_open failed", e);
     }
     // This tab's webview is now the active surface — hide the others.
     invoke("webview_hide_others", { keep: id }).catch(() => {});
@@ -335,40 +347,51 @@ export function Browser() {
     const task = agentPrompt.trim();
     if (!task || agentBusy) return;
     setAgentBusy(true);
-    setAgentLog((l) => [...l, `▸ ${task}`]);
     setAgentPrompt("");
-    // Reset the checklist for this run.
-    setChecklist([]);
-    setStepsDone(0);
-    setPlanDone(false);
 
-    // Per-run event channel: the agent emits its PLAN + STEP checkmarks + DONE
-    // here (Problem 2). We render them live in the panel. Unlisten when the run
-    // resolves so channels don't stack across runs.
-    const channel = `agent-run-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+    // Start a new conversational run: the user's prompt + an (about-to-fill)
+    // reply. The plan arrives first as this run's checklist (the reply), then
+    // checkmarks + a transient action line, then a one-line summary.
+    const runId = `agent-run-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+    setRuns((rs) => [...rs, {
+      id: runId, prompt: task, steps: [], stepsDone: 0,
+      planDone: false, action: "", summary: "",
+    }]);
+
+    // Per-run event channel: the agent emits its PLAN + STEP checkmarks +
+    // ACTION (transient) + DONE here. We render them live as the reply to this
+    // prompt. Unlisten when the run resolves so channels don't stack.
+    const channel = runId;
     let un: undefined | (() => void);
     try {
       un = await listen<any>(channel, (ev) => {
         const p = ev.payload || {};
         if (p.kind === "plan" && Array.isArray(p.steps)) {
-          setChecklist(p.steps as string[]);
-          setStepsDone(0);
-          setPlanDone(false);
+          patchRun(runId, { steps: p.steps as string[], stepsDone: 0, planDone: false, action: "" });
         } else if (p.kind === "step") {
-          // `done` = how many steps are now checked (1-based count).
-          if (typeof p.done === "number") setStepsDone(p.done);
+          // `done` = how many steps are now checked (1-based count). Advancing
+          // clears the transient action line (that action is finished).
+          if (typeof p.done === "number") patchRun(runId, { stepsDone: p.done, action: "" });
+        } else if (p.kind === "action") {
+          // TRANSIENT current-action line — a single replaceable "→ doing X…"
+          // string, NOT an accumulating log. Overwrite the previous one.
+          if (typeof p.label === "string") patchRun(runId, { action: p.label });
         } else if (p.kind === "done") {
-          // A normal finish marks every step done; a STOPPED finish (deny /
-          // take-control / step-failed) freezes the checklist where it is and
-          // surfaces WHY so the human isn't left guessing (spec #3/#5).
+          // Normal finish marks every step done; a STOPPED finish (deny /
+          // take / step-failed) freezes the checklist and surfaces WHY.
           if (p.stopped) {
-            if (typeof p.summary === "string" && p.summary) {
-              setAgentLog((l) => [...l, `⛔ ${p.summary}`]);
-            }
-          } else if (typeof p.total === "number") {
-            setStepsDone(p.total);
+            patchRun(runId, {
+              planDone: true, action: "", stopped: true,
+              summary: typeof p.summary === "string" && p.summary ? p.summary : "stopped",
+            });
+          } else {
+            const patch: Partial<Run> = {
+              planDone: true, action: "",
+              summary: typeof p.summary === "string" ? p.summary : "",
+            };
+            if (typeof p.total === "number") patch.stepsDone = p.total;
+            patchRun(runId, patch);
           }
-          setPlanDone(true);
         }
       });
     } catch { /* channel listen best-effort */ }
@@ -381,11 +404,12 @@ export function Browser() {
       // page. folder:null => Rust resolves the ACTIVE agent + its configured model.
       const cur = tabs.find((t) => t.id === activeId);
       const primed = `You are driving the in-app browser in the tab the human is watching (currently: ${cur?.addr || cur?.title || "a page"}). Use the browser tools to act in THAT page. Task: ${task}`;
-      const res = await invoke<string>("agent_run", { prompt: primed, folder: null, channel });
-      setAgentLog((l) => [...l, res]);
-      setPlanDone(true);
+      await invoke<string>("agent_run", { prompt: primed, folder: null, channel });
+      // The raw transcript is intentionally DISCARDED — the checklist + the
+      // one-line `done` summary are the user-facing result now (no raw list).
+      patchRun(runId, { planDone: true, action: "" });
     } catch (e) {
-      setAgentLog((l) => [...l, `✗ ${e}`]);
+      patchRun(runId, { planDone: true, action: "", stopped: true, summary: `${e}` });
     } finally {
       un?.();
       setAgentBusy(false);
@@ -551,65 +575,96 @@ export function Browser() {
               </div>
             )}
 
-            {/* LIVE CHECKLIST (Problem 2) — the agent's plan, rendered up front
-                with checkmarks that fill in as each step completes. When every
-                step is checked the turn ends deterministically (no re-search
-                loop, because there's no unchecked "search again" step). */}
-            {checklist.length > 0 && (
-              <div style={{
-                border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)",
-                padding: 10, background: "var(--bg)", display: "flex", flexDirection: "column", gap: 6,
-              }}>
-                <div style={{ fontSize: 11.5, fontWeight: 700, color: "var(--text-muted)", display: "flex", alignItems: "center", gap: 6 }}>
-                  <span>Plan</span>
-                  <span style={{ marginLeft: "auto", fontWeight: 600, color: "var(--text-faint)" }}>
-                    {Math.min(stepsDone, checklist.length)}/{checklist.length}
-                  </span>
-                </div>
-                {checklist.map((s, i) => {
-                  const done = i < stepsDone;
-                  const active = i === stepsDone && !planDone && agentBusy;
-                  return (
-                    <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 12.5, lineHeight: 1.35 }}>
-                      <span style={{
-                        flexShrink: 0, width: 16, height: 16, borderRadius: 4, marginTop: 1,
-                        display: "flex", alignItems: "center", justifyContent: "center",
-                        fontSize: 11, fontWeight: 800,
-                        border: `1.5px solid ${done ? "var(--accent)" : active ? "var(--accent)" : "var(--line)"}`,
-                        background: done ? "var(--accent)" : "transparent",
-                        color: done ? "#fff" : "var(--accent)",
-                      }}>{done ? "✓" : active ? "•" : ""}</span>
-                      <span style={{
-                        color: done ? "var(--text-muted)" : "var(--text)",
-                        textDecoration: done ? "line-through" : "none",
-                        opacity: done ? 0.75 : 1,
-                      }}>{s}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {/* Conversation log fills the pane. */}
-            <div style={{ flex: 1, minHeight: 0, overflow: "auto", display: "flex", flexDirection: "column", gap: 8, paddingRight: 2 }}>
-              {agentLog.length === 0 ? (
+            {/* CONVERSATIONAL THREAD (Mason's Part-2 redesign). Each run is a
+                [user prompt] bubble followed by its REPLY: the plan/checklist
+                that checks off live, a single TRANSIENT current-action line,
+                and a one-line summary when done. NO raw tool-call list — the
+                checklist is the meaningful progress; the action line is
+                ephemeral (it overwrites, never accumulates). */}
+            <div style={{ flex: 1, minHeight: 0, overflow: "auto", display: "flex", flexDirection: "column", gap: 12, paddingRight: 2 }}>
+              {runs.length === 0 ? (
                 <div style={{ fontSize: 12, color: "var(--text-faint)", marginTop: 4 }}>
-                  Try: “click the sign-in button”, “summarize this page”, “scroll down”.
+                  Try: “search for the docs and open the first result”, “summarize this page”.
                 </div>
-              ) : agentLog.map((l, i) => {
-                const isUser = l.startsWith("▸ ");
+              ) : runs.map((run) => {
+                const isLast = run.id === runs[runs.length - 1].id;
+                const running = isLast && agentBusy && !run.planDone;
                 return (
-                  <div key={i} style={{
-                    alignSelf: isUser ? "flex-end" : "flex-start", maxWidth: "92%",
-                    fontSize: 12.5, lineHeight: 1.4, padding: "7px 10px", borderRadius: 10,
-                    background: isUser ? "var(--accent)" : "var(--bg)",
-                    color: isUser ? "#fff" : "var(--text)",
-                    border: isUser ? "none" : "var(--border-width) solid var(--line)",
-                    whiteSpace: "pre-wrap", wordBreak: "break-word",
-                  }}>{isUser ? l.slice(2) : l}</div>
+                  <div key={run.id} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {/* USER PROMPT bubble */}
+                    <div style={{
+                      alignSelf: "flex-end", maxWidth: "92%",
+                      fontSize: 12.5, lineHeight: 1.4, padding: "7px 10px", borderRadius: 10,
+                      background: "var(--accent)", color: "#fff",
+                      whiteSpace: "pre-wrap", wordBreak: "break-word",
+                    }}>{run.prompt}</div>
+
+                    {/* REPLY: the plan/checklist, threaded UNDER the prompt. */}
+                    {run.steps.length > 0 && (
+                      <div style={{
+                        alignSelf: "flex-start", maxWidth: "96%",
+                        border: "var(--border-width) solid var(--line)", borderRadius: 10,
+                        padding: 10, background: "var(--bg)", display: "flex", flexDirection: "column", gap: 6,
+                      }}>
+                        <div style={{ fontSize: 11.5, fontWeight: 700, color: "var(--text-muted)", display: "flex", alignItems: "center", gap: 6 }}>
+                          <span>Plan</span>
+                          <span style={{ marginLeft: "auto", fontWeight: 600, color: "var(--text-faint)" }}>
+                            {Math.min(run.stepsDone, run.steps.length)}/{run.steps.length}
+                          </span>
+                        </div>
+                        {run.steps.map((s, i) => {
+                          const done = i < run.stepsDone;
+                          const active = i === run.stepsDone && running;
+                          return (
+                            <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 12.5, lineHeight: 1.35 }}>
+                              <span style={{
+                                flexShrink: 0, width: 16, height: 16, borderRadius: 4, marginTop: 1,
+                                display: "flex", alignItems: "center", justifyContent: "center",
+                                fontSize: 11, fontWeight: 800,
+                                border: `1.5px solid ${done || active ? "var(--accent)" : "var(--line)"}`,
+                                background: done ? "var(--accent)" : "transparent",
+                                color: done ? "#fff" : "var(--accent)",
+                              }}>{done ? "✓" : active ? "•" : ""}</span>
+                              <span style={{
+                                color: done ? "var(--text-muted)" : "var(--text)",
+                                textDecoration: done ? "line-through" : "none",
+                                opacity: done ? 0.75 : 1,
+                              }}>{s}</span>
+                            </div>
+                          );
+                        })}
+
+                        {/* TRANSIENT current-action line — one replaceable row,
+                            only while this run is live and has an action set. */}
+                        {running && run.action && (
+                          <div style={{
+                            marginTop: 2, fontSize: 11.5, color: "var(--accent)", fontStyle: "italic",
+                            display: "flex", alignItems: "center", gap: 6, opacity: 0.9,
+                            whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                          }}>→ {run.action}…</div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* If the plan hasn't arrived yet, a tiny "thinking" hint. */}
+                    {run.steps.length === 0 && running && (
+                      <div style={{ alignSelf: "flex-start", fontSize: 12, color: "var(--text-faint)" }}>planning…</div>
+                    )}
+
+                    {/* FINAL one-line summary (or stop reason). Falls back to a
+                        plain "Done." when the turn finished cleanly without an
+                        explicit summary (all steps checked). */}
+                    {run.planDone && (run.summary || !run.stopped) && (
+                      <div style={{
+                        alignSelf: "flex-start", maxWidth: "96%",
+                        fontSize: 12, lineHeight: 1.4, color: run.stopped ? "var(--accent)" : "var(--text-muted)",
+                        display: "flex", alignItems: "flex-start", gap: 6,
+                        whiteSpace: "pre-wrap", wordBreak: "break-word",
+                      }}>{run.stopped ? "⛔" : "✓"} {run.summary || "Done."}</div>
+                    )}
+                  </div>
                 );
               })}
-              {agentBusy && <div style={{ fontSize: 12, color: "var(--text-faint)" }}>working…</div>}
             </div>
 
             {/* Prompt input pinned to the bottom of the pane. */}

@@ -1546,6 +1546,17 @@ async fn agent_run(
     const MAX_STEP_RETRIES: u32 = 2;
     let mut step_fail_streak: u32 = 0;
     let mut streak_step: usize = 0;
+    // STEP-OVERRUN GUARD (Mason's Part-1 fix). Once a NAV-step's navigation
+    // actually lands on a real (non-search) destination, we record the step
+    // index here. While `satisfied_step == Some(next_step)`:
+    //   - the per-turn CURRENT-STATE tells the model the step's goal is MET and
+    //     to advance (step_done) or task_complete — NOT click/open/type again;
+    //   - a further browser_click_text/browser_open/browser_type_text on that
+    //     SAME step is REJECTED (never executed) with "this step is already
+    //     complete — advance", so a wandering second click can't happen.
+    // Keyed off the ACTUAL plan step + ACTUAL navigation, not hardcoded google
+    // logic. Cleared whenever the checklist advances (next_step changes).
+    let mut satisfied_step: Option<usize> = None;
     // Iteration cap scales with plan size (each step may need a couple tool
     // calls) but stays bounded so a misbehaving model can't spin forever.
     let max_iters = (steps.len() * 4).clamp(8, 24);
@@ -1564,17 +1575,46 @@ async fn agent_run(
             steps.iter().take(next_step).enumerate()
                 .map(|(i, s)| format!("{}. {} ✓", i + 1, s)).collect::<Vec<_>>().join("; ")
         };
-        let turn_system = format!(
-            "{system}\n\n── CURRENT STATE ──\n\
-            You are on STEP {}/{}: \"{}\".\n\
-            Already completed (do NOT redo): {}.\n\
-            Do ONLY step {} now. When its goal is met, call step_done({}). \
-            Do NOT act outside this step. Do NOT re-open or re-search Google if it's already done.",
-            cur_idx + 1, steps.len(),
-            steps.get(cur_idx).map(|s| s.as_str()).unwrap_or(""),
-            done_list,
-            cur_idx + 1, cur_idx + 1,
-        );
+        // If the step's goal is ALREADY MET (a nav-step whose navigation landed
+        // on a real destination), the ONLY correct next move is to advance —
+        // NOT to click/open/type again. Inject that unambiguously so the model
+        // calls step_done (or task_complete on the last step) instead of taking
+        // another action and wandering (the exact double-click bug).
+        let goal_met = satisfied_step == Some(cur_idx);
+        let turn_system = if goal_met {
+            let is_last = cur_idx + 1 >= steps.len();
+            let cur_url = browser::current_agent_url();
+            format!(
+                "{system}\n\n── CURRENT STATE ──\n\
+                STEP {}/{} (\"{}\") is ALREADY COMPLETE — its goal is MET. The browser \
+                successfully navigated to the destination ({}).\n\
+                Already completed (do NOT redo): {}.\n\
+                Your ONLY valid next action is to {}. Do NOT click, open, type, or read \
+                again for this step — it is finished. Do NOT take ANY browser action now.",
+                cur_idx + 1, steps.len(),
+                steps.get(cur_idx).map(|s| s.as_str()).unwrap_or(""),
+                if cur_url.is_empty() { "the intended page".to_string() } else { cur_url },
+                done_list,
+                if is_last {
+                    format!("call step_done({}) to finish the turn (or task_complete with a one-line summary)", cur_idx + 1)
+                } else {
+                    format!("call step_done({}) so the checklist advances to the next step", cur_idx + 1)
+                },
+            )
+        } else {
+            format!(
+                "{system}\n\n── CURRENT STATE ──\n\
+                You are on STEP {}/{}: \"{}\".\n\
+                Already completed (do NOT redo): {}.\n\
+                Do ONLY step {} now. When its goal is met, call step_done({}) IMMEDIATELY — \
+                do NOT take a second action once the goal is achieved. \
+                Do NOT act outside this step. Do NOT re-open or re-search Google if it's already done.",
+                cur_idx + 1, steps.len(),
+                steps.get(cur_idx).map(|s| s.as_str()).unwrap_or(""),
+                done_list,
+                cur_idx + 1, cur_idx + 1,
+            )
+        };
         let resp = provider::anthropic_turn(&key, &model, &turn_system, &messages, &tools).await?;
         let content = resp.get("content").and_then(|c| c.as_array()).cloned().unwrap_or_default();
         let stop = resp.get("stop_reason").and_then(|s| s.as_str()).unwrap_or("");
@@ -1612,6 +1652,8 @@ async fn agent_run(
                         let idx = if claimed >= 1 { (claimed as usize).saturating_sub(1).max(next_step) } else { next_step };
                         let idx = idx.min(steps.len().saturating_sub(1));
                         next_step = idx + 1;
+                        // Advancing clears the step-overrun guard for the new step.
+                        satisfied_step = None;
                         eprintln!("[aygent][browser][STEP] {}/{} done: {}", next_step, steps.len(),
                             steps.get(idx).map(|s| s.as_str()).unwrap_or(""));
                         emit_ev("step", serde_json::json!({ "index": idx, "done": next_step, "total": steps.len() }));
@@ -1646,7 +1688,45 @@ async fn agent_run(
                     // EXECUTE THROUGH THE BROKER (jailed) — or the browser tools
                     // (act on the VISIBLE tab + per-agent domain policy + wheel).
                     let (result_text, is_err) = if browser::is_agent_tool(name) {
+                        // STEP-OVERRUN GUARD (Part-1 fix): if THIS step's goal is
+                        // already met (a nav-step that already navigated to its
+                        // destination) and the model tries ANOTHER acting browser
+                        // tool on the SAME step, REJECT it — do NOT execute. This
+                        // is the code-level backstop that stops the second,
+                        // wandering click that landed on the wrong site. Reads are
+                        // harmless; only clicks/opens/types wander.
+                        let is_acting = matches!(name, "browser_click_text" | "browser_open" | "browser_type_text");
+                        if is_acting && satisfied_step == Some(next_step) {
+                            let cur = steps.get(next_step).map(|s| s.as_str()).unwrap_or("(current step)");
+                            eprintln!("[aygent][browser][STOP] rejected extra {name} on satisfied step {}/{}: {}",
+                                next_step + 1, steps.len(), cur);
+                            (format!(
+                                "this step is already complete — advance. Step {}/{} (\"{}\") is DONE: the page \
+                                 already navigated to its destination ({}). Do NOT {name} again. Call step_done({}) \
+                                 now (or task_complete if this was the last step).",
+                                next_step + 1, steps.len(), cur, browser::current_agent_url(), next_step + 1,
+                            ), true)
+                        } else {
                         browser_actions += 1;
+                        // TRANSIENT CURRENT-ACTION line (Part-2 UX): emit a single
+                        // replaceable "→ doing X…" label the panel shows live and
+                        // OVERWRITES each action — NOT an accumulating log. The
+                        // meaningful persistent progress is the checklist.
+                        {
+                            let label = match name {
+                                "browser_open" => format!("opening {}", input.get("url").and_then(|u| u.as_str()).unwrap_or("page")),
+                                "browser_read" => "reading the page".to_string(),
+                                "browser_click_text" => format!("clicking “{}”", input.get("text").and_then(|t| t.as_str()).unwrap_or("")),
+                                "browser_type_text" => {
+                                    let submit = input.get("submit").and_then(|b| b.as_bool()).unwrap_or(false);
+                                    format!("typing “{}”{}", input.get("text").and_then(|t| t.as_str()).unwrap_or(""), if submit { " and submitting" } else { "" })
+                                }
+                                "browser_screenshot" => "capturing the page".to_string(),
+                                other => other.to_string(),
+                            };
+                            eprintln!("[aygent][browser][ACTION] step {}/{}: {label}", next_step + 1, steps.len());
+                            emit_ev("action", serde_json::json!({ "step": next_step + 1, "total": steps.len(), "label": label }));
+                        }
                         // Hard backstop only: too many actions = force a stop.
                         // Real termination is checking off the last plan step.
                         if browser_actions > (steps.len() as u32 * 4).clamp(8, 20) {
@@ -1695,6 +1775,7 @@ async fn agent_run(
                             }
                             out
                         }
+                        } // end step-overrun-guard else (step not already satisfied)
                     } else { match name {
                         "read_file" => match broker.resolve_and_open("default", path, broker::Mode::Read) {
                             Ok(mut f) => {
@@ -1744,7 +1825,13 @@ async fn agent_run(
                     // MAX_STEP_RETRIES failures on the same step, we surface an
                     // honest "couldn't complete" message and STOP the turn rather
                     // than let the model retry forever / wander.
-                    if browser::is_agent_tool(name) {
+                    // A guard-rejection ("this step is already complete — advance")
+                    // is NOT a genuine action failure — it means the step already
+                    // SUCCEEDED. Do NOT let it count toward the retry cap (that
+                    // would falsely hard-stop a completed step). It's is_err only
+                    // so the model treats it as "don't do that; advance".
+                    let guard_reject = result_text.starts_with("this step is already complete");
+                    if browser::is_agent_tool(name) && !guard_reject {
                         if streak_step != next_step { streak_step = next_step; step_fail_streak = 0; }
                         if is_err {
                             step_fail_streak += 1;
@@ -1773,13 +1860,63 @@ async fn agent_run(
                         }
                     }
 
+                    // ==========================================================
+                    // STEP-OVERRUN DETECTION (Part-1 fix — the core of the bug).
+                    // If the CURRENT step is a NAV-step ("click the first result",
+                    // "open the link", "go to X"…) and an ACTING browser tool just
+                    // SUCCEEDED and the page is now on a REAL non-search
+                    // destination, the step's GOAL IS MET. Mark it satisfied so
+                    // (a) next turn's CURRENT-STATE says "advance, don't act", and
+                    // (b) any further click/open/type on this same step is
+                    // rejected by the guard above. Keyed off the actual plan step
+                    // + actual navigation — NOT the old left_google turn-gate.
+                    // We ALSO amend the tool_result the model sees so it advances
+                    // instead of clicking again on this very turn.
+                    let mut satisfied_now = false;
+                    if browser::is_agent_tool(name)
+                        && !is_err
+                        && matches!(name, "browser_click_text" | "browser_open" | "browser_type_text")
+                        && satisfied_step != Some(next_step)
+                    {
+                        let cur_step_txt = steps.get(next_step).map(|s| s.as_str()).unwrap_or("");
+                        if step_is_nav(cur_step_txt) {
+                            let host = browser::current_agent_host();
+                            if !browser::is_search_host(&host) {
+                                satisfied_step = Some(next_step);
+                                satisfied_now = true;
+                                eprintln!("[aygent][browser][STEP] goal MET for step {}/{} (nav landed on {}): require step_done next",
+                                    next_step + 1, steps.len(), browser::current_agent_url());
+                            }
+                        }
+                    }
+
                     transcript.push_str(&format!("  ⚙ {name}({path}) → {}\n",
                         if is_err { format!("✗ {result_text}") } else { "✓".to_string() }));
+
+                    // When the nav-step just became satisfied, steer the model to
+                    // advance THIS turn: append an explicit instruction to the
+                    // tool_result so it calls step_done next instead of clicking
+                    // again (the exact wandering second click we're killing).
+                    let content_for_model = if satisfied_now {
+                        let is_last = next_step + 1 >= steps.len();
+                        format!(
+                            "{result_text}\n\n[STEP GOAL MET] Step {}/{} is now COMPLETE — the page navigated to its \
+                             destination. Do NOT click, open, or type again for this step. {}",
+                            next_step + 1, steps.len(),
+                            if is_last {
+                                format!("Call step_done({}) to finish (or task_complete with a one-line summary).", next_step + 1)
+                            } else {
+                                format!("Call step_done({}) so the checklist advances.", next_step + 1)
+                            },
+                        )
+                    } else {
+                        result_text.clone()
+                    };
 
                     tool_results.push(serde_json::json!({
                         "type": "tool_result",
                         "tool_use_id": id,
-                        "content": result_text,
+                        "content": content_for_model,
                         "is_error": is_err
                     }));
                 }
@@ -1832,6 +1969,23 @@ fn parse_plan_steps(text: &str) -> Vec<String> {
         .filter(|s| !s.is_empty() && s.len() > 2)
         .collect();
     v.into_iter().take(8).collect()
+}
+
+/// Does this plan step's GOAL consist of NAVIGATING to a destination — i.e. is
+/// it a "click the result", "open the link", "go to X", "visit", "navigate"
+/// step? Used by the STEP-OVERRUN GUARD in `agent_run`: for a nav-step, a
+/// successful navigation OFF the search page onto a real destination MEANS THE
+/// STEP IS DONE, so the loop must require step_done next instead of tolerating a
+/// second click. This keys off the ACTUAL plan step text (not hardcoded google
+/// logic) — the brittle `left_google` heuristic is NOT reintroduced.
+fn step_is_nav(step: &str) -> bool {
+    let s = step.to_ascii_lowercase();
+    // Any verb that means "end up on a different page/destination".
+    (s.contains("click") && (s.contains("result") || s.contains("link") || s.contains("hit")
+        || s.contains("listing") || s.contains("title") || s.contains("first")))
+        || s.contains("open the") || s.starts_with("open ")
+        || s.contains("go to") || s.contains("navigate") || s.contains("visit")
+        || s.contains("follow the") || s.contains("select the first")
 }
 
 // --- STREAMING agent loop (Phase 1) ----------------------------------------
