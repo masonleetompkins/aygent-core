@@ -998,13 +998,23 @@ pub async fn webview_open(
     }
 
     // EMBED a child webview INSIDE the main window. add_child lives on the raw
-    // WINDOW (not WebviewWindow/AppHandle), so pull the underlying Window from
-    // the main WebviewWindow via .window().
-    let main = app.get_webview_window("main").ok_or("no main window")?;
+    // WINDOW (not WebviewWindow/AppHandle). Getting the parent WINDOW:
+    // get_webview_window("main") returns None once child webviews exist (the
+    // registry entry "main" is the parent WEBVIEW, and after children the
+    // lookup can miss) — which is exactly why tab 2 failed with "no main
+    // window" while tab 1 succeeded. Get the parent Window robustly: prefer
+    // the windows() map (keyed by window label), falling back to any existing
+    // child webview's own .window() (all children share the same parent
+    // window), then finally the webview lookup.
+    let parent_window: tauri::Window = app
+        .get_window("main")
+        .or_else(|| app.windows().into_values().next())
+        .or_else(|| app.get_webview_window("main").map(|wv| wv.as_ref().window()))
+        .or_else(|| app.webviews().into_values().next().map(|wv| wv.window()))
+        .ok_or_else(|| { eprintln!("[aygent][browser] NO PARENT WINDOW found via any path"); "no main window".to_string() })?;
+    eprintln!("[aygent][browser] parent window resolved label={}", parent_window.label());
     let builder = tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed));
-    let wv = main
-        .as_ref()
-        .window()
+    let wv = parent_window
         .add_child(builder, pos, size)
         .map_err(|e| { eprintln!("[aygent][browser] add_child FAILED: {e}"); format!("embed webview: {e}") })?;
     eprintln!("[aygent][browser] webview_open add_child OK label={label}");
