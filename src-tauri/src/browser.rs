@@ -947,6 +947,22 @@ async fn ensure_session(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
     // domains are enabled and BEFORE any real navigation, so it applies to the
     // very first document too.
     apply_fingerprint_hardening(state).await;
+    // ISSUE 4 (agent-side downloads) — tell the headless CDP Chromium to ALLOW
+    // downloads and save them into the SAME jailed dir the visible WKWebView's
+    // on_download handler uses, so agent-driven downloads also populate the
+    // Downloads panel. Best-effort: older builds may only accept the Page.*
+    // form, so try Browser.setDownloadBehavior then fall back. Never fatal.
+    if let Ok(dir) = browser_dir(app)
+        .map(|d| d.join("profiles").join(active_browser_agent(app)).join("downloads"))
+    {
+        let _ = std::fs::create_dir_all(&dir);
+        let dl = dir.display().to_string();
+        let params = serde_json::json!({ "behavior": "allow", "downloadPath": dl });
+        if session_call(state, "Browser.setDownloadBehavior", params.clone()).await.is_err() {
+            let _ = session_call(state, "Page.setDownloadBehavior", params).await;
+        }
+        eprintln!("[aygent][browser][DL] CDP download behavior=allow path={dl}");
+    }
     session_call(
         state,
         "Page.startScreencast",
@@ -1163,6 +1179,103 @@ fn tab_label(tab_id: Option<i64>) -> String {
     }
 }
 
+/// ISSUE 1 — tell the FE to update THIS tab's displayed label to where the
+/// page actually is. Fired on every MAIN-FRAME commit (on_page_load Started).
+/// The FE (Browser.tsx) listens for `browser:tab-navigated` and updates that
+/// tab's { addr, title } so the tab strip reflects the live page (link clicks,
+/// redirects, agent nav) instead of the stale typed address. `title` may be
+/// empty at commit; `emit_tab_title` backfills it a beat later.
+fn emit_tab_navigated(app: &tauri::AppHandle, tab_id: Option<i64>, url: &str, title: &str) {
+    use tauri::Emitter;
+    let _ = app.emit("browser:tab-navigated", &serde_json::json!({
+        "tabId": tab_id, "url": url, "title": title,
+    }));
+}
+
+/// ISSUE 1 (title backfill) — the page title resolved after commit. Emit a
+/// title-only update the FE applies to the tab whose last commit we tracked.
+fn emit_tab_title(app: &tauri::AppHandle, tab_id: Option<i64>, title: &str) {
+    use tauri::Emitter;
+    let _ = app.emit("browser:tab-navigated", &serde_json::json!({
+        "tabId": tab_id, "url": serde_json::Value::Null, "title": title,
+    }));
+}
+
+/// Make a URL/Content-Disposition-ish name filesystem-safe. Strips path
+/// separators and control chars; caps length; falls back to a timestamped name.
+fn sanitize_filename(raw: &str) -> String {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+    // Drop any query string on a URL-derived name.
+    let base = base.split(['?', '#']).next().unwrap_or(base);
+    let cleaned: String = base
+        .chars()
+        .map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim().trim_matches('.').to_string();
+    if cleaned.is_empty() {
+        format!("download-{}", SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    } else {
+        cleaned.chars().take(180).collect()
+    }
+}
+
+/// ISSUE 4 — the SINGLE handler for WKWebView download events (wry
+/// `on_download`). Wiring `on_download` is what STOPS the terminal flood: with
+/// no handler, WKWebView treated the download URL as a navigation the page
+/// couldn't render and churned it through on_navigation -> history in a tight
+/// loop. Here we INTERCEPT the download so it is NEVER a navigation: on
+/// `Requested` we pick a concrete destination under the active agent's jailed
+/// downloads dir (so the file actually lands where `browser_downloads_list`
+/// reads); on `Finished` we log + notify the FE. Logging is ONE LINE PER EVENT
+/// (begin/complete) so it can't flood. Returns `true` to let the download run.
+///
+/// A download URL therefore NEVER touches history or the tab label (on_page_load
+/// only fires for committed PAGE loads, and a download is not one).
+fn download_event(app: &tauri::AppHandle, event: tauri::webview::DownloadEvent<'_>) -> bool {
+    use tauri::webview::DownloadEvent;
+    match event {
+        DownloadEvent::Requested { url, destination } => {
+            let name = sanitize_filename(url.as_str());
+            // Route into the active agent's jailed downloads dir (same dir
+            // browser_downloads_list scans) so the file shows in the panel.
+            match browser_dir(app)
+                .map(|d| d.join("profiles").join(active_browser_agent(app)).join("downloads"))
+            {
+                Ok(dir) => {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let target = dir.join(&name);
+                    eprintln!("[aygent][browser][DL] begin name={name} url={} -> {}", url, target.display());
+                    *destination = target;
+                }
+                Err(e) => {
+                    eprintln!("[aygent][browser][DL] begin name={name} url={url} (dest error: {e}; using default)");
+                }
+            }
+            // Notify the FE a download STARTED (so it can auto-open Downloads).
+            {
+                use tauri::Emitter;
+                let _ = app.emit("browser:download", &serde_json::json!({
+                    "state": "begin", "name": name, "url": url.as_str(),
+                }));
+            }
+            true // allow the download
+        }
+        DownloadEvent::Finished { url, path, success } => {
+            // macOS: `path` is documented as always empty (API limitation), so
+            // don't rely on it — the file is at the destination we set above.
+            let p = path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+            eprintln!("[aygent][browser][DL] complete success={success} url={url} path={p}");
+            use tauri::Emitter;
+            let _ = app.emit("browser:download", &serde_json::json!({
+                "state": if success { "complete" } else { "error" },
+                "url": url.as_str(), "path": p, "success": success,
+            }));
+            true
+        }
+        _ => true,
+    }
+}
+
 /// Create the embedded browser webview if absent, positioned + sized to the
 /// Browser pane rect (CSS px from the UI). Navigates to `url`. Idempotent:
 /// re-shows + repositions an existing one.
@@ -1235,34 +1348,69 @@ pub async fn webview_open(
     eprintln!("[aygent][browser] parent window resolved label={}", parent_window.label());
 
     // ============================================================
-    // PERSISTENT HISTORY — THE ROOT FIX (Atlas).
+    // MAIN-FRAME-ONLY NAVIGATION CAPTURE — THE ROOT FIX v2 (Atlas).
     //
-    // The OLD capture points (mirror_visible_to_cdp / webview_page_info /
-    // webview_navigate) only fired for AGENT navigation or the FE's explicit
-    // address-bar `go()` -> page-info poll. HUMAN browsing — typing a URL, and
-    // especially clicking an in-page LINK or hitting a REDIRECT — navigates the
-    // WKWebView entirely INSIDE WebKit with ZERO Rust involvement, so
-    // history::record was never called and the History panel stayed EMPTY.
+    // v1 used WebviewBuilder::on_navigation as the history source. PROBLEM: wry
+    // invokes on_navigation for EVERY navigation of the webview — including
+    // SUBFRAMES/IFRAMES (hCaptcha widgets, ad/embed frames) and download URLs.
+    // That polluted history with entries like newassets.hcaptcha.com/... that
+    // Mason never navigated to, and (worse) a DOWNLOAD url handed to WKWebView
+    // as a "navigation" fired on_navigation -> history::record in a tight churn
+    // (the terminal flood). on_navigation cannot distinguish main-frame from
+    // sub-frame, so it is the WRONG signal for both the tab label and history.
     //
-    // THE ROBUST SOURCE: WebviewBuilder::on_navigation. Tauri (wry) invokes this
-    // closure for EVERY navigation of THIS child webview — human typed URL,
-    // in-page link click, JS/HTTP redirect, back/forward, AND agent-driven
-    // wv.navigate() from the mirror. It is the single choke point that observes
-    // ALL navigations regardless of who triggered them. We return `true` to
-    // ALLOW every navigation (this is purely an observer; we never cancel).
+    // THE CORRECT SIGNAL: WebviewBuilder::on_page_load. wry fires on_page_load
+    // ONLY for the MAIN FRAME's committed document loads (Started at commit,
+    // Finished at load-complete) — never for subframes/iframes, never for a
+    // sub-resource, and never for a download (a download is not a committed
+    // page load). This cleanly gives us "the actual pages Mason visits, in
+    // order" — the exact main-frame-only semantics Issue 2 asks for.
     //
-    // Title is unknown at navigation-start, so we record an empty title here;
-    // the existing webview_page_info poll + mirror backfill upgrade the title
-    // in place via history::record's title-upgrade path once the page settles.
+    // On PageLoadEvent::Started (commit) we:
+    //   * record the page in persistent history (main-frame only), and
+    //   * emit `browser:tab-navigated` { tabId, url, title:"" } so Browser.tsx
+    //     updates THIS tab's label to where the page actually went (Issue 1).
+    // Title is unknown at commit; on_document_title_changed backfills it below
+    // (emits `browser:tab-navigated` again with the real title, and history's
+    // title-upgrade path upgrades the stored entry in place).
+    //
+    // on_navigation is kept ONLY as a pure allow-all observer (returns true);
+    // it NO LONGER records history or touches the tab — so subframe/captcha/
+    // download navigations can't pollute anything.
     // ============================================================
-    let nav_app = app.clone();
+    let this_tab = tab_id; // captured for the event payloads (which tab this is)
+    let load_app = app.clone();
+    let title_app = app.clone();
+    let dl_app = app.clone();
     let builder = tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed))
-        .on_navigation(move |url| {
-            let u = url.as_str();
-            eprintln!("[aygent][browser][HIST] on_navigation fired url={u}");
-            crate::history::record(&nav_app, u, "");
-            true // observer only — never cancel a navigation
-        });
+        .on_navigation(|_url| true) // allow-all observer; NEVER records (see on_page_load)
+        .on_page_load(move |_wv, payload| {
+            use tauri::webview::PageLoadEvent;
+            // Only act at COMMIT (Started); Finished would double-fire per page.
+            if !matches!(payload.event(), PageLoadEvent::Started) { return; }
+            let url = payload.url().as_str().to_string();
+            // Guard: main-frame commits still include about:blank / devtools —
+            // history::record already skips non-http(s), but skip the emit too.
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return;
+            }
+            eprintln!("[aygent][browser][HIST] main-frame commit tab={this_tab:?} url={url}");
+            // PERSISTENT HISTORY — main-frame only, at commit.
+            crate::history::record(&load_app, &url, "");
+            // ISSUE 1: update the tab strip label to where the page really is.
+            emit_tab_navigated(&load_app, this_tab, &url, "");
+        })
+        .on_document_title_changed(move |_wv, title| {
+            // Title resolved after the main-frame commit. Backfill it: read the
+            // committed url so the event/history carry a matching url+title.
+            let t = title.trim().to_string();
+            if t.is_empty() { return; }
+            // We don't get the url in this callback; the FE keeps the last
+            // committed url per tab and just applies the title. Emit title-only.
+            eprintln!("[aygent][browser][HIST] title-changed tab={this_tab:?} title={t:?}");
+            emit_tab_title(&title_app, this_tab, &t);
+        })
+        .on_download(move |_wv, event| download_event(&dl_app, event));
     let wv = parent_window
         .add_child(builder, pos, size)
         .map_err(|e| { eprintln!("[aygent][browser] add_child FAILED: {e}"); format!("embed webview: {e}") })?;
