@@ -25,6 +25,11 @@ let TAB_SEQ = 1;
 // Width (CSS px) of the right-hand agent pane when handed off. syncBounds
 // shrinks the native webview by this + a gap so the pane sits BESIDE the page.
 const AGENT_PANE_W = 340;
+// ISSUE 3: width (CSS px) of the right strip reserved for the History/Downloads
+// dropdown panel. syncBounds shrinks the webview by this much on the right when
+// a panel is open (shrink-not-hide), so the page stays visible. Matches the
+// panel's own width (340) + a small gutter so the page doesn't peek under it.
+const PANEL_PANE_W = 360;
 // The native WKWebView's OWN CALayer is rounded in Rust (cornerRadius +
 // masksToBounds) so the OS clips the page to a rounded rect. To make the accent
 // frame read as an OUTER STROKE framing the page (not a hairline hidden under
@@ -150,11 +155,13 @@ export function Browser() {
   // right pane takes AGENT_PANE_W, so we shrink the webview to leave room — the
   // agent prompt pane sits BESIDE the page, not over it.
   function syncBounds() {
-    // A drop panel (History/Downloads) is open — the native webview is hidden so
-    // the panel is visible. Don't reposition/re-front it now; the panel-close
-    // effect re-shows + re-syncs. (Guards the ResizeObserver/resize/timeout
-    // callers that would otherwise re-front the webview over an open panel.)
-    if (panelRef.current) return;
+    // ISSUE 3 (Atlas): the History/Downloads panel NO LONGER hides the webview.
+    // Instead, when a panel is open we SHRINK the webview from the RIGHT by
+    // PANEL_PANE_W (the same shrink-not-hide pattern agent mode uses for its
+    // pane) so the page STAYS VISIBLE in the reclaimed-left area and the narrow
+    // dropdown panel sits over/beside the strip on the right. When the panel
+    // closes, the shrink is removed and the webview reclaims full width. We no
+    // longer early-return here on panel-open — we compute the shrunk rect below.
     const el = paneRef.current;
     if (!el) return;
     // DOUBLE rAF: read AFTER React commit + browser layout/paint, so r.top and
@@ -192,7 +199,12 @@ export function Browser() {
       // bigger than the top. Symmetric edges = symmetric insets.
       const left = Math.round(r.left + inset);
       const top = Math.round(r.top + inset);
-      const right = Math.round(r.right - inset);
+      // ISSUE 3: reserve a strip on the RIGHT for the History/Downloads panel
+      // when one is open, so the page stays visible in the remaining area and
+      // the dropdown sits over the reclaimed strip (shrink-not-hide). Read the
+      // ref so observer/timeout closures see the CURRENT panel state.
+      const panelReserve = panelRef.current ? PANEL_PANE_W : 0;
+      const right = Math.round(r.right - inset - panelReserve);
       const bottom = Math.round(r.bottom - inset);
       const bounds = {
         x: left, y: top,
@@ -353,25 +365,22 @@ export function Browser() {
   // Re-sync bounds a beat after the toggle so the webview resizes with it.
   useEffect(() => { syncBounds(); const t = setTimeout(syncBounds, 60); return () => clearTimeout(t); }, [driver]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // DROP-PANEL VISIBILITY (Atlas overlay fix). The native WKWebView paints on
-  // top of DOM wherever it overlaps the page rect, so an open History/Downloads
-  // panel would be COVERED. While a panel is open we HIDE all tab webviews
-  // (nothing left to cover the panel); when it closes we re-show + reposition
-  // the active tab's webview. This effect is the SINGLE owner of "panel drives
-  // webview visibility", and its cleanup guarantees the webview is never left
-  // stuck hidden — on unmount (leave screen) the mount effect's cleanup already
-  // hides everything, and on panel-close here we restore the active tab.
+  // DROP-PANEL VISIBILITY (Atlas, ISSUE 3 — shrink-not-hide). Mason wants the
+  // page to STAY VISIBLE while History/Downloads is open. The native WKWebView
+  // still paints on top of DOM wherever it OVERLAPS, so instead of hiding it we
+  // SHRINK it out from under the panel: syncBounds reserves PANEL_PANE_W on the
+  // right when a panel is open, so the webview occupies only the LEFT area and
+  // the narrow dropdown sits over the reclaimed right strip (both visible). On
+  // panel toggle we keep the active tab fronted and just re-sync to the new
+  // (shrunk or full) rect. Cleanup (leave screen) still hides everything via
+  // the mount effect. GUARANTEE: closing the panel restores full width because
+  // syncBounds recomputes with panelReserve=0.
   useEffect(() => {
     if (installed !== true) return;
-    if (panel) {
-      // Panel open: hide EVERY tab's native layer so the DOM panel shows.
-      invoke("webview_hide_others", { keep: null }).catch(() => {});
-      return;
-    }
-    // Panel closed: re-front the active tab's webview if it has a page, at its
-    // correct rect. `panelRef` is already null here, so syncBounds runs.
     const cur = tabs.find((t) => t.id === activeIdRef.current);
     if (cur?.opened) {
+      // Keep the active tab fronted (never hidden for panels now); re-sync so
+      // it shrinks (panel open) or reclaims full width (panel closed).
       invoke("webview_hide_others", { keep: cur.id }).catch(() => {});
       syncBounds();
       setTimeout(syncBounds, 60);
@@ -380,9 +389,62 @@ export function Browser() {
   }, [panel, installed]);
 
   // If the user switches tabs or flips the driver while a panel is open, close
-  // the panel first so we never leave a webview re-fronted over a stale panel
-  // (and so the panel-visibility effect above can cleanly restore the webview).
+  // the panel first (a tab switch / driver flip changes the layout the panel
+  // was anchored against; closing it lets syncBounds cleanly reclaim width).
   useEffect(() => { setPanel(null); }, [activeId, driver]);
+
+  // ISSUE 1 — TAB LABEL follows the live page. Rust emits `browser:tab-navigated`
+  // on every MAIN-FRAME commit (on_page_load) with { tabId, url, title } and
+  // again (url:null) when the title resolves. Update that tab's addr/title so
+  // the tab strip shows where the page ACTUALLY is (link clicks, redirects,
+  // agent nav) — not the stale typed address. tabId may be null (legacy single
+  // webview) -> apply to the active tab. Title falls back to the url's hostname.
+  useEffect(() => {
+    let un: undefined | (() => void);
+    const hostOf = (u: string) => { try { return new URL(u).hostname; } catch { return u; } };
+    listen<{ tabId: number | null; url: string | null; title: string }>("browser:tab-navigated", (ev) => {
+      const p = ev.payload || ({} as any);
+      const targetId = (p.tabId ?? activeIdRef.current) as number;
+      setTabs((ts) => ts.map((t) => {
+        if (t.id !== targetId) return t;
+        // Don't stomp an address the user is actively typing into.
+        if (t.editing) return t;
+        const next: Partial<Tab> = {};
+        if (typeof p.url === "string" && p.url) {
+          next.addr = p.url;
+          // Only set a placeholder title from the url if we don't have a real
+          // one yet; the title-changed event upgrades it right after.
+          if (!p.title && (!t.title || t.title === "New Tab" || t.title === t.addr)) {
+            next.title = hostOf(p.url);
+          }
+        }
+        if (p.title) next.title = p.title;
+        return { ...t, ...next };
+      }));
+    }).then((f) => { un = f; }).catch(() => {});
+    return () => { un?.(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ISSUE 4 — DOWNLOADS. Rust emits `browser:download` { state, name, url }.
+  // On begin, auto-open the Downloads panel so Mason sees it happen; on
+  // complete/error, refresh the list from disk so the finished file appears.
+  useEffect(() => {
+    let un: undefined | (() => void);
+    listen<{ state: string; name?: string; url?: string }>("browser:download", (ev) => {
+      const st = ev.payload?.state;
+      if (st === "begin") {
+        setPanel("downloads");
+      }
+      // Refresh the on-disk list on any event (begin shows in-progress-less;
+      // complete shows the finished file). browser_downloads_list skips temp
+      // .crdownload/.part files, so a finished file appears on complete.
+      invoke<DlEntry[]>("browser_downloads_list")
+        .then((list) => setDownloads(Array.isArray(list) ? list : []))
+        .catch(() => {});
+    }).then((f) => { un = f; }).catch(() => {});
+    return () => { un?.(); };
+  }, []);
 
   // LISTEN for shared-control changes from Rust. A non-empty `note` means the
   // agent got blocked and wants the human -> pulse the toggle + show the note.
