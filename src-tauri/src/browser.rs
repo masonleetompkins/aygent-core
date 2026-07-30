@@ -1105,6 +1105,9 @@ pub fn webview_set_bounds(
     client_width: Option<f64>,
     client_height: Option<f64>,
     parent_height: Option<f64>,
+    // Corner radius (CSS px) to round the WKWebView's CALayer, matching the UI
+    // frame. Same single-sourced value the open call sends.
+    radius: Option<f64>,
 ) -> Result<(), String> {
     use tauri::Manager;
     if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {

@@ -93,7 +93,7 @@ export function Browser() {
         parentHeight,
       };
       // Skip redundant calls — only push when the rect actually changed.
-      const key = `${bounds.x},${bounds.y},${bounds.width},${bounds.height},${bounds.clientWidth},${bounds.clientHeight}`;
+      const key = `${bounds.x},${bounds.y},${bounds.width},${bounds.height},${bounds.clientWidth},${bounds.clientHeight},${bounds.radius}`;
       if (key === lastBoundsRef.current) return;
       lastBoundsRef.current = key;
       invoke("webview_set_bounds", bounds).catch(() => {});
