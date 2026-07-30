@@ -1374,12 +1374,17 @@ async fn agent_run(
     let key = keychain::get_key("anthropic")
         .map_err(|_| "no anthropic key set — add one first".to_string())?;
     let models = provider::anthropic_list_models(&key).await?;
+    // Browser hand-off needs REAL reasoning (haiku loops: it can't reliably
+    // judge "task done, stop"). Prefer sonnet, then any non-haiku, then whatever
+    // exists. This is the model that drives the visible tab from the Agent panel.
     let model = models
         .iter()
-        .find(|m| m.contains("haiku"))
+        .find(|m| m.contains("sonnet"))
+        .or_else(|| models.iter().find(|m| !m.contains("haiku")))
         .cloned()
         .or_else(|| models.first().cloned())
         .ok_or_else(|| "account returned no usable models".to_string())?;
+    eprintln!("[aygent][browser][AGENT] model={model}");
 
     // M0.2b: capability model. In Folder Mode (the M0.3 default) the granted
     // caps are {fs.read, fs.write, net.http, mcp.net}. The file tools below need
@@ -1443,6 +1448,14 @@ async fn agent_run(
     let mut transcript = String::new();
     transcript.push_str(&format!("[{model}]\n"));
 
+    // HARD COMPLETION GUARD (don't trust the model to self-terminate): once the
+    // agent has left Google (clicked into a destination), re-opening Google or
+    // re-searching is almost always a loop, not intent. Track whether we've
+    // navigated off Google; if so, refuse a Google re-open/search and tell the
+    // model it's done. Also count browser actions to end runaway loops.
+    let mut left_google = false;
+    let mut browser_actions = 0u32;
+
     // Agent loop: cap iterations so a misbehaving model can't spin forever.
     for _ in 0..8 {
         let resp = provider::anthropic_turn(&key, &model, system, &messages, &tools).await?;
@@ -1473,11 +1486,35 @@ async fn agent_run(
                     // EXECUTE THROUGH THE BROKER (jailed) — or the browser tools
                     // (act on the VISIBLE tab + per-agent domain policy + wheel).
                     let (result_text, is_err) = if browser::is_agent_tool(name) {
-                        // No configured allowlist here — the human-in-the-loop
-                        // permission flow (Allow/Deny/Take) governs new hosts, and
-                        // the current tab's host is always pre-allowed. Pass empty.
-                        let domains: Vec<String> = Vec::new();
-                        browser::agent_tool(&app, &browser_state, name, &input, &domains).await
+                        browser_actions += 1;
+                        // COMPLETION GUARD: if the agent already left Google and
+                        // now tries to search Google or re-open it, that's a loop.
+                        // Refuse + tell it the task is done so it ends the turn.
+                        let wants_google = {
+                            let u = input.get("url").and_then(|u| u.as_str()).unwrap_or("").to_lowercase();
+                            let t = input.get("text").and_then(|t| t.as_str()).unwrap_or("").to_lowercase();
+                            name == "browser_open" && u.contains("google.")
+                                || (name == "browser_type_text" && left_google)
+                                || (name == "browser_click_text" && t == "search" && left_google)
+                        };
+                        if left_google && wants_google {
+                            ("You have already navigated off Google to the destination — the task is COMPLETE. Do NOT search again. Stop now and give a one-sentence summary of what you did.".to_string(), true)
+                        } else if browser_actions > 10 {
+                            ("You've taken many actions. Stop now and summarize what you accomplished in one sentence.".to_string(), true)
+                        } else {
+                            // No configured allowlist — the human-in-the-loop
+                            // permission flow governs new hosts; current tab host
+                            // is pre-allowed. Pass empty.
+                            let domains: Vec<String> = Vec::new();
+                            let out = browser::agent_tool(&app, &browser_state, name, &input, &domains).await;
+                            // Mark that we've left Google once a click/open lands
+                            // us on a non-google page (result text carries the url).
+                            if !out.1 && !out.0.to_lowercase().contains("google.")
+                                && (name == "browser_click_text" || name == "browser_open") {
+                                left_google = true;
+                            }
+                            out
+                        }
                     } else { match name {
                         "read_file" => match broker.resolve_and_open("default", path, broker::Mode::Read) {
                             Ok(mut f) => {
