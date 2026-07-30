@@ -944,64 +944,38 @@ pub async fn webview_open(
     width: f64,
     height: f64,
 ) -> Result<(), String> {
-    use tauri::{Manager, PhysicalPosition, PhysicalSize, WebviewUrl};
+    use tauri::{LogicalPosition, LogicalSize, Manager, WebviewUrl};
     let target = normalize_url(&url);
     let parsed = target.parse().map_err(|e| format!("bad url: {e}"))?;
 
-    // THE FIX (BROWSER-WEBVIEW-HANDOFF): on this platform, add_child +
-    // set_position/set_size treat the value we pass as PHYSICAL pixels for the
-    // child's placement in the parent NSView, but the frontend measures the pane
-    // rect in CSS/LOGICAL px. On a Retina (2x) display that mismatch placed the
-    // child at logical-treated-as-physical — up + left by exactly the DPR factor
-    // (proven: SENT (316,73) -> APPLIED (632,146) = 2x, scale reported 1 but the
-    // real device DPR is 2). So we convert logical->physical ourselves using the
-    // TRUE scale factor and pass Physical{Position,Size}. scale is read live, so
-    // this is correct at 1x, 2x, and any window size — zero hardcoded pixels.
-    let scale = physical_scale(&app);
-    let (px, py) = (x * scale, y * scale);
-    let (pw, ph) = ((width.max(1.0)) * scale, (height.max(1.0)) * scale);
-
+    // Pass the frontend's measured CSS-px rect straight through as LOGICAL.
+    // Tauri converts logical->physical internally using the window's DPR, so
+    // this is correct on Retina + 1x. (Do NOT pre-multiply by scale ourselves —
+    // that double-applied DPR and shrank the child top-left.)
     // Existing EMBEDDED child webview? reposition + navigate. add_child creates
-    // a `Webview` (embedded child), NOT a `WebviewWindow` (standalone window),
-    // so it MUST be retrieved via get_webview() — get_webview_window() returns
-    // None for embedded children, which silently no-op'd every reposition/hide
-    // (the pop-out + never-hides bug). Verified against tauri 2.11.5 docs.
+    // a `Webview` (embedded child), retrieved via get_webview() (not
+    // get_webview_window(), which returns None for embedded children).
     if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
-        let _ = wv.set_position(PhysicalPosition::new(px, py));
-        let _ = wv.set_size(PhysicalSize::new(pw.max(1.0), ph.max(1.0)));
+        let _ = wv.set_position(LogicalPosition::new(x, y));
+        let _ = wv.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
         wv.navigate(parsed).map_err(|e| format!("navigate: {e}"))?;
         return Ok(());
     }
 
     // EMBED a child webview INSIDE the main window. add_child lives on the raw
     // WINDOW (not WebviewWindow/AppHandle), so pull the underlying Window from
-    // the main WebviewWindow via .window(). This embeds + clips to the parent,
-    // positioned at the pane rect (NOT a free-floating child window).
+    // the main WebviewWindow via .window().
     let main = app.get_webview_window("main").ok_or("no main window")?;
     let builder = tauri::webview::WebviewBuilder::new(WEBVIEW_LABEL, WebviewUrl::External(parsed));
-    // add_child lives on the raw Window. WebviewWindow derefs to Webview
-    // (.as_ref()), whose .window() returns that Window — public under 'unstable'.
     main.as_ref()
         .window()
         .add_child(
             builder,
-            PhysicalPosition::new(px, py),
-            PhysicalSize::new(pw.max(1.0), ph.max(1.0)),
+            LogicalPosition::new(x, y),
+            LogicalSize::new(width.max(1.0), height.max(1.0)),
         )
         .map_err(|e| format!("embed webview: {e}"))?;
     Ok(())
-}
-
-/// The TRUE device scale factor (DPR) of the main window — read live so the
-/// logical(CSS px)->physical conversion is correct on Retina (2x), 1x, and
-/// external monitors of any DPR. Never hardcoded. Falls back to 1.0 (logical ==
-/// physical) if the window can't be read, which is the correct 1x behavior.
-fn physical_scale(app: &tauri::AppHandle) -> f64 {
-    use tauri::Manager;
-    app.get_webview_window("main")
-        .and_then(|w| w.scale_factor().ok())
-        .filter(|s| *s > 0.0)
-        .unwrap_or(1.0)
 }
 
 /// Reposition/resize the embedded webview to track the pane (called on layout
@@ -1019,19 +993,12 @@ pub fn webview_set_bounds(
     // not change its call shape.
     #[allow(unused_variables)] parent_height: Option<f64>,
 ) -> Result<(), String> {
-    use tauri::{Manager, PhysicalPosition, PhysicalSize};
+    use tauri::{LogicalPosition, LogicalSize, Manager};
     if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
-        // THE FIX: convert the frontend's LOGICAL (CSS px) rect to PHYSICAL px
-        // using the true DPR, because add_child/set_position place the child in
-        // the parent NSView's PHYSICAL coordinate space on this platform. Read
-        // live — correct at 1x, 2x, any window size. (See webview_open for the
-        // full diagnosis.)
-        let scale = physical_scale(&app);
-        let _ = wv.set_position(PhysicalPosition::new(x * scale, y * scale));
-        let _ = wv.set_size(PhysicalSize::new(
-            (width.max(1.0)) * scale,
-            (height.max(1.0)) * scale,
-        ));
+        // Pass the measured CSS-px rect straight through as LOGICAL; Tauri does
+        // the DPR conversion. No manual scale math (that shrank the child).
+        let _ = wv.set_position(LogicalPosition::new(x, y));
+        let _ = wv.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
     }
     Ok(())
 }
