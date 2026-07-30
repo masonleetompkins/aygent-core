@@ -1048,22 +1048,23 @@ fn place_child_exact(wv: &tauri::Webview, x: f64, y: f64, w: f64, h: f64, conten
         let flip_h = content_h.filter(|v| *v > 0.0).unwrap_or(parent_h);
         let oy = if parent_flipped { y } else { flip_h - y - h };
 
+        let wrapped = Retained::as_ptr(&target) != (raw as *const NSView);
         eprintln!(
             "[aygent][browser][NSVIEW] in=({x:.0},{y:.0} {w:.0}x{h:.0}) \
              content_flipped={} parent_flipped={parent_flipped} parent_h={parent_h:.0} \
-             flip_h={flip_h:.0} => frame=({x:.0},{oy:.0} {w:.0}x{h:.0})",
+             flip_h={flip_h:.0} wrapped={wrapped} => frame=({x:.0},{oy:.0} {w:.0}x{h:.0})",
             content.isFlipped(),
         );
 
-        // Pin it: no autoresizing drift between our explicit placements
-        // (ResizeObserver re-fires set_bounds on every layout change).
-        target.setAutoresizingMask(NSAutoresizingMaskOptions::empty());
+        // MINIMAL INTERVENTION: place ONLY the outer container (the view sitting
+        // directly under contentView). Do NOT touch the inner WKWebView frame
+        // and do NOT clear autoresizing — doing both is what broke rendering
+        // (blank page). The WKWebView tracks its container via its own
+        // autoresizing mask; we only correct WHERE the container sits. wry still
+        // sized it via set_size before this call; we override position + size on
+        // the container only.
         target.setFrame(NSRect::new(NSPoint::new(x, oy), NSSize::new(w, h)));
-
-        // If there IS a wrapper, make the WKWebView fill it exactly.
-        if Retained::as_ptr(&target) != (raw as *const NSView) {
-            view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)));
-        }
+        let _ = NSAutoresizingMaskOptions::empty();
     });
 }
 
