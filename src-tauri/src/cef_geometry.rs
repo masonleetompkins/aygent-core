@@ -84,13 +84,12 @@ define_class!(
 impl AygentCefWrapper {
     fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
         let this = Self::alloc(mtm);
-        // objc2 0.6: an init-family super message on an Allocated<Self> must go
-        // through the NSView superclass explicitly so the retain-semantics /
-        // MsgSendSuper bounds resolve (a bare `super(this)` init doesn't satisfy
-        // MethodFamily<3>). Use the typed super receiver.
-        let this: Retained<Self> = unsafe {
-            msg_send![super(this, NSView), initWithFrame: frame]
-        };
+        // objc2 0.6: send the inherited `initWithFrame:` init-family message
+        // DIRECTLY to the allocated instance (NOT via super — super init trips
+        // MethodFamily<3>/MsgSendSuper bounds). The init-family message on
+        // Allocated<Self> returns Retained<Self> and runs NSView's designated
+        // initializer up the chain. This is the standard objc2 custom-view init.
+        let this: Retained<Self> = unsafe { msg_send![this, initWithFrame: frame] };
         unsafe {
             this.setWantsLayer(true);
             if let Some(layer) = this.layer() {
