@@ -198,7 +198,12 @@ pub fn init_early() -> bool {
 
     let settings = Settings {
         no_sandbox: !cfg!(feature = "sandbox") as _,
-        multi_threaded_message_loop: 1,
+        // macOS: multi_threaded_message_loop is Windows-only; leave BOTH loop
+        // flags OFF (the safe macOS baseline the cefsimple example uses). CEF
+        // integrates with the app run loop via CefDoMessageLoopWork / the app's
+        // NSApp loop. (Was multi_threaded_message_loop:1 — suspected cause of the
+        // silent CefInitialize→0; confirming against the working spike's flags.)
+        multi_threaded_message_loop: 0,
         external_message_pump: 0,
         remote_debugging_port: port as _,
         browser_subprocess_path: s(&helper),
