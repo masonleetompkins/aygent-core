@@ -1001,41 +1001,42 @@ pub fn webview_set_bounds(
         // ACTUALLY landed. Everything in Tauri readbacks is PHYSICAL px, so we
         // convert to logical via the main window's scale factor to compare
         // apples-to-apples with the LOGICAL x/y the frontend sent (CSS px).
-        let scale = app
+        let win_scale = app
             .get_webview_window("main")
             .and_then(|w| w.scale_factor().ok())
-            .unwrap_or(1.0);
+            .unwrap_or(-1.0);
+        let child_scale = wv.scale_factor().unwrap_or(-1.0);
 
-        // Read parent (main webview) physical size → logical, so we can see if
-        // documentElement.clientHeight (what JS flipped against) matches the
-        // real wry parent NSView height wry flips against.
-        let parent_logical = app
+        // Parent (main webview) RAW PHYSICAL size (no division) so we can see the
+        // real numbers wry works in.
+        let parent_phys = app
             .get_webview("main")
             .and_then(|m| m.size().ok())
-            .map(|s| (s.width as f64 / scale, s.height as f64 / scale));
+            .map(|s| (s.width, s.height));
 
         let _ = wv.set_position(LogicalPosition::new(x, y));
         let _ = wv.set_size(LogicalSize::new(width.max(1.0), height.max(1.0)));
 
-        // Read back the applied position/size (PHYSICAL) and convert to logical.
-        let applied_pos = wv.position().ok().map(|p| (p.x as f64 / scale, p.y as f64 / scale));
-        let applied_size = wv.size().ok().map(|s| (s.width as f64 / scale, s.height as f64 / scale));
-
-        let (dx, dy) = match applied_pos {
-            Some((ax, ay)) => (ax - x, ay - y),
-            None => (f64::NAN, f64::NAN),
-        };
+        // Read back the applied position/size RAW PHYSICAL (no division). If
+        // set_position(Logical(x)) lands at physical x, DPR was NOT applied; if
+        // it lands at x*dpr, it WAS. This disambiguates the scale bug directly.
+        let applied_phys_pos = wv.position().ok().map(|p| (p.x, p.y));
+        let applied_phys_size = wv.size().ok().map(|s| (s.width, s.height));
 
         eprintln!(
-            "[aygent][browser][DELTA] scale={scale} | SENT pos=({x:.1},{y:.1}) size=({:.1},{:.1}) parentHeight(JS)={:?} \
-             | APPLIED pos={:?} size={:?} | DELTA applied-sent=({dx:.1},{dy:.1}) \
-             | wry_parent_logical={:?}",
+            "[aygent][browser][DELTA] win_scale={win_scale} child_scale={child_scale} \
+             | SENT_LOGICAL pos=({x:.1},{y:.1}) size=({:.1},{:.1}) parentHeight(JS)={:?} \
+             | APPLIED_PHYSICAL pos={:?} size={:?} \
+             | parent_PHYSICAL={:?} \
+             | ratio_pos=({:.3},{:.3})",
             width.max(1.0),
             height.max(1.0),
             parent_height,
-            applied_pos,
-            applied_size,
-            parent_logical,
+            applied_phys_pos,
+            applied_phys_size,
+            parent_phys,
+            applied_phys_pos.map(|(px, _)| px as f64 / x.max(1.0)).unwrap_or(f64::NAN),
+            applied_phys_pos.map(|(_, py)| py as f64 / y.max(1.0)).unwrap_or(f64::NAN),
         );
         // --------------------------------------------------------------------
     }
