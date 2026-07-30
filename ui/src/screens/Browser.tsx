@@ -17,7 +17,9 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Input } from "../components/ui";
 import { Icon } from "../components/Icon";
 
-type Tab = { id: number; addr: string; title: string; editing: boolean };
+type Tab = { id: number; addr: string; title: string; editing: boolean; opened?: boolean };
+// Monotonic tab id counter — NEVER reuse ids (Atlas P1: label reuse races the
+// async webview close, so a reopened tab could grab a stale/half-closed handle).
 let TAB_SEQ = 1;
 // Width (CSS px) of the right-hand agent pane when handed off. syncBounds
 // shrinks the native webview by this + a gap so the pane sits BESIDE the page.
@@ -32,7 +34,7 @@ const FRAME_RADIUS = 14;
 const FRAME_STROKE = 2;           // accent border width (outer stroke)
 const WEB_INSET = FRAME_STROKE;   // pull webview in so the stroke frames it
 const WEB_RADIUS = FRAME_RADIUS - FRAME_STROKE; // page corners nest inside frame
-const newTab = (): Tab => ({ id: TAB_SEQ++, addr: "", title: "New Tab", editing: true });
+const newTab = (): Tab => ({ id: TAB_SEQ++, addr: "", title: "New Tab", editing: true, opened: false });
 
 export function Browser() {
   const [installed] = useInstalled();
@@ -47,6 +49,10 @@ export function Browser() {
   const paneRef = useRef<HTMLDivElement>(null);
   // Last rect we pushed to Rust — dedupe so we don't re-apply an unchanged rect.
   const lastBoundsRef = useRef<string>("");
+  // Active tab id in a ref so syncBounds (called from observers/timeouts) always
+  // reads the CURRENT active tab, not a stale closure value.
+  const activeIdRef = useRef<number>(activeId);
+  activeIdRef.current = activeId;
 
   const active = tabs.find((t) => t.id === activeId) ?? tabs[0];
   function patch(id: number, p: Partial<Tab>) {
@@ -105,9 +111,10 @@ export function Browser() {
         // compute the native titlebar inset at runtime (THE fix).
         clientWidth, clientHeight,
         parentHeight,
+        tabId: activeIdRef.current,
       };
       // Skip redundant calls — only push when the rect actually changed.
-      const key = `${bounds.x},${bounds.y},${bounds.width},${bounds.height},${bounds.clientWidth},${bounds.clientHeight},${bounds.radius}`;
+      const key = `${bounds.tabId},${bounds.x},${bounds.y},${bounds.width},${bounds.height},${bounds.clientWidth},${bounds.clientHeight},${bounds.radius}`;
       if (key === lastBoundsRef.current) return;
       lastBoundsRef.current = key;
       invoke("webview_set_bounds", bounds).catch(() => {});
@@ -137,7 +144,9 @@ export function Browser() {
       window.removeEventListener("resize", onResize);
       ro?.disconnect();
       winUn.then((f) => f()).catch(() => {});
-      invoke("webview_hide").catch(() => {});
+      // Leaving the Browser screen: hide ALL tab webviews so none float over
+      // other screens.
+      invoke("webview_hide_others", { keep: null }).catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [installed]);
@@ -167,8 +176,11 @@ export function Browser() {
     console.log("[browser] webview_open →", { x: ox, y: oy, width: ow, height: oh }, "raw:", { l: r?.left, t: r?.top, w: r?.width, h: r?.height });
     const clientWidth = Math.round(document.documentElement.clientWidth);
     const clientHeight = Math.round(document.documentElement.clientHeight);
-    await invoke("webview_open", { url, x: ox, y: oy, width: ow, height: oh, clientWidth, clientHeight, radius: WEB_RADIUS })
+    await invoke("webview_open", { url, x: ox, y: oy, width: ow, height: oh, clientWidth, clientHeight, radius: WEB_RADIUS, tabId: id })
       .catch((e) => setAgentLog((l) => [...l, `open failed: ${e}`]));
+    // This tab's webview is now the active surface — hide the others.
+    invoke("webview_hide_others", { keep: id }).catch(() => {});
+    patch(id, { opened: true });
     // Re-sync a beat later so the webview lands on the SETTLED rect (the agent
     // prompt bar toggling can shift the pane by a row).
     setTimeout(syncBounds, 120);
@@ -180,6 +192,8 @@ export function Browser() {
   }
   function addTab() { const t = newTab(); setTabs((ts) => [...ts, t]); setActiveId(t.id); }
   function closeTab(id: number) {
+    // Destroy this tab's native webview (frees its WebContent process).
+    invoke("webview_close", { tabId: id }).catch(() => {});
     setTabs((ts) => {
       const next = ts.filter((t) => t.id !== id);
       if (next.length === 0) { const t = newTab(); setActiveId(t.id); return [t]; }
@@ -187,6 +201,24 @@ export function Browser() {
       return next;
     });
   }
+
+  // TAB SWITCH: show the active tab's webview + hide the rest. If the active
+  // tab has already navigated (opened), reposition+show it; if it's a fresh
+  // "New Tab" (not opened), just hide everything so the placeholder shows.
+  useEffect(() => {
+    if (installed !== true) return;
+    const cur = tabs.find((t) => t.id === activeId);
+    if (cur?.opened) {
+      // Reposition + un-hide the active tab; webview_hide_others fronts it.
+      syncBounds();
+      invoke("webview_hide_others", { keep: activeId }).catch(() => {});
+      setTimeout(syncBounds, 60);
+    } else {
+      // Fresh tab with no page yet — hide all so the empty-state shows.
+      invoke("webview_hide_others", { keep: null }).catch(() => {});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId]);
 
   // THE HAND-OFF. Flip to agent: the right prompt pane opens + the webview
   // shrinks to make room. Flip to human: pane closes, webview reclaims width.

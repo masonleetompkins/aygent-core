@@ -932,6 +932,17 @@ pub async fn browser_start_view(
 
 const WEBVIEW_LABEL: &str = "aygent-browser";
 
+/// Per-tab webview label. Multi-tab = one native child webview per tab, each
+/// with a unique label `aygent-browser-<tabId>`, so every tab holds its OWN
+/// live page + WebKit history. `tab_id: None` maps to the legacy single label
+/// (back-compat + the agent path that operates on "the active tab").
+fn tab_label(tab_id: Option<i64>) -> String {
+    match tab_id {
+        Some(id) => format!("{WEBVIEW_LABEL}-{id}"),
+        None => WEBVIEW_LABEL.to_string(),
+    }
+}
+
 /// Create the embedded browser webview if absent, positioned + sized to the
 /// Browser pane rect (CSS px from the UI). Navigates to `url`. Idempotent:
 /// re-shows + repositions an existing one.
@@ -953,21 +964,28 @@ pub async fn webview_open(
     // Corner radius (CSS px) to round the WKWebView's own CALayer, so the OS
     // clips the page to a rounded rect matching the UI frame.
     radius: Option<f64>,
+    // Which tab this webview belongs to. Each tab = its own native webview.
+    tab_id: Option<i64>,
 ) -> Result<(), String> {
     use tauri::{Manager, WebviewUrl};
     let target = normalize_url(&url);
     let parsed = target.parse().map_err(|e| format!("bad url: {e}"))?;
+    let label = tab_label(tab_id);
 
     let _ = (client_width, client_height);
     let pos = tauri::LogicalPosition::new(x, y);
     let size = tauri::LogicalSize::new(width.max(1.0), height.max(1.0));
 
-    // Existing EMBEDDED child webview? reposition + navigate. add_child creates
-    // a `Webview` (embedded child), retrieved via get_webview() (not
-    // get_webview_window(), which returns None for embedded children).
-    if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
+    // Existing EMBEDDED child webview for THIS tab? reposition + navigate.
+    // add_child creates a `Webview` (embedded child), retrieved via
+    // get_webview() (not get_webview_window(), None for embedded children).
+    if let Some(wv) = app.get_webview(&label) {
         #[cfg(target_os = "macos")]
-        place_child_exact(&wv, x, y, width, height, client_height, radius);
+        {
+            place_child_exact(&wv, x, y, width, height, client_height, radius);
+            set_child_hidden(&wv, false);
+            bring_child_to_front(&wv);
+        }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = wv.set_position(pos);
@@ -981,7 +999,7 @@ pub async fn webview_open(
     // WINDOW (not WebviewWindow/AppHandle), so pull the underlying Window from
     // the main WebviewWindow via .window().
     let main = app.get_webview_window("main").ok_or("no main window")?;
-    let builder = tauri::webview::WebviewBuilder::new(WEBVIEW_LABEL, WebviewUrl::External(parsed));
+    let builder = tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed));
     let wv = main
         .as_ref()
         .window()
@@ -1108,9 +1126,11 @@ pub fn webview_set_bounds(
     // Corner radius (CSS px) to round the WKWebView's CALayer, matching the UI
     // frame. Same single-sourced value the open call sends.
     radius: Option<f64>,
+    // Which tab's webview to reposition.
+    tab_id: Option<i64>,
 ) -> Result<(), String> {
     use tauri::Manager;
-    if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
+    if let Some(wv) = app.get_webview(&tab_label(tab_id)) {
         let _ = client_width;
         let content_h = client_height.or(parent_height);
         #[cfg(target_os = "macos")]
@@ -1128,34 +1148,115 @@ pub fn webview_set_bounds(
 /// Hide the embedded webview when the user leaves the Browser tab so it doesn't
 /// float over other screens. Embedded child webviews have no hide() — shrink to
 /// zero + move off-screen (reliable across versions).
+/// Set NSView `hidden` on a tab's webview (macOS). Atlas P0: hiding by
+/// setHidden removes the view from hit-testing (no leaked clicks) + drops it
+/// from compositing (no GPU/flash), and is lossless on re-show (no reload).
+/// The old size-0/offscreen hack leaked input + paint. Non-macOS falls back to
+/// the geometry hack.
+#[cfg(target_os = "macos")]
+fn set_child_hidden(wv: &tauri::Webview, hidden: bool) {
+    let _ = wv.with_webview(move |pw| unsafe {
+        use objc2_app_kit::NSView;
+        let raw: *mut NSView = pw.inner().cast();
+        if raw.is_null() { return; }
+        (&*raw).setHidden(hidden);
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn bring_child_to_front(wv: &tauri::Webview) {
+    let _ = wv.with_webview(move |pw| unsafe {
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
+        use objc2_app_kit::{NSView, NSWindowOrderingMode};
+        let raw: *mut NSView = pw.inner().cast();
+        if raw.is_null() { return; }
+        let view: &NSView = &*raw;
+        if let Some(superview) = view.superview() {
+            let _: () = msg_send![
+                &*superview,
+                addSubview: view,
+                positioned: NSWindowOrderingMode::Above,
+                relativeTo: std::ptr::null::<AnyObject>()
+            ];
+        }
+    });
+}
+
 #[tauri::command]
-pub fn webview_hide(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri::{LogicalPosition, LogicalSize, Manager};
-    if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
-        let _ = wv.set_size(LogicalSize::new(0.0, 0.0));
-        let _ = wv.set_position(LogicalPosition::new(-10000.0, -10000.0));
+pub fn webview_hide(app: tauri::AppHandle, tab_id: Option<i64>) -> Result<(), String> {
+    use tauri::Manager;
+    if let Some(wv) = app.get_webview(&tab_label(tab_id)) {
+        #[cfg(target_os = "macos")]
+        set_child_hidden(&wv, true);
+        #[cfg(not(target_os = "macos"))]
+        {
+            use tauri::{LogicalPosition, LogicalSize};
+            let _ = wv.set_size(LogicalSize::new(0.0, 0.0));
+            let _ = wv.set_position(LogicalPosition::new(-10000.0, -10000.0));
+        }
     }
     Ok(())
 }
 
-/// Navigate the embedded webview to a URL (address bar).
+/// Hide EVERY tab's webview except `keep` (the active tab), and bring `keep` to
+/// the front. Called on tab switch. keep=None hides all (leaving the Browser
+/// screen). Iterates the window's webviews by our label prefix.
 #[tauri::command]
-pub fn webview_navigate(app: tauri::AppHandle, url: String) -> Result<(), String> {
+pub fn webview_hide_others(app: tauri::AppHandle, keep: Option<i64>) -> Result<(), String> {
+    use tauri::Manager;
+    let keep_label = keep.map(|id| tab_label(Some(id)));
+    for (label, wv) in app.webviews() {
+        if !label.starts_with(WEBVIEW_LABEL) { continue; }
+        let is_keep = Some(&label) == keep_label.as_ref();
+        #[cfg(target_os = "macos")]
+        {
+            set_child_hidden(&wv, !is_keep);
+            if is_keep { bring_child_to_front(&wv); }
+        }
+        #[cfg(not(target_os = "macos"))]
+        if !is_keep {
+            use tauri::{LogicalPosition, LogicalSize};
+            let _ = wv.set_size(LogicalSize::new(0.0, 0.0));
+            let _ = wv.set_position(LogicalPosition::new(-10000.0, -10000.0));
+        }
+    }
+    Ok(())
+}
+
+/// Navigate a tab's embedded webview to a URL (address bar).
+#[tauri::command]
+pub fn webview_navigate(app: tauri::AppHandle, url: String, tab_id: Option<i64>) -> Result<(), String> {
     use tauri::Manager;
     let target = normalize_url(&url);
     let parsed = target.parse().map_err(|e| format!("bad url: {e}"))?;
-    let wv = app.get_webview(WEBVIEW_LABEL).ok_or("browser not open")?;
+    let wv = app.get_webview(&tab_label(tab_id)).ok_or("browser not open")?;
     wv.navigate(parsed).map_err(|e| format!("navigate: {e}"))
 }
 
-/// Close/destroy the embedded webview entirely.
+/// Close/destroy a tab's embedded webview entirely.
 #[tauri::command]
-pub fn webview_close(app: tauri::AppHandle) -> Result<(), String> {
+pub fn webview_close(app: tauri::AppHandle, tab_id: Option<i64>) -> Result<(), String> {
     use tauri::Manager;
-    if let Some(wv) = app.get_webview(WEBVIEW_LABEL) {
+    if let Some(wv) = app.get_webview(&tab_label(tab_id)) {
         let _ = wv.close();
     }
     Ok(())
+}
+
+/// Browser HISTORY within a tab's webview (Phase C prep): back / forward /
+/// reload via injected JS on the live WebKit view. Simple + engine-native.
+#[tauri::command]
+pub fn webview_history(app: tauri::AppHandle, action: String, tab_id: Option<i64>) -> Result<(), String> {
+    use tauri::Manager;
+    let wv = app.get_webview(&tab_label(tab_id)).ok_or("browser not open")?;
+    let js = match action.as_str() {
+        "back" => "history.back()",
+        "forward" => "history.forward()",
+        "reload" => "location.reload()",
+        other => return Err(format!("unknown history action: {other}")),
+    };
+    wv.eval(js).map_err(|e| format!("history {action}: {e}"))
 }
 
 // ---------------------------------------------------------------------------
