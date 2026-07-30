@@ -753,35 +753,23 @@ pub fn active_tab_run(app: &tauri::AppHandle, expr: &str) -> Result<(), String> 
     wv.eval(&script).map_err(|e| format!("eval: {e}"))
 }
 
-/// READ a value from the active tab. Uses the CDP session's `Runtime.evaluate`,
-/// which returns values NATIVELY (no `__TAURI__` needed, works on any page). We
-/// point the CDP session at the SAME url the visible tab shows so the agent
-/// reads what the human sees. `expr` must be a JS expression returning a
-/// JSON-serializable value; returns its JSON string.
+/// READ a value from the AUTHORITATIVE agent page — the CDP session. This is
+/// THE desync fix (Problem 1): the CDP session is now the SINGLE SOURCE OF
+/// TRUTH the agent both ACTS ON and READS FROM. We NO LONGER mirror the CDP
+/// page to a frontend-reported URL here — the old code did that and it dragged
+/// every read back to a stale google.com the frontend last reported, so the
+/// agent never "saw" it had navigated (the loop). Now: the CDP page is wherever
+/// the agent's own actions (browser_open/click/type below) drove it; reads just
+/// read THAT page. The VISIBLE WKWebView is mirrored TO the CDP page's url after
+/// each navigation (see `mirror_visible_to_cdp`), never the other way. `expr`
+/// must be a JS expression returning a JSON-serializable value; returns its
+/// JSON string.
 pub async fn active_tab_read(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, BrowserProc>,
     expr: &str,
 ) -> Result<String, String> {
     ensure_session(app, state).await?;
-    // MIRROR the visible tab: the CDP session is a separate Chromium that would
-    // otherwise sit on about:blank. Sync it to ACTIVE_TAB_URL — which the AGENT
-    // ACTIONS keep up to date (see agent_tool: after every click/type/open we
-    // store the CDP page's REAL current url). This kills the old loop where a
-    // STALE google url dragged every read back to Google. Only navigate when the
-    // CDP page's host differs (avoid reload churn on same-page reads).
-    let want = { ACTIVE_TAB_URL.lock().ok().map(|g| g.clone()).unwrap_or_default() };
-    let want = normalize_url(&want);
-    let here = session_call(state, "Runtime.evaluate",
-        serde_json::json!({ "expression": "location.href", "returnByValue": true })
-    ).await.ok().and_then(|r| r["result"]["value"].as_str().map(|s| s.to_string())).unwrap_or_default();
-    if want.starts_with("http") && (here.is_empty() || (host_of(&here) != host_of(&want) && host_of(&here) == "" )) {
-        // Only mirror when the CDP page is truly empty/blank — NOT to override a
-        // real page the agent's own action already navigated to.
-        eprintln!("[aygent][browser][READ] mirroring CDP -> {want} (was {here})");
-        let _ = session_call(state, "Page.navigate", serde_json::json!({ "url": want })).await;
-        tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
-    }
     let r = session_call(state, "Runtime.evaluate",
         serde_json::json!({ "expression": format!("JSON.stringify({expr})"), "returnByValue": true })
     ).await?;
@@ -789,17 +777,32 @@ pub async fn active_tab_read(
         .ok_or_else(|| "no value from page".to_string())
 }
 
-/// After an agent ACTION, store the CDP session's REAL current url as the new
-/// ACTIVE_TAB_URL, so subsequent reads mirror to where the page ACTUALLY is
-/// (not a stale frontend value). This is what lets the agent "see" it navigated
-/// off Google to the destination.
-async fn refresh_active_url_from_cdp(state: &tauri::State<'_, BrowserProc>) {
-    if let Ok(r) = session_call(state, "Runtime.evaluate",
-        serde_json::json!({ "expression": "location.href", "returnByValue": true })).await {
-        if let Some(u) = r["result"]["value"].as_str() {
-            if u.starts_with("http") {
-                if let Ok(mut g) = ACTIVE_TAB_URL.lock() { *g = u.to_string(); }
-            }
+/// Read the CDP page's REAL current url (the authoritative agent page).
+async fn cdp_current_url(state: &tauri::State<'_, BrowserProc>) -> String {
+    session_call(state, "Runtime.evaluate",
+        serde_json::json!({ "expression": "location.href", "returnByValue": true })).await
+        .ok()
+        .and_then(|r| r["result"]["value"].as_str().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
+/// SINGLE-SOURCE-OF-TRUTH SYNC (Problem 1 fix). After the agent navigates the
+/// AUTHORITATIVE CDP page, drag the VISIBLE WKWebView to that same url so the
+/// human watches where the agent actually went — and store it as ACTIVE_TAB_URL
+/// for the permission host pre-check. Direction is ALWAYS CDP -> visible (never
+/// visible -> CDP), which is what breaks the old tug-of-war desync loop.
+async fn mirror_visible_to_cdp(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>) {
+    let url = cdp_current_url(state).await;
+    if !url.starts_with("http") { return; }
+    if let Ok(mut g) = ACTIVE_TAB_URL.lock() { *g = url.clone(); }
+    // Navigate the visible embedded webview (best-effort; the human sees it).
+    let id = ACTIVE_TAB_ID.load(std::sync::atomic::Ordering::SeqCst);
+    if id < 0 { return; }
+    use tauri::Manager;
+    if let Some(wv) = app.get_webview(&tab_label(Some(id))) {
+        if let Ok(parsed) = url.parse::<tauri::Url>() {
+            eprintln!("[aygent][browser][MIRROR] visible tab={id} -> {url}");
+            let _ = wv.navigate(parsed);
         }
     }
 }
@@ -1785,12 +1788,12 @@ pub async fn agent_tool(
         return ("the human just took the browser — not acting".into(), true);
     }
     let out = agent_tool_inner(app, state, name, input, allowed_domains).await;
-    // After ANY action that could navigate, refresh the tracked URL from the CDP
-    // session's REAL current location. This is THE loop fix: reads then mirror to
-    // where the page ACTUALLY is (claude.ai), not the stale google.com the
-    // frontend last reported — so the agent SEES it left Google and stops.
+    // After ANY action that could navigate the AUTHORITATIVE CDP page, mirror the
+    // VISIBLE WKWebView to it (CDP -> visible), so the human watches where the
+    // agent went and the permission host pre-check stays correct. This is the
+    // single-source-of-truth sync that replaces the old fragile read-mirror.
     if matches!(name, "browser_open" | "browser_click_text" | "browser_type_text") {
-        refresh_active_url_from_cdp(state).await;
+        mirror_visible_to_cdp(app, state).await;
     }
     // On a login/CAPTCHA-ish failure, hand off to the human with a note.
     let handoff = if out.1 && looks_like_handoff(&out.0) {
@@ -1924,11 +1927,15 @@ async fn agent_tool_inner(
     input: &serde_json::Value,
     allowed_domains: &[String],
 ) -> (String, bool) {
-    // ALL agent browser tools act on the VISIBLE ACTIVE TAB. ACTIONS (click/
-    // type/navigate) use active_tab_run (fire-and-forget wv.eval, works on any
-    // page). READS use active_tab_read (CDP Runtime.evaluate, returns values on
-    // any page — no __TAURI__ needed, which external pages lack). This is THE
-    // fix for every-eval-times-out: the old path needed the page to emit back.
+    // SINGLE SOURCE OF TRUTH (Problem 1 fix). ALL agent actions AND reads run
+    // against the CDP session's page — the SAME page. Actions used to fire into
+    // the VISIBLE WKWebView via wv.eval() while reads hit a SEPARATE headless
+    // Chromium; those two desynced constantly (act on page A, read stale page B,
+    // loop forever). Now: navigate/click/type all go through CDP, reads read the
+    // very page the CDP actions just changed, and the VISIBLE webview is mirrored
+    // TO the CDP page's url afterwards (see agent_tool -> mirror_visible_to_cdp)
+    // so the human still watches. One authoritative page state; no desync.
+    ensure_session(app, state).await.ok();
     match name {
         "browser_open" => {
             let url = normalize_url(input.get("url").and_then(|u| u.as_str()).unwrap_or(""));
@@ -1942,10 +1949,11 @@ async fn agent_tool_inner(
                     _ => return (format!("the human declined opening {host}. Try a different site or ask them to do it."), true),
                 }
             }
-            if let Err(e) = active_tab_run(app, &format!("location.href={url:?};", url = url)) {
+            // Navigate the AUTHORITATIVE CDP page + wait for load.
+            if let Err(e) = session_call(state, "Page.navigate", serde_json::json!({ "url": url })).await {
                 return (format!("navigate failed: {e}"), true);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+            wait_for_cdp_load(state).await;
             match active_tab_page_text(app, state).await {
                 Ok((title, text)) => (format!("Opened. Title: {title}\n\n{text}"), false),
                 Err(e) => (format!("opened but read failed: {e}"), true),
@@ -1969,31 +1977,44 @@ async fn agent_tool_inner(
                 "take" => return ("the human took the wheel to do this themselves".into(), true),
                 _ => return (format!("the human declined clicking '{want}'. Stopping."), true),
             }
-            // Fire the click (no return needed).
-            let click = format!(
-                "const t={:?}.toLowerCase(); const els=[...document.querySelectorAll('a,button,input[type=submit],[role=button],label,[onclick],h3')]; \
+            // Click via CDP Runtime.evaluate on the AUTHORITATIVE page (returns a
+            // value so we KNOW if a match was found — no fire-and-forget guess).
+            let click_expr = format!(
+                "(()=>{{ const t={want:?}.toLowerCase(); \
+                 const els=[...document.querySelectorAll('a,button,input[type=submit],[role=button],label,[onclick],h3')]; \
                  const el=els.find(e=>(e.innerText||e.value||'').toLowerCase().includes(t)); \
-                 if(el){{ el.scrollIntoView({{block:'center'}}); (el.closest('a')||el).click(); }}",
-                want
+                 if(!el) return 'NOMATCH'; el.scrollIntoView({{block:'center'}}); (el.closest('a')||el).click(); return 'OK'; }})()",
+                want = want
             );
-            if let Err(e) = active_tab_run(app, &click) { return (format!("click failed: {e}"), true); }
-            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
-            // Verify via a CDP read what the page is now.
+            let clicked = active_tab_read(app, state, &click_expr).await.unwrap_or_default();
+            if clicked.contains("NOMATCH") {
+                return (format!("no clickable element matching '{want}' on this page"), true);
+            }
+            wait_for_cdp_load(state).await;
             let (title, url) = active_tab_page_info_cdp(app, state).await.unwrap_or_default();
             (format!("clicked '{want}'. Now on: {title} ({url})"), false)
         }
         "browser_type_text" => {
             let text = input.get("text").and_then(|t| t.as_str()).unwrap_or("");
             let submit = input.get("submit").and_then(|b| b.as_bool()).unwrap_or(false);
-            let run = format!(
-                "let el=document.activeElement; \
-                 if(!el||!('value' in el)||el===document.body){{ el=[...document.querySelectorAll('input[type=text],input[type=search],input:not([type]),textarea,input[type=email],input[type=url]')].find(e=>e.offsetParent!==null); }} \
-                 if(el){{ el.focus(); el.value={text:?}; el.dispatchEvent(new Event('input',{{bubbles:true}})); el.dispatchEvent(new Event('change',{{bubbles:true}})); \
-                 if({submit}){{ const f=el.form; el.dispatchEvent(new KeyboardEvent('keydown',{{key:'Enter',keyCode:13,bubbles:true}})); if(f&&f.requestSubmit){{ try{{f.requestSubmit();}}catch(e){{}} }} else if(f){{ try{{f.submit();}}catch(e){{}} }} }} }}",
+            // Type via CDP Runtime.evaluate on the AUTHORITATIVE page. Returns a
+            // status so we know a field was found. If submit, dispatch Enter +
+            // requestSubmit/submit so the search actually fires.
+            let type_expr = format!(
+                "(()=>{{ let el=document.activeElement; \
+                 if(!el||!('value' in el)||el===document.body){{ el=[...document.querySelectorAll('input[type=text],input[type=search],input:not([type]),textarea,input[type=email],input[type=url],[contenteditable=true]')].find(e=>e.offsetParent!==null); }} \
+                 if(!el) return 'NOFIELD'; el.focus(); \
+                 if('value' in el){{ el.value={text:?}; }} else {{ el.textContent={text:?}; }} \
+                 el.dispatchEvent(new Event('input',{{bubbles:true}})); el.dispatchEvent(new Event('change',{{bubbles:true}})); \
+                 if({submit}){{ const f=el.form; el.dispatchEvent(new KeyboardEvent('keydown',{{key:'Enter',keyCode:13,which:13,bubbles:true}})); el.dispatchEvent(new KeyboardEvent('keyup',{{key:'Enter',keyCode:13,which:13,bubbles:true}})); if(f&&f.requestSubmit){{ try{{f.requestSubmit();}}catch(e){{ try{{f.submit();}}catch(e2){{}} }} }} else if(f){{ try{{f.submit();}}catch(e){{}} }} }} \
+                 return 'OK'; }})()",
                 text = text, submit = submit
             );
-            if let Err(e) = active_tab_run(app, &run) { return (format!("type failed: {e}"), true); }
-            if submit { tokio::time::sleep(std::time::Duration::from_millis(1400)).await; }
+            let typed = active_tab_read(app, state, &type_expr).await.unwrap_or_default();
+            if typed.contains("NOFIELD") {
+                return ("no typeable field found on this page".into(), true);
+            }
+            if submit { wait_for_cdp_load(state).await; }
             (format!("typed '{}'{}", text, if submit { " and submitted" } else { "" }), false)
         }
         "browser_screenshot" => {
@@ -2004,6 +2025,25 @@ async fn agent_tool_inner(
         }
         other => (format!("unknown browser tool: {other}"), true),
     }
+}
+
+/// Wait for the CDP page to settle after a navigation: poll document.readyState
+/// until 'complete' (or a bounded timeout). Replaces the old fixed-sleep guesses
+/// so a slow page doesn't get read half-loaded (a source of stale reads).
+async fn wait_for_cdp_load(state: &tauri::State<'_, BrowserProc>) {
+    // Small initial delay so the navigation has actually begun before we poll.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    for _ in 0..24 { // up to ~6s (24 * 250ms)
+        let ready = session_call(state, "Runtime.evaluate",
+            serde_json::json!({ "expression": "document.readyState", "returnByValue": true })).await
+            .ok()
+            .and_then(|r| r["result"]["value"].as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        if ready == "complete" { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    // Tiny settle for post-load JS (SPA route paints, etc).
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 }
 
 /// Read the ACTIVE tab's (title, visible text) via CDP Runtime.evaluate (works
