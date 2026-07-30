@@ -201,17 +201,13 @@ export function Browser() {
   }
 
   function clickTab(id: number) {
-    // Clicking a tab ALWAYS makes it active. If it was already active (or it's a
-    // fresh unopened tab with no page yet), drop into the inline address field
-    // so you can type a URL. This is the fix for the "typed into the wrong tab"
-    // bug: switching to tab 2 now focuses tab 2's own address field instead of
-    // leaving tab 1 in edit mode.
-    const tab = tabs.find((t) => t.id === id);
-    if (id !== activeId) setActiveId(id);
-    if (id === activeId || !tab?.opened) {
-      patch(id, { editing: true });
-      setTimeout(() => editRef.current?.select(), 0);
-    }
+    // Dead simple: clicking a tab activates it AND opens its own address field.
+    // Every tab click = "I want to work in THIS tab", so focus its editor. This
+    // is the fix for typing landing in the wrong tab, without the fragile
+    // `opened` conditionals that broke first-tab editing.
+    setActiveId(id);
+    patch(id, { editing: true });
+    setTimeout(() => editRef.current?.select(), 0);
   }
   function addTab() { const t = newTab(); setTabs((ts) => [...ts, t]); setActiveId(t.id); }
   function closeTab(id: number) {
