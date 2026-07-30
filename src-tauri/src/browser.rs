@@ -1033,6 +1033,15 @@ fn resolve_child_bounds(
     let top_inset = (win_logical_h - ch).max(0.0);
     let left_inset = ((win_logical_w - cw) / 2.0).max(0.0);
 
+    eprintln!(
+        "[aygent][browser][BOUNDS] rect=({x:.0},{y:.0} {width:.0}x{height:.0}) \
+         client=({cw:.0}x{ch:.0}) win_logical=({win_logical_w:.0}x{win_logical_h:.0}) scale={scale} \
+         top_inset={top_inset:.1} left_inset={left_inset:.1} \
+         => final_pos=({:.0},{:.0}) size=({width:.0}x{height:.0})",
+        x + left_inset,
+        y + top_inset,
+    );
+
     (LogicalPosition::new(x + left_inset, y + top_inset), size)
 }
 
