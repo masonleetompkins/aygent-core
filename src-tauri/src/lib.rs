@@ -1470,18 +1470,26 @@ async fn agent_run(
         (e.g. the title of the first result). The human approves each click.\n\
         - After EACH tool call, the tool returns the current page title + URL. TRUST IT. If the URL \
         changed to the destination you intended, the action SUCCEEDED.\n\n\
-        HOW TO FINISH (CRITICAL — follow your PLAN):\n\
-        - You were given an ordered PLAN. Execute it ONE STEP AT A TIME, in order.\n\
-        - The INSTANT you finish a step, call `step_done` with that step's number. This checks it off \
-        in the human's live checklist. Do NOT move to the next step's actions until you've marked the \
-        current one done.\n\
+        THE PLAN IS THE LAW (CRITICAL — do EXACTLY this, nothing else):\n\
+        - You were given an ordered PLAN. It is the ONLY authority for what to do. Execute it ONE STEP \
+        AT A TIME, strictly in order. Each turn you will be told the CURRENT step — do ONLY that step.\n\
+        - You MUST NOT take any action outside the current step. Do NOT explore, do NOT open extra \
+        pages, do NOT 'double-check' by re-searching. If it isn't the current step, don't do it.\n\
+        - The INSTANT the current step's goal is met, call `step_done` with that step's number. This \
+        checks it off in the human's live checklist. Only then move on.\n\
+        - Steps already checked off are FINISHED FOREVER. NEVER redo a completed step. In particular, \
+        once you have navigated OFF Google onto a destination, you may NOT go back to Google or \
+        re-open/re-search it — that step is done.\n\
         - Reads are AUTHORITATIVE: after each tool call the result shows the current page title + URL. \
         TRUST IT. If the URL is the destination you intended, that step SUCCEEDED — mark it done.\n\
         - 'Click the first result' is DONE the instant the page navigates off the results page onto \
-        the destination. Mark it done. NEVER re-search or re-open Google after a step is done.\n\
+        the destination. Mark it done and STOP touching Google.\n\
+        - If a step genuinely CANNOT be completed (element missing, page won't navigate, permission \
+        denied), say so plainly in text and call task_complete with a one-sentence reason — do NOT \
+        keep retrying or wander to a different approach.\n\
         - Calling step_done on the LAST step ENDS your turn. That is how you finish. You do not need \
         task_complete unless you're stopping early.\n\n\
-        Be concise. Prefer the FEWEST tool calls. Advance the checklist; don't loop.";
+        Be concise. Prefer the FEWEST tool calls. Advance the checklist in order; never loop, never wander.";
 
     // =====================================================================
     // PLAN-FIRST (Problem 2 — the visible checklist Mason has asked for 4×).
@@ -1530,13 +1538,44 @@ async fn agent_run(
     // step; when it reaches steps.len() every step is checked => DONE.
     let mut next_step: usize = 0;
     let mut browser_actions = 0u32;
+    // PER-STEP RETRY CAP (spec #3 — honest failure, no infinite loop). Count
+    // consecutive FAILED browser actions while the plan is parked on the same
+    // step. If a step can't complete after MAX_STEP_RETRIES attempts, surface a
+    // clear message to the user and STOP (don't loop forever). Resets whenever
+    // the checklist advances (next_step changes).
+    const MAX_STEP_RETRIES: u32 = 2;
+    let mut step_fail_streak: u32 = 0;
+    let mut streak_step: usize = 0;
     // Iteration cap scales with plan size (each step may need a couple tool
     // calls) but stays bounded so a misbehaving model can't spin forever.
     let max_iters = (steps.len() * 4).clamp(8, 24);
 
     // Agent loop: cap iterations so a misbehaving model can't spin forever.
     for _ in 0..max_iters {
-        let resp = provider::anthropic_turn(&key, &model, system, &messages, &tools).await?;
+        // CHECKLIST AUTHORITY (spec #1/#2): each turn, tell the model EXACTLY
+        // which step it is on and forbid anything else. This is the runtime
+        // enforcement of sequential execution — combined with the deterministic
+        // step_done -> next_step advance + the retry cap, the model cannot
+        // legitimately wander back to a finished step.
+        let cur_idx = next_step.min(steps.len().saturating_sub(1));
+        let done_list = if next_step == 0 {
+            "(none yet)".to_string()
+        } else {
+            steps.iter().take(next_step).enumerate()
+                .map(|(i, s)| format!("{}. {} ✓", i + 1, s)).collect::<Vec<_>>().join("; ")
+        };
+        let turn_system = format!(
+            "{system}\n\n── CURRENT STATE ──\n\
+            You are on STEP {}/{}: \"{}\".\n\
+            Already completed (do NOT redo): {}.\n\
+            Do ONLY step {} now. When its goal is met, call step_done({}). \
+            Do NOT act outside this step. Do NOT re-open or re-search Google if it's already done.",
+            cur_idx + 1, steps.len(),
+            steps.get(cur_idx).map(|s| s.as_str()).unwrap_or(""),
+            done_list,
+            cur_idx + 1, cur_idx + 1,
+        );
+        let resp = provider::anthropic_turn(&key, &model, &turn_system, &messages, &tools).await?;
         let content = resp.get("content").and_then(|c| c.as_array()).cloned().unwrap_or_default();
         let stop = resp.get("stop_reason").and_then(|s| s.as_str()).unwrap_or("");
 
@@ -1617,7 +1656,44 @@ async fn agent_run(
                             // permission flow governs new hosts; current tab host
                             // is pre-allowed. Pass empty.
                             let domains: Vec<String> = Vec::new();
-                            browser::agent_tool(&app, &browser_state, name, &input, &domains).await
+                            let out = browser::agent_tool(&app, &browser_state, name, &input, &domains).await;
+
+                            // ==========================================================
+                            // HARD STOP (Mason's spec #5): Deny / Take Control.
+                            // browser.rs signals these by returning a result whose
+                            // text STARTS WITH a sentinel token (__DENIED__ /
+                            // __TAKEOVER__). We NEVER feed that back to the model —
+                            // we END THE TURN right here so the agent cannot call
+                            // browser_open again or wander. The wheel was already
+                            // set (deny->idle, take->human) inside agent_tool.
+                            // ==========================================================
+                            if browser::is_hard_stop(&out.0) {
+                                let denied = out.0.starts_with(browser::STOP_DENIED);
+                                let tail = out.0
+                                    .trim_start_matches(browser::STOP_DENIED)
+                                    .trim_start_matches(browser::STOP_TAKEOVER)
+                                    .trim();
+                                let reason = if denied {
+                                    format!("stopped: user denied — {tail}")
+                                } else {
+                                    format!("stopped: user took control — {tail}")
+                                };
+                                eprintln!("[aygent][browser][STOP] hard stop ({}) at step {}/{}: {}",
+                                    if denied { "DENY" } else { "TAKEOVER" },
+                                    next_step + 1, steps.len(), tail);
+                                transcript.push_str(&format!("\n⛔ {reason}\n"));
+                                // Tell the FE the turn ended (spinner off, checklist
+                                // frozen where it is) + who's driving now.
+                                emit_ev("done", serde_json::json!({
+                                    "total": steps.len(),
+                                    "stopped": true,
+                                    "reason": if denied { "denied" } else { "takeover" },
+                                    "at_step": next_step + 1,
+                                    "summary": reason,
+                                }));
+                                return Ok(transcript);
+                            }
+                            out
                         }
                     } else { match name {
                         "read_file" => match broker.resolve_and_open("default", path, broker::Mode::Read) {
@@ -1660,6 +1736,42 @@ async fn agent_run(
                         },
                         other => (format!("unknown tool: {other}"), true),
                     } };
+
+                    // PER-STEP RETRY CAP (spec #3). Track consecutive FAILED
+                    // browser actions on the CURRENT step. A success resets the
+                    // streak; the checklist advancing (handled by step_done above)
+                    // also naturally moves us to a new streak_step. After
+                    // MAX_STEP_RETRIES failures on the same step, we surface an
+                    // honest "couldn't complete" message and STOP the turn rather
+                    // than let the model retry forever / wander.
+                    if browser::is_agent_tool(name) {
+                        if streak_step != next_step { streak_step = next_step; step_fail_streak = 0; }
+                        if is_err {
+                            step_fail_streak += 1;
+                            eprintln!("[aygent][browser][STEP] fail {}/{} on step {}/{}: {}",
+                                step_fail_streak, MAX_STEP_RETRIES, next_step + 1, steps.len(),
+                                result_text.chars().take(160).collect::<String>());
+                            if step_fail_streak >= MAX_STEP_RETRIES {
+                                let cur = steps.get(next_step).map(|s| s.as_str()).unwrap_or("(current step)");
+                                let msg = format!(
+                                    "stopped: couldn't complete step {}/{} (\"{}\") after {} attempts — {}",
+                                    next_step + 1, steps.len(), cur, step_fail_streak,
+                                    result_text.chars().take(240).collect::<String>());
+                                eprintln!("[aygent][browser][STOP] step retry cap hit: {msg}");
+                                transcript.push_str(&format!("\n⛔ {msg}\n"));
+                                emit_ev("done", serde_json::json!({
+                                    "total": steps.len(),
+                                    "stopped": true,
+                                    "reason": "step_failed",
+                                    "at_step": next_step + 1,
+                                    "summary": msg,
+                                }));
+                                return Ok(transcript);
+                            }
+                        } else {
+                            step_fail_streak = 0;
+                        }
+                    }
 
                     transcript.push_str(&format!("  ⚙ {name}({path}) → {}\n",
                         if is_err { format!("✗ {result_text}") } else { "✓".to_string() }));

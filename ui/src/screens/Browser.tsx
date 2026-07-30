@@ -358,7 +358,16 @@ export function Browser() {
           // `done` = how many steps are now checked (1-based count).
           if (typeof p.done === "number") setStepsDone(p.done);
         } else if (p.kind === "done") {
-          if (typeof p.total === "number") setStepsDone(p.total);
+          // A normal finish marks every step done; a STOPPED finish (deny /
+          // take-control / step-failed) freezes the checklist where it is and
+          // surfaces WHY so the human isn't left guessing (spec #3/#5).
+          if (p.stopped) {
+            if (typeof p.summary === "string" && p.summary) {
+              setAgentLog((l) => [...l, `⛔ ${p.summary}`]);
+            }
+          } else if (typeof p.total === "number") {
+            setStepsDone(p.total);
+          }
           setPlanDone(true);
         }
       });
