@@ -169,7 +169,7 @@ export function Browser() {
     if (!url) { dlog("go() BAILED: empty url"); patch(id, { editing: false }); return; }
     // Make sure the stored addr reflects what we're navigating to.
     patch(id, { addr: url });
-    patch(id, { editing: false, title: prettyTitle(url) });
+    patch(id, { editing: false, title: url });
     const el = paneRef.current;
     const r = el?.getBoundingClientRect();
     // First navigation for the pane opens/positions the webview; later ones reuse.
