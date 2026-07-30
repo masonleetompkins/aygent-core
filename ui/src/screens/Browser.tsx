@@ -100,7 +100,12 @@ export function Browser() {
       const parentHeight = Math.round(document.documentElement.clientHeight);
       const clientWidth = Math.round(document.documentElement.clientWidth);
       const clientHeight = parentHeight;
-      const rightPane = driverRef.current === "agent" ? AGENT_PANE_W + 10 : 0; // +gap
+      // NO rightPane subtraction: paneRef is the LEFT flex child, and when the
+      // Agent panel mounts as its right sibling the flex layout ALREADY shrinks
+      // paneRef by the panel width + gap. r (paneRef's rect) is therefore the
+      // correct target on its own. The old subtraction double-counted the shrink
+      // (748 -> 48px in agent mode, per the NSVIEW log: 748-48≈700≈2×350). We
+      // simply track paneRef's real border-box.
       // Webview rect == paneRef's BORDER-BOX rect (no inset). The rounded
       // outline is a pointer-events:none overlay rendered ON TOP of the webview,
       // so its ~radius corner arcs mask the webview's square corners while the
@@ -113,7 +118,7 @@ export function Browser() {
       // bigger than the top. Symmetric edges = symmetric insets.
       const left = Math.round(r.left + inset);
       const top = Math.round(r.top + inset);
-      const right = Math.round(r.right - inset - rightPane);
+      const right = Math.round(r.right - inset);
       const bottom = Math.round(r.bottom - inset);
       const bounds = {
         x: left, y: top,
