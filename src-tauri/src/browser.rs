@@ -1005,7 +1005,6 @@ pub fn webview_set_bounds(
             .get_webview_window("main")
             .and_then(|w| w.scale_factor().ok())
             .unwrap_or(-1.0);
-        let child_scale = wv.scale_factor().unwrap_or(-1.0);
 
         // Parent (main webview) RAW PHYSICAL size (no division) so we can see the
         // real numbers wry works in.
@@ -1024,7 +1023,7 @@ pub fn webview_set_bounds(
         let applied_phys_size = wv.size().ok().map(|s| (s.width, s.height));
 
         eprintln!(
-            "[aygent][browser][DELTA] win_scale={win_scale} child_scale={child_scale} \
+            "[aygent][browser][DELTA] win_scale={win_scale} \
              | SENT_LOGICAL pos=({x:.1},{y:.1}) size=({:.1},{:.1}) parentHeight(JS)={:?} \
              | APPLIED_PHYSICAL pos={:?} size={:?} \
              | parent_PHYSICAL={:?} \
