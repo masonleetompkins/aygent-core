@@ -727,51 +727,41 @@ pub fn set_active_browser_tab(tab_id: i64) {
     ACTIVE_TAB_ID.store(tab_id, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Eval JS in the ACTIVE tab's embedded webview (the one the human sees) and
-/// return the JSON-stringified result. Same IPC round-trip as `webview_eval`
-/// but targets `aygent-browser-<activeTabId>` instead of the legacy label.
-pub async fn active_tab_eval(app: &tauri::AppHandle, expr: &str) -> Result<String, String> {
-    use tauri::{Manager, Listener};
+/// FIRE-AND-FORGET action in the ACTIVE tab's embedded webview. `wv.eval()`
+/// runs JS with NO return channel; on EXTERNAL pages (google.com etc) the page
+/// has no `window.__TAURI__` to emit a result back, so ANY round-trip stalls.
+/// For actions (click/type/navigate) we don't need a value — run + assume
+/// success. Returns Ok(()) once the eval is dispatched.
+pub fn active_tab_run(app: &tauri::AppHandle, expr: &str) -> Result<(), String> {
+    use tauri::Manager;
     let id = ACTIVE_TAB_ID.load(std::sync::atomic::Ordering::SeqCst);
     if id < 0 { return Err("no active browser tab".into()); }
-    let label = tab_label(Some(id));
-    let wv = app.get_webview(&label).ok_or("active tab has no open page")?;
-    let nonce = format!("ate_{}", SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
-    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-    let tx = std::sync::Mutex::new(Some(tx));
-    let handler = app.once(nonce.clone(), move |ev| {
-        if let Ok(mut g) = tx.lock() {
-            if let Some(sender) = g.take() { let _ = sender.send(ev.payload().to_string()); }
-        }
-    });
-    let script = format!(
-        "(async () => {{ let r; try {{ r = JSON.stringify(await (async()=>({expr}))()); }} catch(e) {{ r = 'ERR: '+ (e && e.message || e); }} \
-         if (window.__TAURI__ && window.__TAURI__.event) {{ window.__TAURI__.event.emit({nonce:?}, r); }} }})()",
-        expr = expr, nonce = nonce
-    );
-    eprintln!("[aygent][browser][EVAL] tab={id} expr={:.80}", expr);
-    wv.eval(&script).map_err(|e| { app.unlisten(handler); format!("eval: {e}") })?;
-    // 6s (not 15) so a post-navigation page where __TAURI__ isn't ready yet
-    // fails FAST instead of stalling the agent for 15s per call (looked like an
-    // endless "working...").
-    match tokio::time::timeout(std::time::Duration::from_secs(6), rx).await {
-        Ok(Ok(v)) => {
-            let inner: String = serde_json::from_str(&v).unwrap_or(v);
-            eprintln!("[aygent][browser][EVAL] tab={id} OK -> {:.100}", inner);
-            Ok(inner)
-        }
-        Ok(Err(_)) => Err("active tab eval channel closed".into()),
-        Err(_) => { app.unlisten(handler); eprintln!("[aygent][browser][EVAL] tab={id} TIMED OUT"); Err("active tab eval timed out (page may still be loading)".into()) }
-    }
+    let wv = app.get_webview(&tab_label(Some(id))).ok_or("active tab has no open page")?;
+    // Wrap so a page-side exception can't crash anything; result is discarded.
+    let script = format!("(()=>{{ try {{ {expr} }} catch(e) {{}} }})()", expr = expr);
+    eprintln!("[aygent][browser][RUN] tab={id} {:.80}", expr);
+    wv.eval(&script).map_err(|e| format!("eval: {e}"))
 }
 
-/// Read the active tab's (title, url) from its embedded webview.
-pub async fn active_tab_page_info(app: &tauri::AppHandle) -> Result<(String, String), String> {
-    let r = active_tab_eval(app, "[document.title||'', location.href||'']").await?;
-    let arr: Vec<String> = serde_json::from_str(&r).unwrap_or_default();
-    Ok((arr.get(0).cloned().unwrap_or_default(), arr.get(1).cloned().unwrap_or_default()))
+/// READ a value from the active tab. Uses the CDP session's `Runtime.evaluate`,
+/// which returns values NATIVELY (no `__TAURI__` needed, works on any page). We
+/// point the CDP session at the SAME url the visible tab shows so the agent
+/// reads what the human sees. `expr` must be a JS expression returning a
+/// JSON-serializable value; returns its JSON string.
+pub async fn active_tab_read(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, BrowserProc>,
+    expr: &str,
+) -> Result<String, String> {
+    ensure_session(app, state).await?;
+    let r = session_call(state, "Runtime.evaluate",
+        serde_json::json!({ "expression": format!("JSON.stringify({expr})"), "returnByValue": true })
+    ).await?;
+    r["result"]["value"].as_str().map(|s| s.to_string())
+        .ok_or_else(|| "no value from page".to_string())
 }
 
+/// Read the active tab's (title, url) — from the VISIBLE embedded webview via a
 /// Ensure a live CDP session exists (open the persistent socket + spawn the pump
 /// + start the screencast). Idempotent: returns quickly if one is already live.
 async fn ensure_session(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>) -> Result<(), String> {
@@ -1772,9 +1762,10 @@ fn host_of(url: &str) -> String {
 }
 
 /// The host the ACTIVE tab is currently showing (always allowed for the agent,
-/// since the human navigated there and is watching). Empty if unreadable.
-async fn active_tab_host(app: &tauri::AppHandle) -> String {
-    match active_tab_page_info(app).await {
+/// since the human navigated there and is watching). Read via CDP so it works
+/// on external pages. Empty if unreadable.
+async fn active_tab_host(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>) -> String {
+    match active_tab_page_info_cdp(app, state).await {
         Ok((_t, url)) => host_of(&url),
         Err(_) => String::new(),
     }
@@ -1790,7 +1781,7 @@ async fn host_preallowed(
     allowed_domains: &[String],
 ) -> bool {
     if host.is_empty() { return false; }
-    let cur = active_tab_host(app).await;
+    let cur = active_tab_host(app, state).await;
     if !cur.is_empty() && (host == cur || host.ends_with(&format!(".{cur}")) || cur.ends_with(&format!(".{host}"))) {
         return true;
     }
@@ -1878,17 +1869,16 @@ async fn agent_tool_inner(
     input: &serde_json::Value,
     allowed_domains: &[String],
 ) -> (String, bool) {
-    // ALL agent browser tools now act on the VISIBLE ACTIVE TAB (the embedded
-    // webview the human is watching) via active_tab_eval — same DOM, same
-    // session, same cookies. "Watch it work." No separate headless browser.
+    // ALL agent browser tools act on the VISIBLE ACTIVE TAB. ACTIONS (click/
+    // type/navigate) use active_tab_run (fire-and-forget wv.eval, works on any
+    // page). READS use active_tab_read (CDP Runtime.evaluate, returns values on
+    // any page — no __TAURI__ needed, which external pages lack). This is THE
+    // fix for every-eval-times-out: the old path needed the page to emit back.
     match name {
         "browser_open" => {
             let url = normalize_url(input.get("url").and_then(|u| u.as_str()).unwrap_or(""));
-            // Block internal/localhost/file always (SSRF), regardless of prompt.
             if let Err(e) = check_internal_only(&url) { return (e, true); }
             let host = host_of(&url);
-            // Same host as the tab / granted / allowlisted => go. NEW host =>
-            // ASK the human (Allow/Deny/Take Control) instead of refusing.
             if !host_preallowed(app, state, &host, allowed_domains).await {
                 let ans = request_permission(app, state, &format!("open {host}"), &url).await;
                 match ans.as_str() {
@@ -1897,63 +1887,51 @@ async fn agent_tool_inner(
                     _ => return (format!("the human declined opening {host}. Try a different site or ask them to do it."), true),
                 }
             }
-            // Navigate the VISIBLE tab.
-            match active_tab_eval(app, &format!("(()=>{{ location.href={url:?}; return 'navigating'; }})()", url = url)).await {
-                Ok(_) => {}
-                Err(e) => return (format!("navigate failed: {e}"), true),
+            if let Err(e) = active_tab_run(app, &format!("location.href={url:?};", url = url)) {
+                return (format!("navigate failed: {e}"), true);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
-            match active_tab_page_text(app).await {
+            tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+            match active_tab_page_text(app, state).await {
                 Ok((title, text)) => (format!("Opened. Title: {title}\n\n{text}"), false),
                 Err(e) => (format!("opened but read failed: {e}"), true),
             }
         }
-        "browser_read" => match active_tab_page_text(app).await {
+        "browser_read" => match active_tab_page_text(app, state).await {
             Ok((title, text)) => (format!("Title: {title}\n\n{text}"), false),
             Err(e) => (format!("read failed: {e}"), true),
         },
         "browser_click_text" => {
             let want = input.get("text").and_then(|t| t.as_str()).unwrap_or("");
             if want.is_empty() { return ("browser_click_text needs `text`".into(), true); }
-            let expr = format!(
-                "(() => {{ const t={:?}.toLowerCase(); const els=[...document.querySelectorAll('a,button,input[type=submit],[role=button],label,[onclick]')]; \
+            // Fire the click (no return needed).
+            let click = format!(
+                "const t={:?}.toLowerCase(); const els=[...document.querySelectorAll('a,button,input[type=submit],[role=button],label,[onclick],h3')]; \
                  const el=els.find(e=>(e.innerText||e.value||'').toLowerCase().includes(t)); \
-                 if(!el) return 'NONE'; el.scrollIntoView({{block:'center'}}); el.click(); \
-                 return 'clicked: '+((el.innerText||el.value||t)+'').slice(0,60); }})()",
+                 if(el){{ el.scrollIntoView({{block:'center'}}); (el.closest('a')||el).click(); }}",
                 want
             );
-            match active_tab_eval(app, &expr).await {
-                Ok(r) => {
-                    let r = r.trim_matches('"');
-                    if r == "NONE" { (format!("no clickable element found containing '{want}'"), true) }
-                    else { tokio::time::sleep(std::time::Duration::from_millis(500)).await; (r.to_string(), false) }
-                }
-                Err(e) => (format!("click failed: {e}"), true),
-            }
+            if let Err(e) = active_tab_run(app, &click) { return (format!("click failed: {e}"), true); }
+            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+            // Verify via a CDP read what the page is now.
+            let (title, url) = active_tab_page_info_cdp(app, state).await.unwrap_or_default();
+            (format!("clicked '{want}'. Now on: {title} ({url})"), false)
         }
         "browser_type_text" => {
             let text = input.get("text").and_then(|t| t.as_str()).unwrap_or("");
             let submit = input.get("submit").and_then(|b| b.as_bool()).unwrap_or(false);
-            // Type into the focused field (or the first visible text input) +
-            // fire input/change so React-y pages register it; optional Enter via
-            // a submit()/keydown so search boxes go.
-            let expr = format!(
-                "(() => {{ let el=document.activeElement; \
+            let run = format!(
+                "let el=document.activeElement; \
                  if(!el||!('value' in el)||el===document.body){{ el=[...document.querySelectorAll('input[type=text],input[type=search],input:not([type]),textarea,input[type=email],input[type=url]')].find(e=>e.offsetParent!==null); }} \
-                 if(!el) return 'no input field found'; el.focus(); \
-                 el.value={text:?}; el.dispatchEvent(new Event('input',{{bubbles:true}})); el.dispatchEvent(new Event('change',{{bubbles:true}})); \
-                 if({submit}){{ const f=el.form; el.dispatchEvent(new KeyboardEvent('keydown',{{key:'Enter',keyCode:13,bubbles:true}})); if(f&&f.requestSubmit){{ try{{f.requestSubmit();}}catch(e){{}} }} }} \
-                 return 'typed '+({text:?}).length+' chars'+({submit}?' + Enter':''); }})()",
+                 if(el){{ el.focus(); el.value={text:?}; el.dispatchEvent(new Event('input',{{bubbles:true}})); el.dispatchEvent(new Event('change',{{bubbles:true}})); \
+                 if({submit}){{ const f=el.form; el.dispatchEvent(new KeyboardEvent('keydown',{{key:'Enter',keyCode:13,bubbles:true}})); if(f&&f.requestSubmit){{ try{{f.requestSubmit();}}catch(e){{}} }} else if(f){{ try{{f.submit();}}catch(e){{}} }} }} }}",
                 text = text, submit = submit
             );
-            match active_tab_eval(app, &expr).await {
-                Ok(r) => { if submit { tokio::time::sleep(std::time::Duration::from_millis(900)).await; } (r.trim_matches('"').to_string(), false) }
-                Err(e) => (format!("type failed: {e}"), true),
-            }
+            if let Err(e) = active_tab_run(app, &run) { return (format!("type failed: {e}"), true); }
+            if submit { tokio::time::sleep(std::time::Duration::from_millis(1400)).await; }
+            (format!("typed '{}'{}", text, if submit { " and submitted" } else { "" }), false)
         }
         "browser_screenshot" => {
-            // The human already SEES the live tab; report the current title/url.
-            match active_tab_page_info(app).await {
+            match active_tab_page_info_cdp(app, state).await {
                 Ok((title, url)) => (format!("the human sees the live page. Title: {title} ({url})"), false),
                 Err(e) => (format!("page info failed: {e}"), true),
             }
@@ -1962,14 +1940,20 @@ async fn agent_tool_inner(
     }
 }
 
-/// Read the ACTIVE tab's (title, visible text) from the embedded webview.
-async fn active_tab_page_text(app: &tauri::AppHandle) -> Result<(String, String), String> {
-    let r = active_tab_eval(
-        app,
-        "[document.title||'', (document.body?document.body.innerText:'').slice(0,8000)]",
-    ).await?;
+/// Read the ACTIVE tab's (title, visible text) via CDP Runtime.evaluate (works
+/// on external pages; no __TAURI__ needed).
+async fn active_tab_page_text(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>) -> Result<(String, String), String> {
+    let r = active_tab_read(app, state,
+        "[document.title||'', (document.body?document.body.innerText:'').slice(0,8000)]").await?;
     let arr: Vec<String> = serde_json::from_str(&r).unwrap_or_default();
     if arr.len() == 2 { Ok((arr[0].clone(), arr[1].clone())) } else { Err("unexpected page text shape".into()) }
+}
+
+/// Read (title, url) via CDP.
+async fn active_tab_page_info_cdp(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>) -> Result<(String, String), String> {
+    let r = active_tab_read(app, state, "[document.title||'', location.href||'']").await?;
+    let arr: Vec<String> = serde_json::from_str(&r).unwrap_or_default();
+    Ok((arr.get(0).cloned().unwrap_or_default(), arr.get(1).cloned().unwrap_or_default()))
 }
 
 /// Read the page title + visible text (agent's primary "sense"). Caps length so
