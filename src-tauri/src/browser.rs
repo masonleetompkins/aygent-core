@@ -1002,7 +1002,7 @@ pub async fn webview_open(
 /// bottom-left coords ourselves, and we place the view. All values live,
 /// nothing hardcoded.
 #[cfg(target_os = "macos")]
-fn place_child_exact(wv: &tauri::Webview, x: f64, y: f64, w: f64, h: f64) {
+fn place_child_exact(wv: &tauri::Webview, x: f64, y: f64, w: f64, h: f64, content_h: Option<f64>) {
     let w = w.max(1.0);
     let h = h.max(1.0);
     let _ = wv.with_webview(move |pw| unsafe {
@@ -1039,12 +1039,19 @@ fn place_child_exact(wv: &tauri::Webview, x: f64, y: f64, w: f64, h: f64) {
             Some(p) => (p.isFlipped(), p.bounds().size.height),
             None => (content.isFlipped(), content.bounds().size.height),
         };
-        let oy = if parent_flipped { y } else { parent_h - y - h };
+        // KEY FIX: the parent NSView spans the FULL WINDOW (incl. titlebar),
+        // but the frontend's y is measured from the CONTENT area top (below the
+        // titlebar). Flip against the CONTENT height (client_height from JS),
+        // not the parent's full height — otherwise the webview rides up over the
+        // tabs by exactly the titlebar height. NSVIEW log proved parent_h=720
+        // while content=688. Fall back to parent_h if JS didn't send it.
+        let flip_h = content_h.filter(|v| *v > 0.0).unwrap_or(parent_h);
+        let oy = if parent_flipped { y } else { flip_h - y - h };
 
         eprintln!(
             "[aygent][browser][NSVIEW] in=({x:.0},{y:.0} {w:.0}x{h:.0}) \
              content_flipped={} parent_flipped={parent_flipped} parent_h={parent_h:.0} \
-             => frame=({x:.0},{oy:.0} {w:.0}x{h:.0})",
+             flip_h={flip_h:.0} => frame=({x:.0},{oy:.0} {w:.0}x{h:.0})",
             content.isFlipped(),
         );
 
