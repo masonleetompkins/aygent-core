@@ -10,6 +10,7 @@ mod agents;
 mod browser;
 mod broker;
 mod broker_ws;
+mod history;
 mod catalog;
 mod connections;
 mod savepoint;
@@ -3205,6 +3206,7 @@ pub fn run() {
             set_active_agent_marker,
             browser::webview_open, browser::webview_set_bounds, browser::webview_hide,
             browser::webview_hide_others, browser::webview_history, browser::browser_downloads_list,
+            browser::browser_history_list, browser::browser_history_clear,
             browser::webview_navigate, browser::webview_close, browser::webview_agent_act,
             browser::webview_page_info,
             browser::set_active_browser_tab, browser::browser_permission_answer,

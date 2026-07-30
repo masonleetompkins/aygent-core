@@ -875,6 +875,19 @@ async fn mirror_visible_to_cdp(app: &tauri::AppHandle, state: &tauri::State<'_, 
     let url = cdp_current_url(state).await;
     if !url.starts_with("http") { return; }
     if let Ok(mut g) = ACTIVE_TAB_URL.lock() { *g = url.clone(); }
+    // PERSISTENT HISTORY: this runs after EVERY agent navigation
+    // (browser_open/click/type -> mirror) and on the visible-tab url-change
+    // path, reading the AUTHORITATIVE CDP url. Record it here so agent
+    // navigations, in-page nav and redirects are all captured at the source
+    // (the crux fix for the old empty/FE-only history). Grab the CDP page title
+    // too (best-effort) so the entry has a real label immediately; the FE's
+    // webview_page_info poll backfills/upgrades it either way.
+    let title = session_call(state, "Runtime.evaluate",
+        serde_json::json!({ "expression": "document.title", "returnByValue": true })).await
+        .ok()
+        .and_then(|r| r["result"]["value"].as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    crate::history::record(app, &url, &title);
     // Navigate the visible embedded webview (best-effort; the human sees it).
     let id = ACTIVE_TAB_ID.load(std::sync::atomic::Ordering::SeqCst);
     if id < 0 { return; }
@@ -1103,6 +1116,9 @@ pub async fn browser_navigate(
         }
     }
 
+    // PERSISTENT HISTORY: the CDP-side navigate settled; record the landed
+    // url + title (this is the headless/agent navigate command path).
+    crate::history::record(&app, &final_url, &title);
     Ok(serde_json::json!({ "url": final_url, "title": title }))
 }
 
@@ -1448,6 +1464,9 @@ pub fn webview_navigate(app: tauri::AppHandle, url: String, tab_id: Option<i64>)
     let target = normalize_url(&url);
     let parsed = target.parse().map_err(|e| format!("bad url: {e}"))?;
     let wv = app.get_webview(&tab_label(tab_id)).ok_or("browser not open")?;
+    // PERSISTENT HISTORY: record the explicit target immediately (title empty;
+    // the webview_page_info poll backfills the real title once the page loads).
+    crate::history::record(&app, &target, "");
     wv.navigate(parsed).map_err(|e| format!("navigate: {e}"))
 }
 
@@ -1484,6 +1503,12 @@ pub async fn webview_page_info(app: tauri::AppHandle, tab_id: Option<i64>) -> Re
     let arr: Vec<String> = serde_json::from_str(&inner).unwrap_or_default();
     let title = arr.get(0).cloned().unwrap_or_default();
     let url = arr.get(1).cloned().unwrap_or_default();
+    // PERSISTENT HISTORY: this command is polled after every human go() and
+    // every back/forward/reload, returning the REAL committed title+url of the
+    // visible tab. Record it here so human navigations (incl. in-page link
+    // clicks + redirects that never touched go()) are captured with their real
+    // title. record() de-dupes consecutive identical urls and upgrades titles.
+    crate::history::record(&app, &url, &title);
     Ok(serde_json::json!({ "title": title, "url": url }))
 }
 
@@ -1543,6 +1568,29 @@ pub fn browser_downloads_list(app: tauri::AppHandle) -> Result<Vec<serde_json::V
     }
     out.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
     Ok(out.into_iter().map(|(_, v)| v).collect())
+}
+
+// ---------------------------------------------------------------------------
+// PERSISTENT BROWSING HISTORY (Atlas). The RECORD side lives in `history.rs`
+// and is called from the navigation-confirmation points below
+// (`mirror_visible_to_cdp`, `webview_page_info`, `webview_navigate`,
+// `browser_navigate`). These two commands are the FE's read + clear surface.
+// ---------------------------------------------------------------------------
+
+/// List browsing history, NEWEST-FIRST, for the History pane. Each entry is
+/// { url, title, ts } (ts = unix seconds). Loaded from the persisted store so
+/// it survives app restarts.
+#[tauri::command]
+pub fn browser_history_list(app: tauri::AppHandle) -> Result<Vec<crate::history::HistEntry>, String> {
+    Ok(crate::history::list(&app))
+}
+
+/// Wipe all browsing history (memory + the on-disk history.json). The FE calls
+/// this from the "Clear history" button, then re-lists.
+#[tauri::command]
+pub fn browser_history_clear(app: tauri::AppHandle) -> Result<(), String> {
+    crate::history::clear(&app);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

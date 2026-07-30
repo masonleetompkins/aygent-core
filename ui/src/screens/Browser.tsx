@@ -68,11 +68,12 @@ export function Browser() {
   // non-empty `note` — that's the BLOCKED signal that pulses the You/Agent
   // toggle so the human knows to intervene.
   const [blockedNote, setBlockedNote] = useState<string>("");
-  // BROWSER CHROME CONTROLS (ITEM 3). Session browsing history (visited URLs,
-  // newest last) + which drop panel is open + the downloads listing pulled from
-  // Rust on demand. History is tracked FE-side from each committed navigation
-  // (go() + the title/url poll) — engine-native back/forward still works via
-  // webview_history; this list is the "show me where I've been" affordance.
+  // BROWSER CHROME CONTROLS. Browsing history is now PERSISTED IN RUST
+  // (history.rs -> <app_data>/browser/history.json): every committed navigation
+  // — agent navigations, in-page nav, redirects AND human go()s — is recorded
+  // at the webview/CDP source, survives restarts, and is capped at 1000. This
+  // FE list is just what `browser_history_list` returns (newest-first). Ts is
+  // UNIX SECONDS from Rust (not ms), matching the downloads mtime unit.
   type HistEntry = { url: string; title: string; ts: number };
   const [history, setHistory] = useState<HistEntry[]>([]);
   const [panel, setPanel] = useState<null | "history" | "downloads">(null);
@@ -90,20 +91,32 @@ export function Browser() {
   panelRef.current = panel;
   type DlEntry = { name: string; size: number; mtime: number };
   const [downloads, setDownloads] = useState<DlEntry[]>([]);
-  const pushHistory = (url: string, title?: string) => {
-    const u = (url || "").trim();
-    if (!u || !/^https?:/i.test(u)) return;
-    setHistory((h) => {
-      // De-dupe consecutive repeats (a reload / title backfill shouldn't spam).
-      if (h.length && h[h.length - 1].url === u) {
-        if (title && title !== h[h.length - 1].title) {
-          const copy = h.slice(); copy[copy.length - 1] = { ...copy[copy.length - 1], title };
-          return copy;
-        }
-        return h;
-      }
-      return [...h, { url: u, title: title || u, ts: Date.now() }].slice(-200);
-    });
+  // Fetch the PERSISTED history (newest-first) from Rust. Called when the
+  // History panel opens and after a clear. Navigation RECORDING happens in Rust
+  // at the source now, so the FE no longer tracks visits itself.
+  const refreshHistory = async () => {
+    try {
+      const list = await invoke<HistEntry[]>("browser_history_list");
+      setHistory(Array.isArray(list) ? list : []);
+    } catch (e) { console.error("browser_history_list", e); setHistory([]); }
+  };
+  async function openHistory() {
+    if (panel === "history") { setPanel(null); return; }
+    await refreshHistory();
+    setPanel("history");
+  }
+  async function clearHistory() {
+    try { await invoke("browser_history_clear"); } catch (e) { console.error("browser_history_clear", e); }
+    await refreshHistory();
+  }
+  // Short relative timestamp for a unix-SECONDS value.
+  const fmtWhen = (tsSecs: number) => {
+    const diff = Math.max(0, Math.floor(Date.now() / 1000 - tsSecs));
+    if (diff < 60) return "just now";
+    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+    if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`;
+    try { return new Date(tsSecs * 1000).toLocaleDateString(); } catch { return ""; }
   };
   const editRef = useRef<HTMLInputElement>(null);
   // The div whose rect the native webview is positioned over.
@@ -240,7 +253,8 @@ export function Browser() {
     // Make sure the stored addr reflects what we're navigating to.
     patch(id, { addr: url });
     patch(id, { editing: false, title: url });
-    pushHistory(url); // ITEM 3: record the navigation in session history
+    // History is recorded in RUST at the navigation source now (webview_open ->
+    // page-info poll + the CDP mirror), so the FE no longer pushes here.
     const el = paneRef.current;
     const r = el?.getBoundingClientRect();
     // First navigation for the pane opens/positions the webview; later ones reuse.
@@ -279,9 +293,8 @@ export function Browser() {
         const doc = await invoke<{ title?: string; url?: string }>("webview_page_info", { tabId: id });
         const real = (doc?.title || "").trim();
         const realUrl = (doc?.url || "").trim();
-        // ITEM 3: record where we actually landed (covers in-page link clicks +
-        // agent navigations that didn't go through go()), and backfill the title.
-        if (realUrl) pushHistory(realUrl, real || undefined);
+        // NOTE: the webview_page_info call itself records the landed url+title
+        // in Rust history (covers in-page clicks/redirects) — no FE push needed.
         if (real) { patch(id, { title: real }); return; }
       } catch { /* webview not ready yet */ }
       if (tries < 6) setTimeout(pollTitle, 400);
@@ -436,7 +449,7 @@ export function Browser() {
         const real = (doc?.title || "").trim();
         const realUrl = (doc?.url || "").trim();
         if (real) patch(active.id, { title: real });
-        if (realUrl) { patch(active.id, { addr: realUrl }); pushHistory(realUrl, real || undefined); }
+        if (realUrl) { patch(active.id, { addr: realUrl }); }
       } catch { /* not ready */ }
     }, 350);
   }
@@ -611,7 +624,7 @@ export function Browser() {
             <button title="Refresh" onClick={() => navHistory("reload")} disabled={!canNav} style={navBtnStyle(false, !canNav)}>
               <Icon name="refresh" size={15} />
             </button>
-            <button title="History" onClick={() => setPanel(panel === "history" ? null : "history")} style={navBtnStyle(panel === "history", false)}>
+            <button title="History" onClick={openHistory} style={navBtnStyle(panel === "history", false)}>
               <Icon name="clock" size={15} />
             </button>
             <button title="Downloads" onClick={openDownloads} style={navBtnStyle(panel === "downloads", false)}>
@@ -651,15 +664,33 @@ export function Browser() {
                 history.length === 0 ? (
                   <div style={{ fontSize: 12, color: "var(--text-muted)", padding: "6px 4px" }}>No pages visited yet.</div>
                 ) : (
-                  [...history].reverse().map((h, i) => (
-                    <div key={`${h.url}-${h.ts}-${i}`} onClick={() => navTo(h.url)}
-                      style={{ padding: "6px 6px", borderRadius: "var(--radius-control)", cursor: "pointer", display: "flex", flexDirection: "column", gap: 1 }}
-                      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg)")}
-                      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
-                      <span style={{ fontSize: 12.5, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{h.title}</span>
-                      <span style={{ fontSize: 11, color: "var(--text-muted)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{h.url}</span>
+                  <>
+                    {/* Rust returns newest-first already; render as-is. */}
+                    {history.map((h, i) => (
+                      <div key={`${h.url}-${h.ts}-${i}`} onClick={() => navTo(h.url)}
+                        style={{ padding: "6px 6px", borderRadius: "var(--radius-control)", cursor: "pointer", display: "flex", flexDirection: "column", gap: 1 }}
+                        onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg)")}
+                        onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                        <span style={{ fontSize: 12.5, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{h.title || h.url}</span>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <span style={{ flex: 1, fontSize: 11, color: "var(--text-muted)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{h.url}</span>
+                          <span style={{ fontSize: 10.5, color: "var(--text-muted)", flexShrink: 0 }}>{fmtWhen(h.ts)}</span>
+                        </div>
+                      </div>
+                    ))}
+                    {/* Clear history — pinned at the BOTTOM of the History pane. */}
+                    <div style={{ borderTop: "var(--border-width) solid var(--line)", marginTop: 6, paddingTop: 6 }}>
+                      <button onClick={clearHistory}
+                        style={{ width: "100%", padding: "6px 8px", fontSize: 12, fontWeight: 600,
+                          color: "var(--text-muted)", background: "transparent", border: "none",
+                          borderRadius: "var(--radius-control)", cursor: "pointer", display: "flex",
+                          alignItems: "center", justifyContent: "center", gap: 6 }}
+                        onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg)")}
+                        onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                        <Icon name="trash" size={13} /> Clear history
+                      </button>
                     </div>
-                  ))
+                  </>
                 )
               ) : (
                 downloads.length === 0 ? (
