@@ -64,6 +64,28 @@ fn cft_platform() -> &'static str {
     }
 }
 
+/// A real, current desktop Chrome User-Agent string (NO "HeadlessChrome"),
+/// with the major version matching our pinned Chrome-for-Testing build so the
+/// UA and the actual engine agree (a mismatch is itself a detection signal).
+/// Chrome-for-Testing's default UA contains "HeadlessChrome/<ver>" when run
+/// headless — that is the #1 tell, so we override it everywhere.
+///
+/// Platform token: CfT only ships macOS builds for us today, and Mason runs on
+/// a Mac, so we present a Mac desktop Chrome UA. The `Intel Mac OS X` token is
+/// the CANONICAL Chrome UA even on Apple Silicon (Chrome reports Intel for
+/// compatibility), so this is correct for both arches.
+fn desktop_user_agent() -> String {
+    // Major version from the pinned CfT build (e.g. "131.0.6778.204" -> "131").
+    // Chrome's UA carries the FULL version, so use the whole string; it must
+    // match the running engine exactly.
+    let full = PINNED_CFT_VERSION;
+    format!(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+         AppleWebKit/537.36 (KHTML, like Gecko) \
+         Chrome/{full} Safari/537.36"
+    )
+}
+
 /// The relative CDN path segment for a CfT chrome build:
 ///   {version}/{platform}/chrome-{platform}.zip
 fn cft_zip_relpath(version: &str, platform: &str) -> String {
@@ -655,6 +677,20 @@ async fn ensure_running(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
     let downloads = profile.join("downloads");
     std::fs::create_dir_all(&downloads).map_err(|e| format!("mkdir profile/downloads: {e}"))?;
 
+    // FINGERPRINT HARDENING (#2). Chrome-for-Testing + --headless leaks several
+    // "I am automation" tells that Google's bot detector reads:
+    //   - `navigator.webdriver === true` (set by --enable-automation, which
+    //     Chromium turns on implicitly with remote-debugging; we suppress it
+    //     with --disable-blink-features=AutomationControlled + a per-document
+    //     patch in ensure_session).
+    //   - a User-Agent string containing "HeadlessChrome" (overridden below
+    //     via --user-agent AND Network.setUserAgentOverride in ensure_session).
+    //   - the automation infobar / "Chrome is being controlled by automated
+    //     test software" flag.
+    // We keep --headless=new (we do NOT want a second visible OS window; the
+    // human watches via the screencast mirror), but strip the automation tells.
+    // A real, current desktop Chrome UA matching the CfT major version:
+    let real_ua = desktop_user_agent();
     let mut child = std::process::Command::new(&exe)
         .arg("--headless=new")
         .arg(format!("--remote-debugging-port={port}"))
@@ -664,6 +700,19 @@ async fn ensure_running(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--disable-gpu")
+        // --- ANTI-DETECTION LAUNCH FLAGS (#2) --------------------------------
+        // Kills the `navigator.webdriver=true` blink flag + the AutomationControlled
+        // feature that flips several detectable properties.
+        .arg("--disable-blink-features=AutomationControlled")
+        // Suppress the "controlled by automated test software" infobar/flag.
+        .arg("--disable-infobars")
+        // Belt-and-suspenders for the automation feature (the blink flag above
+        // is the documented one; we also avoid ever passing --enable-automation,
+        // which is what would set navigator.webdriver=true in the first place).
+        // Override the HeadlessChrome UA at the process level (belt); we ALSO
+        // apply Network.setUserAgentOverride per-session (suspenders) so the UA
+        // is normal even on the CDP page's network requests.
+        .arg(format!("--user-agent={real_ua}"))
         // Reasonable default viewport for the screenshot.
         .arg("--window-size=1280,800")
         .arg("about:blank")
@@ -845,6 +894,10 @@ async fn ensure_session(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
     // Enable the domains + start the screencast (JPEG, capped size for latency).
     session_call(state, "Page.enable", serde_json::json!({})).await?;
     session_call(state, "Runtime.enable", serde_json::json!({})).await?;
+    // FINGERPRINT HARDENING (#2) — done ONCE per session, right after the
+    // domains are enabled and BEFORE any real navigation, so it applies to the
+    // very first document too.
+    apply_fingerprint_hardening(state).await;
     session_call(
         state,
         "Page.startScreencast",
@@ -1610,6 +1663,340 @@ async fn viewport_size(state: &tauri::State<'_, BrowserProc>) -> Result<(f64, f6
     Ok((w.max(1.0), h.max(1.0)))
 }
 
+// ===========================================================================
+// FINGERPRINT HARDENING (#2) + TRUSTED CDP INPUT (#1) SHARED HELPERS.
+//
+// Everything below produces input/fingerprints that are INDISTINGUISHABLE from
+// a real human on a real Chrome: CDP Input.* events carry isTrusted:true at the
+// browser layer (unlike el.click()/dispatchEvent JS which are isTrusted:false),
+// and the per-document patch scrubs the automation tells (navigator.webdriver,
+// missing plugins, HeadlessChrome UA) that detectors like Google read.
+// ===========================================================================
+
+/// Apply anti-detection to the live CDP session. Called ONCE per session in
+/// ensure_session after Page.enable/Runtime.enable. Two parts:
+///   (a) Network.setUserAgentOverride — force a normal desktop Chrome UA (no
+///       "HeadlessChrome") on the CDP page's own requests, matching the launch
+///       --user-agent so page-JS `navigator.userAgent` and the network layer
+///       agree.
+///   (b) Page.addScriptToEvaluateOnNewDocument — runs BEFORE any page script on
+///       every new document, so it patches the automation fingerprint the
+///       instant the page loads (webdriver, plugins, languages, chrome runtime,
+///       and any leftover cdc_/webdriver props).
+async fn apply_fingerprint_hardening(state: &tauri::State<'_, BrowserProc>) {
+    let ua = desktop_user_agent();
+    // Network.setUserAgentOverride is honored without Network.enable on current
+    // Chromium, but enabling the domain first is the documented, robust order
+    // (and lets the override apply to the very first request). Best-effort.
+    let _ = session_call(state, "Network.enable", serde_json::json!({})).await;
+    // (a) UA override. Also set a matching platform + acceptLanguage + a
+    // client-hints userAgentMetadata so navigator.userAgentData (Chrome's UA-CH)
+    // does not still say Headless/leak a mismatch.
+    let ua_res = session_call(
+        state,
+        "Network.setUserAgentOverride",
+        serde_json::json!({
+            "userAgent": ua,
+            "acceptLanguage": "en-US,en;q=0.9",
+            "platform": "MacIntel",
+            "userAgentMetadata": {
+                "brands": [
+                    { "brand": "Not_A Brand", "version": "24" },
+                    { "brand": "Chromium", "version": "131" },
+                    { "brand": "Google Chrome", "version": "131" }
+                ],
+                "fullVersion": PINNED_CFT_VERSION,
+                "platform": "macOS",
+                "platformVersion": "14.5.0",
+                "architecture": "arm",
+                "model": "",
+                "mobile": false
+            }
+        }),
+    )
+    .await;
+    eprintln!(
+        "[aygent][browser][FINGERPRINT] setUserAgentOverride ua=\"{ua}\" ok={}",
+        ua_res.is_ok()
+    );
+
+    // (b) Per-new-document patch. This is the load-bearing scrub: it deletes the
+    // webdriver flag, gives navigator sane plugins/languages, defines a
+    // window.chrome shim, and strips any Selenium/cdc_ globals. Runs before the
+    // page's own JS on EVERY document (main frame + iframes).
+    let patch = r#"
+(() => {
+  try {
+    // 1) navigator.webdriver -> undefined (the single biggest tell).
+    try { Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => undefined, configurable: true }); } catch (e) {}
+    try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true }); } catch (e) {}
+    try { delete navigator.__proto__.webdriver; } catch (e) {}
+
+    // 2) navigator.languages must be a real array (headless can return []).
+    try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'], configurable: true }); } catch (e) {}
+
+    // 3) navigator.plugins / mimeTypes non-empty (headless returns 0 -> a tell).
+    try {
+      const fakePlugin = (name, filename, desc) => {
+        const p = { name, filename, description: desc, length: 1 };
+        return p;
+      };
+      const plugins = [
+        fakePlugin('Chrome PDF Plugin', 'internal-pdf-viewer', 'Portable Document Format'),
+        fakePlugin('Chrome PDF Viewer', 'mhjfbmdgcfjbbpaeojofohoefgiehjai', ''),
+        fakePlugin('Native Client', 'internal-nacl-plugin', '')
+      ];
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => { const arr = plugins.slice(); arr.item = (i) => arr[i]; arr.namedItem = (n) => arr.find(p => p.name === n); return arr; },
+        configurable: true
+      });
+    } catch (e) {}
+
+    // 4) window.chrome shim (real Chrome exposes window.chrome.runtime etc;
+    //    headless often does not, which detectors check).
+    try {
+      if (!window.chrome) { window.chrome = {}; }
+      if (!window.chrome.runtime) { window.chrome.runtime = {}; }
+    } catch (e) {}
+
+    // 5) Permissions.query for 'notifications' should not throw / should look
+    //    like a real prompt-state (a known headless divergence).
+    try {
+      const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+      if (origQuery) {
+        window.navigator.permissions.query = (params) =>
+          (params && params.name === 'notifications')
+            ? Promise.resolve({ state: Notification.permission || 'default', onchange: null })
+            : origQuery.call(window.navigator.permissions, params);
+      }
+    } catch (e) {}
+
+    // 6) Scrub Selenium/ChromeDriver globals if any snuck in.
+    try {
+      for (const k of Object.keys(window)) {
+        if (k.indexOf('cdc_') === 0 || k.indexOf('$cdc_') === 0 || k === 'webdriver' || k === '__webdriver_evaluate' || k === '__selenium_evaluate' || k === '__driver_evaluate') {
+          try { delete window[k]; } catch (e) {}
+        }
+      }
+      try { delete document.$cdc_asdjflasutopfhvcZLmcfl_; } catch (e) {}
+    } catch (e) {}
+  } catch (e) {}
+})();
+"#;
+    let patch_res = session_call(
+        state,
+        "Page.addScriptToEvaluateOnNewDocument",
+        serde_json::json!({ "source": patch }),
+    )
+    .await;
+    eprintln!(
+        "[aygent][browser][FINGERPRINT] addScriptToEvaluateOnNewDocument ok={}",
+        patch_res.is_ok()
+    );
+}
+
+/// A tiny randomized delay (ms range inclusive) so sub-actions are not
+/// instantaneous — uniform timing is itself a bot signal. No rand crate dep:
+/// derive jitter from the nanosecond clock.
+async fn human_delay(min_ms: u64, max_ms: u64) {
+    let span = max_ms.saturating_sub(min_ms).max(1);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let jitter = nanos % (span + 1);
+    tokio::time::sleep(std::time::Duration::from_millis(min_ms + jitter)).await;
+}
+
+/// Find an element by visible text and return its viewport-center [x,y] in CSS
+/// px (the coordinate space CDP Input.* mouse events use), AFTER scrolling it
+/// into view. Returns None if no element matches. This is the FIRST half of a
+/// TRUSTED click: we locate WHERE to click, then dispatch a real mouse click
+/// there (never el.click()).
+async fn element_center_by_text(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, BrowserProc>,
+    want: &str,
+) -> Result<Option<(f64, f64)>, String> {
+    // Runtime.evaluate returning the center coords (or null). We scroll into
+    // view first so the rect is within the viewport for the mouse event.
+    let expr = format!(
+        "(()=>{{ const t={want:?}.toLowerCase(); \
+         const els=[...document.querySelectorAll('a,button,input[type=submit],input[type=button],[role=button],label,[onclick],h3,li,span,div')]; \
+         const el=els.find(e=>{{ const s=(e.innerText||e.value||e.textContent||''); return s && s.toLowerCase().includes(t) && e.offsetParent!==null; }}); \
+         if(!el) return null; \
+         el.scrollIntoView({{block:'center',inline:'center'}}); \
+         const r=el.getBoundingClientRect(); \
+         if(r.width===0||r.height===0) return null; \
+         return [r.left + r.width/2, r.top + r.height/2]; }})()",
+        want = want
+    );
+    let json = active_tab_read(app, state, &expr).await?;
+    if json.trim() == "null" || json.trim().is_empty() {
+        return Ok(None);
+    }
+    let coords: Vec<f64> = serde_json::from_str(&json).unwrap_or_default();
+    if coords.len() == 2 {
+        Ok(Some((coords[0], coords[1])))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Find a typeable field's viewport-center [x,y] in CSS px (scrolled into view),
+/// so we can REAL-click it to focus before typing. Prefers the current
+/// activeElement if it is already an editable field; otherwise the first visible
+/// text-like input/textarea/contenteditable.
+async fn typeable_field_center(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, BrowserProc>,
+) -> Result<Option<(f64, f64)>, String> {
+    let expr = "(()=>{ \
+         let el=document.activeElement; \
+         const editable=(e)=>e && (('value' in e && e!==document.body) || e.isContentEditable); \
+         if(!editable(el)){ el=[...document.querySelectorAll('input[type=text],input[type=search],input:not([type]),textarea,input[type=email],input[type=url],[contenteditable=true],[role=searchbox],[role=textbox]')].find(e=>e.offsetParent!==null); } \
+         if(!el) return null; \
+         el.scrollIntoView({block:'center',inline:'center'}); \
+         const r=el.getBoundingClientRect(); \
+         if(r.width===0||r.height===0) return null; \
+         return [r.left + r.width/2, r.top + r.height/2]; })()";
+    let json = active_tab_read(app, state, expr).await?;
+    if json.trim() == "null" || json.trim().is_empty() {
+        return Ok(None);
+    }
+    let coords: Vec<f64> = serde_json::from_str(&json).unwrap_or_default();
+    if coords.len() == 2 { Ok(Some((coords[0], coords[1]))) } else { Ok(None) }
+}
+
+/// TRUSTED mouse click at ABSOLUTE CSS-px coords (x,y) via CDP Input.* — the
+/// events carry isTrusted:true. Adds a short human-like approach: 2-3
+/// intermediate mouseMoved points toward the target before press/release, plus
+/// small randomized delays. This is the shape a real pointer produces.
+async fn trusted_click_at(
+    state: &tauri::State<'_, BrowserProc>,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
+    // Approach from a point up-and-left of the target (arbitrary but plausible),
+    // stepping in 3 mouseMoved events so hover/mousemove handlers see motion.
+    let start_x = (x - 40.0).max(0.0);
+    let start_y = (y - 30.0).max(0.0);
+    for i in 1..=3u32 {
+        let f = i as f64 / 3.0;
+        let mx = start_x + (x - start_x) * f;
+        let my = start_y + (y - start_y) * f;
+        session_call(
+            state,
+            "Input.dispatchMouseEvent",
+            serde_json::json!({ "type": "mouseMoved", "x": mx, "y": my, "button": "none", "buttons": 0 }),
+        )
+        .await?;
+        human_delay(15, 45).await;
+    }
+    // Settle on the exact target.
+    session_call(
+        state,
+        "Input.dispatchMouseEvent",
+        serde_json::json!({ "type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0 }),
+    )
+    .await?;
+    human_delay(30, 90).await;
+    // Press.
+    session_call(
+        state,
+        "Input.dispatchMouseEvent",
+        serde_json::json!({ "type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1 }),
+    )
+    .await?;
+    human_delay(40, 110).await; // dwell time of a real press
+    // Release.
+    session_call(
+        state,
+        "Input.dispatchMouseEvent",
+        serde_json::json!({ "type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1 }),
+    )
+    .await?;
+    eprintln!("[aygent][browser][INPUT] trusted click at ({x:.1},{y:.1})");
+    Ok(())
+}
+
+/// Map a character to the CDP key-event fields Chromium wants so per-character
+/// typing produces trusted keydown/char/keyup with a plausible virtual keycode.
+/// For printable chars, `text` carries the char and the keyDown "char" event is
+/// what actually inserts it. Returns (windowsVirtualKeyCode, key, text).
+fn char_key_fields(c: char) -> (i64, String, String) {
+    let text = c.to_string();
+    // Best-effort virtual keycode: letters/digits map to their ASCII-upper code;
+    // everything else we leave 0 (the "char" event still inserts the glyph).
+    let vk = if c.is_ascii_alphabetic() {
+        (c.to_ascii_uppercase() as u8) as i64
+    } else if c.is_ascii_digit() {
+        (c as u8) as i64
+    } else if c == ' ' {
+        32
+    } else {
+        0
+    };
+    (vk, text.clone(), text)
+}
+
+/// TRUSTED per-character typing into the focused element via CDP
+/// Input.dispatchKeyEvent (keyDown with `text` -> keyUp), with small randomized
+/// inter-key delays so timing looks human. isTrusted:true, real key events —
+/// unlike el.value=... which fires nothing trusted.
+async fn trusted_type(
+    state: &tauri::State<'_, BrowserProc>,
+    text: &str,
+) -> Result<(), String> {
+    for c in text.chars() {
+        let (vk, key, ch) = char_key_fields(c);
+        // keyDown carrying `text` inserts the character as a trusted input.
+        let mut down = serde_json::json!({
+            "type": "keyDown", "text": ch, "key": key.clone(),
+            "unmodifiedText": text_unmod(c),
+        });
+        if vk != 0 {
+            down["windowsVirtualKeyCode"] = vk.into();
+            down["nativeVirtualKeyCode"] = vk.into();
+        }
+        session_call(state, "Input.dispatchKeyEvent", down).await?;
+        let mut up = serde_json::json!({ "type": "keyUp", "key": key });
+        if vk != 0 {
+            up["windowsVirtualKeyCode"] = vk.into();
+            up["nativeVirtualKeyCode"] = vk.into();
+        }
+        session_call(state, "Input.dispatchKeyEvent", up).await?;
+        human_delay(40, 120).await; // per-key human cadence
+    }
+    eprintln!("[aygent][browser][INPUT] trusted type of {} chars", text.chars().count());
+    Ok(())
+}
+
+fn text_unmod(c: char) -> String {
+    // For a shifted char the unmodifiedText would differ; we type without a
+    // shift modifier and let `text` carry the final glyph, so unmodifiedText =
+    // the lowercase/base char is a fine approximation for detectors.
+    c.to_string()
+}
+
+/// TRUSTED Enter keypress via CDP Input.dispatchKeyEvent (keyDown+keyUp,
+/// windowsVirtualKeyCode 13). Real navigation trigger — not form.submit().
+async fn trusted_enter(state: &tauri::State<'_, BrowserProc>) -> Result<(), String> {
+    let down = serde_json::json!({
+        "type": "keyDown", "key": "Enter", "code": "Enter",
+        "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13, "text": "\r"
+    });
+    session_call(state, "Input.dispatchKeyEvent", down).await?;
+    human_delay(30, 80).await;
+    let up = serde_json::json!({
+        "type": "keyUp", "key": "Enter", "code": "Enter",
+        "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13
+    });
+    session_call(state, "Input.dispatchKeyEvent", up).await?;
+    eprintln!("[aygent][browser][INPUT] trusted Enter");
+    Ok(())
+}
+
 /// Forward a mouse CLICK at normalized (fx,fy in 0..1) coords on the frame.
 /// Dispatches move -> press -> release so pages that track hover/mousedown work.
 #[tauri::command]
@@ -1977,18 +2364,21 @@ async fn agent_tool_inner(
                 "take" => return ("the human took the wheel to do this themselves".into(), true),
                 _ => return (format!("the human declined clicking '{want}'. Stopping."), true),
             }
-            // Click via CDP Runtime.evaluate on the AUTHORITATIVE page (returns a
-            // value so we KNOW if a match was found — no fire-and-forget guess).
-            let click_expr = format!(
-                "(()=>{{ const t={want:?}.toLowerCase(); \
-                 const els=[...document.querySelectorAll('a,button,input[type=submit],[role=button],label,[onclick],h3')]; \
-                 const el=els.find(e=>(e.innerText||e.value||'').toLowerCase().includes(t)); \
-                 if(!el) return 'NOMATCH'; el.scrollIntoView({{block:'center'}}); (el.closest('a')||el).click(); return 'OK'; }})()",
-                want = want
-            );
-            let clicked = active_tab_read(app, state, &click_expr).await.unwrap_or_default();
-            if clicked.contains("NOMATCH") {
-                return (format!("no clickable element matching '{want}' on this page"), true);
+            // TRUSTED CLICK (#1). Instead of el.click() via JS (isTrusted:false,
+            // which Google flags), we (a) locate the element's viewport-center
+            // coords via a CDP Runtime.evaluate (scrolling it into view), then
+            // (b) dispatch a REAL CDP mouse click at those coords
+            // (mouseMoved x3 approach -> mousePressed -> mouseReleased). The
+            // events carry isTrusted:true — indistinguishable from a human click.
+            eprintln!("[aygent][browser][INPUT] browser_click_text want={want:?}");
+            let center = match element_center_by_text(app, state, want).await {
+                Ok(Some(c)) => c,
+                Ok(None) => return (format!("no clickable element matching '{want}' on this page"), true),
+                Err(e) => return (format!("click locate failed: {e}"), true),
+            };
+            human_delay(60, 150).await;
+            if let Err(e) = trusted_click_at(state, center.0, center.1).await {
+                return (format!("trusted click dispatch failed: {e}"), true);
             }
             wait_for_cdp_load(state).await;
             let (title, url) = active_tab_page_info_cdp(app, state).await.unwrap_or_default();
@@ -1997,24 +2387,50 @@ async fn agent_tool_inner(
         "browser_type_text" => {
             let text = input.get("text").and_then(|t| t.as_str()).unwrap_or("");
             let submit = input.get("submit").and_then(|b| b.as_bool()).unwrap_or(false);
-            // Type via CDP Runtime.evaluate on the AUTHORITATIVE page. Returns a
-            // status so we know a field was found. If submit, dispatch Enter +
-            // requestSubmit/submit so the search actually fires.
-            let type_expr = format!(
-                "(()=>{{ let el=document.activeElement; \
-                 if(!el||!('value' in el)||el===document.body){{ el=[...document.querySelectorAll('input[type=text],input[type=search],input:not([type]),textarea,input[type=email],input[type=url],[contenteditable=true]')].find(e=>e.offsetParent!==null); }} \
-                 if(!el) return 'NOFIELD'; el.focus(); \
-                 if('value' in el){{ el.value={text:?}; }} else {{ el.textContent={text:?}; }} \
-                 el.dispatchEvent(new Event('input',{{bubbles:true}})); el.dispatchEvent(new Event('change',{{bubbles:true}})); \
-                 if({submit}){{ const f=el.form; el.dispatchEvent(new KeyboardEvent('keydown',{{key:'Enter',keyCode:13,which:13,bubbles:true}})); el.dispatchEvent(new KeyboardEvent('keyup',{{key:'Enter',keyCode:13,which:13,bubbles:true}})); if(f&&f.requestSubmit){{ try{{f.requestSubmit();}}catch(e){{ try{{f.submit();}}catch(e2){{}} }} }} else if(f){{ try{{f.submit();}}catch(e){{}} }} }} \
-                 return 'OK'; }})()",
-                text = text, submit = submit
-            );
-            let typed = active_tab_read(app, state, &type_expr).await.unwrap_or_default();
-            if typed.contains("NOFIELD") {
-                return ("no typeable field found on this page".into(), true);
+            if text.is_empty() { return ("browser_type_text needs `text`".into(), true); }
+            // TRUSTED TYPING (#1). Instead of el.value=... (fires no trusted
+            // input events — flagged), we:
+            //   (a) locate the target field's center coords + REAL-click it to
+            //       focus (trusted mouse click),
+            //   (b) type per-character via CDP Input.dispatchKeyEvent
+            //       (keyDown+keyUp, `text` carries the glyph) with 40-120ms
+            //       human-cadence delays,
+            //   (c) on submit, press a REAL Enter (windowsVirtualKeyCode 13) via
+            //       Input.dispatchKeyEvent — not form.submit(). requestSubmit()
+            //       is kept ONLY as a fallback if the Enter path caused no nav.
+            eprintln!("[aygent][browser][INPUT] browser_type_text submit={submit} text_len={}", text.len());
+            let field = match typeable_field_center(app, state).await {
+                Ok(Some(c)) => c,
+                Ok(None) => return ("no typeable field found on this page".into(), true),
+                Err(e) => return (format!("type locate failed: {e}"), true),
+            };
+            human_delay(60, 150).await;
+            if let Err(e) = trusted_click_at(state, field.0, field.1).await {
+                return (format!("focus-click failed: {e}"), true);
             }
-            if submit { wait_for_cdp_load(state).await; }
+            human_delay(60, 150).await;
+            if let Err(e) = trusted_type(state, text).await {
+                return (format!("trusted type failed: {e}"), true);
+            }
+            if submit {
+                // Capture the url before Enter so we can tell if it navigated.
+                let url_before = cdp_current_url(state).await;
+                human_delay(60, 150).await;
+                if let Err(e) = trusted_enter(state).await {
+                    return (format!("Enter dispatch failed: {e}"), true);
+                }
+                wait_for_cdp_load(state).await;
+                let url_after = cdp_current_url(state).await;
+                // FALLBACK ONLY: if the trusted Enter produced no navigation
+                // (some SPA search boxes rely on form submit), try
+                // requestSubmit()/submit() on the field's form as a last resort.
+                if url_after == url_before {
+                    eprintln!("[aygent][browser][INPUT] Enter yielded no nav — requestSubmit() fallback");
+                    let _ = active_tab_read(app, state,
+                        "(()=>{ const el=document.activeElement; const f=el&&el.form; if(f){ try{ if(f.requestSubmit) f.requestSubmit(); else f.submit(); }catch(e){} } return 'OK'; })()").await;
+                    wait_for_cdp_load(state).await;
+                }
+            }
             (format!("typed '{}'{}", text, if submit { " and submitted" } else { "" }), false)
         }
         "browser_screenshot" => {
