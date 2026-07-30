@@ -158,6 +158,8 @@ export function Browser() {
   async function go(id: number, rawUrl?: string) {
     const tab = tabs.find((t) => t.id === id);
     const url = (rawUrl ?? tab?.addr ?? "").trim();
+    // eslint-disable-next-line no-console
+    console.log("[browser] go() fired", { id, rawUrl, tabAddr: tab?.addr, resolvedUrl: url });
     if (!url) { patch(id, { editing: false }); return; }
     // Make sure the stored addr reflects what we're navigating to.
     patch(id, { addr: url });
@@ -309,8 +311,16 @@ export function Browser() {
               {editing ? (
                 <input ref={editRef} autoFocus value={t.addr}
                   onChange={(e) => patch(t.id, { addr: e.target.value })}
-                  onKeyDown={(e) => { if (e.key === "Enter") go(t.id, e.currentTarget.value); if (e.key === "Escape") patch(t.id, { editing: false }); }}
-                  onBlur={() => patch(t.id, { editing: false })}
+                  onKeyDown={(e) => {
+                    // eslint-disable-next-line no-console
+                    console.log("[browser] keydown", e.key, "value=", e.currentTarget.value);
+                    if (e.key === "Enter") { e.preventDefault(); go(t.id, e.currentTarget.value); }
+                    if (e.key === "Escape") patch(t.id, { editing: false });
+                  }}
+                  // Commit on blur too (clicking away / focus loss), so Enter
+                  // isn't the only way to navigate. If there's a URL, GO instead
+                  // of just dropping edit mode — and don't let a blur-race eat it.
+                  onBlur={(e) => { const v = e.currentTarget.value.trim(); if (v) go(t.id, v); else patch(t.id, { editing: false }); }}
                   onClick={(e) => e.stopPropagation()}
                   placeholder="Enter a URL or search…"
                   style={{ flex: 1, minWidth: 0, border: "none", outline: "none", background: "transparent", color: "var(--text)", fontSize: 13, fontFamily: "inherit" }} />
