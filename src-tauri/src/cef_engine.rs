@@ -169,11 +169,43 @@ pub fn init_early() -> bool {
         return false;
     }
 
+    // MACOS BUNDLE PATHS — THE FIX for silent CefInitialize -> 0. On a bundled
+    // macOS CEF app, CEF cannot find its framework/resources/helper-subprocess
+    // relative to the main binary automatically; unset paths => silent failure
+    // (returns 0, no log). We resolve all five from the running executable's
+    // location inside AYGENT.app. Layout (from cef-bundle.sh):
+    //   AYGENT.app/Contents/MacOS/AYGENT                          <- current_exe
+    //   AYGENT.app/Contents/Frameworks/
+    //     Chromium Embedded Framework.framework/
+    //       Chromium Embedded Framework                           <- fw binary
+    //       Resources/                                            <- .pak/icudtl/locales
+    //     AYGENT Helper.app/Contents/MacOS/AYGENT Helper          <- subprocess
+    let exe = std::env::current_exe().unwrap_or_default();
+    // .../Contents/MacOS/AYGENT -> .../Contents
+    let contents = exe.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf()).unwrap_or_default();
+    let frameworks = contents.join("Frameworks");
+    let fw_dir = frameworks.join("Chromium Embedded Framework.framework");
+    let resources = fw_dir.join("Resources");
+    let locales = resources.join("locales");
+    let helper = frameworks
+        .join("AYGENT Helper.app")
+        .join("Contents").join("MacOS").join("AYGENT Helper");
+    // .app bundle root = .../Contents/.. = AYGENT.app
+    let main_bundle = contents.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let s = |p: &std::path::Path| CefString::from(p.to_string_lossy().as_ref());
+    eprintln!("[aygent][cef] paths: bundle={} fw={} helper={} res={}",
+        main_bundle.display(), fw_dir.display(), helper.display(), resources.display());
+
     let settings = Settings {
         no_sandbox: !cfg!(feature = "sandbox") as _,
         multi_threaded_message_loop: 1,
         external_message_pump: 0,
         remote_debugging_port: port as _,
+        browser_subprocess_path: s(&helper),
+        framework_dir_path: s(&fw_dir),
+        main_bundle_path: s(&main_bundle),
+        resources_dir_path: s(&resources),
+        locales_dir_path: s(&locales),
         ..Default::default()
     };
 
