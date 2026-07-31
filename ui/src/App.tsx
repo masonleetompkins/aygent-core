@@ -136,12 +136,15 @@ export function App() {
     return <div style={{ minHeight: "100vh", background: "var(--bg)" }} />;
   }
   if (needsOnboarding) {
-    // On finish we must RESTART THE PROCESS, not just reload the UI. The SQLite
-    // state spine (writer::Db) is opened ONCE in Rust setup() against the
-    // pre-onboarding path; a window reload can't re-point that connection, so the
-    // old app-data DB (with old agents) would stay live. app_restart re-runs
-    // setup() which reopens SQLite from <root>/.aygent — the clean root.
-    return <Onboarding onDone={() => { void invoke("app_restart"); }} />;
+    // On finish: NO process restart. onboarding_set_root already re-pointed the
+    // live DB to <root>/.aygent (the writer thread swapped its connection), so
+    // the agent created in step 3 is already in the root's DB. We just flip the
+    // gate off + re-check status so the app renders. (app.restart() from inside
+    // a command future was aborting the process — SIGABRT; removed.)
+    return <Onboarding onDone={() => {
+      void invoke("onboarding_finish").catch(() => {});
+      setNeedsOnboarding(false);
+    }} />;
   }
 
   // M1.4 parallel UI: viewing an agent no longer changes which agents RUN. We

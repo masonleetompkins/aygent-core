@@ -30,10 +30,18 @@ type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 
 /// Handle to the state database. Cheap to clone (just the sender + app_data);
 /// held in Tauri state and shared across all commands.
+///
+/// CONFIG RELOCATION (2026-07-31): `app_data` is behind a Mutex + the writer
+/// thread can be RE-POINTED live (repoint) when onboarding sets the root — so we
+/// swap the DB from app-data to <root>/.aygent WITHOUT restarting the process
+/// (app.restart() from inside a command future aborts — that was the crash).
 #[derive(Clone)]
 pub struct Db {
     tx: Sender<Job>,
-    app_data: PathBuf,
+    app_data: std::sync::Arc<std::sync::Mutex<PathBuf>>,
+    // Set once onboarding re-points; the writer thread swaps its connection to
+    // the new path on the next job. Held as a shared cell the writer reads.
+    repoint: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
 }
 
 impl Db {
@@ -45,6 +53,10 @@ impl Db {
         let mut conn = db::open(&app_data)?;
         let (tx, rx) = mpsc::channel::<Job>();
 
+        let repoint: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let repoint_w = repoint.clone();
+
         thread::Builder::new()
             .name("aygent-db-writer".into())
             .spawn(move || {
@@ -52,12 +64,44 @@ impl Db {
                 // Db handle drops, the channel closes, the loop ends, the
                 // connection closes cleanly.
                 for job in rx {
+                    // RELOCATION: before each job, check whether onboarding asked
+                    // to re-point the DB. If so, checkpoint the OLD wal, open the
+                    // NEW path, and swap — no process restart. Best-effort: a
+                    // failed reopen keeps the current connection so we never lose
+                    // the writer.
+                    let pending = repoint_w.lock().unwrap().take();
+                    if let Some(new_path) = pending {
+                        let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+                        match db::open(&new_path) {
+                            Ok(new_conn) => {
+                                conn = new_conn;
+                                eprintln!("[aygent] db re-pointed to {}", new_path.display());
+                            }
+                            Err(e) => eprintln!("[aygent] db repoint FAILED (keeping current): {e}"),
+                        }
+                    }
                     job(&mut conn);
                 }
             })
             .map_err(|e| format!("spawn writer thread: {e}"))?;
 
-        Ok(Db { tx, app_data })
+        Ok(Db {
+            tx,
+            app_data: std::sync::Arc::new(std::sync::Mutex::new(app_data)),
+            repoint,
+        })
+    }
+
+    /// RELOCATION: re-point the live DB to a new directory (onboarding set the
+    /// root). Queues the swap for the writer thread and updates app_data (which
+    /// readers use). The next write — e.g. agents_create — lands in the new DB.
+    /// We run a no-op write immediately so the swap happens before the caller's
+    /// next real write, and the new DB's migrations run.
+    pub fn repoint(&self, new_dir: PathBuf) -> Result<(), String> {
+        *self.repoint.lock().unwrap() = Some(new_dir.clone());
+        *self.app_data.lock().unwrap() = new_dir;
+        // Force the writer to process the pending repoint now (empty job).
+        self.write(|_c| Ok(()))
     }
 
     /// Run a write on the writer thread and wait for its result. The closure
@@ -85,11 +129,12 @@ impl Db {
     /// A fresh reader connection. WAL => concurrent with the writer. Callers
     /// that only SELECT use this; they never touch the writer thread.
     pub fn reader(&self) -> Result<Connection, String> {
-        db::open_reader(&self.app_data)
+        let dir = self.app_data.lock().unwrap().clone();
+        db::open_reader(&dir)
     }
 
     /// The app-data dir (used for one-time JSON->SQLite migration source paths).
-    pub fn app_data(&self) -> &PathBuf {
-        &self.app_data
+    pub fn app_data(&self) -> PathBuf {
+        self.app_data.lock().unwrap().clone()
     }
 }

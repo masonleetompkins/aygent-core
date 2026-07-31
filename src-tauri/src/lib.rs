@@ -130,15 +130,26 @@ async fn onboarding_pick_root(app: tauri::AppHandle) -> Result<serde_json::Value
 /// Idempotent — pointing at an existing root just RESTORES it (adopts its config).
 /// After this, a restart boots into the root (SQLite loads from <root>/.aygent).
 #[tauri::command]
-fn onboarding_set_root(app: tauri::AppHandle, folder: String) -> Result<serde_json::Value, String> {
+fn onboarding_set_root(
+    app: tauri::AppHandle,
+    db: tauri::State<writer::Db>,
+    folder: String,
+) -> Result<serde_json::Value, String> {
     let root = std::path::PathBuf::from(&folder);
     if !root.is_dir() {
         return Err(format!("folder does not exist: {folder}"));
     }
     let restored = paths::is_aygent_root(&root);
     paths::init_root(&root)?;              // safe if already a root (won't overwrite manifest)
-    paths::write_pointer(&app, &root)?;    // flip the pointer LAST
-    eprintln!("[aygent] root set: {} (restored={restored})", root.display());
+    paths::write_pointer(&app, &root)?;    // flip the pointer
+    // RE-POINT THE LIVE DB to <root>/.aygent — no process restart (app.restart()
+    // from inside a command future aborts; that was the SIGABRT crash). The
+    // writer thread checkpoints the old WAL, opens the new DB, runs its
+    // migrations, and the next write (agents_create) lands in the root's DB.
+    let state_dir = root.join(".aygent");
+    std::fs::create_dir_all(&state_dir).map_err(|e| format!("mkdir state: {e}"))?;
+    db.repoint(state_dir)?;
+    eprintln!("[aygent] root set + db re-pointed: {} (restored={restored})", root.display());
     Ok(serde_json::json!({ "ok": true, "root": root.to_string_lossy(), "restored": restored }))
 }
 
@@ -154,15 +165,16 @@ fn onboarding_make_agent_home(app: tauri::AppHandle, name: String) -> Result<Str
     Ok(home.to_string_lossy().to_string())
 }
 
-/// Restart the whole app process. REQUIRED after onboarding sets the root: the
-/// SQLite state spine (writer::Db) is opened ONCE in setup() against the
-/// pre-onboarding app-data path — a UI reload can't re-point it. A real restart
-/// re-runs setup(), which now reads the pointer and opens SQLite from
-/// <root>/.aygent/state.db (the bug: old agents kept showing because the DB
-/// connection was still the app-data one after only a UI reload).
+/// Finish onboarding WITHOUT a process restart. The DB was already re-pointed to
+/// <root>/.aygent by onboarding_set_root (live swap, no restart), so the agent
+/// created in step 3 is in the root's DB. This just returns ok so the UI can
+/// flip from the wizard into the app by re-checking onboarding_status.
+///
+/// (Replaces app_restart, which called app.restart() from inside a command
+/// future — that aborts the process (SIGABRT) with live daemon/WS/writer threads.)
 #[tauri::command]
-fn app_restart(app: tauri::AppHandle) {
-    app.restart();
+fn onboarding_finish() -> Result<(), String> {
+    Ok(())
 }
 
 /// PRO MODE: read whether shell.exec is enabled for a folder's agent. GUI-only
@@ -3601,7 +3613,7 @@ pub fn run() {
             pro_mode_get, pro_mode_set, shell_procs, shell_kill_proc,
             github_git_auth,
             onboarding_status, onboarding_pick_root, onboarding_set_root,
-            onboarding_make_agent_home, app_restart
+            onboarding_make_agent_home, onboarding_finish
         ])
         .setup(move |_app| {
             // ENGINE-CEF (Phase 1): CEF was ALREADY initialized at the top of
