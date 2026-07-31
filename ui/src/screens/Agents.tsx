@@ -237,6 +237,35 @@ export function AgentForm({
     try { await invoke("agent_context_remove", { agentId: initial.id, id }); await loadCtx(); } catch { /* ignore */ }
   }
 
+  // IMPORT MEMORY (2026-07-31): one-click port of an existing memory bundle
+  // (a CleoPort-style vault or any Obsidian folder) INTO this agent's folder,
+  // then auto-ingest so retrieval + graph expansion light up. The AYGENT-native
+  // "bring my memory / restore me" flow — no terminal. Needs a saved agent (for
+  // the id) + a folder (the destination jail).
+  const [importBusy, setImportBusy] = useState(false);
+  const [importMsg, setImportMsg] = useState<string | null>(null);
+  async function importMemory() {
+    const id = await ensureSaved();
+    if (!id) { setImportMsg("Give the agent a name first."); return; }
+    if (!folder) { setImportMsg("Set the agent's folder first."); return; }
+    setImportBusy(true); setImportMsg(null);
+    try {
+      const r = await invoke<{
+        cancelled?: boolean; files_copied?: number;
+        ingest?: { parsed: number; embedded: number; links: number };
+      }>("import_memory", { agentId: id, agentFolder: folder });
+      if (r.cancelled) { setImportMsg(null); }
+      else {
+        const ing = r.ingest;
+        setImportMsg(
+          `Imported ${r.files_copied ?? 0} files — ${ing?.parsed ?? 0} notes, ` +
+          `${ing?.embedded ?? 0} embedded, ${ing?.links ?? 0} links. Memory is live.`
+        );
+      }
+    } catch (e) { setImportMsg(`Import failed: ${String(e)}`); }
+    finally { setImportBusy(false); }
+  }
+
   // PRO MODE (2026-07-31): shell.exec consent for THIS agent's folder. Scary-
   // honest — flips the folder from zero-shell Folder Mode to "can run programs."
   // Backed by pro_mode_get/set (writes a per-folder flag; the Rust exec broker
@@ -564,6 +593,23 @@ export function AgentForm({
             </span>
           </label>
           {!initial?.id && <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Save the agent first, then attach documents.</span>}
+        </div>
+
+        {/* IMPORT MEMORY — bring an existing memory vault into this agent + ingest. */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "12px 14px" }}>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>🧠 Import memory</div>
+          <span style={{ ...hint, fontSize: 12 }}>
+            Bring an existing memory vault (Memory/ + Daily/ notes) into this agent’s folder and
+            index it. Use this to port an agent to a new machine, or give a fresh agent a past.
+            Additive — it never deletes existing notes.
+          </span>
+          <div>
+            <Button variant="secondary" onClick={importMemory} disabled={importBusy || !folder}>
+              {importBusy ? "Importing & indexing…" : "📥 Import memory folder…"}
+            </Button>
+          </div>
+          {importMsg && <span style={{ ...hint, fontSize: 12, color: importMsg.startsWith("Import failed") ? "var(--danger)" : "var(--accent)" }}>{importMsg}</span>}
+          {!folder && <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Set the agent’s folder first.</span>}
         </div>
 
         <div style={{ display: "flex", gap: 8 }}>

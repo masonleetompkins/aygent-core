@@ -177,6 +177,87 @@ fn onboarding_finish() -> Result<(), String> {
     Ok(())
 }
 
+/// IMPORT MEMORY (2026-07-31): one-click port of an existing memory bundle into
+/// an agent's folder, then auto-ingest. This is the AYGENT-native "restore me /
+/// bring my memory" flow — no terminal. The user picks a source folder (e.g. a
+/// CleoPort bundle or an existing Obsidian vault); we copy its Memory/, Daily/,
+/// and _index/ layers INTO the agent's jailed folder, then run the same
+/// memory_ingest read-path so retrieval + graph expansion light up immediately.
+///
+/// Safety: copy is additive (never deletes the agent's existing notes); we only
+/// bring the recognized memory layers, not arbitrary files. The destination is
+/// the agent's own folder (already its jail).
+#[tauri::command]
+async fn import_memory(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, writer::Db>,
+    agent_id: String,
+    agent_folder: String,
+) -> Result<serde_json::Value, String> {
+    // 1. Pick the SOURCE folder (native picker, off the main thread).
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.dialog().file().pick_folder(move |chosen| { let _ = tx.send(chosen); });
+    let chosen = tokio::task::spawn_blocking(move || rx.recv().ok().flatten())
+        .await.map_err(|e| e.to_string())?;
+    let Some(fp) = chosen else { return Ok(serde_json::json!({ "cancelled": true })) };
+    let src = fp.into_path().map_err(|e| e.to_string())?;
+    let dst = std::path::PathBuf::from(&agent_folder);
+    if !dst.is_dir() {
+        return Err(format!("agent folder does not exist: {agent_folder}"));
+    }
+
+    // 2. Copy the recognized memory LAYERS (Memory/, Daily/) additively. If the
+    //    source IS a layer root (has Memory/ or Daily/), copy those; otherwise
+    //    treat the whole picked folder as a Memory/ drop-in.
+    let mut copied = 0usize;
+    let layers = ["Memory", "Daily"];
+    let has_layers = layers.iter().any(|l| src.join(l).is_dir());
+    if has_layers {
+        for layer in layers {
+            let s = src.join(layer);
+            if s.is_dir() {
+                copied += copy_dir_recursive(&s, &dst.join(layer))?;
+            }
+        }
+    } else {
+        // No layer structure — import the whole folder as the Memory layer.
+        copied += copy_dir_recursive(&src, &dst.join("Memory"))?;
+    }
+
+    // 3. Auto-ingest so retrieval + graph expansion light up now.
+    let embed_model = ensure_embed_model(&app).await?;
+    let report = memory::ingest_vault(&db, "agent", &agent_id, &dst, &embed_model, "").await?;
+
+    Ok(serde_json::json!({
+        "cancelled": false,
+        "files_copied": copied,
+        "source": src.to_string_lossy(),
+        "ingest": report,
+    }))
+}
+
+/// Recursively copy a directory's .md files into `dst` (created if missing).
+/// Additive: never deletes; overwrites same-named files (re-import = refresh).
+/// Returns the count of files copied. Skips dotfiles + non-markdown noise.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<usize, String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
+    let mut n = 0;
+    for entry in std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))? {
+        let entry = entry.map_err(|e| format!("entry: {e}"))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.') { continue; } // skip dotfiles/.aygent
+        if path.is_dir() {
+            n += copy_dir_recursive(&path, &dst.join(&name))?;
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            std::fs::copy(&path, dst.join(&name)).map_err(|e| format!("copy {}: {e}", path.display()))?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 /// PRO MODE: read whether shell.exec is enabled for a folder's agent. GUI-only
 /// (no config files) — stored per-folder like browser-policy.
 #[tauri::command]
@@ -3613,7 +3694,7 @@ pub fn run() {
             pro_mode_get, pro_mode_set, shell_procs, shell_kill_proc,
             github_git_auth,
             onboarding_status, onboarding_pick_root, onboarding_set_root,
-            onboarding_make_agent_home, onboarding_finish
+            onboarding_make_agent_home, onboarding_finish, import_memory
         ])
         .setup(move |_app| {
             // ENGINE-CEF (Phase 1): CEF was ALREADY initialized at the top of
