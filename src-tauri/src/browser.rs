@@ -1744,14 +1744,24 @@ pub async fn webview_open(
             crate::cef_geometry::set_main_webview_transparent(&wv);
         }
         let content_h = client_height.filter(|v| *v > 0.0).unwrap_or(height + y);
-        let ptr = crate::cef_geometry::ensure_wrapper(&parent_window, tid, (x, y, width, height));
-        let parent_ptr = ptr.unwrap_or(std::ptr::null_mut());
-        crate::cef_geometry::set_wrapper_hidden(tid, false);
-        crate::cef_geometry::front_wrapper(tid);
-        crate::cef_geometry::place_wrapper(tid, x, y, width, height, Some(content_h));
         note_active_tab_url(tid, &target);
-        crate::cef_engine::create_or_navigate(tid, target.clone(), parent_ptr, 0, 0, width as i32, height as i32);
-        eprintln!("[aygent][cef] webview_open (CEF) tab={tid} url={target}");
+        // ALL AppKit wrapper work MUST run on the MAIN THREAD (webview_open runs
+        // on a Tauri worker thread -> MainThreadMarker::new() was None -> wrapper
+        // never created -> parent_view=0x0 -> CEF spawned its own window). Hop
+        // onto the main thread, create/position the wrapper there, get its
+        // NSView pointer, then create the CEF browser parented into it.
+        let target_c = target.clone();
+        let pw = parent_window.clone();
+        let _ = app.run_on_main_thread(move || {
+            let ptr = crate::cef_geometry::ensure_wrapper(&pw, tid, (x, y, width, height));
+            let parent_ptr = ptr.unwrap_or(std::ptr::null_mut());
+            // Transparency also needs main thread; do it here alongside.
+            crate::cef_geometry::set_wrapper_hidden(tid, false);
+            crate::cef_geometry::front_wrapper(tid);
+            crate::cef_geometry::place_wrapper(tid, x, y, width, height, Some(content_h));
+            crate::cef_engine::create_or_navigate(tid, target_c.clone(), parent_ptr, 0, 0, width as i32, height as i32);
+            eprintln!("[aygent][cef] webview_open (CEF, main-thread) tab={tid} parent={parent_ptr:?} url={target_c}");
+        });
         return Ok(());
     }
 
