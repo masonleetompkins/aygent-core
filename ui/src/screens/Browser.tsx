@@ -807,13 +807,20 @@ export function Browser() {
             pointer-events:none OVERLAY rendered on top (below), whose rounded
             corners mask the webview's square corners. Both are driven by the
             same measured rect, so they stay locked at every window size. */}
+        {/* PANE: background TRANSPARENT so the native browser (WKWebView float
+            OR the CEF punchout view behind) shows through. An opaque bg here
+            occludes the CEF wrapper NSView that sits behind the React layer. */}
         <div ref={paneRef} style={{
           flex: 1, minWidth: 0, minHeight: 0, height: "100%", position: "relative",
-          borderRadius: "var(--radius-card)", background: "var(--bg)", overflow: "hidden",
+          borderRadius: "var(--radius-card)", background: "transparent", overflow: "hidden",
         }}>
-          <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", fontSize: 14, pointerEvents: "none" }}>
-            Click the tab to type a URL, or search.
-          </div>
+          {/* Placeholder only BEFORE a page is opened; once opened it must NOT
+              paint over the punchout hole. */}
+          {!active?.opened && (
+            <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-faint)", fontSize: 14, pointerEvents: "none" }}>
+              Click the tab to type a URL, or search.
+            </div>
+          )}
           {/* (Permission prompt moved INTO the Agent panel — answer inline
               without switching to You.) */}
           {/* ROUNDED FRAME OVERLAY — sits ON TOP of the native webview. Just an
