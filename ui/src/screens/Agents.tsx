@@ -95,6 +95,7 @@ export function Agents({
         initial={editing}
         pendingFolder={pendingFolder}
         onPickFolder={onPickFolder}
+        onRosterChange={onRosterChange}
         onDone={async (saved) => {
           setCreating(false); setEditing(null);
           await refresh();
@@ -147,13 +148,16 @@ export function Agents({
 }
 
 function AgentForm({
-  initial, pendingFolder, onPickFolder, onDone, onCancel,
+  initial, pendingFolder, onPickFolder, onDone, onCancel, onRosterChange,
 }: {
   initial: AgentProfile | null;
   pendingFolder: string | null;
   onPickFolder: () => void;
   onDone: (saved: AgentProfile | null) => void;
   onCancel: () => void;
+  // Fired when ensureSaved() auto-creates a draft agent so the rail shows the
+  // new chip immediately (threaded from the parent Agents component).
+  onRosterChange?: () => void;
 }) {
   const [name, setName] = useState(initial?.name ?? "");
   const [icon, setIcon] = useState(initial?.icon ?? "🤖");
