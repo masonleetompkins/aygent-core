@@ -155,7 +155,9 @@ export function AgentForm({
 }: {
   initial: AgentProfile | null;
   pendingFolder: string | null;
-  onPickFolder: () => void;
+  // Optional `name` arg so onboarding can DERIVE the agent home (<root>/<Name>/)
+  // from the current name. The in-app native picker ignores the arg.
+  onPickFolder: (name?: string) => void;
   onDone: (saved: AgentProfile | null) => void;
   onCancel: () => void;
   // Fired when ensureSaved() auto-creates a draft agent so the rail shows the
