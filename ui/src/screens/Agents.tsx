@@ -172,22 +172,55 @@ function AgentForm({
       .then((a) => setSharedWith(a || [])).catch(() => setSharedWith([]));
   }, [folder, initial?.id]);
 
+  // The agent's live id. Starts from `initial` (edit) or null (create). When a
+  // create-form action needs a saved agent (Generate Soul / attach a document),
+  // ensureSaved() auto-creates the draft ONCE and stashes the id here, so those
+  // features work in a brand-new agent without a manual Save first (bug: they
+  // were dead in the create form because they gated on initial?.id).
+  const [savedId, setSavedId] = useState<string | null>(initial?.id ?? null);
+  const savingDraftRef = useRef<Promise<string | null> | null>(null);
+
   // M1.4 #4: per-agent context documents (uploaded reference files).
   const [ctxDocs, setCtxDocs] = useState<Array<{ id: number; filename: string; bytes: number; char_count: number }>>([]);
   const [ctxBusy, setCtxBusy] = useState(false);
   async function loadCtx() {
-    if (!initial?.id) { setCtxDocs([]); return; }
-    try { setCtxDocs(await invoke("agent_context_list", { agentId: initial.id }) || []); } catch { setCtxDocs([]); }
+    const id = savedId;
+    if (!id) { setCtxDocs([]); return; }
+    try { setCtxDocs(await invoke("agent_context_list", { agentId: id }) || []); } catch { setCtxDocs([]); }
   }
-  useEffect(() => { void loadCtx(); /* eslint-disable-next-line */ }, [initial?.id]);
+  useEffect(() => { void loadCtx(); /* eslint-disable-next-line */ }, [savedId]);
+
+  // Ensure a draft agent exists (create-form actions need an id). Idempotent:
+  // returns the existing id if already saved, otherwise creates once (guarded by
+  // a ref so rapid double-clicks don't create two). Requires a name.
+  async function ensureSaved(): Promise<string | null> {
+    if (savedId) return savedId;
+    if (!name.trim()) return null;
+    if (savingDraftRef.current) return savingDraftRef.current;
+    const p = (async () => {
+      try {
+        const created = await invoke<AgentProfile>("agents_create", {
+          name: name.trim(), icon, color, folderPath: folder, model, provider,
+          contextMode: "isolated", systemPrompt,
+        });
+        setSavedId(created.id);
+        onRosterChange?.(); // new chip appears in the rail immediately
+        return created.id;
+      } catch { return null; }
+      finally { savingDraftRef.current = null; }
+    })();
+    savingDraftRef.current = p;
+    return p;
+  }
   async function uploadCtx(file: File) {
-    if (!initial?.id) return;
+    const id = await ensureSaved();
+    if (!id) return;
     setCtxBusy(true);
     try {
       const buf = new Uint8Array(await file.arrayBuffer());
       let bin = ""; for (let i = 0; i < buf.length; i++) bin += String.fromCharCode(buf[i]);
       const b64 = btoa(bin);
-      await invoke("agent_context_add", { agentId: initial.id, filename: file.name, bytesB64: b64 });
+      await invoke("agent_context_add", { agentId: id, filename: file.name, bytesB64: b64 });
       await loadCtx();
     } catch { /* surfaced via reload */ }
     finally { setCtxBusy(false); }
@@ -233,10 +266,11 @@ function AgentForm({
   const [soulBusy, setSoulBusy] = useState(false);
   const [soulErr, setSoulErr] = useState<string | null>(null);
   async function generateSoul() {
-    if (!initial?.id) { setSoulErr("Save the agent first, then generate its soul."); return; }
+    const id = await ensureSaved();
+    if (!id) { setSoulErr("Give the agent a name first."); return; }
     setSoulBusy(true); setSoulErr(null);
     try {
-      const soul = await invoke<string>("agent_generate_soul", { agentId: initial.id, brief: soulBrief });
+      const soul = await invoke<string>("agent_generate_soul", { agentId: id, brief: soulBrief });
       setSystemPrompt(soul); // drop it into the editable field so the user can tweak before Save
     } catch (e) { setSoulErr(String(e)); }
     finally { setSoulBusy(false); }
@@ -407,6 +441,19 @@ function AgentForm({
                 <Input value={model} onChange={(e) => setModel(e.target.value)} mono
                   placeholder={localLoading ? "scanning…" : "path to .gguf (none downloaded yet)"} />
               )
+            ) : provider === "openrouter" ? (
+              // OpenRouter has THOUSANDS of models — a dropdown is unusable. Let
+              // the user paste the exact model id (the “author/model” slug shown
+              // on openrouter.ai, e.g. anthropic/claude-3.5-sonnet). A datalist
+              // offers the fetched list as suggestions without forcing a pick.
+              <>
+                <Input value={model} onChange={(e) => setModel(e.target.value)} mono
+                  list="openrouter-models"
+                  placeholder="paste a model id, e.g. anthropic/claude-3.5-sonnet" />
+                <datalist id="openrouter-models">
+                  {models.map((m) => <option key={m} value={m} />)}
+                </datalist>
+              </>
             ) : (
               <select
                 value={model}
@@ -429,6 +476,11 @@ function AgentForm({
             )}
             {provider === "local" && localModels.length > 0 && (
               <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Downloaded models on this Mac.</span>
+            )}
+            {provider === "openrouter" && (
+              <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>
+                Paste the model id from openrouter.ai (the “author/model” slug). Suggestions come from the live list; leave blank for Auto.
+              </span>
             )}
           </label>
         </div>
