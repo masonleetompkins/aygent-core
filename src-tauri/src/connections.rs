@@ -99,6 +99,48 @@ pub fn provider_enabled_for_agent(db: &Db, agent_id: &str, provider: &str) -> bo
     ).optional().ok().flatten().unwrap_or(false)
 }
 
+/// SELF-HOSTED BUILD: resolve a GitHub PAT + login for `git push`/`git pull`.
+/// Prefers a connection enabled for `agent_id`; falls back to ANY connected
+/// GitHub connection (Mason's personal harness — one login is the norm). Returns
+/// (token, login). Used by github_git_auth to seed the osxkeychain git helper.
+pub fn resolve_github_push_token(db: &Db, agent_id: Option<&str>) -> Result<(String, String), String> {
+    // Try the per-agent path first when we have an agent id.
+    if let Some(aid) = agent_id {
+        if let Ok((tok, _id)) = token_for_agent_provider(db, aid, "github") {
+            let login = github_login_for(db)?;
+            return Ok((tok, login));
+        }
+    }
+    // Fall back to the first connected GitHub connection.
+    let key_ref: String = {
+        let conn = db.reader()?;
+        conn.query_row(
+            "SELECT key_ref FROM connection WHERE provider='github' AND status='connected' \
+             ORDER BY updated_at DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        ).optional().map_err(|e| format!("resolve github: {e}"))?
+         .ok_or("no connected GitHub account — connect one in Connections first")?
+    };
+    let token = read_token(&key_ref, "token")?;
+    // key_ref is "github-<login>"; strip the prefix for the login.
+    let login = key_ref.strip_prefix("github-").unwrap_or(&key_ref).to_string();
+    Ok((token, login))
+}
+
+/// The login of the most-recently-updated connected GitHub connection.
+fn github_login_for(db: &Db) -> Result<String, String> {
+    let conn = db.reader()?;
+    let key_ref: String = conn.query_row(
+        "SELECT key_ref FROM connection WHERE provider='github' AND status='connected' \
+         ORDER BY updated_at DESC LIMIT 1",
+        [],
+        |r| r.get(0),
+    ).optional().map_err(|e| format!("github login: {e}"))?
+     .ok_or("no connected GitHub account")?;
+    Ok(key_ref.strip_prefix("github-").unwrap_or(&key_ref).to_string())
+}
+
 /// Resolve the live bearer token for a provider enabled on this agent (reads the
 /// keychain via the connection's key_ref). Returns (token, connection_id).
 fn token_for_agent_provider(db: &Db, agent_id: &str, provider: &str) -> Result<(String, i64), String> {

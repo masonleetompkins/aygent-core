@@ -216,6 +216,7 @@ pub enum ExecError {
     Spawn(String),
     NotFound,
     Io(String),
+    Denied(String),
 }
 
 impl std::fmt::Display for ExecError {
@@ -225,8 +226,49 @@ impl std::fmt::Display for ExecError {
             ExecError::Spawn(e) => write!(f, "spawn failed: {e}"),
             ExecError::NotFound => write!(f, "unknown process handle"),
             ExecError::Io(e) => write!(f, "io: {e}"),
+            ExecError::Denied(e) => write!(f, "refused: {e}"),
         }
     }
+}
+
+/// GUI-launch denylist (Atlas self-hosted-build §2). Returns Some(reason) if this
+/// argv would open a window / relaunch the app, None if it's safe. Argv-based on
+/// purpose — the environment can't stop macOS from making a window, this can.
+fn gui_launch_denied(program: &str, args: &[String]) -> Option<String> {
+    // normalize the program to its basename (handles /usr/bin/open, ./cargo, etc.)
+    let prog = std::path::Path::new(program)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    let lower: Vec<String> = args.iter().map(|a| a.to_ascii_lowercase()).collect();
+
+    // `cargo tauri dev` / `cargo tauri-cli dev` / `tauri dev` — opens the app window.
+    // Allow `cargo tauri build` + `cargo build` (produce binaries, no window).
+    let mentions = |needle: &str| lower.iter().any(|a| a == needle);
+    if (prog == "cargo" && mentions("tauri") && mentions("dev"))
+        || (prog == "tauri" && mentions("dev"))
+        || (prog == "cargo-tauri" && mentions("dev"))
+        || (prog == "npm" && (mentions("tauri") && lower.iter().any(|a| a.contains("dev"))))
+    {
+        return Some(
+            "`tauri dev` opens a GUI window and would relaunch the app hosting you. \
+             Use `cargo build --release` or `cargo tauri build` to PRODUCE a binary; \
+             Mason launches the staging app himself."
+                .into(),
+        );
+    }
+
+    // `open` / `open -a` targeting an app or bundle — launches a GUI app.
+    if prog == "open" {
+        return Some(
+            "`open` launches a GUI app. You produce binaries and run headless smoke \
+             tests; Mason opens windows."
+                .into(),
+        );
+    }
+
+    None
 }
 
 impl ExecBroker {
@@ -246,6 +288,15 @@ impl ExecBroker {
         program: &str,
         args: &[String],
     ) -> Result<serde_json::Value, ExecError> {
+        // SAFETY KEYSTONE (Atlas self-hosted-build §2): the DEV agent must never
+        // launch a GUI — that's how it would relaunch/replace the very app hosting
+        // it (the footgun that locks Mason out of his repair tool). We reject at
+        // the ONE spawn chokepoint, argv-based, so it doesn't depend on the LLM
+        // behaving. `cargo build`/`cargo tauri build` are fine (produce binaries);
+        // `cargo tauri dev` (opens a window) + `open`/`open -a` an .app are banned.
+        if let Some(reason) = gui_launch_denied(program, args) {
+            return Err(ExecError::Denied(reason));
+        }
         let handle = new_handle();
 
         // Log file lives inside the agent folder's .aygent dir (same place Save

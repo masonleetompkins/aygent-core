@@ -102,6 +102,61 @@ fn pro_mode_set(app: tauri::AppHandle, folder: String, enabled: bool) -> Result<
     Ok(enabled)
 }
 
+/// PRO MODE / SELF-HOSTED BUILD: seed macOS git credentials from a connected
+/// GitHub PAT so `git push`/`git pull` authenticate WITHOUT the token ever
+/// entering the repo OR the scrubbed child env.
+///
+/// HOW (Atlas §4, the env-scrub-safe path): we configure git's built-in
+/// `osxkeychain` credential helper globally, then store the PAT into the LOGIN
+/// KEYCHAIN under `https://github.com` via `git credential-osxkeychain store`.
+/// From then on, ANY `git push` in ANY checkout (incl. a Pro-Mode-spawned one)
+/// asks the osxkeychain helper, which reads the login keychain directly — the
+/// token is NOT in .git/config, NOT in a remote URL, and NOT in AYGENT's env
+/// whitelist, so the exec broker's child-env scrub can't leak it. This runs on
+/// the PRIVILEGED Rust side (the daemon is jailed); the token comes from AYGENT's
+/// own keychain connection store, decoded here only to hand to git's helper.
+#[tauri::command]
+async fn github_git_auth(
+    db: tauri::State<'_, writer::Db>,
+    agent_id: Option<String>,
+) -> Result<String, String> {
+    // Pull the PAT + login from the connected GitHub connection (any enabled one
+    // for this agent, else the first connected github connection).
+    let (token, login) = connections::resolve_github_push_token(&db, agent_id.as_deref())?;
+
+    // 1. Set the credential helper globally to osxkeychain (idempotent).
+    let set = std::process::Command::new("git")
+        .args(["config", "--global", "credential.helper", "osxkeychain"])
+        .output()
+        .map_err(|e| format!("git config: {e}"))?;
+    if !set.status.success() {
+        return Err(format!("git config failed: {}", String::from_utf8_lossy(&set.stderr)));
+    }
+
+    // 2. Feed the credential to the osxkeychain helper's `store` on stdin. The
+    //    protocol is a blank-line-terminated key=value block.
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("git")
+        .args(["credential-osxkeychain", "store"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn credential helper: {e}"))?;
+    {
+        let stdin = child.stdin.as_mut().ok_or("no stdin to credential helper")?;
+        let block = format!(
+            "protocol=https\nhost=github.com\nusername={login}\npassword={token}\n\n"
+        );
+        stdin.write_all(block.as_bytes()).map_err(|e| format!("write cred: {e}"))?;
+    }
+    let out = child.wait_with_output().map_err(|e| format!("cred helper: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("credential store failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(format!("git push/pull authenticated as @{login} (stored in macOS Keychain)."))
+}
+
 /// PRO MODE: list running/known shell processes (for the UI process panel).
 #[tauri::command]
 fn shell_procs() -> serde_json::Value {
@@ -3455,7 +3510,8 @@ pub fn run() {
             github_connect, connections_list, connection_disconnect,
             connection_set_agent_enabled, connection_enabled_for_agent,
             memory_get_auto_remember, memory_set_auto_remember,
-            pro_mode_get, pro_mode_set, shell_procs, shell_kill_proc
+            pro_mode_get, pro_mode_set, shell_procs, shell_kill_proc,
+            github_git_auth
         ])
         .setup(move |_app| {
             // ENGINE-CEF (Phase 1): CEF was ALREADY initialized at the top of
