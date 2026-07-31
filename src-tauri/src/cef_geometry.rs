@@ -152,7 +152,10 @@ pub fn set_main_webview_transparent(webview: &tauri::Webview) {
 /// parent the CEF browser into. Must be called on the main thread (Tauri
 /// command handlers run on the main thread on macOS via run_on_main).
 pub fn ensure_wrapper(window: &tauri::Window, tab_id: i64, frame: (f64, f64, f64, f64)) -> Option<*mut std::ffi::c_void> {
-    let mtm = MainThreadMarker::new()?;
+    let Some(mtm) = MainThreadMarker::new() else {
+        eprintln!("[aygent][cef] ensure_wrapper: NOT on main thread -> wrapper NOT created (parent_view will be null)");
+        return None;
+    };
     // Already have one?
     if let Ok(map) = wrappers().lock() {
         if let Some(e) = map.get(&tab_id) {
