@@ -15,6 +15,8 @@ mod browser;
 mod cef_engine;
 #[cfg(all(target_os = "macos", feature = "engine-cef"))]
 mod cef_geometry;
+#[cfg(all(target_os = "macos", feature = "engine-cef"))]
+pub mod cef_app_mac;
 mod broker;
 mod broker_ws;
 mod history;
