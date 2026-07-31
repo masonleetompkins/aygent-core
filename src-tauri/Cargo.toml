@@ -89,6 +89,11 @@ objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSValue", "NSSt
 # (cornerRadius + masksToBounds). Already in the tree via tauri/wry; declare it
 # directly so NSView::layer()'s CALayer methods are in scope.
 objc2-quartz-core = { version = "0.3", features = ["CALayer", "objc2-core-foundation"] }
+# ENGINE-CEF external message pump: schedule do_message_loop_work() on the main
+# GCD queue (DispatchQueue::main().exec_async) from on_schedule_message_pump_work.
+# Already in the tree transitively via objc2/tao (0.3.1); declare it direct so
+# `use dispatch2::DispatchQueue` resolves. Harmless when engine-cef is off.
+dispatch2 = "0.3"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

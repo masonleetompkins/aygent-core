@@ -198,13 +198,14 @@ pub fn init_early() -> bool {
 
     let settings = Settings {
         no_sandbox: !cfg!(feature = "sandbox") as _,
-        // macOS: multi_threaded_message_loop is Windows-only; leave BOTH loop
-        // flags OFF (the safe macOS baseline the cefsimple example uses). CEF
-        // integrates with the app run loop via CefDoMessageLoopWork / the app's
-        // NSApp loop. (Was multi_threaded_message_loop:1 — suspected cause of the
-        // silent CefInitialize→0; confirming against the working spike's flags.)
+        // macOS: multi_threaded_message_loop is Windows-only (setting it made
+        // CefInitialize fail silently -> 0). We use EXTERNAL MESSAGE PUMP: CEF
+        // calls on_schedule_message_pump_work() when it has queued work, and we
+        // pump do_message_loop_work() on the main GCD queue (see the browser
+        // process handler). This is what makes posted UI-thread tasks (browser
+        // creation) actually run while tao owns the main run loop.
         multi_threaded_message_loop: 0,
-        external_message_pump: 0,
+        external_message_pump: 1,
         remote_debugging_port: port as _,
         browser_subprocess_path: s(&helper),
         framework_dir_path: s(&fw_dir),
@@ -300,6 +301,22 @@ wrap_browser_process_handler! {
             eprintln!("[aygent][cef] context initialized");
             // Nothing to create here — browsers are created per-tab on demand
             // from the FE (webview_open path -> create_browser_for_tab).
+        }
+
+        // EXTERNAL MESSAGE PUMP (the fix for the never-created browser). With
+        // external_message_pump:1, CEF calls this whenever it has queued work
+        // (including our post_task create-jobs), asking us to run
+        // do_message_loop_work() on the MAIN thread after ~delay_ms. tao owns
+        // the main run loop, so we can't call CefRunMessageLoop; instead we
+        // schedule the pump onto the main GCD queue. `delay_ms` is an
+        // optimization hint — pumping promptly is always correct, so we
+        // dispatch async to the main queue (dispatch2, already a dep). This is
+        // what makes create_or_navigate_ui actually execute.
+        fn on_schedule_message_pump_work(&self, _delay_ms: i64) {
+            use dispatch2::DispatchQueue;
+            DispatchQueue::main().exec_async(|| {
+                do_message_loop_work();
+            });
         }
     }
 }
