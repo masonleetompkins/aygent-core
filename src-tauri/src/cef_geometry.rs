@@ -168,11 +168,15 @@ pub fn ensure_wrapper(window: &tauri::Window, tab_id: i64, frame: (f64, f64, f64
     let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(w.max(1.0), h.max(1.0)));
     let wrapper = AygentCefWrapper::new(mtm, rect);
     unsafe {
-        // Add BEHIND everything else (Below the front-most main webview).
+        // Add ABOVE the main webview so the CEF child view fills the transparent
+        // punchout hole FROM THE FRONT. `Below` put it behind the entire WKWebView
+        // (which paints an opaque window even with drawsBackground:NO on the web
+        // content), so it was never visible. The wrapper's hitTest override still
+        // lets overlay clicks fall through to React when an overlay is open.
         let _: () = msg_send![
             &*content,
             addSubview: &*wrapper,
-            positioned: NSWindowOrderingMode::Below,
+            positioned: NSWindowOrderingMode::Above,
             relativeTo: std::ptr::null::<AnyObject>()
         ];
     }
