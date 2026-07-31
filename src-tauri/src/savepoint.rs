@@ -110,19 +110,37 @@ fn open_or_init(root: &Path) -> Result<Repository, String> {
 fn stage_all(repo: &Repository) -> Result<git2::Oid, String> {
     let mut index = repo.index().map_err(|e| format!("index: {e}"))?;
 
-    // Return 0 = add this path, 1 = skip it. Skip our own shadow dir.
-    let mut skip_aygent = |path: &Path, _matched: &[u8]| -> i32 {
+    // Return 0 = add this path, 1 = skip it. Skip our own shadow dir AND anything
+    // the user's .gitignore excludes.
+    //
+    // WHY .gitignore now (2026-07-31, Pro Mode / self-hosted build): once an agent
+    // runs `cargo build` in its folder, `target/` fills with HUNDREDS OF MB of
+    // binary artifacts. Snapshotting that per turn is a disk disaster (Atlas
+    // Risk 2). The user's repo already declares `target/`, `node_modules/`,
+    // `dist/` in .gitignore — so we honor it. `status_should_ignore` consults the
+    // repo's ignore rules (.gitignore + core.excludesfile + info/exclude); we use
+    // the SHADOW repo but point its work-tree at the user's folder, so the user's
+    // .gitignore at the folder root is read. This keeps Save Points lean + fast
+    // and makes self-hosted builds viable. Source files still snapshot normally.
+    let mut filter = |path: &Path, _matched: &[u8]| -> i32 {
         let p = path.to_string_lossy();
-        if p.starts_with(".aygent/") || p == ".aygent" { 1 } else { 0 }
+        if p.starts_with(".aygent/") || p == ".aygent" { return 1; }
+        // Honor .gitignore. status_should_ignore returns Ok(true) => ignored.
+        // On any error, DON'T skip (fail-open to "include") so we never silently
+        // drop a real source file because ignore resolution hiccupped.
+        match repo.status_should_ignore(path) {
+            Ok(true) => 1,
+            _ => 0,
+        }
     };
 
     index
-        .add_all(["*"].iter(), IndexAddOption::DEFAULT, Some(&mut skip_aygent))
+        .add_all(["*"].iter(), IndexAddOption::DEFAULT, Some(&mut filter))
         .map_err(|e| format!("add_all: {e}"))?;
     // Capture deletions too (update_all only touches already-tracked entries, so
     // it can't re-introduce .aygent, but we keep it consistent for safety).
     index
-        .update_all(["*"].iter(), Some(&mut skip_aygent))
+        .update_all(["*"].iter(), Some(&mut filter))
         .map_err(|e| format!("update_all: {e}"))?;
     index.write().map_err(|e| format!("index write: {e}"))?;
     index.write_tree().map_err(|e| format!("write_tree: {e}"))
