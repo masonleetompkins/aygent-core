@@ -11,6 +11,7 @@ import { SavePoints } from "./screens/SavePoints";
 import { Tools } from "./screens/Tools";
 import { Scheduler } from "./screens/Scheduler";
 import { Connections } from "./screens/Connections";
+import { Onboarding } from "./screens/Onboarding";
 import { initTheme, saveTheme, type Mode } from "./lib/theme";
 import { startHeadlessWatcher } from "./lib/turns";
 
@@ -43,6 +44,14 @@ export function App() {
   // delete is reflected everywhere immediately — no app restart. Previously the
   // rail kept showing a deleted agent because nothing told it to re-list.
   const [rosterRefresh, setRosterRefresh] = useState(0);
+  // ONBOARDING gate: null = checking, true = show the wizard (no root configured),
+  // false = normal app. Checked on boot via onboarding_status.
+  const [needsOnboarding, setNeedsOnboarding] = useState<boolean | null>(null);
+  useEffect(() => {
+    invoke<{ needsOnboarding: boolean }>("onboarding_status")
+      .then((r) => setNeedsOnboarding(!!r.needsOnboarding))
+      .catch(() => setNeedsOnboarding(false)); // fail open to the app if the check errors
+  }, []);
 
   // Load the canonical roster order (declared AFTER `screen` so the dep is in
   // scope — TDZ: referencing `screen` above its declaration crashed the module).
@@ -120,6 +129,17 @@ export function App() {
   }
 
   const good = status.kind === "connected";
+
+  // While we don't know onboarding state yet, render nothing (avoids a flash of
+  // the main app before the wizard). Once known, show the wizard OR the app.
+  if (needsOnboarding === null) {
+    return <div style={{ minHeight: "100vh", background: "var(--bg)" }} />;
+  }
+  if (needsOnboarding) {
+    // On finish, re-check status; a set root flips us into the app. A full reload
+    // is the safest way to re-bootstrap the daemon against the new root's SQLite.
+    return <Onboarding onDone={() => { window.location.reload(); }} />;
+  }
 
   // M1.4 parallel UI: viewing an agent no longer changes which agents RUN. We
   // still call agents_set_active (so the primary Chat pane's folder/model track

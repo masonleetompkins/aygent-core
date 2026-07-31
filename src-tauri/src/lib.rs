@@ -20,6 +20,7 @@ pub mod cef_app_mac;
 mod broker;
 mod broker_ws;
 mod exec;      // PRO MODE: the process-spawn broker (shell.exec). Only Rust spawns.
+mod paths;     // CONFIG RELOCATION: root-folder pointer + state-dir seam + onboarding paths.
 mod history;
 mod catalog;
 mod connections;
@@ -77,6 +78,80 @@ fn mint_ws_token() -> String {
 fn daemon_info(state: tauri::State<Arc<DaemonState>>) -> serde_json::Value {
     let port = *state.ws_port.lock().unwrap();
     serde_json::json!({ "port": port, "token": state.ws_token })
+}
+
+// ---------------------------------------------------------------------------
+// ONBOARDING / CONFIG RELOCATION (2026-07-31). The AYGENT root folder is the
+// home; app-support holds only root.json. These commands drive the first-launch
+// wizard: is onboarding needed? → pick/detect a folder → init or restore → create
+// the first agent with a home subfolder.
+// ---------------------------------------------------------------------------
+
+/// Does the app need onboarding? True when no valid root is configured (missing
+/// pointer OR the pointed-at folder is gone). The UI shows the wizard when true.
+#[tauri::command]
+fn onboarding_status(app: tauri::AppHandle) -> serde_json::Value {
+    match paths::configured_root(&app) {
+        Some(root) => serde_json::json!({
+            "needsOnboarding": false,
+            "root": root.to_string_lossy(),
+        }),
+        None => serde_json::json!({ "needsOnboarding": true, "root": serde_json::Value::Null }),
+    }
+}
+
+/// Native folder picker for onboarding's "choose your AYGENT root" step. Returns
+/// the chosen path + whether it's ALREADY an AYGENT root (has the manifest), so
+/// the wizard can offer RESTORE vs fresh init. Also flags non-empty folders.
+#[tauri::command]
+async fn onboarding_pick_root(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.dialog().file().pick_folder(move |chosen| { let _ = tx.send(chosen); });
+    let chosen = tokio::task::spawn_blocking(move || rx.recv().ok().flatten())
+        .await.map_err(|e| e.to_string())?;
+    let Some(fp) = chosen else { return Ok(serde_json::json!({ "cancelled": true })) };
+    let path = fp.into_path().map_err(|e| e.to_string())?;
+    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+    let existing = paths::is_aygent_root(&canonical);
+    // Is the folder otherwise non-empty (a heads-up before we init in it)?
+    let non_empty = std::fs::read_dir(&canonical)
+        .map(|mut rd| rd.next().is_some())
+        .unwrap_or(false);
+    Ok(serde_json::json!({
+        "cancelled": false,
+        "path": canonical.to_string_lossy(),
+        "existingRoot": existing,
+        "nonEmpty": non_empty,
+    }))
+}
+
+/// Commit the chosen root: init the folder as an AYGENT root (manifest + .aygent
+/// engine bay) if it isn't one already, then write the app-support pointer at it.
+/// Idempotent — pointing at an existing root just RESTORES it (adopts its config).
+/// After this, a restart boots into the root (SQLite loads from <root>/.aygent).
+#[tauri::command]
+fn onboarding_set_root(app: tauri::AppHandle, folder: String) -> Result<serde_json::Value, String> {
+    let root = std::path::PathBuf::from(&folder);
+    if !root.is_dir() {
+        return Err(format!("folder does not exist: {folder}"));
+    }
+    let restored = paths::is_aygent_root(&root);
+    paths::init_root(&root)?;              // safe if already a root (won't overwrite manifest)
+    paths::write_pointer(&app, &root)?;    // flip the pointer LAST
+    eprintln!("[aygent] root set: {} (restored={restored})", root.display());
+    Ok(serde_json::json!({ "ok": true, "root": root.to_string_lossy(), "restored": restored }))
+}
+
+/// Create an agent's HOME skeleton under the root (<root>/<Name>/ + context/,
+/// memory/, .aygent/). Called by onboarding's "first agent" step BEFORE
+/// agents_create so the profile can point folder_path at the home. Returns the
+/// absolute home path the UI passes as the agent's folder.
+#[tauri::command]
+fn onboarding_make_agent_home(app: tauri::AppHandle, name: String) -> Result<String, String> {
+    let root = paths::configured_root(&app)
+        .ok_or("no root configured — set the root folder first")?;
+    let home = paths::init_agent_home(&root, &name)?;
+    Ok(home.to_string_lossy().to_string())
 }
 
 /// PRO MODE: read whether shell.exec is enabled for a folder's agent. GUI-only
@@ -351,12 +426,14 @@ fn reveal_in_finder(
 
 use tauri::Manager;
 
-/// Resolve the app data dir (created if missing). All conversation storage hangs
-/// off this. Fails clearly if the platform dir can't be determined.
+/// Resolve the STATE DIR (created if missing) — where SQLite + JSON stores live.
+/// CONFIG RELOCATION (2026-07-31): this now routes through paths::state_dir,
+/// which returns <root>/.aygent when a root folder is configured (via the
+/// pointer file), else falls back to the OS app-data dir (pre-onboarding). Every
+/// existing `app_data(&app)` call site relocates automatically — this helper is
+/// the single chokepoint. Name kept as `app_data` to avoid churning ~26 sites.
 fn app_data(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
-    let dir = app.path().app_data_dir().map_err(|e| format!("app_data_dir: {e}"))?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir app_data: {e}"))?;
-    Ok(dir)
+    paths::state_dir(app)
 }
 
 /// Resolve the UI's `folder` arg to an agent_id. The frontend still keys chat
@@ -3511,7 +3588,9 @@ pub fn run() {
             connection_set_agent_enabled, connection_enabled_for_agent,
             memory_get_auto_remember, memory_set_auto_remember,
             pro_mode_get, pro_mode_set, shell_procs, shell_kill_proc,
-            github_git_auth
+            github_git_auth,
+            onboarding_status, onboarding_pick_root, onboarding_set_root,
+            onboarding_make_agent_home
         ])
         .setup(move |_app| {
             // ENGINE-CEF (Phase 1): CEF was ALREADY initialized at the top of
@@ -3536,9 +3615,13 @@ pub fn run() {
             // setup so every command that follows sees a ready DB. A failure
             // here is fatal — the app has no state without it.
             {
-                use tauri::Manager;
-                let app_data = _app.handle().path().app_data_dir()
-                    .map_err(|e| format!("app_data_dir: {e}"))?;
+                // CONFIG RELOCATION: the state dir now comes from paths::state_dir
+                // — <root>/.aygent when a root folder is configured (via root.json),
+                // else the OS app-data dir (pre-onboarding / first launch). SQLite
+                // + all JSON stores live there, so the whole config lives WITH the
+                // folder Mason chose (owned + portable), not buried in app-support.
+                let app_data = paths::state_dir(_app.handle())
+                    .map_err(|e| format!("state_dir: {e}"))?;
                 let db = writer::Db::start(app_data.clone())
                     .map_err(|e| format!("db init: {e}"))?;
                 if let Err(e) = migrate_json::run(&db, &app_data) {
