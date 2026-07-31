@@ -130,42 +130,20 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
 
         {step === "agent" && (
           <Card title="3 · Create your first agent">
-            <p style={hint}>Your agent gets its own folder under your home — its soul, memory, and files live there.</p>
-            <label style={fieldLabel}>Name
-              <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Cleo, Work, Research…" />
-            </label>
-            <label style={{ ...fieldLabel, flex: 0 }}>Icon
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 4 }}>
-                {ICONS.slice(0, 10).map((i) => {
-                  const sel = icon === i;
-                  return (
-                    <button key={i} onClick={() => setIcon(i)} title={i} style={{
-                      width: 38, height: 38, borderRadius: "var(--radius-control)", cursor: "pointer",
-                      display: "flex", alignItems: "center", justifyContent: "center",
-                      color: sel ? "var(--accent)" : "var(--text-muted)",
-                      border: sel ? "var(--border-width) solid var(--accent)" : "var(--border-width) solid var(--line)",
-                      background: sel ? "color-mix(in srgb, var(--accent) 10%, var(--bg))" : "var(--bg)",
-                    }}><Icon name={i as IconName} size={19} /></button>
-                  );
-                })}
-              </div>
-            </label>
-            <label style={fieldLabel}>Model
-              <select value={model} onChange={(e) => setModel(e.target.value)} style={selectStyle}>
-                <option value="">Auto (recommended)</option>
-                {models.map((m) => <option key={m} value={m}>{m}</option>)}
-              </select>
-            </label>
-            <label style={fieldLabel}>Soul / instructions <span style={{ fontWeight: 400, color: "var(--text-faint)" }}>(optional)</span>
-              <textarea value={soul} onChange={(e) => setSoul(e.target.value)} rows={3}
-                placeholder="This agent's personality, values & instructions…"
-                style={{ background: "var(--bg)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", color: "var(--text)", padding: "9px 12px", fontSize: 14, resize: "vertical", fontFamily: "inherit" }} />
-            </label>
-            {agentErr && <span style={errStyle}>{agentErr}</span>}
-            <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
-              <Button variant="secondary" onClick={() => setStep("folder")}>Back</Button>
-              <Button onClick={createAgent} disabled={agentBusy || !name.trim()}>{agentBusy ? "Creating…" : "Create & enter AYGENT"}</Button>
-            </div>
+            <p style={hint}>
+              Your agent gets its own folder under your home — its soul, memory, and files live there.
+              This is the same setup you'll use in-app: generate a soul, attach context files, pick a model.
+            </p>
+            {/* Reuse the EXACT in-app agent form (1:1 parity). Its folder defaults
+                to the agent's home under the root via onboarding_make_agent_home;
+                on save it creates the profile + finishes onboarding (restart). */}
+            <AgentForm
+              initial={null}
+              pendingFolder={null}
+              onPickFolder={() => { /* onboarding derives the home folder from the name */ }}
+              onDone={() => onDone()}
+              onCancel={() => setStep("folder")}
+            />
           </Card>
         )}
       </div>
@@ -181,3 +159,4 @@ const selectStyle = {
   border: "var(--border-width) solid var(--line)", background: "var(--bg)", color: "var(--text)",
   width: "100%", boxSizing: "border-box",
 } as const;
+
