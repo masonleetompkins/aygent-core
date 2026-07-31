@@ -576,20 +576,21 @@ fn create_or_navigate_ui(p: PendingCreate) {
     // instead of spawning a top-level window. windowless_rendering_enabled must
     // be 0 for windowed/native embedding. bounds are the child rect inside the
     // parent. ALLOY runtime style supports child-view hosting.
-    let mut window_info = WindowInfo {
+    // ONE clean path: start from a default WindowInfo with ALLOY runtime style,
+    // then set_as_child (the intended API sets parent_view + bounds + the child
+    // flags together). Setting fields manually AND calling set_as_child fought
+    // each other (set_as_child overwrote). windowless_rendering_enabled stays 0
+    // (default) = native windowed child.
+    let window_info = WindowInfo {
         runtime_style: RuntimeStyle::ALLOY,
-        windowless_rendering_enabled: 0,
-        parent_view: parent_handle as *mut std::os::raw::c_void,
-        bounds: Rect { x: p.x, y: p.y, width: p.w, height: p.h },
         ..Default::default()
-    };
-    // Also run set_as_child (belt) so any internal flags it flips are set too.
-    window_info = window_info.set_as_child(
+    }
+    .set_as_child(
         parent_handle,
-        &Rect { x: p.x, y: p.y, width: p.w, height: p.h },
+        &Rect { x: 0, y: 0, width: p.w, height: p.h },
     );
-    eprintln!("[aygent][cef] window_info: parent_view={:?} bounds=({},{} {}x{})",
-        parent_handle, p.x, p.y, p.w, p.h);
+    eprintln!("[aygent][cef] window_info(set_as_child): parent={:?} view={:?} wl={} bounds=(0,0 {}x{})",
+        window_info.parent_view, window_info.view, window_info.windowless_rendering_enabled, p.w, p.h);
     let url = CefString::from(p.url.as_str());
     let settings = BrowserSettings::default();
     let mut client = AygentClient::new();
