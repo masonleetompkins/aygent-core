@@ -38,14 +38,29 @@ export function App() {
   const [mode, setMode] = useState<Mode>("light");
   const [accent, setAccent] = useState("");
   const [keySet, setKeySet] = useState(false);
+  // Bumped whenever the agent roster changes (create/delete/update in the Agents
+  // screen). Both the AgentRail and the roster-order effect key off this, so a
+  // delete is reflected everywhere immediately — no app restart. Previously the
+  // rail kept showing a deleted agent because nothing told it to re-list.
+  const [rosterRefresh, setRosterRefresh] = useState(0);
 
   // Load the canonical roster order (declared AFTER `screen` so the dep is in
   // scope — TDZ: referencing `screen` above its declaration crashed the module).
+  // Re-runs on rosterRefresh so a delete drops the agent from panes/openSet too.
   useEffect(() => {
     invoke<{ agents: AgentProfile[] }>("agents_list")
-      .then((r) => setRosterOrder((r.agents || []).filter((a) => !a.archived).map((a) => a.id)))
+      .then((r) => {
+        const live = (r.agents || []).filter((a) => !a.archived);
+        const liveIds = live.map((a) => a.id);
+        setRosterOrder(liveIds);
+        // Prune any open panes for agents that no longer exist.
+        setOpenSet((prev) => {
+          const next = new Set([...prev].filter((id) => liveIds.includes(id)));
+          return next.size === prev.size ? prev : next;
+        });
+      })
       .catch(() => {});
-  }, [screen]);
+  }, [screen, rosterRefresh]);
 
   useEffect(() => { const t = initTheme(); setMode(t.mode); setAccent(t.accent); }, []);
   // Start the standing watcher for inter-agent (headless) turns so their live
@@ -159,6 +174,7 @@ export function App() {
         openIds={effectivePaneIds}
         onView={onViewAgent}
         onManage={() => setScreen("agents")}
+        refreshKey={rosterRefresh}
       />
       <Sidebar active={screen} onSelect={setScreen} />
       <div style={{ flex: 1, height: "100vh", minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column" }}>
@@ -186,6 +202,7 @@ export function App() {
               onActiveChange={onActiveChange}
               onPickFolder={pickFolder}
               pendingFolder={folder}
+              onRosterChange={() => setRosterRefresh((n) => n + 1)}
             />
           )}
           {screen === "settings" && (

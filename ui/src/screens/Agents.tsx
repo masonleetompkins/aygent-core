@@ -50,11 +50,16 @@ export function Agents({
   onActiveChange,
   onPickFolder,
   pendingFolder,
+  onRosterChange,
 }: {
   activeId: string | null;
   onActiveChange: (a: AgentProfile) => void;
   onPickFolder: () => void;
   pendingFolder: string | null;
+  // Fired whenever the roster changes (create/delete/update) so App can bump the
+  // shared refreshKey — this is what makes the AgentRail re-list immediately
+  // instead of showing a deleted agent until restart.
+  onRosterChange?: () => void;
 }) {
   const [agents, setAgents] = useState<AgentProfile[]>([]);
   const [editing, setEditing] = useState<AgentProfile | null>(null);
@@ -77,7 +82,11 @@ export function Agents({
 
   async function remove(a: AgentProfile) {
     if (agents.length <= 1) return; // keep at least one
-    try { await invoke("agents_delete", { id: a.id }); await refresh(); } catch { /* ignore */ }
+    try {
+      await invoke("agents_delete", { id: a.id });
+      await refresh();
+      onRosterChange?.(); // tell App → AgentRail re-lists, panes prune the deleted agent
+    } catch { /* ignore */ }
   }
 
   if (creating || editing) {
@@ -89,6 +98,7 @@ export function Agents({
         onDone={async (saved) => {
           setCreating(false); setEditing(null);
           await refresh();
+          onRosterChange?.(); // create/edit also changes the rail (new chip / renamed / new icon)
           if (saved) onActiveChange(saved);
         }}
         onCancel={() => { setCreating(false); setEditing(null); }}
@@ -185,6 +195,37 @@ function AgentForm({
   async function removeCtx(id: number) {
     if (!initial?.id) return;
     try { await invoke("agent_context_remove", { agentId: initial.id, id }); await loadCtx(); } catch { /* ignore */ }
+  }
+
+  // PRO MODE (2026-07-31): shell.exec consent for THIS agent's folder. Scary-
+  // honest — flips the folder from zero-shell Folder Mode to "can run programs."
+  // Backed by pro_mode_get/set (writes a per-folder flag; the Rust exec broker
+  // cap-gates authoritatively). Keyed on folder, not agent id, matching the jail.
+  const [proMode, setProMode] = useState(false);
+  const [proBusy, setProBusy] = useState(false);
+  useEffect(() => {
+    if (!folder) { setProMode(false); return; }
+    invoke<boolean>("pro_mode_get", { folder }).then(setProMode).catch(() => setProMode(false));
+  }, [folder]);
+  async function toggleProMode(next: boolean) {
+    if (!folder) return;
+    if (next) {
+      const ok = window.confirm(
+        "Enable Pro Mode for this agent?\n\n" +
+        "This agent will be able to RUN PROGRAMS on your Mac — including build tools, " +
+        "git, and anything on your PATH — rooted in this folder. Commands run from the " +
+        "folder and cannot leave it, secrets are never shared with them, and you can kill " +
+        "any process at any time. But this relaxes the zero-shell guarantee.\n\n" +
+        "Only enable this for an agent you're using to build or run code."
+      );
+      if (!ok) return;
+    }
+    setProBusy(true);
+    try {
+      const saved = await invoke<boolean>("pro_mode_set", { folder, enabled: next });
+      setProMode(saved);
+    } catch { /* ignore */ }
+    finally { setProBusy(false); }
   }
 
   // M1.4 #5: generate a Soul.md (agent authors its own personality/values).
@@ -390,6 +431,30 @@ function AgentForm({
               <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Downloaded models on this Mac.</span>
             )}
           </label>
+        </div>
+
+        {/* PRO MODE consent (scary-honest). Only meaningful once a folder is set. */}
+        <div style={{
+          display: "flex", flexDirection: "column", gap: 8,
+          background: proMode ? "color-mix(in srgb, var(--danger, #ef4444) 8%, var(--surface))" : "var(--surface)",
+          border: `var(--border-width) solid ${proMode ? "color-mix(in srgb, var(--danger, #ef4444) 40%, transparent)" : "var(--line)"}`,
+          borderRadius: "var(--radius-control)", padding: "12px 14px",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>⚡ Pro Mode — run shell commands</div>
+            <label style={{ display: "inline-flex", alignItems: "center", gap: 8, cursor: folder ? "pointer" : "not-allowed", opacity: folder ? 1 : 0.5 }}>
+              <input type="checkbox" checked={proMode} disabled={!folder || proBusy}
+                onChange={(e) => toggleProMode(e.target.checked)} />
+              <span style={{ fontSize: 13 }}>{proMode ? "Enabled" : "Off"}</span>
+            </label>
+          </div>
+          <span style={{ ...hint, fontSize: 12 }}>
+            Lets this agent run programs on your Mac (build tools, git, anything on your PATH),
+            rooted in this folder. Commands can’t leave the folder and your API keys are never
+            shared with them — but this relaxes the zero-shell guarantee. Use it for an agent that
+            builds or runs code (e.g. an “AYGENT Dev” agent).
+          </span>
+          {!folder && <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Pick a folder first.</span>}
         </div>
 
         <label style={fieldLabel}>Custom instructions / Soul

@@ -12,11 +12,15 @@ export class BrokerWsTransport implements BrokerTransport {
   private nextId = 1;
   private pending = new Map<number, (v: any) => void>();
 
-  constructor(port: number, private token: string) {
+  // `caps` are the session's granted capabilities (e.g. ["shell.exec"] for a Pro
+  // Mode agent). They're sent ONCE in the auth frame; the Rust broker binds them
+  // at connect and refuses any exec.* that isn't covered. The daemon cannot
+  // self-assert a cap per-call — this is the whole cap-gate integrity story.
+  constructor(port: number, private token: string, private caps: string[] = []) {
     this.ws = new WebSocket(`ws://127.0.0.1:${port}`);
     this.ready = new Promise((resolve, reject) => {
       const ws = this.ws!;
-      ws.on("open", () => ws.send(JSON.stringify({ type: "auth", token: this.token })));
+      ws.on("open", () => ws.send(JSON.stringify({ type: "auth", token: this.token, caps: this.caps })));
       ws.on("message", (raw) => {
         let msg: any;
         try { msg = JSON.parse(raw.toString()); } catch { return; }

@@ -9,6 +9,7 @@
 
 import { startWsServer } from "./core/ws.js";
 import { BrokerClient } from "./broker/client.js";
+import { ExecBrokerClient } from "./broker/exec-client.js";
 
 // --- WS auth (Atlas C6) --------------------------------------------------
 // The Rust shell generates a random per-session token and injects it via env.
@@ -18,6 +19,10 @@ const WS_TOKEN = process.env.AYGENT_WS_TOKEN;
 const WS_SOCKET = process.env.AYGENT_WS_SOCKET; // prefer a unix socket if provided
 const BROKER_PORT = process.env.AYGENT_BROKER_PORT;   // Rust-hosted broker WS (M0.2b)
 const BROKER_TOKEN = process.env.AYGENT_BROKER_TOKEN;
+// PRO MODE: the session's granted capabilities, comma-separated, injected by the
+// supervisor for the active agent (e.g. "shell.exec"). Bound on the Rust broker
+// at connect; the daemon can't self-grant. Empty/unset = Folder Mode (no exec).
+const AGENT_CAPS = (process.env.AYGENT_AGENT_CAPS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 
 if (!WS_TOKEN) {
   // Fail closed: without the token the daemon has no legitimate client.
@@ -27,14 +32,20 @@ if (!WS_TOKEN) {
 
 async function main() {
   const broker = new BrokerClient(); // talks to the Rust broker; NO local fs
+  const exec = new ExecBrokerClient(); // PRO MODE: talks to the Rust exec broker
 
   // M0.2b: connect to the Rust-hosted broker WS as an authed client, then
   // self-test the jail from the DAEMON side (admit inside, refuse outside).
   if (BROKER_PORT && BROKER_TOKEN) {
     try {
       const { BrokerWsTransport } = await import("./broker/transport.js");
-      const transport = new BrokerWsTransport(Number(BROKER_PORT), BROKER_TOKEN);
+      // Send the session caps in the auth frame so the broker binds shell.exec
+      // (or not) for this connection. The file broker + exec broker share this
+      // one authed transport — one channel, one cap binding.
+      const transport = new BrokerWsTransport(Number(BROKER_PORT), BROKER_TOKEN, AGENT_CAPS);
       broker.attach(transport);
+      exec.attach(transport);
+      console.error(`[aygent] session caps: [${AGENT_CAPS.join(", ") || "folder-mode"}]`);
 
       const inside = await broker.resolve("default", "aygent-selftest.txt", "w");
       const outside = await broker.resolve("default", "/etc/passwd", "r");

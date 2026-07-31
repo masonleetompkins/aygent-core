@@ -19,6 +19,7 @@ mod cef_geometry;
 pub mod cef_app_mac;
 mod broker;
 mod broker_ws;
+mod exec;      // PRO MODE: the process-spawn broker (shell.exec). Only Rust spawns.
 mod history;
 mod catalog;
 mod connections;
@@ -76,6 +77,47 @@ fn mint_ws_token() -> String {
 fn daemon_info(state: tauri::State<Arc<DaemonState>>) -> serde_json::Value {
     let port = *state.ws_port.lock().unwrap();
     serde_json::json!({ "port": port, "token": state.ws_token })
+}
+
+/// PRO MODE: read whether shell.exec is enabled for a folder's agent. GUI-only
+/// (no config files) — stored per-folder like browser-policy.
+#[tauri::command]
+fn pro_mode_get(app: tauri::AppHandle, folder: String) -> Result<bool, String> {
+    Ok(pro_mode_enabled(&app, &folder))
+}
+
+/// PRO MODE: enable/disable shell.exec for a folder's agent. Called by the
+/// scary-honest consent screen. Writes <app_data>/pro-mode/<folderkey>.json.
+/// This is the UX gate; the Rust exec broker cap-gates authoritatively at the WS.
+#[tauri::command]
+fn pro_mode_set(app: tauri::AppHandle, folder: String, enabled: bool) -> Result<bool, String> {
+    let ad = app_data(&app)?;
+    let dir = ad.join("pro-mode");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
+    let path = dir.join(format!("{}.json", folder_key_fnv(&folder)));
+    let body = serde_json::json!({ "enabled": enabled });
+    std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap_or_default())
+        .map_err(|e| format!("write: {e}"))?;
+    eprintln!("[aygent] pro-mode {} for folder {folder}", if enabled { "ENABLED" } else { "disabled" });
+    Ok(enabled)
+}
+
+/// PRO MODE: list running/known shell processes (for the UI process panel).
+#[tauri::command]
+fn shell_procs() -> serde_json::Value {
+    match exec::global() {
+        Some(xb) => xb.list(),
+        None => serde_json::json!({ "ok": true, "procs": [] }),
+    }
+}
+
+/// PRO MODE: kill a running shell process from the UI panel (the always-visible
+/// stop button). Handle comes from shell_procs.
+#[tauri::command]
+fn shell_kill_proc(handle: String, signal: Option<String>) -> Result<(), String> {
+    let xb = exec::global().ok_or("exec broker not initialized")?;
+    xb.kill(&handle, signal.as_deref().unwrap_or("TERM")).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Open the native folder picker, canonicalize the choice, and register it as
@@ -2193,7 +2235,70 @@ fn exec_tool_cfg(
                 Err(e) => (format!("fetch failed: {e}"), true),
             }
         }
+        // PRO MODE SHELL TOOLS (2026-07-31). Gated: exposed to the model ONLY
+        // when the agent holds shell.exec (see agent_tools_for_full). cwd is
+        // ALWAYS the agent's jailed root (exec broker pins it). shell_run is the
+        // 90% one-shot (git/cargo/npm); shell_spawn/poll/kill drive long-lived
+        // processes like `cargo tauri dev`. The daemon can't spawn — only the
+        // exec broker does.
+        "shell_run" | "shell_spawn" | "shell_poll" | "shell_write" | "shell_kill" => {
+            exec_shell_tool(agent_id, name, input)
+        }
         other => (format!("unknown tool: {other}"), true),
+    }
+}
+
+/// PRO MODE: dispatch a shell_* tool through the global exec broker. Returns the
+/// (agent-facing text, is_error) pair like every other tool. The exec broker
+/// pins cwd to the agent's jailed root and scrubs env — the tool just names a
+/// program + args. Output is already bounded by the broker (digest + tail).
+fn exec_shell_tool(agent_id: &str, name: &str, input: &serde_json::Value) -> (String, bool) {
+    let Some(xb) = exec::global() else {
+        return ("shell exec unavailable (exec broker not initialized)".into(), true);
+    };
+    // Resolve the jailed root for cwd-pinning via the file broker's scope.
+    let root = match exec::global_root(agent_id) {
+        Some(r) => r,
+        None => return ("no agent folder set — pick a folder first".into(), true),
+    };
+    let program = input.get("program").and_then(|p| p.as_str())
+        .or_else(|| input.get("cmd").and_then(|p| p.as_str())).unwrap_or("");
+    let args: Vec<String> = input.get("args").and_then(|a| a.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if program.is_empty() && name != "shell_poll" && name != "shell_kill" && name != "shell_write" {
+        return (format!("{name} needs a `program`"), true);
+    }
+    let handle = input.get("proc_handle").and_then(|h| h.as_str()).unwrap_or("");
+
+    let result = match name {
+        "shell_run" => {
+            let timeout_ms = input.get("timeout_ms").and_then(|t| t.as_u64()).unwrap_or(120_000);
+            xb.run(&root, program, &args, timeout_ms)
+        }
+        "shell_spawn" => xb.spawn(&root, program, &args),
+        "shell_poll" => {
+            let cursor = input.get("cursor").and_then(|c| c.as_u64()).unwrap_or(0);
+            xb.poll(handle, cursor, /*tail_only=*/ true)
+        }
+        "shell_write" => {
+            let data = input.get("data").and_then(|d| d.as_str()).unwrap_or("");
+            xb.write_stdin(handle, data)
+        }
+        "shell_kill" => {
+            let signal = input.get("signal").and_then(|s| s.as_str()).unwrap_or("TERM");
+            xb.kill(handle, signal)
+        }
+        _ => Ok(serde_json::json!({ "ok": false, "error": "unknown shell tool" })),
+    };
+    match result {
+        Ok(v) => {
+            // Compact the JSON into readable text for the model: the digest +
+            // tail are what it reasons over, not raw bytes.
+            let is_err = v.get("ok").and_then(|o| o.as_bool()) == Some(false);
+            (serde_json::to_string_pretty(&v).unwrap_or_default(), is_err)
+        }
+        Err(e) => (format!("shell error: {e}"), true),
     }
 }
 
@@ -2310,6 +2415,26 @@ fn agent_tools_for_full(
         }
     }
 
+    // PRO MODE SHELL TOOLS (2026-07-31). Exposed ONLY when this folder's agent
+    // has Pro Mode enabled (the scary-honest consent screen writes the flag).
+    // Fails closed: no flag => no shell tools => Folder Mode (zero-shell). The
+    // Rust exec broker ALSO cap-gates at the WS boundary, so this is the UX
+    // gate; the broker is the authoritative one.
+    if let Some(f) = folder {
+        if pro_mode_enabled(app, f) {
+            for schema in shell_tool_schemas() { tools.push(schema); }
+            extra_instructions.push_str(
+                "\n\nPRO MODE: you can run shell commands, rooted in this folder. Use shell_run \
+                 for one-shot commands (git pull, cargo build, npm run build, tsc) — it returns a \
+                 bounded digest (exit code, error/warning counts, the key error lines, and a short \
+                 tail), NOT the full log. For long-running processes (e.g. `cargo tauri dev`) use \
+                 shell_spawn to start it, shell_poll to check its digest, shell_kill to stop it. \
+                 Commands run from the folder root and cannot leave it. Read the digest's `signal` \
+                 lines to find compiler errors; the full log is on disk if you need to grep it.",
+            );
+        }
+    }
+
     if let (Ok(ad), Some(f)) = (app_data(app), folder) {
         for t in tools_registry::enabled_tools(&ad, f) {
             match t.kind.as_str() {
@@ -2343,6 +2468,68 @@ fn agent_tools_for_full(
 /// Back-compat: the base-only tool set (used where no folder/app context).
 fn agent_tools() -> serde_json::Value {
     serde_json::json!(base_tools())
+}
+
+/// PRO MODE: is shell.exec enabled for this folder's agent? GUI-managed (no
+/// config files) — the scary-honest consent screen writes a flag per folder,
+/// same scheme as browser-policy. Fails closed (missing => false => Folder Mode).
+fn pro_mode_enabled(app: &tauri::AppHandle, folder: &str) -> bool {
+    let Ok(ad) = app_data(app) else { return false; };
+    let path = ad.join("pro-mode").join(format!("{}.json", folder_key_fnv(folder)));
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("enabled").and_then(|e| e.as_bool()))
+        .unwrap_or(false)
+}
+
+/// PRO MODE: the shell tool schemas exposed to the model when Pro Mode is on.
+/// shell_run is the ergonomic 90% case; spawn/poll/write/kill drive long-lived
+/// processes. Output is bounded by the exec broker (digest + tail), never raw.
+fn shell_tool_schemas() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "name": "shell_run",
+            "description": "Run a one-shot shell command from the agent folder root and wait for it to finish. Best for git, cargo build, npm run build, tsc, etc. Returns a BOUNDED digest: exit_code, error/warning counts, the key error lines (`signal`), and a short output tail — not the full log. cwd is pinned to the folder; the command cannot escape it.",
+            "input_schema": { "type": "object", "properties": {
+                "program": { "type": "string", "description": "the executable, e.g. \"git\", \"cargo\", \"npm\"" },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "arguments, e.g. [\"build\"] or [\"pull\"]" },
+                "timeout_ms": { "type": "number", "description": "max wait in ms (default 120000)" }
+            }, "required": ["program"] }
+        }),
+        serde_json::json!({
+            "name": "shell_spawn",
+            "description": "Start a LONG-RUNNING process (e.g. `cargo tauri dev`, a dev server) from the folder root and return a proc_handle immediately. Use shell_poll to watch it, shell_kill to stop it. cwd is pinned to the folder.",
+            "input_schema": { "type": "object", "properties": {
+                "program": { "type": "string" },
+                "args": { "type": "array", "items": { "type": "string" } }
+            }, "required": ["program"] }
+        }),
+        serde_json::json!({
+            "name": "shell_poll",
+            "description": "Check a spawned process by its proc_handle. Returns whether it's still running, the exit_code if done, a running digest (error/warning counts, key `signal` lines), and a short output tail. Poll this to follow a long build without ingesting the whole log.",
+            "input_schema": { "type": "object", "properties": {
+                "proc_handle": { "type": "string" },
+                "cursor": { "type": "number", "description": "only return output after this line index (optional)" }
+            }, "required": ["proc_handle"] }
+        }),
+        serde_json::json!({
+            "name": "shell_write",
+            "description": "Write text to a running process's stdin (e.g. answer a prompt). Identify it by proc_handle.",
+            "input_schema": { "type": "object", "properties": {
+                "proc_handle": { "type": "string" },
+                "data": { "type": "string" }
+            }, "required": ["proc_handle", "data"] }
+        }),
+        serde_json::json!({
+            "name": "shell_kill",
+            "description": "Stop a running process by proc_handle. Sends SIGTERM by default; pass signal \"KILL\" to force.",
+            "input_schema": { "type": "object", "properties": {
+                "proc_handle": { "type": "string" },
+                "signal": { "type": "string", "enum": ["TERM", "KILL"] }
+            }, "required": ["proc_handle"] }
+        }),
+    ]
 }
 
 /// SLICE 4 — per-agent browser DOMAIN POLICY. The agent may only navigate to
@@ -3208,9 +3395,20 @@ pub fn run() {
     // register a DIFFERENT type => 'state not managed'.
     let browser_proc = browser::BrowserProc::new();
 
+    // PRO MODE (2026-07-31): the exec broker — the ONLY code with process-spawn
+    // authority. The daemon (Seatbelt deny-exec) requests spawns over the broker
+    // WS; only THIS spawns. cwd-pinned to the agent scope, env-scrubbed. Managed
+    // as state + handed to broker_ws so exec.* ops resolve against it.
+    let exec_broker = exec::ExecBroker::new();
+    // Install process-wide handles so the synchronous agent-tool dispatch
+    // (exec_tool_cfg → exec_shell_tool) can reach the exec broker + resolve the
+    // jailed root without threading state through every tool call site.
+    exec::install_global(exec_broker.clone(), broker.clone());
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(broker.clone())
+        .manage(exec_broker.clone())
         .manage(state.clone())
         .manage(lanes.clone())
         .manage(drain_signal.clone())
@@ -3256,7 +3454,8 @@ pub fn run() {
             scheduler_reset_counters,
             github_connect, connections_list, connection_disconnect,
             connection_set_agent_enabled, connection_enabled_for_agent,
-            memory_get_auto_remember, memory_set_auto_remember
+            memory_get_auto_remember, memory_set_auto_remember,
+            pro_mode_get, pro_mode_set, shell_procs, shell_kill_proc
         ])
         .setup(move |_app| {
             // ENGINE-CEF (Phase 1): CEF was ALREADY initialized at the top of
@@ -3346,14 +3545,16 @@ pub fn run() {
             }
 
             let broker = broker.clone();
+            let exec_broker = exec_broker.clone();
             let state = state.clone();
             let broker_token = broker_token.clone();
             // Start the Rust-hosted broker WS server (M0.2b), then spawn the
             // daemon, handing it the broker-WS {port, token} so it can connect
             // as an authed client. jailed=false in dev; Seatbelt (jailed=true)
-            // is finalized later in M0.2.
+            // is finalized later in M0.2. The exec broker is passed in so exec.*
+            // ops (Pro Mode) resolve against the same privileged actor.
             tauri::async_runtime::spawn(async move {
-                match broker_ws::start(broker, broker_token.clone()).await {
+                match broker_ws::start(broker, exec_broker, broker_token.clone()).await {
                     Ok(broker_port) => {
                         // M0.2(e): jail ON by default on macOS (deny file+exec
                         // Seatbelt). Override with AYGENT_JAILED=0 for dev if a

@@ -14,6 +14,7 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::broker::{Broker, Mode};
+use crate::exec::ExecBroker;
 
 /// Info the Rust side hands the daemon (via env at spawn) so it can connect.
 pub struct BrokerWsInfo {
@@ -22,8 +23,13 @@ pub struct BrokerWsInfo {
 }
 
 /// Start the broker WS server on loopback:0 (ephemeral). Returns the bound
-/// port; serves for the app lifetime on the tokio runtime.
-pub async fn start(broker: Arc<Broker>, token: String) -> std::io::Result<u16> {
+/// port; serves for the app lifetime on the tokio runtime. The exec broker is
+/// passed in so Pro-Mode `exec.*` ops resolve against the same privileged actor.
+pub async fn start(
+    broker: Arc<Broker>,
+    exec_broker: Arc<ExecBroker>,
+    token: String,
+) -> std::io::Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     eprintln!("[aygent] broker-ws listening 127.0.0.1:{port}");
@@ -31,9 +37,10 @@ pub async fn start(broker: Arc<Broker>, token: String) -> std::io::Result<u16> {
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let broker = broker.clone();
+            let exec_broker = exec_broker.clone();
             let token = token.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_conn(stream, broker, token).await {
+                if let Err(e) = handle_conn(stream, broker, exec_broker, token).await {
                     eprintln!("[aygent] broker-ws conn ended: {e}");
                 }
             });
@@ -46,6 +53,7 @@ pub async fn start(broker: Arc<Broker>, token: String) -> std::io::Result<u16> {
 async fn handle_conn(
     stream: tokio::net::TcpStream,
     broker: Arc<Broker>,
+    exec_broker: Arc<ExecBroker>,
     token: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ws = tokio_tungstenite::accept_async(stream).await?;
@@ -53,6 +61,10 @@ async fn handle_conn(
 
     // First frame MUST be the auth token (Atlas C6 — localhost is not authz).
     let mut authed = false;
+    // PRO MODE: the caps the daemon session declared at auth. The daemon can NOT
+    // self-assert shell.exec per-call — it's bound ONCE here at connect, and the
+    // broker enforces it. A compromised daemon still can't spawn without it.
+    let mut granted_exec = false;
 
     while let Some(msg) = rx.next().await {
         let msg = msg?;
@@ -74,6 +86,14 @@ async fn handle_conn(
                 break; // fail closed
             }
             authed = true;
+            // Bind the session's exec grant AT AUTH TIME. The daemon declares
+            // whether the active agent holds shell.exec (Pro Mode). The broker
+            // records it here and refuses every exec.* if it's false — the daemon
+            // cannot flip it mid-session.
+            granted_exec = v.get("caps")
+                .and_then(|c| c.as_array())
+                .map(|arr| arr.iter().any(|c| c.as_str() == Some("shell.exec")))
+                .unwrap_or(false);
             tx.send(Message::Text(r#"{"type":"auth:ok"}"#.into())).await?;
             continue;
         }
@@ -87,8 +107,97 @@ async fn handle_conn(
             obj["id"] = id;
             tx.send(Message::Text(obj.to_string().into())).await?;
         }
+
+        // PRO MODE: exec ops (spawn/run/poll/write/kill/wait/list). Same reply
+        // envelope + id correlation as broker ops. Cap-gated: refused unless the
+        // session was granted shell.exec at auth.
+        if v.get("type").and_then(|t| t.as_str()) == Some("exec") {
+            let id = v.get("id").cloned().unwrap_or(serde_json::Value::Null);
+            let reply = if !granted_exec {
+                serde_json::json!({
+                    "ok": false,
+                    "error": "shell.exec not granted — enable Pro Mode for this agent"
+                })
+            } else {
+                handle_exec(&broker, &exec_broker, &v)
+            };
+            let mut obj = reply;
+            obj["type"] = serde_json::Value::String("exec:reply".into());
+            obj["id"] = id;
+            tx.send(Message::Text(obj.to_string().into())).await?;
+        }
     }
     Ok(())
+}
+
+/// PRO MODE: dispatch one exec.* op. The cwd is ALWAYS resolved to the agent's
+/// scoped root via broker.root_for (the same fail-closed/stale-bookmark rule as
+/// files) — the daemon can NOT choose an arbitrary cwd. shell.exec is already
+/// verified granted by the caller before we get here.
+fn handle_exec(
+    broker: &Arc<Broker>,
+    exec_broker: &Arc<ExecBroker>,
+    v: &serde_json::Value,
+) -> serde_json::Value {
+    let op = v.get("op").and_then(|o| o.as_str()).unwrap_or("");
+    let agent = v.get("agentId").and_then(|a| a.as_str()).unwrap_or("default");
+
+    // Resolve the jailed root for cwd-pinning. Ops that address an existing
+    // process by handle (poll/write/kill/wait/list) don't need a root.
+    let needs_root = matches!(op, "spawn" | "run");
+    let root = if needs_root {
+        match broker.root_for(agent) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                return serde_json::json!({
+                    "ok": false,
+                    "error": format!("no agent folder: {e:?}")
+                })
+            }
+        }
+    } else {
+        None
+    };
+
+    let program = v.get("program").and_then(|p| p.as_str()).unwrap_or("");
+    let args: Vec<String> = v
+        .get("args")
+        .and_then(|a| a.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let handle = v.get("proc_handle").and_then(|h| h.as_str()).unwrap_or("");
+
+    let result = match op {
+        "spawn" => exec_broker.spawn(root.as_ref().unwrap(), program, &args),
+        "run" => {
+            let timeout_ms = v.get("timeout_ms").and_then(|t| t.as_u64()).unwrap_or(120_000);
+            exec_broker.run(root.as_ref().unwrap(), program, &args, timeout_ms)
+        }
+        "poll" => {
+            let cursor = v.get("cursor").and_then(|c| c.as_u64()).unwrap_or(0);
+            let tail_only = v.get("tail_only").and_then(|t| t.as_bool()).unwrap_or(false);
+            exec_broker.poll(handle, cursor, tail_only)
+        }
+        "write" => {
+            let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
+            exec_broker.write_stdin(handle, data)
+        }
+        "kill" => {
+            let signal = v.get("signal").and_then(|s| s.as_str()).unwrap_or("TERM");
+            exec_broker.kill(handle, signal)
+        }
+        "wait" => {
+            let timeout_ms = v.get("timeout_ms").and_then(|t| t.as_u64()).unwrap_or(120_000);
+            exec_broker.wait(handle, timeout_ms)
+        }
+        "list" => Ok(exec_broker.list()),
+        _ => return serde_json::json!({ "ok": false, "error": "unknown exec op" }),
+    };
+
+    match result {
+        Ok(v) => v,
+        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+    }
 }
 
 /// Execute one broker op via the proven Broker::resolve, then do the actual
