@@ -407,7 +407,7 @@ export function AgentForm({
         <label style={fieldLabel}>Agent Folder (its jail)
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
             <Input value={folder} onChange={(e) => setFolder(e.target.value)} mono placeholder="pick a folder…" />
-            <Button variant="secondary" onClick={onPickFolder}>Pick…</Button>
+            <Button variant="secondary" onClick={() => onPickFolder(name)}>Pick…</Button>
           </div>
           <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>
             This agent can only ever touch files inside this folder.

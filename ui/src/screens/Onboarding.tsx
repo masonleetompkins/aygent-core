@@ -29,6 +29,14 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   const [rootBusy, setRootBusy] = useState(false);
   const [rootErr, setRootErr] = useState<string | null>(null);
 
+  // Step 3 — the agent's derived home folder (<root>/<Name>/). In onboarding you
+  // DON'T pick the agent's jail by hand — it's created under your root from the
+  // agent name. "Pick…" in the reused AgentForm calls back here, which derives +
+  // creates the home and feeds it in via pendingHome. This also drives the
+  // agent-name value the home is based on.
+  const [pendingHome, setPendingHome] = useState<string | null>(null);
+  const [homeErr, setHomeErr] = useState<string | null>(null);
+
   // --- Step 1: save the provider key to the keychain -----------------------
   async function saveKey() {
     if (!apiKey.trim()) { setStep("folder"); return; } // allow skip (e.g. local later)
@@ -134,13 +142,23 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
               Your agent gets its own folder under your home — its soul, memory, and files live there.
               This is the same setup you'll use in-app: generate a soul, attach context files, pick a model.
             </p>
-            {/* Reuse the EXACT in-app agent form (1:1 parity). Its folder defaults
-                to the agent's home under the root via onboarding_make_agent_home;
-                on save it creates the profile + finishes onboarding (restart). */}
+            {homeErr && <span style={errStyle}>{homeErr}</span>}
+            {/* Reuse the EXACT in-app agent form (1:1 parity). The "Pick…" button
+                here doesn't open a native picker — instead it DERIVES the agent's
+                home under your root (<root>/<AgentName>/), creates it, and fills
+                the folder field via pendingHome. Requires a name first. */}
             <AgentForm
               initial={null}
-              pendingFolder={null}
-              onPickFolder={() => { /* onboarding derives the home folder from the name */ }}
+              pendingFolder={pendingHome}
+              onPickFolder={async (name?: string) => {
+                setHomeErr(null);
+                const n = (name ?? "").trim();
+                if (!n) { setHomeErr("Enter the agent's name first — its folder is created from it."); return; }
+                try {
+                  const home = await invoke<string>("onboarding_make_agent_home", { name: n });
+                  setPendingHome(home);
+                } catch (e) { setHomeErr(String(e)); }
+              }}
               onDone={() => onDone()}
               onCancel={() => setStep("folder")}
             />
