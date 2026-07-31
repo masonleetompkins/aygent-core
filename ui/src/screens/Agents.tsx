@@ -147,7 +147,10 @@ export function Agents({
   );
 }
 
-function AgentForm({
+// Exported so ONBOARDING reuses the EXACT same agent-creation form (Generate
+// Soul + context files + provider/model + Pro Mode) — one source of truth, no
+// slimmed duplicate that drifts out of 1:1 parity with the in-app screen.
+export function AgentForm({
   initial, pendingFolder, onPickFolder, onDone, onCancel, onRosterChange,
 }: {
   initial: AgentProfile | null;

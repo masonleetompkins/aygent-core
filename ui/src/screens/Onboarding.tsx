@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Input } from "../components/ui";
-import { Icon, AGENT_ICONS, type IconName } from "../components/Icon";
+import { AgentForm } from "./Agents";
 
 // ONBOARDING (config relocation, 2026-07-31). First-launch wizard:
 //   1) Provider key (or local model)   2) Pick the AYGENT root folder
@@ -14,7 +14,6 @@ import { Icon, AGENT_ICONS, type IconName } from "../components/Icon";
 // path. onDone() → App re-checks onboarding_status and boots into the root.
 
 type Step = "key" | "folder" | "agent";
-const ICONS = AGENT_ICONS;
 
 export function Onboarding({ onDone }: { onDone: () => void }) {
   const [step, setStep] = useState<Step>("key");
@@ -24,21 +23,11 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   const [apiKey, setApiKey] = useState("");
   const [keyBusy, setKeyBusy] = useState(false);
   const [keyErr, setKeyErr] = useState<string | null>(null);
-  const [keySaved, setKeySaved] = useState(false);
 
   // Step 2 — root folder
   const [root, setRoot] = useState<string | null>(null);
   const [rootBusy, setRootBusy] = useState(false);
   const [rootErr, setRootErr] = useState<string | null>(null);
-
-  // Step 3 — first agent
-  const [name, setName] = useState("");
-  const [icon, setIcon] = useState<string>("sparkles");
-  const [model, setModel] = useState("");
-  const [soul, setSoul] = useState("");
-  const [models, setModels] = useState<string[]>([]);
-  const [agentBusy, setAgentBusy] = useState(false);
-  const [agentErr, setAgentErr] = useState<string | null>(null);
 
   // --- Step 1: save the provider key to the keychain -----------------------
   async function saveKey() {
@@ -46,7 +35,6 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
     setKeyBusy(true); setKeyErr(null);
     try {
       await invoke("set_provider_key", { provider, key: apiKey.trim() });
-      setKeySaved(true);
       setStep("folder");
     } catch (e) { setKeyErr(String(e)); }
     finally { setKeyBusy(false); }
@@ -76,40 +64,9 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
     setRootBusy(true); setRootErr(null);
     try {
       await invoke("onboarding_set_root", { folder: root });
-      // load models for the chosen provider now that we're set up
-      await loadModels(provider);
       setStep("agent");
     } catch (e) { setRootErr(String(e)); }
     finally { setRootBusy(false); }
-  }
-
-  async function loadModels(prov: string) {
-    if (prov === "local") { setModels([]); return; }
-    try {
-      const list = prov === "anthropic"
-        ? await invoke<string[]>("anthropic_models")
-        : await invoke<string[]>("openai_models", { provider: prov });
-      setModels(list || []);
-    } catch { setModels([]); }
-  }
-  useEffect(() => { if (step === "agent") void loadModels(provider); /* eslint-disable-next-line */ }, [step]);
-
-  // --- Step 3: create the first agent (home subfolder under root) ----------
-  async function createAgent() {
-    if (!name.trim()) { setAgentErr("Give your agent a name."); return; }
-    setAgentBusy(true); setAgentErr(null);
-    try {
-      // 1. make the agent's home folder under the root (<root>/<Name>/…)
-      const home = await invoke<string>("onboarding_make_agent_home", { name: name.trim() });
-      // 2. create the profile pointing its jail at that home
-      await invoke("agents_create", {
-        name: name.trim(), icon, color: "#5b8cff",
-        folderPath: home, model, provider,
-        contextMode: "isolated", systemPrompt: soul,
-      });
-      onDone(); // done — App boots into the fully set-up root
-    } catch (e) { setAgentErr(String(e)); }
-    finally { setAgentBusy(false); }
   }
 
   return (

@@ -154,6 +154,17 @@ fn onboarding_make_agent_home(app: tauri::AppHandle, name: String) -> Result<Str
     Ok(home.to_string_lossy().to_string())
 }
 
+/// Restart the whole app process. REQUIRED after onboarding sets the root: the
+/// SQLite state spine (writer::Db) is opened ONCE in setup() against the
+/// pre-onboarding app-data path — a UI reload can't re-point it. A real restart
+/// re-runs setup(), which now reads the pointer and opens SQLite from
+/// <root>/.aygent/state.db (the bug: old agents kept showing because the DB
+/// connection was still the app-data one after only a UI reload).
+#[tauri::command]
+fn app_restart(app: tauri::AppHandle) {
+    app.restart();
+}
+
 /// PRO MODE: read whether shell.exec is enabled for a folder's agent. GUI-only
 /// (no config files) — stored per-folder like browser-policy.
 #[tauri::command]
@@ -3590,7 +3601,7 @@ pub fn run() {
             pro_mode_get, pro_mode_set, shell_procs, shell_kill_proc,
             github_git_auth,
             onboarding_status, onboarding_pick_root, onboarding_set_root,
-            onboarding_make_agent_home
+            onboarding_make_agent_home, app_restart
         ])
         .setup(move |_app| {
             // ENGINE-CEF (Phase 1): CEF was ALREADY initialized at the top of

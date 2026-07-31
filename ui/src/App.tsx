@@ -136,9 +136,12 @@ export function App() {
     return <div style={{ minHeight: "100vh", background: "var(--bg)" }} />;
   }
   if (needsOnboarding) {
-    // On finish, re-check status; a set root flips us into the app. A full reload
-    // is the safest way to re-bootstrap the daemon against the new root's SQLite.
-    return <Onboarding onDone={() => { window.location.reload(); }} />;
+    // On finish we must RESTART THE PROCESS, not just reload the UI. The SQLite
+    // state spine (writer::Db) is opened ONCE in Rust setup() against the
+    // pre-onboarding path; a window reload can't re-point that connection, so the
+    // old app-data DB (with old agents) would stay live. app_restart re-runs
+    // setup() which reopens SQLite from <root>/.aygent — the clean root.
+    return <Onboarding onDone={() => { void invoke("app_restart"); }} />;
   }
 
   // M1.4 parallel UI: viewing an agent no longer changes which agents RUN. We
