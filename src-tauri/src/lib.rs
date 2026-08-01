@@ -35,6 +35,7 @@ mod memory;
 mod scheduler;
 mod vault_write;
 mod web;
+mod whisper;
 mod migrate_json;
 mod repo;
 mod writer;
@@ -2595,6 +2596,13 @@ fn builtin_tool_schema(name: &str) -> Option<serde_json::Value> {
                 "output_path": { "type": "string", "description": "e.g. report.pdf" }
             }, "required": ["title", "content", "output_path"] }
         })),
+        "transcribe_audio" => Some(serde_json::json!({
+            "name": "transcribe_audio",
+            "description": "Transcribe an audio file (mp3, wav, m4a, webm, ogg, flac; max 25MB) inside the agent folder to text, using OpenAI Whisper. Requires an OpenAI key in Settings.",
+            "input_schema": { "type": "object", "properties": {
+                "path": { "type": "string", "description": "audio file path relative to the folder root" }
+            }, "required": ["path"] }
+        })),
         "fetch_url" => Some(serde_json::json!({
             "name": "fetch_url",
             "description": "Fetch a web page or API endpoint over HTTPS and return its readable text (HTML is stripped to prose). Use this to read articles, docs, or JSON APIs when you need current information. http(s) only; long pages are truncated.",
@@ -3112,6 +3120,21 @@ async fn agent_stream(
                             Ok(mailbox::SendResult::Refused { reason }) => (format!("not sent: {reason}"), true),
                             Err(e) => (format!("send failed: {e}"), true),
                         }
+                    } else if name == "transcribe_audio" {
+                        let rel = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                        match broker.resolve(&scope_id, rel, broker::Mode::Read) {
+                            Err(e) => (format!("refused by jail: {e:?}"), true),
+                            Ok(abs) => match std::fs::read(&abs) {
+                                Err(e) => (format!("read audio: {e}"), true),
+                                Ok(bytes) => {
+                                    let fname = abs.file_name().and_then(|n| n.to_str()).unwrap_or("audio.mp3").to_string();
+                                    match whisper::transcribe_bytes(bytes, &fname).await {
+                                        Ok(text) => (text, false),
+                                        Err(e) => (e, true),
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         exec_tool_cfg(&broker, &scope_id, &name, &input, &pdf_cfg)
                     };
@@ -3231,6 +3254,23 @@ async fn agent_stream(
                         // Connection tool: token attached Rust-side. Async GitHub
                         // call, so run it directly (we're already in async here).
                         connections::github_list_prs(&db, &scope_id).await
+                    } else if name == "transcribe_audio" {
+                        // Whisper (task #6): resolve the audio THROUGH THE JAIL
+                        // (read mode), then the async API call. Key from Keychain.
+                        let rel = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                        match broker.resolve(&scope_id, rel, broker::Mode::Read) {
+                            Err(e) => (format!("refused by jail: {e:?}"), true),
+                            Ok(abs) => match std::fs::read(&abs) {
+                                Err(e) => (format!("read audio: {e}"), true),
+                                Ok(bytes) => {
+                                    let fname = abs.file_name().and_then(|n| n.to_str()).unwrap_or("audio.mp3").to_string();
+                                    match whisper::transcribe_bytes(bytes, &fname).await {
+                                        Ok(text) => (text, false),
+                                        Err(e) => (e, true),
+                                    }
+                                }
+                            }
+                        }
                     } else {
                     // Run the tool inside catch_unwind so a PANIC (e.g. deep in
                     // genpdf table/render) becomes a VISIBLE tool error the model
@@ -3734,6 +3774,7 @@ pub fn run() {
         .manage(sched_signal.clone())
         .manage(browser_proc)
         .invoke_handler(tauri::generate_handler![
+            whisper::transcribe_audio_b64,
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
             agent_stream, reveal_in_finder, get_selected_model, set_selected_model,

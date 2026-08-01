@@ -44,7 +44,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", 
 tokio-tungstenite = "0.24"         # Rust-hosted broker WS server (M0.2b)
 futures-util = "0.3"
 keyring = { version = "=3.2.1", features = ["apple-native"] }  # API keys in macOS Keychain (M0.3; never touch JS/WebView). PINNED: later 3.x absorbed the keyring-core rewrite which tightened credential validation -> 'Attribute user is invalid: cannot be empty' + changed apple-native target mapping. Commit Cargo.lock so this never drifts.
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }  # Anthropic HTTP (M0.3)
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "multipart"], default-features = false }  # Anthropic HTTP (M0.3)
 git2 = { version = "0.19", default-features = false }  # checkpoints (C4): git object model compiled IN — no system git, zero user setup
 llama-cpp-2 = "0.1"                 # LOCAL MODELS: llama.cpp compiled IN — download + run GGUF models in-app, zero user setup (Metal on mac / CUDA on PC via features below)
 num_cpus = "1"                      # thread count for local inference / perf prediction

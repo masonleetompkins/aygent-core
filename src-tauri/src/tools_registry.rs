@@ -99,6 +99,17 @@ fn builtins() -> Vec<ToolDef> {
             allowed_tools: vec![],
         },
         ToolDef {
+            id: "builtin.whisper".into(),
+            name: "transcribe_audio".into(),
+            display_name: "Whisper Transcription".into(),
+            description: "Transcribe audio files to text with OpenAI Whisper (needs an OpenAI key in \
+                Settings). Powers the mic button too. Args: path (audio file in the agent folder).".into(),
+            kind: "builtin".into(),
+            builtin: true,
+            instructions: String::new(),
+            allowed_tools: vec![],
+        },
+        ToolDef {
             id: "builtin.web".into(),
             name: "fetch_url".into(),
             display_name: "Web Fetch".into(),
