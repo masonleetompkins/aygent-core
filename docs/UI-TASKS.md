@@ -8,7 +8,7 @@
 2. [x] Chat input grows with newlines but COVERS the last message — slide content up
        (scroll-to-bottom when input height changes).
 3. [x] Chat window scrolls horizontally — lock to vertical; text must always wrap to width.
-4. [ ] Browser toggle: move Settings → Tools; rename "AYGENT Browser"; hide sidebar
+4. [x] Browser toggle: move Settings → Tools; rename "AYGENT Browser"; hide sidebar
        entry entirely when disabled.
 5. [ ] Plus (+) button left of chat box: attach ANY file (image/audio/video/etc) as context.
 6. [ ] Whisper transcription Tool (OpenAI API): available when OpenAI key set + enabled in Tools.

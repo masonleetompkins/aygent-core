@@ -5,6 +5,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Input, Pill } from "../components/ui";
+import { AygentBrowser } from "../components/AygentBrowser";
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 const BASE_TOOLS = ["read_file", "write_file", "list_files", "generate_pdf"];
@@ -54,6 +55,9 @@ export function Tools({ folder }: { folder: string | null }) {
       </p>
       {!folder && <Pill tone="muted">Pick an Agent Folder in Settings to enable tools.</Pill>}
       {msg && <Pill tone={msg.startsWith("✗") ? "danger" : "muted"}>{msg}</Pill>}
+
+      {/* AYGENT-branded tools (UI task #4): the browser moved here from Settings. */}
+      <AygentBrowser />
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
         {tools.map((t) => (

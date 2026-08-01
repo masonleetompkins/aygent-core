@@ -15,7 +15,7 @@ export interface NavItem { id: ScreenId; label: string; icon: IconName; enabled:
 //  • "Global"      — app-wide (roster, connectors, app settings)
 export const NAV: NavItem[] = [
   { id: "chat", label: "Chat", icon: "chat", enabled: true, group: "agent" },
-  { id: "browser", label: "Browser", icon: "globe", enabled: true, group: "agent" },
+  { id: "browser", label: "AYGENT Browser", icon: "globe", enabled: true, group: "agent" },
   { id: "tools", label: "Tools", icon: "tools", enabled: true, group: "agent" },
   { id: "scheduler", label: "Scheduler", icon: "scheduler", enabled: true, group: "agent" },
   { id: "savepoints", label: "Save Points", icon: "savepoints", enabled: true, group: "agent" },
@@ -24,7 +24,10 @@ export const NAV: NavItem[] = [
   { id: "settings", label: "Settings", icon: "settings", enabled: true, group: "global" },
 ];
 
-export function Sidebar({ active, onSelect }: { active: ScreenId; onSelect: (id: ScreenId) => void }) {
+export function Sidebar({ active, onSelect, showBrowser }: { active: ScreenId; onSelect: (id: ScreenId) => void; showBrowser: boolean }) {
+  // UI task #4 (Mason 08-01): the browser is a TOOL — no sidebar entry until
+  // it's actually enabled/installed (Tools tab owns the enable flow).
+  const nav = NAV.filter((i) => i.id !== "browser" || showBrowser);
   return (
     <nav style={{
       width: 220, flexShrink: 0, height: "100vh", boxSizing: "border-box",
@@ -36,11 +39,11 @@ export function Sidebar({ active, onSelect }: { active: ScreenId; onSelect: (id:
         AYGENT
       </div>
       <SectionLabel>This Agent</SectionLabel>
-      {NAV.filter((i) => i.group === "agent").map((item) => (
+      {nav.filter((i) => i.group === "agent").map((item) => (
         <NavButton key={item.id} item={item} active={active === item.id} onSelect={onSelect} />
       ))}
       <SectionLabel style={{ marginTop: 14 }}>Global</SectionLabel>
-      {NAV.filter((i) => i.group === "global").map((item) => (
+      {nav.filter((i) => i.group === "global").map((item) => (
         <NavButton key={item.id} item={item} active={active === item.id} onSelect={onSelect} />
       ))}
       <div style={{ marginTop: "auto", padding: "10px", fontSize: 11, color: "var(--text-faint)" }}>
