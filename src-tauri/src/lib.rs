@@ -2570,6 +2570,19 @@ fn send_message_tool() -> serde_json::Value {
     })
 }
 
+/// task_continue (2026-08-01): the agent schedules ITSELF a follow-up turn so
+/// "I'll check back and report" is a real capability, not a broken promise.
+fn task_continue_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "task_continue",
+        "description": "Schedule YOURSELF a follow-up turn after a delay, so you can end this turn and still continue/report later (e.g. poll a long build). You will be woken with your note in a fresh continuation turn that streams live to your chat. Use this whenever you would otherwise say 'I'll check back' — it is the only way to actually do it.",
+        "input_schema": { "type": "object", "properties": {
+            "delay_secs": { "type": "integer", "description": "seconds until wake-up (5-3600, default 60)" },
+            "note": { "type": "string", "description": "note to self: exactly what to check/continue on wake-up (include proc handles, file paths, next steps)" }
+        }, "required": ["note"] }
+    })
+}
+
 /// The JSON schema for a built-in tool by its agent-facing name.
 fn builtin_tool_schema(name: &str) -> Option<serde_json::Value> {
     match name {
@@ -2616,6 +2629,7 @@ fn agent_tools_for_full(
     conn_ctx: Option<(&writer::Db, &str)>,
 ) -> (serde_json::Value, String) {
     let mut tools = base_tools();
+    tools.push(task_continue_tool());
     if has_peers { tools.push(send_message_tool()); }
     let mut extra_instructions = String::new();
 
@@ -3079,7 +3093,18 @@ async fn agent_stream(
                     let args_str = f.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
                     let input: serde_json::Value = serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
                     // M1.4 #7: inter-agent send_message routes through the mailbox.
-                    let (result_text, is_err) = if name == "send_message" {
+                    let (result_text, is_err) = if name == "task_continue" {
+                        let delay = input.get("delay_secs").and_then(|d| d.as_u64()).unwrap_or(60).clamp(5, 3600);
+                        let note = input.get("note").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
+                        if note.is_empty() {
+                            ("task_continue refused: a non-empty note is required (say what to check on wake-up)".to_string(), true)
+                        } else {
+                            match mailbox::enqueue_continue(&db, &scope_id, &note, delay) {
+                                Ok(_) => (format!("wake-up scheduled in {delay}s — end your turn now; you'll be woken with your note"), false),
+                                Err(e) => (format!("task_continue failed: {e}"), true),
+                            }
+                        }
+                    } else if name == "send_message" {
                         let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
                         let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
                         match mailbox::send(&db, &scope_id, to, body, 0) {
@@ -3182,6 +3207,17 @@ async fn agent_stream(
                         // agent_tools_for_full used to expose the tools).
                         let domains = folder.as_deref().map(|f| agent_browser_domains(&app, f)).unwrap_or_default();
                         browser::agent_tool(&app, &browser_state, &name, &input, &domains).await
+                    } else if name == "task_continue" {
+                        let delay = input.get("delay_secs").and_then(|d| d.as_u64()).unwrap_or(60).clamp(5, 3600);
+                        let note = input.get("note").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
+                        if note.is_empty() {
+                            ("task_continue refused: a non-empty note is required (say what to check on wake-up)".to_string(), true)
+                        } else {
+                            match mailbox::enqueue_continue(&db, &scope_id, &note, delay) {
+                                Ok(_) => (format!("wake-up scheduled in {delay}s — end your turn now; you'll be woken with your note"), false),
+                                Err(e) => (format!("task_continue failed: {e}"), true),
+                            }
+                        }
                     } else if name == "send_message" {
                         let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
                         let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
@@ -3366,14 +3402,25 @@ pub async fn run_headless_turn(
     // (Mason 07-28: it composed a great fact then failed trying to reply to
     // scheduler:7). Inter-agent turns keep the reply-capable peer framing.
     let is_scheduled = msg.from_agent.starts_with("scheduler:");
+    let is_continue = msg.from_agent.starts_with("continue:");
 
-    let from_name = if is_scheduled {
+    let from_name = if is_continue {
+        "Continuation".to_string()
+    } else if is_scheduled {
         "Scheduler".to_string()
     } else {
         repo::get_agent(db, &msg.from_agent)?.map(|a| a.name).unwrap_or_else(|| msg.from_agent.clone())
     };
 
-    let framed = if is_scheduled {
+    let framed = if is_continue {
+        format!(
+            "WAKE-UP: you previously called task_continue and asked to resume work. Your note to self:\n\n{}\n\n\
+             Continue the task now: check any processes you started (shell_poll), finish the work, and report \
+             the outcome — this turn streams live to your chat. If you need more time, call task_continue again. \
+             Do NOT use send_message; there is no sender to reply to.",
+            msg.body
+        )
+    } else if is_scheduled {
         format!(
             "This is a SCHEDULED TASK that just fired (no sender to reply to). Do the task, \
              then stop — your output is recorded in your own notes. Do NOT use send_message; \
@@ -3480,7 +3527,18 @@ pub async fn run_headless_turn(
                             let name = blk.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                             let id = blk.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
                             let input = blk.get("input").cloned().unwrap_or(serde_json::json!({}));
-                            let (result_text, is_err) = if name == "send_message" {
+                            let (result_text, is_err) = if name == "task_continue" {
+                                let delay = input.get("delay_secs").and_then(|d| d.as_u64()).unwrap_or(60).clamp(5, 3600);
+                                let note = input.get("note").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
+                                if note.is_empty() {
+                                    ("task_continue refused: a non-empty note is required".to_string(), true)
+                                } else {
+                                    match mailbox::enqueue_continue(db, agent_id, &note, delay) {
+                                        Ok(_) => (format!("wake-up scheduled in {delay}s — end your turn now; you'll be woken with your note"), false),
+                                        Err(e) => (format!("task_continue failed: {e}"), true),
+                                    }
+                                }
+                            } else if name == "send_message" {
                                 let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
                                 let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
                                 // Already sent this exact (to, body) this turn? Ack, don't resend.

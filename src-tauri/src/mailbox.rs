@@ -163,6 +163,33 @@ pub fn send(
     })
 }
 
+/// task_continue (2026-08-01): enqueue a SELF-addressed wake-up, delivered no
+/// earlier than now + delay_secs. Bypasses peer guards deliberately (self-send
+/// is the point); origin sentinel "continue:<epoch_ms_due>" — the drainer skips
+/// it until due, and run_headless_turn frames it as a wake-up, not a peer msg.
+/// Fresh root/budget per continuation chain (cap stops infinite self-loops).
+pub fn enqueue_continue(db: &Db, agent_id: &str, note: &str, delay_secs: u64) -> Result<i64, String> {
+    let due_at = now() + (delay_secs as i64) * 1000;
+    let (agent_s, note_s) = (agent_id.to_string(), note.to_string());
+    db.write(move |c| {
+        let tx = c.transaction().map_err(|e| format!("txn: {e}"))?;
+        tx.execute(
+            "INSERT INTO mailbox (from_agent,to_agent,body,root_id,depth,ancestry,status,created_at)
+             VALUES (?1,?2,?3,0,6,'','pending',?4)",
+            params![format!("continue:{due_at}"), agent_s, note_s, now()],
+        ).map_err(|e| format!("enqueue continue: {e}"))?;
+        let mid = tx.last_insert_rowid();
+        tx.execute("UPDATE mailbox SET root_id = ?1 WHERE id = ?1", params![mid])
+            .map_err(|e| format!("set root: {e}"))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO mailbox_budget (root_id, turns, cap, created_at) VALUES (?1, 0, 12, ?2)",
+            params![mid, now()],
+        ).map_err(|e| format!("init budget: {e}"))?;
+        tx.commit().map_err(|e| format!("commit: {e}"))?;
+        Ok(mid)
+    })
+}
+
 /// Pull the next pending message for a recipient (oldest first), marking it
 /// delivered + incrementing the tree budget, all atomic. Returns None if the
 /// recipient has no pending mail. The caller then runs it as a turn on the
@@ -172,10 +199,15 @@ pub fn take_next_for(db: &Db, to_agent: &str) -> Result<Option<Message>, String>
     let to_s = to_agent.to_string();
     db.write(move |c| {
         let tx = c.transaction().map_err(|e| format!("txn: {e}"))?;
+        // task_continue: a self-wake row encodes its due time in from_agent as
+        // "continue:<epoch_ms>". Skip rows not yet due ('continue:' is 9 chars,
+        // substr is 1-based -> position 10). Other messages are always due.
         let row: Option<(i64, String, String, i64, i64, String)> = tx.query_row(
             "SELECT id, from_agent, body, root_id, depth, ancestry FROM mailbox
-             WHERE to_agent = ?1 AND status = 'pending' ORDER BY id ASC LIMIT 1",
-            params![to_s], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+             WHERE to_agent = ?1 AND status = 'pending'
+               AND (from_agent NOT LIKE 'continue:%' OR CAST(substr(from_agent, 10) AS INTEGER) <= ?2)
+             ORDER BY id ASC LIMIT 1",
+            params![to_s, now()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         ).optional().map_err(|e| format!("take next: {e}"))?;
 
         let Some((id, from_agent, body, root_id, depth, ancestry)) = row else {
@@ -225,7 +257,12 @@ pub fn roster(db: &Db, self_id: &str) -> Result<Vec<(String, String)>, String> {
 pub fn pending_counts(db: &Db) -> Result<Vec<(String, i64)>, String> {
     let conn = db.reader()?;
     let mut stmt = conn.prepare(
-        "SELECT to_agent, COUNT(*) FROM mailbox WHERE status = 'pending' GROUP BY to_agent",
+        // Exclude task_continue wake-ups that aren't due yet (due epoch-ms is
+        // encoded in from_agent after the 9-char 'continue:' prefix) — otherwise
+        // the drainer sees a phantom count and spins on its 1.5s poll.
+        "SELECT to_agent, COUNT(*) FROM mailbox WHERE status = 'pending'
+           AND (from_agent NOT LIKE 'continue:%' OR CAST(substr(from_agent, 10) AS INTEGER) <= strftime('%s','now') * 1000)
+         GROUP BY to_agent",
     ).map_err(|e| format!("prepare counts: {e}"))?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
         .map_err(|e| format!("query counts: {e}"))?;
