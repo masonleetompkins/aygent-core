@@ -1,13 +1,13 @@
 # UI-TASKS — Mason's list, 2026-08-01 (working doc, check off as shipped)
 
-1. [ ] Continuation reports should land IN THE ORIGINATING CHAT (not just Activity).
+1. [x] Continuation reports should land IN THE ORIGINATING CHAT (not just Activity).
        Route: encode conv id in task_continue mailbox body envelope (conv:<id>\n<note>);
        run_headless_turn persists continues to that conv (preserving its title);
        UI reloads the open conv when a headless turn for it completes.
        Compact framing: "⏰ resumed: <note>" instead of "📨 from Continuation: …".
-2. [ ] Chat input grows with newlines but COVERS the last message — slide content up
+2. [x] Chat input grows with newlines but COVERS the last message — slide content up
        (scroll-to-bottom when input height changes).
-3. [ ] Chat window scrolls horizontally — lock to vertical; text must always wrap to width.
+3. [x] Chat window scrolls horizontally — lock to vertical; text must always wrap to width.
 4. [ ] Browser toggle: move Settings → Tools; rename "AYGENT Browser"; hide sidebar
        entry entirely when disabled.
 5. [ ] Plus (+) button left of chat box: attach ANY file (image/audio/video/etc) as context.

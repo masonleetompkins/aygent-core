@@ -133,11 +133,20 @@ export async function startHeadlessWatcher() {
     } else if (a.kind === "turn_done") {
       const cur = slot(a.agentId);
       cur.turn = { ...cur.turn, status: "idle" };
+      // UI task #1: headless/continuation turn persisted messages — bump so
+      // viewing panes reload from disk (Chat.tsx effect).
+      convVersion++;
       const un = headlessUnlisten.get(a.agentId);
       if (un) { try { un(); } catch { /* ignore */ } headlessUnlisten.delete(a.agentId); }
       emit();
     }
   });
+}
+
+// Bumped when a headless turn persists; panes subscribe to reload their conv.
+let convVersion = 0;
+export function useConvVersion(): number {
+  return useSyncExternalStore(subscribe, () => convVersion);
 }
 
 /** The live inbound peer-message for an agent (if a headless turn is mid-flight). */

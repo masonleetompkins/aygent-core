@@ -7,7 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Button } from "../components/ui";
 import { Icon, type IconName } from "../components/Icon";
 import { Markdown } from "../components/Markdown";
-import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound } from "../lib/turns";
+import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
 
 type ToolLine = { name: string; path: string; ok?: boolean; detail?: string };
@@ -434,6 +434,13 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   const running = turn.status === "running";
   // Follow the live stream: msgs is static mid-turn now, so scroll on liveText.
   useEffect(() => { scrollRef.current?.scrollTo({ top: 1e9 }); }, [turn.liveText]);
+  // UI task #1: reload the viewed conv when a headless/continuation turn
+  // persists, so the report STAYS on screen instead of vanishing.
+  const convVersion = useConvVersion();
+  useEffect(() => {
+    if (convVersion > 0 && convIdRef.current && !isRunning(agentId)) { void openConv(convIdRef.current); }
+    // eslint-disable-next-line
+  }, [convVersion]);
 
   return (
     <div style={{ display: "flex", height: "100%", minHeight: 0, gap: "var(--space-4)" }}>

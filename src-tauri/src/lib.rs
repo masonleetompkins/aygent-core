@@ -3099,7 +3099,7 @@ async fn agent_stream(
                         if note.is_empty() {
                             ("task_continue refused: a non-empty note is required (say what to check on wake-up)".to_string(), true)
                         } else {
-                            match mailbox::enqueue_continue(&db, &scope_id, &note, delay) {
+                            match mailbox::enqueue_continue(&db, &scope_id, &format!("conv:{}\n{}", session_id.clone().unwrap_or_default(), note), delay) {
                                 Ok(_) => (format!("wake-up scheduled in {delay}s — end your turn now; you'll be woken with your note"), false),
                                 Err(e) => (format!("task_continue failed: {e}"), true),
                             }
@@ -3213,7 +3213,7 @@ async fn agent_stream(
                         if note.is_empty() {
                             ("task_continue refused: a non-empty note is required (say what to check on wake-up)".to_string(), true)
                         } else {
-                            match mailbox::enqueue_continue(&db, &scope_id, &note, delay) {
+                            match mailbox::enqueue_continue(&db, &scope_id, &format!("conv:{}\n{}", session_id.clone().unwrap_or_default(), note), delay) {
                                 Ok(_) => (format!("wake-up scheduled in {delay}s — end your turn now; you'll be woken with your note"), false),
                                 Err(e) => (format!("task_continue failed: {e}"), true),
                             }
@@ -3403,6 +3403,18 @@ pub async fn run_headless_turn(
     // scheduler:7). Inter-agent turns keep the reply-capable peer framing.
     let is_scheduled = msg.from_agent.starts_with("scheduler:");
     let is_continue = msg.from_agent.starts_with("continue:");
+    // task_continue routing (Mason 08-01, UI task #1): body may carry a
+    // "conv:<session id>" first line — the chat the wake-up reports INTO.
+    let (continue_conv, msg_body): (Option<String>, String) = if is_continue {
+        match msg.body.split_once('\n') {
+            Some((first, rest)) if first.starts_with("conv:") => {
+                let id = first.trim_start_matches("conv:").trim().to_string();
+                (if id.is_empty() { None } else { Some(id) }, rest.to_string())
+            }
+            _ => (None, msg.body.clone()),
+        }
+    } else { (None, msg.body.clone()) };
+    let msg_body = msg_body.as_str();
 
     let from_name = if is_continue {
         "Continuation".to_string()
@@ -3418,14 +3430,14 @@ pub async fn run_headless_turn(
              Continue the task now: check any processes you started (shell_poll), finish the work, and report \
              the outcome — this turn streams live to your chat. If you need more time, call task_continue again. \
              Do NOT use send_message; there is no sender to reply to.",
-            msg.body
+            msg_body
         )
     } else if is_scheduled {
         format!(
             "This is a SCHEDULED TASK that just fired (no sender to reply to). Do the task, \
              then stop — your output is recorded in your own notes. Do NOT use send_message; \
              there is no one to send it to.\n\nTask:\n\n{}",
-            msg.body
+            msg_body
         )
     } else {
         format!(
@@ -3439,20 +3451,28 @@ pub async fn run_headless_turn(
     // The per-agent stream channel the UI subscribes to (SAME id the human path
     // uses for this agent's inbox conversation) so the turn streams LIVE into
     // whichever pane is viewing the recipient — you WATCH the work happen.
-    let stream_channel = format!("inbox-{agent_id}");
+    let stream_channel = match &continue_conv {
+        Some(cid) => cid.clone(),                    // wake-up streams into the origin chat
+        None => format!("inbox-{agent_id}"),
+    };
 
     // 1) DISPATCH-TIME VISIBILITY: show the inbound message in the recipient's
     //    inbox thread IMMEDIATELY (before any work), so "📨 from Atlas: …" appears
     //    the instant it's sent. We persist it now + emit a stream event so an
     //    open pane renders it live.
     {
-        let conv_id = format!("inbox-{agent_id}");
+        let conv_id = continue_conv.clone().unwrap_or_else(|| format!("inbox-{agent_id}"));
         let existing = repo::load_conversation(db, &conv_id).ok();
         let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
-        ui_msgs.push(serde_json::json!({ "role": "user", "from": from_name, "text": format!("\u{1F4E8} from {from_name}: {}", msg.body) }));
+        let inbound_text = if is_continue { format!("\u{23F0} resumed: {}", msg_body) }
+            else { format!("\u{1F4E8} from {from_name}: {}", msg_body) };
+        ui_msgs.push(serde_json::json!({ "role": "user", "from": from_name, "text": inbound_text }));
+        let title = existing.as_ref().map(|c| c.title.clone()).unwrap_or_else(|| "Activity".into());
+        let pinned = existing.as_ref().map(|c| c.pinned).unwrap_or(true);
+        let order = existing.as_ref().map(|c| c.order).unwrap_or(1);
         let conv = repo::Conversation {
             id: conv_id, agent_id: agent_id.to_string(),
-            title: "Activity".into(), updated: 0, pinned: true, order: 1,
+            title, updated: 0, pinned, order,
             msgs: serde_json::json!(ui_msgs),
             history: existing.map(|c| c.history).unwrap_or(serde_json::json!([])),
         };
@@ -3533,7 +3553,7 @@ pub async fn run_headless_turn(
                                 if note.is_empty() {
                                     ("task_continue refused: a non-empty note is required".to_string(), true)
                                 } else {
-                                    match mailbox::enqueue_continue(db, agent_id, &note, delay) {
+                                    match mailbox::enqueue_continue(db, agent_id, &format!("conv:{}\n{}", continue_conv.clone().unwrap_or_default(), note), delay) {
                                         Ok(_) => (format!("wake-up scheduled in {delay}s — end your turn now; you'll be woken with your note"), false),
                                         Err(e) => (format!("task_continue failed: {e}"), true),
                                     }
@@ -3603,19 +3623,24 @@ pub async fn run_headless_turn(
     // the agent's normal chat now share ONE conversation id so when you talk to
     // the agent directly it REMEMBERS the inter-agent message. We append the
     // full turn (framed inbound + assistant reply) to whatever history exists.
-    let conv_id = format!("inbox-{agent_id}");
+    let conv_id = continue_conv.clone().unwrap_or_else(|| format!("inbox-{agent_id}"));
     let existing = repo::load_conversation(db, &conv_id).ok();
     let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
-    ui_msgs.push(serde_json::json!({ "role": "user", "from": from_name, "text": format!("\u{1F4E8} from {from_name}: {}", msg.body) }));
+    let inbound_text = if is_continue { format!("\u{23F0} resumed: {}", msg_body) }
+        else { format!("\u{1F4E8} from {from_name}: {}", msg_body) };
+    ui_msgs.push(serde_json::json!({ "role": "user", "from": from_name, "text": inbound_text }));
     ui_msgs.push(serde_json::json!({ "role": "assistant", "text": reply_display, "tools": [] }));
     // Real history: prior history + this turn's messages (framed user + all
     // assistant/tool turns we accumulated in `messages`). `messages` starts with
     // the framed user msg; append the whole thing to prior history.
     let mut hist = existing.as_ref().and_then(|c| c.history.as_array().cloned()).unwrap_or_default();
     if let Some(turn) = messages.as_array() { for m in turn { hist.push(m.clone()); } }
+    let title2 = existing.as_ref().map(|c| c.title.clone()).unwrap_or_else(|| "Activity".into());
+    let pinned2 = existing.as_ref().map(|c| c.pinned).unwrap_or(true);
+    let order2 = existing.as_ref().map(|c| c.order).unwrap_or(1);
     let conv = repo::Conversation {
         id: conv_id, agent_id: agent_id.to_string(),
-        title: "Activity".into(), updated: 0, pinned: true, order: 1,
+        title: title2, updated: 0, pinned: pinned2, order: order2,
         msgs: serde_json::json!(ui_msgs),
         history: serde_json::json!(hist),
     };
