@@ -169,7 +169,10 @@ pub fn send(
 /// it until due, and run_headless_turn frames it as a wake-up, not a peer msg.
 /// Fresh root/budget per continuation chain (cap stops infinite self-loops).
 pub fn enqueue_continue(db: &Db, agent_id: &str, note: &str, delay_secs: u64) -> Result<i64, String> {
-    let due_at = now() + (delay_secs as i64) * 1000;
+    // mailbox::now() is epoch SECONDS (unlike scheduler::now_ms) — the units
+    // bug that broke the first live test (90s became 25h). Everything in this
+    // module stays in seconds.
+    let due_at = now() + delay_secs as i64;
     let (agent_s, note_s) = (agent_id.to_string(), note.to_string());
     db.write(move |c| {
         let tx = c.transaction().map_err(|e| format!("txn: {e}"))?;
@@ -200,7 +203,7 @@ pub fn take_next_for(db: &Db, to_agent: &str) -> Result<Option<Message>, String>
     db.write(move |c| {
         let tx = c.transaction().map_err(|e| format!("txn: {e}"))?;
         // task_continue: a self-wake row encodes its due time in from_agent as
-        // "continue:<epoch_ms>". Skip rows not yet due ('continue:' is 9 chars,
+        // "continue:<epoch_secs>". Skip rows not yet due ('continue:' is 9 chars,
         // substr is 1-based -> position 10). Other messages are always due.
         let row: Option<(i64, String, String, i64, i64, String)> = tx.query_row(
             "SELECT id, from_agent, body, root_id, depth, ancestry FROM mailbox
@@ -257,11 +260,11 @@ pub fn roster(db: &Db, self_id: &str) -> Result<Vec<(String, String)>, String> {
 pub fn pending_counts(db: &Db) -> Result<Vec<(String, i64)>, String> {
     let conn = db.reader()?;
     let mut stmt = conn.prepare(
-        // Exclude task_continue wake-ups that aren't due yet (due epoch-ms is
+        // Exclude task_continue wake-ups that aren't due yet (due epoch SECONDS
         // encoded in from_agent after the 9-char 'continue:' prefix) — otherwise
         // the drainer sees a phantom count and spins on its 1.5s poll.
         "SELECT to_agent, COUNT(*) FROM mailbox WHERE status = 'pending'
-           AND (from_agent NOT LIKE 'continue:%' OR CAST(substr(from_agent, 10) AS INTEGER) <= strftime('%s','now') * 1000)
+           AND (from_agent NOT LIKE 'continue:%' OR CAST(substr(from_agent, 10) AS INTEGER) <= strftime('%s','now'))
          GROUP BY to_agent",
     ).map_err(|e| format!("prepare counts: {e}"))?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
