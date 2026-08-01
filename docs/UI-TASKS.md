@@ -10,9 +10,9 @@
 3. [x] Chat window scrolls horizontally — lock to vertical; text must always wrap to width.
 4. [x] Browser toggle: move Settings → Tools; rename "AYGENT Browser"; hide sidebar
        entry entirely when disabled.
-5. [ ] Plus (+) button left of chat box: attach ANY file (image/audio/video/etc) as context.
+5. [x] Plus (+) button left of chat box: attach ANY file (image/audio/video/etc) as context.
 6. [x] Whisper transcription Tool (OpenAI API): available when OpenAI key set + enabled in Tools.
-7. [ ] Mic button (left of upload): record voice, transcribe into the input via Whisper.
-8. [ ] #tool tagging in the input, like @agent mentions (directly request a tool).
+7. [x] Mic button (left of upload): record voice, transcribe into the input via Whisper.
+8. [x] #tool tagging in the input, like @agent mentions (directly request a tool).
 
 Order: 2+3 (CSS, fast) → 1 (routing) → 4 → 6 (Whisper is the base for 7) → 5 → 7 → 8.

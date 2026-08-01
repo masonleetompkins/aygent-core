@@ -105,6 +105,73 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // Active @mention query state: { query, matches, sel, start } or null.
   const [mention, setMention] = useState<{ query: string; matches: typeof allAgents; sel: number; start: number } | null>(null);
 
+  // ---- Task #5: attachments (+ button). ANY file becomes agent context ----
+  const [attachments, setAttachments] = useState<Array<{ name: string; pending: boolean }>>([]);
+  const fileRef = useRef<HTMLInputElement>(null);
+  async function onFilesPicked(files: FileList | null) {
+    if (!files || !agentId) return;
+    for (const file of Array.from(files)) {
+      setAttachments((a) => [...a, { name: file.name, pending: true }]);
+      try {
+        const buf = await file.arrayBuffer();
+        // chunked btoa — String.fromCharCode(...bigArray) blows the stack
+        const u8 = new Uint8Array(buf);
+        let bin = "";
+        for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode(...u8.subarray(i, i + 0x8000));
+        const b64 = btoa(bin);
+        await invoke("agent_context_add", { agentId, filename: file.name, bytesB64: b64 });
+        setAttachments((a) => a.map((x) => x.name === file.name ? { ...x, pending: false } : x));
+      } catch (err) {
+        setAttachments((a) => a.filter((x) => x.name !== file.name));
+        alert("Attach failed: " + String(err));
+      }
+    }
+  }
+
+  // ---- Task #7: mic button -> record -> Whisper -> input ----
+  const [rec, setRec] = useState<"idle" | "recording" | "transcribing">("idle");
+  const recRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  async function toggleMic() {
+    if (rec === "recording") { recRef.current?.stop(); return; }
+    if (rec !== "idle") return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mr = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      chunksRef.current = [];
+      mr.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+      mr.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        setRec("transcribing");
+        try {
+          const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+          const buf = await blob.arrayBuffer();
+          const u8 = new Uint8Array(buf);
+          let bin = "";
+          for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode(...u8.subarray(i, i + 0x8000));
+          const text = await invoke<string>("transcribe_audio_b64", { b64: btoa(bin), filename: "recording.webm" });
+          setInput((prev) => (prev ? prev + " " : "") + text);
+          taRef.current?.focus();
+        } catch (err) { alert("Transcription failed: " + String(err)); }
+        setRec("idle");
+      };
+      mr.start();
+      recRef.current = mr;
+      setRec("recording");
+    } catch (err) { alert("Mic unavailable: " + String(err)); }
+  }
+
+  // ---- Task #8: #tool tagging (mirrors @mentions) ----
+  const [toolNames, setToolNames] = useState<string[]>([]);
+  useEffect(() => {
+    const base = ["read_file", "write_file", "list_files", "rename_file", "delete_file", "task_continue"];
+    if (!folder) { setToolNames(base); return; }
+    invoke<Array<{ name: string; enabled: boolean }>>("tools_list", { folder })
+      .then((ts) => setToolNames([...base, ...ts.filter((t) => t.enabled && t.name).map((t) => t.name)]))
+      .catch(() => setToolNames(base));
+  }, [folder]);
+  const [toolTag, setToolTag] = useState<{ query: string; matches: string[]; sel: number; start: number } | null>(null);
+
   // #3 auto-grow: single-line by default, grows with content up to a sane cap.
   // Reset to auto first so it can SHRINK too; when empty, scrollHeight collapses
   // to one line. Cap ~200px (~8 lines), not 50vh (that let an empty box balloon
@@ -130,6 +197,29 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     } else {
       setMention(null);
     }
+    // Task #8: #tool token at the caret — offer enabled tools.
+    const t = upto.match(/#([\w-]*)$/);
+    if (t) {
+      const q = t[1].toLowerCase();
+      const matches = toolNames.filter((n) => n.toLowerCase().includes(q)).slice(0, 6);
+      setToolTag({ query: t[1], matches, sel: 0, start: caret - t[0].length });
+    } else {
+      setToolTag(null);
+    }
+  }
+
+  function pickToolTag(name: string) {
+    if (!toolTag) return;
+    const before = input.slice(0, toolTag.start);
+    const after = input.slice(toolTag.start + 1 + toolTag.query.length);
+    const inserted = `#${name} `;
+    setInput(before + inserted + after);
+    setToolTag(null);
+    requestAnimationFrame(() => {
+      const ta = taRef.current; if (!ta) return;
+      const pos = (before + inserted).length;
+      ta.focus(); ta.setSelectionRange(pos, pos);
+    });
   }
 
   // Insert the picked agent's @Name into the input, replacing the partial token.
@@ -151,6 +241,12 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
   // #3 + #4 key handling: mention nav when open; else Enter=send, Shift+Enter=newline.
   function onInputKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (toolTag && toolTag.matches.length > 0) {
+      if (e.key === "ArrowDown") { e.preventDefault(); setToolTag({ ...toolTag, sel: (toolTag.sel + 1) % toolTag.matches.length }); return; }
+      if (e.key === "ArrowUp") { e.preventDefault(); setToolTag({ ...toolTag, sel: (toolTag.sel - 1 + toolTag.matches.length) % toolTag.matches.length }); return; }
+      if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); pickToolTag(toolTag.matches[toolTag.sel]); return; }
+      if (e.key === "Escape") { e.preventDefault(); setToolTag(null); return; }
+    }
     if (mention && mention.matches.length > 0) {
       if (e.key === "ArrowDown") { e.preventDefault(); setMention({ ...mention, sel: (mention.sel + 1) % mention.matches.length }); return; }
       if (e.key === "ArrowUp") { e.preventDefault(); setMention({ ...mention, sel: (mention.sel - 1 + mention.matches.length) % mention.matches.length }); return; }
@@ -355,7 +451,16 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   }
 
   async function send() {
-    const prompt = input.trim();
+    let prompt = input.trim();
+    // Task #8: #tool tags become an explicit instruction the model honors.
+    const tagged = [...new Set((prompt.match(/#([\w-]+)/g) || []).map((x) => x.slice(1)).filter((n) => toolNames.includes(n)))];
+    if (tagged.length > 0) prompt += `\n\n(Use the ${tagged.join(", ")} tool${tagged.length > 1 ? "s" : ""} for this.)`;
+    // Task #5: tell the agent what was just attached (it's in agent context).
+    const done = attachments.filter((a) => !a.pending).map((a) => a.name);
+    if (done.length > 0) {
+      prompt += `\n\n(I attached for context: ${done.join(", ")} — available in your agent context documents.)`;
+      setAttachments([]);
+    }
     // Gate on THIS agent's status (per-agent), not a global pane flag — so you
     // can send to a second agent while the first still runs (Atlas #2).
     if (!prompt || !agentId || isRunning(agentId)) return;
@@ -506,7 +611,60 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           </div>
         </div>
 
+        {/* Task #5: attachment chips above the input */}
+        {attachments.length > 0 && (
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
+            {attachments.map((a) => (
+              <span key={a.name} style={{
+                display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12,
+                padding: "4px 10px", borderRadius: 999, border: "var(--border-width) solid var(--line)",
+                background: "var(--surface)", color: a.pending ? "var(--text-faint)" : "var(--text)",
+              }}>
+                📎 {a.name}{a.pending ? "…" : ""}
+                {!a.pending && (
+                  <button onClick={() => setAttachments((x) => x.filter((y) => y.name !== a.name))}
+                    style={{ background: "none", border: "none", cursor: "pointer", padding: 0, color: "var(--text-muted)" }}>✕</button>
+                )}
+              </span>
+            ))}
+          </div>
+        )}
         <div style={{ display: "flex", gap: 8, marginTop: "var(--space-3)", flexShrink: 0, alignItems: "flex-end", position: "relative" }}>
+          {/* Task #8: #tool picker (mirrors the @ picker) */}
+          {toolTag && toolTag.matches.length > 0 && (
+            <div style={{
+              position: "absolute", bottom: "calc(100% + 6px)", left: 0, minWidth: 220,
+              background: "var(--surface)", border: "var(--border-width) solid var(--line)",
+              borderRadius: "var(--radius-control)", boxShadow: "var(--elevation)", overflow: "hidden", zIndex: 21,
+            }}>
+              {toolTag.matches.map((n, i) => (
+                <button key={n} onMouseDown={(e) => { e.preventDefault(); pickToolTag(n); }}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 8, width: "100%", textAlign: "left",
+                    padding: "8px 12px", border: "none", cursor: "pointer", fontSize: 13,
+                    fontFamily: "ui-monospace, monospace",
+                    background: i === toolTag.sel ? "var(--bg)" : "transparent", color: "var(--text)",
+                  }}>⚙ {n}</button>
+              ))}
+            </div>
+          )}
+          {/* Task #7: mic — record voice, Whisper transcribes into the input */}
+          <button onClick={toggleMic} disabled={blocked} title={rec === "recording" ? "Stop recording" : "Record voice"}
+            style={{
+              width: 40, height: 44, flexShrink: 0, cursor: "pointer",
+              background: rec === "recording" ? "var(--danger)" : "var(--bg)",
+              border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)",
+              color: rec === "recording" ? "#fff" : "var(--text-muted)", fontSize: 16,
+            }}>{rec === "transcribing" ? "…" : rec === "recording" ? "■" : "🎙"}</button>
+          {/* Task #5: + attach any file as context */}
+          <input ref={fileRef} type="file" multiple style={{ display: "none" }}
+            onChange={(e) => { void onFilesPicked(e.target.files); e.target.value = ""; }} />
+          <button onClick={() => fileRef.current?.click()} disabled={blocked} title="Attach files as context"
+            style={{
+              width: 40, height: 44, flexShrink: 0, cursor: "pointer",
+              background: "var(--bg)", border: "var(--border-width) solid var(--line)",
+              borderRadius: "var(--radius-control)", color: "var(--text-muted)", fontSize: 20,
+            }}>+</button>
           {/* #4: @mention picker — shows matching agents as you type @Name. */}
           {mention && mention.matches.length > 0 && (
             <div style={{
@@ -534,7 +692,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
             rows={1}
             onChange={(e) => { setInput(e.target.value); onInputChange(e.target.value, e.target.selectionStart); }}
             onKeyDown={onInputKeyDown}
-            placeholder={blocked ? "Set up folder + key in Settings first…" : "Message your agent…  (@ to call another agent)"}
+            placeholder={blocked ? "Set up folder + key in Settings first…" : "Message your agent…  (@ agent · # tool)"}
             style={{
               flex: 1, resize: "none", overflowY: "auto",
               // fixed single-line start; JS auto-grow adjusts height up to 200px.
