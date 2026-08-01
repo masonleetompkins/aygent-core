@@ -3796,6 +3796,7 @@ pub fn run() {
             // as an authed client. jailed=false in dev; Seatbelt (jailed=true)
             // is finalized later in M0.2. The exec broker is passed in so exec.*
             // ops (Pro Mode) resolve against the same privileged actor.
+            let app_handle_for_daemon = _app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 match broker_ws::start(broker, exec_broker, broker_token.clone()).await {
                     Ok(broker_port) => {
@@ -3804,7 +3805,7 @@ pub fn run() {
                         // Seatbelt issue needs isolating.
                         let jailed = std::env::var("AYGENT_JAILED").as_deref() != Ok("0");
                         if let Err(e) = supervisor::spawn_daemon(
-                            state.clone(), jailed, broker_port, &broker_token,
+                            &app_handle_for_daemon, state.clone(), jailed, broker_port, &broker_token,
                         ) {
                             eprintln!("[aygent] daemon spawn failed: {e}");
                         }

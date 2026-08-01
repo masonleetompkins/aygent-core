@@ -21,28 +21,87 @@ pub struct DaemonState {
 
 /// Find the absolute path to `node` (Seatbelt needs the concrete binary path;
 /// `execvp` inside the jail can't do a PATH search once fs is denied).
+///
+/// BUNDLED-APP FIX (2026-07-31): a Finder-launched .app inherits an EMPTY/minimal
+/// PATH, so `/usr/bin/which node` returns nothing — that's why the production app
+/// never spawned the daemon. We now probe the common absolute install locations
+/// directly (homebrew arm64/intel, /usr/local, /usr/bin, nvm) before falling back
+/// to `which`. AYGENT_NODE_BIN still overrides everything (dev/CI).
 fn resolve_node_bin() -> Option<String> {
     if let Ok(explicit) = std::env::var("AYGENT_NODE_BIN") {
         return Some(explicit);
     }
-    // `which node` (run OUTSIDE the jail — this is the privileged supervisor).
+    // Probe concrete absolute paths first — works even with no PATH (Finder launch).
+    let candidates = [
+        "/opt/homebrew/bin/node",   // Apple Silicon homebrew
+        "/usr/local/bin/node",      // Intel homebrew / manual
+        "/usr/bin/node",            // system
+    ];
+    for c in candidates {
+        if std::path::Path::new(c).exists() {
+            return std::fs::canonicalize(c).ok().map(|p| p.to_string_lossy().to_string()).or_else(|| Some(c.to_string()));
+        }
+    }
+    // nvm: newest installed version under ~/.nvm/versions/node/*/bin/node.
+    if let Some(home) = std::env::var_os("HOME") {
+        let nvm = std::path::Path::new(&home).join(".nvm/versions/node");
+        if let Ok(rd) = std::fs::read_dir(&nvm) {
+            let mut versions: Vec<_> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+            versions.sort();
+            if let Some(latest) = versions.last() {
+                let n = latest.join("bin/node");
+                if n.exists() { return Some(n.to_string_lossy().to_string()); }
+            }
+        }
+    }
+    // Last resort: `which node` (works in dev / a shell-launched app).
     let out = Command::new("/usr/bin/which").arg("node").output().ok()?;
     if out.status.success() {
         let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !p.is_empty() {
-            // canonicalize (homebrew symlinks node -> ../Cellar/...) so the
-            // profile allows the REAL binary path.
             return std::fs::canonicalize(&p).ok().map(|c| c.to_string_lossy().to_string()).or(Some(p));
         }
     }
     None
 }
 
+/// Resolve the DAEMON ENTRY (index.js) + SEATBELT PROFILE, working in BOTH a
+/// bundled .app and dev. Priority: env override → bundled resource dir → dev path.
+///
+/// BUNDLED-APP FIX: in a .app, resources live under `<App>.app/Contents/Resources/`
+/// (Tauri's resource dir). We bundle `daemon/` + `seatbelt/folder-mode.sb` there
+/// (see tauri.conf.json). Dev keeps the old `../daemon`, `../seatbelt` relative
+/// paths. This is why the production app couldn't find/spawn the daemon.
+fn resolve_daemon_entry(app: &tauri::AppHandle) -> String {
+    if let Ok(explicit) = std::env::var("AYGENT_DAEMON_ENTRY") {
+        return explicit;
+    }
+    if let Ok(res) = app.path().resource_dir() {
+        let bundled = res.join("daemon").join("dist").join("index.js");
+        if bundled.exists() {
+            return bundled.to_string_lossy().to_string();
+        }
+    }
+    "../daemon/dist/index.js".to_string()
+}
+
+fn resolve_seatbelt_profile(app: &tauri::AppHandle) -> String {
+    if let Ok(explicit) = std::env::var("AYGENT_SEATBELT_PROFILE") {
+        return explicit;
+    }
+    if let Ok(res) = app.path().resource_dir() {
+        let bundled = res.join("seatbelt").join("folder-mode.sb");
+        if bundled.exists() {
+            return bundled.to_string_lossy().to_string();
+        }
+    }
+    "../seatbelt/folder-mode.sb".to_string()
+}
+
 /// Build a concrete Seatbelt profile from the template, filling in the resolved
 /// node binary + daemon dir, and write it to a temp file. Returns its path.
-fn materialize_profile(node_bin: &str, daemon_dir: &str) -> std::io::Result<std::path::PathBuf> {
-    let template_path = std::env::var("AYGENT_SEATBELT_PROFILE")
-        .unwrap_or_else(|_| "../seatbelt/folder-mode.sb".to_string());
+fn materialize_profile(app: &tauri::AppHandle, node_bin: &str, daemon_dir: &str) -> std::io::Result<std::path::PathBuf> {
+    let template_path = resolve_seatbelt_profile(app);
     let template = std::fs::read_to_string(&template_path)?;
 
     // node lives in a bin dir; allow reading that dir's tree (dylibs, ICU data).
@@ -73,13 +132,15 @@ fn materialize_profile(node_bin: &str, daemon_dir: &str) -> std::io::Result<std:
 /// Launch the daemon. `jailed` selects Seatbelt (true, macOS Folder Mode) vs a
 /// plain dev launch (false). Captures the `AYGENT_WS_PORT=NNNN` line + drains stderr.
 pub fn spawn_daemon(
+    app: &tauri::AppHandle,
     state: Arc<DaemonState>,
     jailed: bool,
     broker_port: u16,
     broker_token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let daemon_entry = std::env::var("AYGENT_DAEMON_ENTRY")
-        .unwrap_or_else(|_| "../daemon/dist/index.js".to_string());
+    // BUNDLED-APP FIX: resolve from the .app resource dir when installed, dev
+    // path otherwise. This is why the production app couldn't spawn the daemon.
+    let daemon_entry = resolve_daemon_entry(app);
     // daemon dir = the tree the jailed node is allowed to READ (its own code).
     // MUST be the whole daemon/ package (dist/ + node_modules/), NOT just dist/,
     // or node can't load its own deps (e.g. ws/index.js) -> EPERM at boot.
@@ -94,7 +155,7 @@ pub fn spawn_daemon(
     let mut cmd = if jailed {
         let node_bin = resolve_node_bin()
             .ok_or("could not resolve node binary for Seatbelt launch")?;
-        let profile = materialize_profile(&node_bin, &daemon_dir)?;
+        let profile = materialize_profile(app, &node_bin, &daemon_dir)?;
         eprintln!("[aygent] jailed launch: node={node_bin} profile={}", profile.display());
         let mut c = Command::new("sandbox-exec");
         c.arg("-f").arg(&profile).arg(&node_bin).arg(&daemon_entry);

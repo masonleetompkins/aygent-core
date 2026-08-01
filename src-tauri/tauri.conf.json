@@ -27,6 +27,12 @@
     "active": true,
     "targets": ["app"],
     "icon": ["icons/icon.icns", "icons/icon.png"],
+    "resources": {
+      "../daemon/dist": "daemon/dist",
+      "../daemon/node_modules": "daemon/node_modules",
+      "../daemon/package.json": "daemon/package.json",
+      "../seatbelt/folder-mode.sb": "seatbelt/folder-mode.sb"
+    },
     "macOS": {
       "minimumSystemVersion": "13.0"
     }
