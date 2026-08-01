@@ -362,10 +362,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     const myConvId = convIdRef.current || `agent://${Date.now()}`;
     const channel = myConvId; // per-conversation channel = the stable session id
 
-    // Optimistic user bubble + a streaming assistant placeholder in the pane.
+    // Optimistic user bubble ONLY. Do NOT append a static assistant placeholder:
+    // live tokens land in the store (turns.ts) and render via the trailing
+    // streaming bubble below — a placeholder here matched that bubble's
+    // suppression condition and blocked live streaming entirely (bug: responses
+    // appeared all-at-once). Cleo 2026-07-31.
     const withUser: Msg[] = [...msgsRef.current, { role: "user", text: prompt }];
-    msgsRef.current = [...withUser, { role: "assistant", text: "", tools: [], streaming: true }];
-    setMsgs(msgsRef.current);
+    msgsRef.current = withUser;
+    setMsgs(withUser);
     void persist(withUser); // thread appears in the sidebar immediately
 
     // Seed the store's per-agent history from this conversation so a follow-up
@@ -425,6 +429,8 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // unmounts, so the stream is always captured and any pane can reattach.
   const turn = useAgentTurn(agentId);
   const running = turn.status === "running";
+  // Follow the live stream: msgs is static mid-turn now, so scroll on liveText.
+  useEffect(() => { scrollRef.current?.scrollTo({ top: 1e9 }); }, [turn.liveText]);
 
   return (
     <div style={{ display: "flex", height: "100%", minHeight: 0, gap: "var(--space-4)" }}>
