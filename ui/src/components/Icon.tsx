@@ -13,7 +13,9 @@ export type IconName =
   // ui affordances
   | "plus" | "trash" | "pencil" | "pin" | "pin-fill" | "close"
   // browser nav controls
-  | "arrow-left" | "arrow-right" | "refresh" | "clock" | "download";
+  | "arrow-left" | "arrow-right" | "refresh" | "clock" | "download"
+  // chat input row (UI task #7)
+  | "mic" | "stop";
 
 // The curated set offered as agent icons (order = swatch order in the picker).
 export const AGENT_ICONS: IconName[] = [
@@ -23,6 +25,9 @@ export const AGENT_ICONS: IconName[] = [
 
 // 24x24 viewBox paths. Stroked, round caps/joins — reads like SF Symbols.
 const PATHS: Record<IconName, JSX.Element> = {
+  // SF-Symbol-style microphone: capsule + stand (Mason: no emoji).
+  mic: <><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3M9 21h6" /></>,
+  stop: <rect x="7" y="7" width="10" height="10" rx="1.5" />,
   chat: <path d="M21 15a2 2 0 0 1-2 2H8l-4 4V5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2z" />,
   agents: <><circle cx="12" cy="8" r="4" /><path d="M4 20c0-4 3.6-6 8-6s8 2 8 6" /></>,
   tools: <path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18v3h3l6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2-2z" />,

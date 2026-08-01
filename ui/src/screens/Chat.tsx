@@ -137,7 +137,8 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     if (rec !== "idle") return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mr = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      const mime = ["audio/webm", "audio/mp4", "audio/mpeg", ""].find((m) => !m || MediaRecorder.isTypeSupported(m)) ?? "";
+      const mr = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
       chunksRef.current = [];
       mr.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
       mr.onstop = async () => {
@@ -149,7 +150,9 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           const u8 = new Uint8Array(buf);
           let bin = "";
           for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode(...u8.subarray(i, i + 0x8000));
-          const text = await invoke<string>("transcribe_audio_b64", { b64: btoa(bin), filename: "recording.webm" });
+          const ext = (recRef.current?.mimeType || "audio/webm").includes("mp4") ? "m4a"
+            : (recRef.current?.mimeType || "").includes("mpeg") ? "mp3" : "webm";
+          const text = await invoke<string>("transcribe_audio_b64", { b64: btoa(bin), filename: `recording.${ext}` });
           setInput((prev) => (prev ? prev + " " : "") + text);
           taRef.current?.focus();
         } catch (err) { alert("Transcription failed: " + String(err)); }
@@ -158,7 +161,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       mr.start();
       recRef.current = mr;
       setRec("recording");
-    } catch (err) { alert("Mic unavailable: " + String(err)); }
+    } catch (err) {
+      const e = err as DOMException;
+      const why = e?.name === "NotAllowedError"
+        ? "macOS blocked the microphone. Check System Settings → Privacy & Security → Microphone → AYGENT."
+        : e?.name === "NotFoundError" ? "No microphone found."
+        : String(err);
+      alert("Mic unavailable: " + why);
+    }
   }
 
   // ---- Task #8: #tool tagging (mirrors @mentions) ----
@@ -655,7 +665,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               background: rec === "recording" ? "var(--danger)" : "var(--bg)",
               border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)",
               color: rec === "recording" ? "#fff" : "var(--text-muted)", fontSize: 16,
-            }}>{rec === "transcribing" ? "…" : rec === "recording" ? "■" : "🎙"}</button>
+            }}>{rec === "transcribing" ? "…" : <Icon name={rec === "recording" ? "stop" : "mic"} size={18} />}</button>
           {/* Task #5: + attach any file as context */}
           <input ref={fileRef} type="file" multiple style={{ display: "none" }}
             onChange={(e) => { void onFilesPicked(e.target.files); e.target.value = ""; }} />
