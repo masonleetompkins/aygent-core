@@ -12,6 +12,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use tauri::Manager; // for app.path().resource_dir() (bundled daemon/seatbelt lookup)
 
 #[derive(Default)]
 pub struct DaemonState {
