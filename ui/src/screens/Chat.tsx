@@ -664,6 +664,9 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           <button onClick={toggleMic} disabled={blocked} title={rec === "recording" ? "Stop recording" : "Record voice"}
             style={{
               width: 40, height: 44, flexShrink: 0, cursor: "pointer",
+              // center the SVG glyph (Mason's screenshot: it sat top-left; a raw
+              // button only centers TEXT, not inline SVG).
+              display: "flex", alignItems: "center", justifyContent: "center", padding: 0,
               background: rec === "recording" ? "var(--danger)" : "var(--bg)",
               border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)",
               color: rec === "recording" ? "#fff" : "var(--text-muted)", fontSize: 16,
@@ -674,6 +677,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           <button onClick={() => fileRef.current?.click()} disabled={blocked} title="Attach files as context"
             style={{
               width: 40, height: 44, flexShrink: 0, cursor: "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center", padding: 0,
               background: "var(--bg)", border: "var(--border-width) solid var(--line)",
               borderRadius: "var(--radius-control)", color: "var(--text-muted)", fontSize: 20,
             }}>+</button>
