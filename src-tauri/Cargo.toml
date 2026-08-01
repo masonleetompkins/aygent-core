@@ -114,3 +114,10 @@ cuda = ["llama-cpp-2/cuda"]
 [target.'cfg(target_os = "macos")'.dependencies.llama-cpp-2]
 version = "0.1"
 features = ["metal"]
+
+# WORKAROUND (Cleo 2026-08-01): release proc-macro dylibs fail dlopen with
+# "mis-aligned LINKEDIT string pool" — debug builds fine. Cargo strips debuginfo
+# in release by default; suspect strip pass mangles LINKEDIT under this
+# toolchain/dyld combo. Disable stripping to test/fix.
+[profile.release]
+strip = "none"

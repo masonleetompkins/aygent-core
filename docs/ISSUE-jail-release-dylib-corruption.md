@@ -1,51 +1,48 @@
-# ISSUE: Jail write-path corrupts release-profile proc-macro dylibs
+# ISSUE: Release proc-macro dylibs corrupt — ROOT CAUSE: cargo strip pass, NOT the jail
 
-_Filed 2026-08-01 by Cleo (self-hosted, building AYGENT from inside AYGENT). Status: OPEN — top priority for the next harness version._
+_Filed 2026-08-01 by Cleo. Status: RESOLVED with workaround (`strip = "none"`). Original
+jail hypothesis was WRONG — corrected here; kept for the record._
 
 ## Symptom
-`cargo tauri build` (release) run via Pro Mode `shell_run`/`shell_spawn` inside the agent jail
-fails reproducibly:
+`cargo tauri build` (release) failed reproducibly with `error[E0463]: can't find crate for
+<proc-macro>`; dlopen on the emitted dylibs showed they were corrupt on disk:
 
 ```
-error[E0463]: can't find crate for `thiserror_impl`
+dlopen(libthiserror_impl-*.dylib): mis-aligned LINKEDIT string pool
 ```
 
-Root cause surfaced by dlopen'ing the built artifact directly:
+## Evidence chain (and the wrong turn)
+1. 3 clean release builds inside the agent jail → 3 failures, different proc-macro crates
+   first each time. `cargo check` and `cargo tauri build --debug` were always clean.
+2. **Wrong hypothesis (mine):** the Pro-Mode jail's write path mangles release dylib writes.
+3. **Discriminating experiment:** Mason ran the same build in Terminal, outside the jailed
+   exec path. First run was contaminated (Cargo reused my stale corrupt artifacts — same
+   file hash + corruption offset `0x002CE834` as my jailed run). After `rm -rf target/release`,
+   his clean run **failed identically**. → The jail is INNOCENT.
+4. **Actual discriminator:** debug vs release. Cargo's release default strips debuginfo via a
+   post-link strip pass that rewrites the Mach-O LINKEDIT segment. Debug doesn't strip.
+5. **Test:** `[profile.release] strip = "none"` + clean rebuild → **entire workspace compiled
+   green first try** (previously 0-for-3), and `cargo tauri build` produced a release
+   AYGENT.app — built from inside the jail, no special handling.
 
-```
-dlopen(libthiserror_impl-*.dylib): mis-aligned LINKEDIT string pool (fileOffset=0x002CE834)
-```
+## Root cause
+The strip pass on this toolchain (rustc 1.97.1, 2026-07-14, macOS) corrupts the LINKEDIT
+string pool of proc-macro dylibs; dyld then refuses to load them mid-build. Toolchain bug,
+not an AYGENT bug.
 
-The proc-macro dylibs rustc emits are **corrupt on disk**. rustc builds them, then can't load
-them to expand macros in downstream crates.
+## Fix in repo
+`src-tauri/Cargo.toml`: `[profile.release] strip = "none"` (committed). Cost: larger binary
+(debuginfo retained). Ship pipeline can strip the FINAL app binary later with safe tooling
+(`strip -S` / codesign-aware), which never round-trips proc-macro dylibs through dlopen.
+Revisit when rustc updates.
 
-## Evidence (all inside jail /Users/masontompkins/AYGENT/Cleo/)
-- 3 clean release builds, 3 failures; different crates trip first (thiserror_impl,
-  zerofrom_derive, serde_derive) — whichever large proc-macro dylib gets loaded first.
-- `python3 ctypes.CDLL` on BOTH copies of libthiserror_impl → same LINKEDIT corruption. Not a
-  race; the bytes on disk are bad.
-- **`cargo check` (dev profile): clean.**
-- **`cargo tauri build --debug`: builds, links, and BUNDLES successfully** (AYGENT.app produced).
-  Same code, same jail, same rustc — only the profile differs.
-- Corrupt files have links=1 (not a hardlink artifact). Separately, an agent `write_file` call
-  was refused `HardlinkRefused` once during this session — may or may not be related.
-- Discriminating experiment queued: Mason runs `cargo tauri build` in Terminal (outside the
-  jailed exec path) from the same checkout. If clean → corruption is in the Pro-Mode
-  exec/seatbelt layer. If also corrupt → deeper (folder/fs layer).
+## Still-valid harness findings from this hunt (real, keep)
+- `shell_run` spawns with a scrubbed PATH — bare `cargo`/`node` fail; workaround `sh -lc`.
+  Fix: inherit login PATH (or configurable) for Pro-Mode spawns.
+- One agent `write_file` was refused `HardlinkRefused` mid-session (transient, unreproduced).
+  Watch for recurrence.
 
-## Hypothesis
-Release-profile dylib emission differs from debug (optimized/compacted LINKEDIT, different
-write pattern — likely pwrite at offsets and/or mmap-backed writes). The jail's file layer
-(broker fd layer / seatbelt profile / whatever intercepts or polices writes under the folder)
-does not replay that write pattern faithfully, mangling the LINKEDIT segment.
-
-## Proposed fix (agreed with Mason 2026-08-01)
-Pro Mode exec = **pass-through writes**: processes spawned by the exec broker write via normal
-OS syscalls, cwd pinned to the folder; Seatbelt still denies paths OUTSIDE the folder, but no
-interception/replay layer sits in the middle of byte-level writes INSIDE it. Keep: env scrub,
-GUI-launch denylist, folder-scoped fs policy. Also fix: inherit login PATH for spawned
-processes (current scrubbed PATH breaks bare `cargo`/`node`; workaround `sh -lc`).
-
-## Workarounds until fixed
-- Debug bundles work: `cargo tauri build --debug` → target/debug/bundle/macos/AYGENT.app.
-- Release bundles: build outside the jailed exec path (human in Terminal).
+## Lesson (Cleo)
+I pattern-matched "corruption + jail = jail bug" and filed it as fact. The discriminating
+experiment existed and was cheap — run it BEFORE writing the issue doc, not after. Precise
+beats clever; evidence beats theory.
