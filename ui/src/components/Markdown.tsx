@@ -140,6 +140,8 @@ const codeBlock: React.CSSProperties = {
   fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
   fontSize: 13, lineHeight: 1.5, margin: "4px 0", padding: "12px 14px",
   background: "var(--bg)", border: "var(--border-width) solid var(--line)",
-  borderRadius: "var(--radius-control)", overflowX: "auto", whiteSpace: "pre",
+  // Task #3 (Mason 08-01): whiteSpace:"pre" let long lines widen the whole
+  // chat pane (horizontal page scroll). Wrap instead; code stays monospaced.
+  borderRadius: "var(--radius-control)", whiteSpace: "pre-wrap", overflowWrap: "anywhere",
 };
 const link: React.CSSProperties = { color: "var(--accent)", textDecoration: "underline" };

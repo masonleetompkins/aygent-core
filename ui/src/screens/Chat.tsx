@@ -113,6 +113,9 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     const ta = taRef.current; if (!ta) return;
     ta.style.height = "auto";
     ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
+    // Task #2 (Mason 08-01): a growing input was COVERING the last message —
+    // the messages column doesn't reflow on its own. Pin to bottom as we grow.
+    scrollRef.current?.scrollTo({ top: 1e9 });
   }, [input]);
 
   // #4 detect an @mention token at the caret and surface matching agents.
@@ -469,7 +472,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
         {/* Messages bottom-align: newest sits just above the input, older scroll
            up (justifyContent flex-end + margin-top auto on the list wrapper). */}
-        <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", paddingRight: 6 }}>
+        <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", paddingRight: 6 }}>
           <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 14 }}>
           {msgs.length === 0 && !running && !blocked && (
             <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
@@ -689,6 +692,8 @@ function Bubble({ m }: { m: Msg }) {
     <div style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start" }}>
       <div style={{
         maxWidth: "82%",
+        minWidth: 0,
+        overflowWrap: "anywhere",
         background: isUser ? "var(--accent)" : "var(--surface)",
         color: isUser ? "var(--bg)" : "var(--text)",
         border: "var(--border-width) solid var(--line)",
