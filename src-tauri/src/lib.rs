@@ -1317,6 +1317,68 @@ fn agent_context_add(
     context_docs::add(&db, &ad, &agent_id, &filename, &bytes)
 }
 
+/// CHAT ATTACHMENTS (Mason 08-01): save an attached file into the agent's
+/// jail under .attachments/ and return its relative path. The UI passes these
+/// paths to agent_stream, which feeds the CONTENT to the model (images as
+/// image blocks — the model can SEE them — text inline, PDFs as documents).
+#[tauri::command]
+fn chat_attach_file(
+    broker: tauri::State<'_, Arc<Broker>>,
+    agent_id: String,
+    filename: String,
+    bytes_b64: String,
+) -> Result<String, String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(bytes_b64.as_bytes())
+        .map_err(|e| format!("decode upload: {e}"))?;
+    let leaf: String = filename.chars().map(|c| if c == '/' || c == '\\' { '_' } else { c }).collect();
+    let rel = format!(".attachments/{}-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), leaf);
+    let abs = broker.resolve(&agent_id, &rel, broker::Mode::Write).map_err(|e| format!("jail refused: {e:?}"))?;
+    if let Some(dir) = abs.parent() { std::fs::create_dir_all(dir).map_err(|e| format!("mkdir attachments: {e}"))?; }
+    std::fs::write(&abs, &bytes).map_err(|e| format!("write attachment: {e}"))?;
+    Ok(rel)
+}
+
+/// Build Anthropic content BLOCKS for attached files. Images become image
+/// blocks (model vision), PDFs document blocks, small text files inline text,
+/// anything else a descriptive note (the agent can still use file tools on it).
+fn attachment_blocks(broker: &Arc<Broker>, agent_id: &str, rels: &[String]) -> Vec<serde_json::Value> {
+    let mut blocks = Vec::new();
+    for rel in rels {
+        let abs = match broker.resolve(agent_id, rel, broker::Mode::Read) { Ok(a) => a, Err(_) => continue };
+        let bytes = match std::fs::read(&abs) { Ok(b) => b, Err(_) => continue };
+        let name = abs.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+        let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        use base64::Engine;
+        let media = match ext.as_str() {
+            "png" => Some("image/png"), "jpg" | "jpeg" => Some("image/jpeg"),
+            "gif" => Some("image/gif"), "webp" => Some("image/webp"), _ => None,
+        };
+        if let Some(m) = media {
+            if bytes.len() > 4_800_000 {
+                blocks.push(serde_json::json!({ "type": "text", "text": format!("[attachment '{name}' is an image over the vision size limit — use file tools on {rel} instead]") }));
+            } else {
+                blocks.push(serde_json::json!({ "type": "text", "text": format!("[attached image: {name}]") }));
+                blocks.push(serde_json::json!({ "type": "image", "source": { "type": "base64", "media_type": m, "data": base64::engine::general_purpose::STANDARD.encode(&bytes) } }));
+            }
+        } else if ext == "pdf" {
+            if bytes.len() > 4_800_000 {
+                blocks.push(serde_json::json!({ "type": "text", "text": format!("[attachment '{name}' is a PDF over the inline size limit — stored at {rel}]") }));
+            } else {
+                blocks.push(serde_json::json!({ "type": "text", "text": format!("[attached PDF: {name}]") }));
+                blocks.push(serde_json::json!({ "type": "document", "source": { "type": "base64", "media_type": "application/pdf", "data": base64::engine::general_purpose::STANDARD.encode(&bytes) } }));
+            }
+        } else if let Ok(text) = String::from_utf8(bytes.clone()) {
+            let capped: String = text.chars().take(30_000).collect();
+            blocks.push(serde_json::json!({ "type": "text", "text": format!("[attached file: {name} ({rel})]\n\n{capped}") }));
+        } else {
+            blocks.push(serde_json::json!({ "type": "text", "text": format!("[attached binary file: {name} — stored at {rel} ({} bytes); use your file/shell tools on it as needed]", bytes.len()) }));
+        }
+    }
+    blocks
+}
+
 #[tauri::command]
 fn agent_context_list(db: tauri::State<writer::Db>, agent_id: String) -> Result<Vec<context_docs::ContextDoc>, String> {
     context_docs::list(&db, &agent_id)
@@ -2885,6 +2947,7 @@ async fn agent_stream(
     folder: Option<String>,
     session_id: Option<String>,
     agent_id: Option<String>,
+    attachments: Option<Vec<String>>,
 ) -> Result<serde_json::Value, String> {
     use tauri::Emitter;
     let broker = broker.inner().clone();
@@ -3197,7 +3260,16 @@ async fn agent_stream(
     let (tools, reg_instr) = agent_tools_for_full(&app, folder.as_deref(), !roster.is_empty(), Some((&db, &scope_id)));
     let anthropic_sys = format!("{AGENT_SYSTEM}{extra_block}{reg_instr}");
     let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
-    messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": prompt }));
+    // ATTACHMENTS (Mason 08-01): images/PDFs/text ride INTO the model as real
+    // content blocks — the model sees what you attached, not a filename.
+    let att = attachments.clone().unwrap_or_default();
+    if att.is_empty() {
+        messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": prompt }));
+    } else {
+        let mut content = vec![serde_json::json!({ "type": "text", "text": prompt })];
+        content.extend(attachment_blocks(&broker, &scope_id, &att));
+        messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": content }));
+    }
 
     let emit = |ev: &provider::StreamEvent| { let _ = app.emit(&channel, ev); };
     emit(&provider::StreamEvent::Info { text: format!("model: {model}") });
@@ -3775,6 +3847,7 @@ pub fn run() {
         .manage(browser_proc)
         .invoke_handler(tauri::generate_handler![
             whisper::transcribe_audio_b64,
+            chat_attach_file,
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
             agent_stream, reveal_in_finder, get_selected_model, set_selected_model,

@@ -106,7 +106,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   const [mention, setMention] = useState<{ query: string; matches: typeof allAgents; sel: number; start: number } | null>(null);
 
   // ---- Task #5: attachments (+ button). ANY file becomes agent context ----
-  const [attachments, setAttachments] = useState<Array<{ name: string; pending: boolean }>>([]);
+  const [attachments, setAttachments] = useState<Array<{ name: string; rel?: string; pending: boolean }>>([]);
   const fileRef = useRef<HTMLInputElement>(null);
   async function onFilesPicked(files: FileList | null) {
     if (!files || !agentId) return;
@@ -119,8 +119,8 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
         let bin = "";
         for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode(...u8.subarray(i, i + 0x8000));
         const b64 = btoa(bin);
-        await invoke("agent_context_add", { agentId, filename: file.name, bytesB64: b64 });
-        setAttachments((a) => a.map((x) => x.name === file.name ? { ...x, pending: false } : x));
+        const rel = await invoke<string>("chat_attach_file", { agentId, filename: file.name, bytesB64: b64 });
+        setAttachments((a) => a.map((x) => x.name === file.name ? { ...x, rel, pending: false } : x));
       } catch (err) {
         setAttachments((a) => a.filter((x) => x.name !== file.name));
         alert("Attach failed: " + String(err));
@@ -465,10 +465,11 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     // Task #8: #tool tags become an explicit instruction the model honors.
     const tagged = [...new Set((prompt.match(/#([\w-]+)/g) || []).map((x) => x.slice(1)).filter((n) => toolNames.includes(n)))];
     if (tagged.length > 0) prompt += `\n\n(Use the ${tagged.join(", ")} tool${tagged.length > 1 ? "s" : ""} for this.)`;
-    // Task #5: tell the agent what was just attached (it's in agent context).
-    const done = attachments.filter((a) => !a.pending).map((a) => a.name);
-    if (done.length > 0) {
-      prompt += `\n\n(I attached for context: ${done.join(", ")} — available in your agent context documents.)`;
+    // Attachments ride into the model as real content blocks (images are SEEN).
+    const attRels = attachments.filter((a) => !a.pending && a.rel).map((a) => a.rel!);
+    const attNames = attachments.filter((a) => !a.pending).map((a) => a.name);
+    if (attNames.length > 0) {
+      prompt += `\n\n(Attached: ${attNames.join(", ")})`;
       setAttachments([]);
     }
     // Gate on THIS agent's status (per-agent), not a global pane flag — so you
@@ -513,6 +514,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
         provider: providerRef.current || null,
         folder: folder || null,
         sessionId: myConvId,
+        attachments: attRels,
       });
       historyRef.current = updated;
       // Compose the final saved msgs from the store's completed live slice.

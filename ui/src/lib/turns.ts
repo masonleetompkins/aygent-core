@@ -164,6 +164,7 @@ export type RunArgs = {
   provider: string | null;
   folder: string | null;
   sessionId: string;
+  attachments?: string[];  // jail-relative paths from chat_attach_file
 };
 
 /**
@@ -205,6 +206,7 @@ export async function runTurn(a: RunArgs): Promise<unknown[]> {
       channel: a.channel, prompt: a.prompt, history: s.history,
       model: a.model, provider: a.provider, folder: a.folder,
       agentId: a.agentId, sessionId: a.sessionId,
+      attachments: a.attachments ?? [],
     });
     slot(a.agentId).history = Array.isArray(updated) ? updated : s.history;
     return slot(a.agentId).history;
