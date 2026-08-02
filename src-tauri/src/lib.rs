@@ -1173,20 +1173,25 @@ fn set_selected_model(db: tauri::State<writer::Db>, folder: String, model: Strin
 }
 
 /// Full per-agent selection (provider + model). Empty provider = anthropic.
+/// BUG FIX (Mason 08-02): this read the VESTIGIAL agent_settings table, but the
+/// Agents tab (the only editing surface) writes agent.model/agent.provider on
+/// the AGENT row — so switching a model in the UI never changed what Chat used.
+/// The agent profile is the single source of truth now; agent_settings remains
+/// only for non-selection knobs (auto_remember).
 #[tauri::command]
 fn get_selection(db: tauri::State<writer::Db>, folder: String) -> Result<serde_json::Value, String> {
     let agent_id = agent_for_folder(&db, &folder)?;
-    let s = repo::load_settings(&db, &agent_id)?;
-    Ok(serde_json::json!({ "provider": s.provider, "model": s.model }))
+    let a = repo::get_agent(&db, &agent_id)?.ok_or("agent not found")?;
+    Ok(serde_json::json!({ "provider": a.provider, "model": a.model }))
 }
 
 #[tauri::command]
 fn set_selection(db: tauri::State<writer::Db>, folder: String, provider: String, model: String) -> Result<(), String> {
     let agent_id = agent_for_folder(&db, &folder)?;
-    let mut s = repo::load_settings(&db, &agent_id)?;
-    s.provider = provider;
-    s.model = model;
-    repo::save_settings(&db, &agent_id, s)
+    let mut a = repo::get_agent(&db, &agent_id)?.ok_or("agent not found")?;
+    a.provider = provider;
+    a.model = model;
+    repo::update_agent(&db, a)
 }
 
 // --- AGENTS (multi-agent profiles) -----------------------------------------
