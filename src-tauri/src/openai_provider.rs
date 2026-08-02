@@ -179,12 +179,23 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
     tools: &serde_json::Value,
     mut on_event: F,
 ) -> Result<(serde_json::Value, String), String> {
-    let body = json!({
+    let tools_json = tools_to_openai(tools);
+    let mut body = json!({
         "model": model,
         "messages": build_openai_messages(system, messages),
-        "tools": tools_to_openai(tools),
+        "tools": tools_json,
         "stream": true,
     });
+    // BUG FIX (Mason 08-02): OpenAI's reasoning-family models (o-series, gpt-5.x
+    // "reasoning" variants) reject function tools on /v1/chat/completions unless
+    // reasoning_effort is explicitly "none" — 400 "Function tools with
+    // reasoning_effort are not supported ... use /v1/responses or set
+    // reasoning_effort to 'none'". We need tool-use for the agent loop, so set
+    // it whenever tools are present. Only OpenAI proper defines this param;
+    // OpenRouter passes it through fine but doesn't require it — harmless either way.
+    if !tools_json.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+        body["reasoning_effort"] = json!("none");
+    }
 
     // No-redirect client (see list_models): keeps the bearer token attached so
     // OpenRouter doesn't 401 with "Missing Authentication header" on a redirect.
