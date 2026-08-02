@@ -132,6 +132,18 @@ fn build_openai_messages(system: &str, messages: &serde_json::Value) -> Vec<serd
                         .collect();
                     if !tool_blocks.is_empty() {
                         for b in tool_blocks {
+                            // CLEO-GUARD (2026-08-02): only emit a tool result if it references a
+                            // REAL preceding assistant tool_call (non-empty, matching id). Some
+                            // reasoning models (gpt-5.6-sol) yield orphaned tool blocks; drop them.
+                            let tcid = b.get("tool_use_id").and_then(|x| x.as_str()).unwrap_or("");
+                            let prevOk = !tcid.is_empty()
+                                && out.last()
+                                    .and_then(|pm| pm.get("tool_calls"))
+                                    .and_then(|tc| tc.as_array())
+                                    .map(|arr| arr.iter().any(|c| c.get("id").and_then(|i| i.as_str()) == Some(tcid)))
+                                    .unwrap_or(false);
+                            if (!prevOk) { continue; }
+
                             out.push(json!({
                                 "role": "tool",
                                 "tool_call_id": b.get("tool_use_id").cloned().unwrap_or(json!("")),

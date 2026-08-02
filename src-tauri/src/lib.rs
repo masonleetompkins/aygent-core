@@ -3231,8 +3231,25 @@ async fn agent_stream(
                 }
             }
 
+            // CLEO-GUARD:assistant-toolcalls (2026-08-02) — if the assistant carried
+            // tool_calls but they were all empty (id/name not captured — a
+            // reasoning-model wire quirk), do NOT push a half-built tool pairing
+            // and loop; surface a clear error instead of a confusing 400 on the
+            // next send.
+            if had_tools {
+                let allEmpty = assistant.get("tool_calls")
+                    .and_then(|tc| tc.as_array())
+                    .map(|arr| arr.iter().all(|c| c.get("id").and_then(|i| i.as_str()).unwrap_or("").is_empty()
+                                              || c.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("").is_empty()))
+                    .unwrap_or(true);
+                if allEmpty {
+                    return Err(format!(
+                        "{provider_kind} emitted a tool_call whose capture came back empty (id/name missing) —                          this model's streamed tool-use isn't fully supported. Try a different model, or                          disable the tool that triggered the call."
+                    ));
+                }
+            }
             if had_tools { continue; }
-            break;
+
         }
 
         // Snapshot AFTER the turn's writes, labeled with the prompt (C4).
