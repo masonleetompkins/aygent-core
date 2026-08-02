@@ -1156,6 +1156,17 @@ async fn openai_models(provider: String) -> Result<Vec<String>, String> {
     openai_provider::list_models(&provider, &key).await
 }
 
+/// REAL connectivity check (Mason 08-02): openai_models() for OpenRouter hits a
+/// PUBLIC endpoint that returns success with no key — the "Test" button lied.
+/// This one actually round-trips auth.
+#[tauri::command]
+async fn provider_verify_key(provider: String) -> Result<(), String> {
+    let key = keychain::get_key(&provider)?;
+    if key.trim().is_empty() { return Err("stored key is empty".into()); }
+    if provider == "anthropic" { return anthropic_models().await.map(|_| ()); }
+    openai_provider::verify_key(&provider, &key).await
+}
+
 /// Per-agent selected model. "" = auto (prefer haiku, else first available).
 /// M1.1: folder→agent then read from SQLite agent_settings.
 #[tauri::command]
@@ -3853,6 +3864,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             whisper::transcribe_audio_b64,
             chat_attach_file,
+            provider_verify_key,
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
             agent_stream, reveal_in_finder, get_selected_model, set_selected_model,

@@ -64,6 +64,30 @@ pub async fn list_models(provider: &str, api_key: &str) -> Result<Vec<String>, S
     Ok(ids)
 }
 
+/// Actually verify a key works — unlike `list_models`, which for OpenRouter
+/// hits a PUBLIC endpoint that returns 200 with a full model list even with an
+/// empty/garbage key (confirmed live 2026-08-02: no auth header, still 200).
+/// OpenRouter's /key endpoint DOES require auth (confirmed: 401 with none) —
+/// use that to actually prove the key works. OpenAI has no equivalent "whoami"
+/// on the same base, so /models (which IS auth-gated there) still applies.
+pub async fn verify_key(provider: &str, api_key: &str) -> Result<(), String> {
+    if provider == "openrouter" {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build().map_err(|e| format!("http: {e}"))?;
+        let resp = client.get(format!("{OPENROUTER_BASE}/key")).bearer_auth(api_key)
+            .send().await.map_err(|e| format!("request failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("openrouter {status}: {text}"));
+        }
+        Ok(())
+    } else {
+        list_models(provider, api_key).await.map(|_| ())
+    }
+}
+
 /// Convert our internal Anthropic-style tool schema to OpenAI `tools` format.
 /// Ours: [{name, description, input_schema}]  ->  OpenAI:
 /// [{type:"function", function:{name, description, parameters}}]
