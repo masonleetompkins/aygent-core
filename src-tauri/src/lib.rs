@@ -502,12 +502,19 @@ fn broker_probe(
 #[tauri::command]
 fn reveal_in_finder(
     broker: tauri::State<Arc<Broker>>,
+    db: tauri::State<writer::Db>,
     path: String,
 ) -> Result<(), String> {
     // Read-mode resolution is the right check: revealing is a read-ish action,
     // and it proves the file is inside the jail before we hand it to the OS.
+    // Resolve against the ACTIVE agent's scope first (the "default" legacy scope
+    // can point at a stale folder if the agent folder moved — Mason 08-03: file
+    // tools and shell diverged for exactly this reason), fall back to "default".
+    let scope: String = repo::get_active_agent(&db).ok().flatten()
+        .map(|a| a.id).unwrap_or_else(|| "default".into());
     let real = broker
-        .resolve("default", &path, broker::Mode::Read)
+        .resolve(&scope, &path, broker::Mode::Read)
+        .or_else(|_| broker.resolve("default", &path, broker::Mode::Read))
         .map_err(|e| format!("refused by jail: {e:?}"))?;
     let real_os = real.as_os_str();
 
@@ -1049,9 +1056,10 @@ fn conv_reorder(
 #[tauri::command]
 fn savepoint_snapshot(
     broker: tauri::State<Arc<Broker>>,
+    db: tauri::State<writer::Db>,
     label: String,
 ) -> Result<Option<String>, String> {
-    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+    let root = active_savepoint_root(&broker, &db)?;
     savepoint::snapshot(&root, &label)
 }
 
@@ -1059,8 +1067,9 @@ fn savepoint_snapshot(
 #[tauri::command]
 fn savepoint_timeline(
     broker: tauri::State<Arc<Broker>>,
+    db: tauri::State<writer::Db>,
 ) -> Result<savepoint::Timeline, String> {
-    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+    let root = active_savepoint_root(&broker, &db)?;
     savepoint::timeline(&root)
 }
 
@@ -1069,23 +1078,24 @@ fn savepoint_timeline(
 #[tauri::command]
 fn savepoint_rewind(
     broker: tauri::State<Arc<Broker>>,
+    db: tauri::State<writer::Db>,
     target: String,
 ) -> Result<(), String> {
-    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+    let root = active_savepoint_root(&broker, &db)?;
     savepoint::rewind(&root, &target)
 }
 
 /// Undo: step the cursor one save point back and restore that state.
 #[tauri::command]
-fn savepoint_undo(broker: tauri::State<Arc<Broker>>) -> Result<Option<String>, String> {
-    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+fn savepoint_undo(broker: tauri::State<Arc<Broker>>, db: tauri::State<writer::Db>) -> Result<Option<String>, String> {
+    let root = active_savepoint_root(&broker, &db)?;
     savepoint::undo(&root)
 }
 
 /// Redo: step the cursor one save point forward and restore that state.
 #[tauri::command]
-fn savepoint_redo(broker: tauri::State<Arc<Broker>>) -> Result<Option<String>, String> {
-    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+fn savepoint_redo(broker: tauri::State<Arc<Broker>>, db: tauri::State<writer::Db>) -> Result<Option<String>, String> {
+    let root = active_savepoint_root(&broker, &db)?;
     savepoint::redo(&root)
 }
 
@@ -1118,8 +1128,8 @@ fn savepoint_set_retention(broker: tauri::State<Arc<Broker>>, db: tauri::State<w
 
 /// Purge ALL save-point history for the folder (user's files untouched).
 #[tauri::command]
-fn savepoint_purge(broker: tauri::State<Arc<Broker>>) -> Result<(), String> {
-    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+fn savepoint_purge(broker: tauri::State<Arc<Broker>>, db: tauri::State<writer::Db>) -> Result<(), String> {
+    let root = active_savepoint_root(&broker, &db)?;
     savepoint::purge_all(&root)
 }
 
@@ -2227,7 +2237,7 @@ async fn agent_run(
                         }
                         } // end step-overrun-guard else (step not already satisfied)
                     } else { match name {
-                        "read_file" => match broker.resolve_and_open("default", path, broker::Mode::Read) {
+                        "read_file" => match broker.resolve_and_open(resolved_agent.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Read) {
                             Ok(mut f) => {
                                 use std::io::Read;
                                 let mut s = String::new();
@@ -2240,10 +2250,10 @@ async fn agent_run(
                         },
                         "write_file" => {
                             let cnt = input.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                            if let Ok(real) = broker.resolve("default", path, broker::Mode::Write) {
+                            if let Ok(real) = broker.resolve(resolved_agent.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Write) {
                                 if let Some(parent) = real.parent() { let _ = std::fs::create_dir_all(parent); }
                             }
-                            match broker.resolve_and_open("default", path, broker::Mode::Write) {
+                            match broker.resolve_and_open(resolved_agent.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Write) {
                                 Ok(mut f) => {
                                     use std::io::Write as _;
                                     match f.write_all(cnt.as_bytes()) {
@@ -2254,7 +2264,7 @@ async fn agent_run(
                                 Err(e) => (format!("refused by jail: {e:?}"), true),
                             }
                         }
-                        "list_files" => match broker.resolve("default", path, broker::Mode::Read) {
+                        "list_files" => match broker.resolve(resolved_agent.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Read) {
                             Ok(real) => match std::fs::read_dir(&real) {
                                 Ok(rd) => {
                                     let names: Vec<String> = rd.filter_map(|e| e.ok())
@@ -2479,6 +2489,13 @@ fn exec_tool_cfg(
     input: &serde_json::Value,
     pdf_config: &serde_json::Value,
 ) -> (String, bool) {
+    // SCOPE KEY (Mason 08-03): file tools used the legacy "default" scope while
+    // shell exec used the per-agent scope — when the agent folder moved, the two
+    // roots DIVERGED (writes landed in a ghost folder the user never saw). Use
+    // the agent's own scope, but fall back to "default" if it was never
+    // registered — that guard is what the 07-28 'refused by jail on files that
+    // plainly exist' bug was about; NoScope is the only case that falls back.
+    let agent_id: &str = if broker.root_for(agent_id).is_ok() { agent_id } else { "default" };
     let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
     match name {
         "read_file" => match broker.resolve_and_open(agent_id, path, broker::Mode::Read) {
@@ -2494,10 +2511,10 @@ fn exec_tool_cfg(
         },
         "write_file" => {
             let cnt = input.get("content").and_then(|c| c.as_str()).unwrap_or("");
-            if let Ok(real) = broker.resolve("default", path, broker::Mode::Write) {
+            if let Ok(real) = broker.resolve(agent_id, path, broker::Mode::Write) {
                 if let Some(parent) = real.parent() { let _ = std::fs::create_dir_all(parent); }
             }
-            match broker.resolve_and_open("default", path, broker::Mode::Write) {
+            match broker.resolve_and_open(agent_id, path, broker::Mode::Write) {
                 Ok(mut f) => {
                     use std::io::Write as _;
                     match f.write_all(cnt.as_bytes()) {
@@ -2519,14 +2536,13 @@ fn exec_tool_cfg(
             if from.is_empty() || to.is_empty() {
                 return ("rename_file needs `from` and `to` paths".into(), true);
             }
-            // Source + destination both jailed. Use the SAME scope key the other
-            // working file tools use ("default") — bug (Mason 07-28): resolving
-            // against agent_id hit an unset scope -> 'refused by jail' on files
-            // that plainly exist. read_file/write_file/list_files all use "default".
-            let src = match broker.resolve("default", from, broker::Mode::Read) {
+            // Source + destination both jailed, same checked scope key as every
+            // other file tool (per-agent scope, "default" only if unregistered —
+            // see the scope-key note at the top of exec_tool_cfg, Mason 08-03).
+            let src = match broker.resolve(agent_id, from, broker::Mode::Read) {
                 Ok(p) => p, Err(e) => return (format!("source refused by jail: {e:?}"), true),
             };
-            let dst = match broker.resolve("default", to, broker::Mode::Write) {
+            let dst = match broker.resolve(agent_id, to, broker::Mode::Write) {
                 Ok(p) => p, Err(e) => return (format!("destination refused by jail: {e:?}"), true),
             };
             if !src.exists() { return (format!("'{from}' does not exist"), true); }
@@ -2542,7 +2558,7 @@ fn exec_tool_cfg(
         "delete_file" => {
             let target = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
             if target.is_empty() { return ("delete_file needs a `path`".into(), true); }
-            let real = match broker.resolve("default", target, broker::Mode::Write) {
+            let real = match broker.resolve(agent_id, target, broker::Mode::Write) {
                 Ok(p) => p, Err(e) => return (format!("refused by jail: {e:?}"), true),
             };
             if !real.exists() { return (format!("'{target}' does not exist"), true); }
@@ -2552,7 +2568,7 @@ fn exec_tool_cfg(
                 Err(e) => (format!("delete failed: {e}"), true),
             }
         }
-        "list_files" => match broker.resolve("default", path, broker::Mode::Read) {
+        "list_files" => match broker.resolve(agent_id, path, broker::Mode::Read) {
             Ok(real) => {
                 if real.is_file() {
                     // Clean guidance instead of a raw 'Not a directory (os error
@@ -2580,7 +2596,7 @@ fn exec_tool_cfg(
             let out_path = input.get("output_path").and_then(|p| p.as_str())
                 .or_else(|| input.get("path").and_then(|p| p.as_str()))
                 .unwrap_or("document.pdf");
-            match broker.resolve("default", out_path, broker::Mode::Write) {
+            match broker.resolve(agent_id, out_path, broker::Mode::Write) {
                 Ok(real) => {
                     if let Some(parent) = real.parent() { let _ = std::fs::create_dir_all(parent); }
                     match pdf_tool::generate(title, content, &real, pdf_config) {
@@ -3375,7 +3391,7 @@ async fn agent_stream(
     // so it correctly represents "the state produced by this prompt." This fixes
     // the bug where a turn's writes were absorbed (mislabeled) into the NEXT
     // turn's pre-snapshot, or lost entirely if they were the last edit.
-    if let Ok(root) = broker.root_for("default") {
+    if let Ok(root) = broker.root_for(&scope_id) {
         let _ = savepoint::snapshot(&root, "baseline");
     }
 
