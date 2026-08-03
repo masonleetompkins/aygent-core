@@ -622,7 +622,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
         {/* Messages bottom-align: newest sits just above the input, older scroll
            up (justifyContent flex-end + margin-top auto on the list wrapper). */}
-        <div ref={scrollRef} className="aygent-scroll" style={{ flex: 1, overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", padding: "4px 10px 14px 4px" }}>
+        <div ref={scrollRef} className="aygent-scroll" style={{ flex: 1, overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", padding: "6px 28px 36px 28px" }}>
           <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 14 }}>
           {msgs.length === 0 && !running && !blocked && (
             <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
@@ -777,9 +777,14 @@ function HistorySidebar({
   return (
     <div style={{
       width: 230, flexShrink: 0, display: "flex", flexDirection: "column", gap: 8,
-      height: "100%",
       // Bleed past App.tsx's 28px top/bottom content padding so the divider
-      // reaches the literal top and bottom of the window, not just this pane.
+      // reaches the literal top and bottom of the window. height:100% alone
+      // does NOT do this with negative margins -- a negative margin SHIFTS a
+      // box, it doesn't stretch it, so height:100% + marginTop:-28 moved the
+      // top up 28px but left the bottom 28px short (the exact bug Mason
+      // caught). Grow the height by the full bled amount (28 top + 28 bottom)
+      // so the box actually stretches past both edges instead of relocating.
+      height: "calc(100% + 56px)",
       marginTop: -28, marginBottom: -28, paddingTop: 28, paddingBottom: 28,
       borderLeft: "var(--border-width) solid var(--line)", paddingLeft: 14,
     }}>
