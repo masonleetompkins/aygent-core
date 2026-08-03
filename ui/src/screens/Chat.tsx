@@ -320,7 +320,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
   function newConv() {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    setConv(id); setMessages([]); historyRef.current = [];
+    // CONTEXT MODE (2026-08-03): "isolated" (default) starts a truly fresh
+    // session — empty provider history, zero cross-chat token cost.
+    // "continuous" carries the CURRENT chat's provider history into the new
+    // one, so the agent picks up mid-thought (the user opted into the token
+    // cost in the Agents pane). The visible transcript always starts clean
+    // either way — only the model-facing context differs.
+    const carry = agent?.context_mode === "continuous" ? historyRef.current : [];
+    setConv(id); setMessages([]); historyRef.current = carry;
   }
 
   async function openConv(id: string) {

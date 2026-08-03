@@ -92,6 +92,66 @@ pub async fn anthropic_complete(
     Ok(out)
 }
 
+
+// --- PROMPT CACHING (2026-08-03) --------------------------------------------
+// Anthropic bills 100% of input tokens on EVERY call unless blocks carry an
+// explicit cache_control breakpoint (it does NOT auto-cache like OpenAI).
+// Before this, every round of the tool loop (up to 20/turn) and every turn of
+// a long chat re-billed the full system prompt + tool schemas + entire history
+// at fresh-input price. These helpers mark three breakpoints (limit is 4):
+//   1. the system prompt (stable per agent),
+//   2. the last tool schema (caches the whole tools array prefix),
+//   3. the last message (caches the growing conversation prefix, so each
+//      tool-loop round / follow-up turn only pays fresh price for what's new;
+//      the rest is a cache read at ~10% of input price, 5-min TTL).
+// All three CLONE their input — the caller's history array (which gets
+// persisted) is never mutated with cache markers.
+
+/// System prompt as a content-block array carrying a cache breakpoint.
+fn cacheable_system(system: &str) -> serde_json::Value {
+    if system.is_empty() {
+        return json!("");
+    }
+    json!([{ "type": "text", "text": system, "cache_control": { "type": "ephemeral" } }])
+}
+
+/// Tools array with a cache breakpoint on the LAST schema (caches the prefix).
+fn cacheable_tools(tools: &serde_json::Value) -> serde_json::Value {
+    let mut arr = tools.as_array().cloned().unwrap_or_default();
+    if let Some(last) = arr.last_mut() {
+        if let Some(obj) = last.as_object_mut() {
+            obj.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+        }
+    }
+    json!(arr)
+}
+
+/// Messages with a cache breakpoint on the last block of the LAST message, so
+/// the whole prior conversation is a cacheable prefix. A plain-string content
+/// is converted to the equivalent single text block (same tokens).
+fn cacheable_messages(messages: &serde_json::Value) -> serde_json::Value {
+    let mut arr = messages.as_array().cloned().unwrap_or_default();
+    if let Some(last) = arr.last_mut() {
+        if let Some(content) = last.get_mut("content") {
+            match content {
+                serde_json::Value::String(s) => {
+                    let text = s.clone();
+                    *content = json!([{ "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }]);
+                }
+                serde_json::Value::Array(blocks) => {
+                    if let Some(b) = blocks.last_mut() {
+                        if let Some(obj) = b.as_object_mut() {
+                            obj.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    json!(arr)
+}
+
 // --- Tool-use aware call (M0.3 agent loop) ---------------------------------
 
 /// One Anthropic Messages turn WITH tools + prior message history. Returns the
@@ -107,9 +167,9 @@ pub async fn anthropic_turn(
     let body = json!({
         "model": model,
         "max_tokens": 1024,
-        "system": system,
-        "tools": tools,
-        "messages": messages,
+        "system": cacheable_system(system),
+        "tools": cacheable_tools(tools),
+        "messages": cacheable_messages(messages),
     });
 
     let client = reqwest::Client::new();
@@ -192,9 +252,9 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
         // emitted, tool_results stays empty, and the loop breaks: a silent death
         // exactly at "generation". 8192 gives tool calls real room.
         "max_tokens": 8192,
-        "system": system,
-        "tools": tools,
-        "messages": messages,
+        "system": cacheable_system(system),
+        "tools": cacheable_tools(tools),
+        "messages": cacheable_messages(messages),
         "stream": true,
     });
 
