@@ -531,9 +531,18 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
         idx === withUser.length - 1 && mm.role === "user" && done.memory
           ? { ...mm, memory: done.memory } : mm
       );
+      // BUG FIX (Mason 08-02): a genuinely empty final answer (no crash, no loop
+      // exhaustion -- the model just returned no text, e.g. after only viewing an
+      // attachment) rendered as a bare "(done)", indistinguishable from the OLD
+      // silent-failure bug this session already fixed once. Make the fallback
+      // say what actually happened instead of a cryptic placeholder, and nudge
+      // toward the fix (ask a follow-up) rather than leaving it a dead end.
+      const emptyReplyText = done.liveTools.length > 0
+        ? "(ran " + done.liveTools.length + " tool" + (done.liveTools.length > 1 ? "s" : "") + " but sent no written reply — try asking a follow-up, e.g. ‘what did you find?’)"
+        : "(no reply text came back from the model this turn — try asking a follow-up)";
       const finalMsgs: Msg[] = [
         ...withUserMem,
-        { role: "assistant", text: done.liveText || "(done)", tools: done.liveTools as ToolLine[], streaming: false },
+        { role: "assistant", text: done.liveText || emptyReplyText, tools: done.liveTools as ToolLine[], streaming: false },
       ];
       // Only overwrite the visible pane if we're STILL viewing this agent+conv.
       if (agentId === myAgent && convIdRef.current === myConvId) {
