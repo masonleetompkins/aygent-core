@@ -207,6 +207,12 @@ use futures_util::StreamExt;
 pub enum StreamEvent {
     /// A chunk of assistant text.
     TextDelta { text: String },
+    /// A tool call BEGAN streaming (name known, args still arriving). The UI
+    /// opens a live card immediately instead of waiting for full assembly.
+    ToolUseStart { id: String, name: String },
+    /// A chunk of the streaming tool-call args (raw partial JSON). For
+    /// write_file this is literally the code being written, live.
+    ToolUseDelta { id: String, text: String },
     /// The model wants to call a tool (emitted once its input is assembled).
     ToolUse { id: String, name: String, input: serde_json::Value },
     /// The turn finished. `stop_reason` = "tool_use" | "end_turn" | ...
@@ -333,6 +339,10 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
                         blocks[idx] = block.clone();
                         if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                             tool_json.insert(idx, String::new());
+                            on_event(StreamEvent::ToolUseStart {
+                                id: block.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                                name: block.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                            });
                         }
                     }
                     Some("content_block_delta") => {
@@ -374,6 +384,10 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
                             Some("input_json_delta") => {
                                 if let Some(pj) = delta.get("partial_json").and_then(|x| x.as_str()) {
                                     tool_json.entry(idx).or_default().push_str(pj);
+                                    on_event(StreamEvent::ToolUseDelta {
+                                        id: blocks.get(idx).and_then(|b| b.get("id")).and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                                        text: pj.to_string(),
+                                    });
                                 }
                             }
                             _ => {}

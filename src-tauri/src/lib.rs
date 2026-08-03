@@ -3350,8 +3350,12 @@ async fn agent_stream(
                     if sig == last_sig { same_sig_streak += 1; } else { last_sig = sig; same_sig_streak = 1; }
                     last_action = if path.is_empty() { name.clone() } else { format!("{name} {path}") };
                     let _ = app.emit(&channel, &serde_json::json!({
-                        "kind": "ToolResult", "name": name, "path": path,
-                        "ok": !is_err, "detail": if is_err { result_text.clone() } else { String::new() }
+                        "kind": "ToolResult", "id": id, "name": name, "path": path,
+                        "ok": !is_err,
+                        // Bounded output for the expanded activity card (Mason 08-03):
+                        // errors in full flavor, successes as a 2000-char preview —
+                        // the full result still goes to the model / logs regardless.
+                        "detail": if is_err { result_text.clone() } else { result_text.chars().take(2000).collect::<String>() }
                     }));
                     // OpenAI expects tool results as {role:"tool", tool_call_id, content};
                     // build_openai_messages translates our tool_result blocks into that.
@@ -3606,8 +3610,12 @@ async fn agent_stream(
                     last_action = if path.is_empty() { name.clone() } else { format!("{name} {path}") };
                     // tell the UI the tool's OUTCOME (the ToolUse start already fired)
                     let _ = app.emit(&channel, &serde_json::json!({
-                        "kind": "ToolResult", "name": name, "path": path,
-                        "ok": !is_err, "detail": if is_err { result_text.clone() } else { String::new() }
+                        "kind": "ToolResult", "id": id, "name": name, "path": path,
+                        "ok": !is_err,
+                        // Bounded output for the expanded activity card (Mason 08-03):
+                        // errors in full flavor, successes as a 2000-char preview —
+                        // the full result still goes to the model / logs regardless.
+                        "detail": if is_err { result_text.clone() } else { result_text.chars().take(2000).collect::<String>() }
                     }));
                     tool_results.push(serde_json::json!({
                         "type": "tool_result", "tool_use_id": id,
