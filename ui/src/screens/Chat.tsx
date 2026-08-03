@@ -7,7 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Button } from "../components/ui";
 import { Icon, type IconName } from "../components/Icon";
 import { Markdown } from "../components/Markdown";
-import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion } from "../lib/turns";
+import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion, stopTurn } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
 
 type ToolLine = { name: string; path: string; ok?: boolean; detail?: string };
@@ -281,6 +281,10 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // "local" routes to the in-app llama.cpp engine. Loaded on folder change and
   // re-checked on each send so a Settings change applies without a reload.
   const modelRef = useRef<string>("");
+  // STOP BUTTON: the channel id of the turn currently in flight on this pane
+  // (set right before runTurn, cleared after) so the Stop button -- rendered
+  // outside send()'s closure -- knows exactly which turn to cancel.
+  const runningChannelRef = useRef<string | null>(null);
   const providerRef = useRef<string>("");
 
   useEffect(() => { scrollRef.current?.scrollTo({ top: 1e9, behavior: "smooth" }); }, [msgs]);
@@ -503,6 +507,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       } catch { /* keep last */ }
     }
 
+    runningChannelRef.current = channel;
     try {
       // runTurn OWNS the listener + accumulator in the App-level store, so the
       // stream keeps landing even if you navigate away. It resolves with the
@@ -526,20 +531,41 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
         idx === withUser.length - 1 && mm.role === "user" && done.memory
           ? { ...mm, memory: done.memory } : mm
       );
+      // BUG FIX (Mason 08-02): a genuinely empty final answer (no crash, no loop
+      // exhaustion -- the model just returned no text, e.g. after only viewing an
+      // attachment) rendered as a bare "(done)", indistinguishable from the OLD
+      // silent-failure bug this session already fixed once. Make the fallback
+      // say what actually happened instead of a cryptic placeholder, and nudge
+      // toward the fix (ask a follow-up) rather than leaving it a dead end.
+      const emptyReplyText = done.liveTools.length > 0
+        ? "(ran " + done.liveTools.length + " tool" + (done.liveTools.length > 1 ? "s" : "") + " but sent no written reply — try asking a follow-up, e.g. ‘what did you find?’)"
+        : "(no reply text came back from the model this turn — try asking a follow-up)";
       const finalMsgs: Msg[] = [
         ...withUserMem,
-        { role: "assistant", text: done.liveText || "(done)", tools: done.liveTools as ToolLine[], streaming: false },
+        { role: "assistant", text: done.liveText || emptyReplyText, tools: done.liveTools as ToolLine[], streaming: false },
       ];
       // Only overwrite the visible pane if we're STILL viewing this agent+conv.
       if (agentId === myAgent && convIdRef.current === myConvId) {
         msgsRef.current = finalMsgs; setMsgs(finalMsgs);
       }
       void persistFor(myConvId, finalMsgs, historyRef.current);
+      runningChannelRef.current = null;
     } catch (err) {
       const errMsgs: Msg[] = [...withUser, { role: "assistant", text: `✗ ${String(err)}`, tools: [], streaming: false }];
       if (agentId === myAgent && convIdRef.current === myConvId) { msgsRef.current = errMsgs; setMsgs(errMsgs); }
       void persistFor(myConvId, errMsgs, historyRef.current);
+      runningChannelRef.current = null;
     }
+  }
+
+  // STOP BUTTON: cancel whatever turn is currently in flight on THIS pane.
+  // Fire-and-forget -- the turn winds down on its own (the backend notices the
+  // cancel flag on the next network chunk and finishes cleanly with a
+  // "stopped by user" message), which flows through the normal runTurn/finally
+  // path exactly like any other turn ending. Nothing to await here.
+  function stop() {
+    const ch = runningChannelRef.current;
+    if (ch) void stopTurn(ch);
   }
 
   const blocked = !folder || !keySet;
@@ -596,7 +622,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
         {/* Messages bottom-align: newest sits just above the input, older scroll
            up (justifyContent flex-end + margin-top auto on the list wrapper). */}
-        <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", paddingRight: 6 }}>
+        <div ref={scrollRef} className="aygent-scroll" style={{ flex: 1, overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", padding: "6px 28px 36px 28px" }}>
           <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 14 }}>
           {msgs.length === 0 && !running && !blocked && (
             <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
@@ -720,7 +746,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               borderRadius: "var(--radius-control)", color: "var(--text)", padding: "10px 12px",
               fontSize: 15, fontFamily: "inherit",
             }} />
-          <Button onClick={send} disabled={blocked || running}>{running ? "…" : "Send"}</Button>
+          <Button onClick={running ? stop : send} disabled={blocked || (!running && !input.trim())}>{running ? "Stop" : "Send"}</Button>
         </div>
       </div>
 
@@ -751,10 +777,19 @@ function HistorySidebar({
   return (
     <div style={{
       width: 230, flexShrink: 0, display: "flex", flexDirection: "column", gap: 8,
+      // Bleed past App.tsx's 28px top/bottom content padding so the divider
+      // reaches the literal top and bottom of the window. height:100% alone
+      // does NOT do this with negative margins -- a negative margin SHIFTS a
+      // box, it doesn't stretch it, so height:100% + marginTop:-28 moved the
+      // top up 28px but left the bottom 28px short (the exact bug Mason
+      // caught). Grow the height by the full bled amount (28 top + 28 bottom)
+      // so the box actually stretches past both edges instead of relocating.
+      height: "calc(100% + 56px)",
+      marginTop: -28, marginBottom: -28, paddingTop: 28, paddingBottom: 28,
       borderLeft: "var(--border-width) solid var(--line)", paddingLeft: 14,
     }}>
       <Button onClick={onNew} disabled={busy}>+ New chat</Button>
-      <div ref={listElRef} style={{ overflowY: "auto", display: "flex", flexDirection: "column", gap: 4, marginTop: 4 }}>
+      <div ref={listElRef} className="aygent-scroll" style={{ overflowY: "auto", display: "flex", flexDirection: "column", gap: 4, marginTop: 4, flex: 1, minHeight: 0 }}>
         {convs.length === 0 && (
           <p style={{ ...hint, fontSize: 13, color: "var(--text-faint)" }}>No chats yet.</p>
         )}

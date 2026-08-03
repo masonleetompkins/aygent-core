@@ -8,6 +8,7 @@ use rusqlite::params; // scheduler_list/scheduler_runs read-only queries
 
 mod agents;
 mod browser;
+mod cancel;
 // ENGINE-CEF (Phase 1): native Chromium visible-surface + punchout geometry.
 // Both are #![cfg(all(target_os = "macos", feature = "engine-cef"))] internally,
 // so declaring them unconditionally is inert unless the feature is on + macOS.
@@ -1156,6 +1157,17 @@ async fn openai_models(provider: String) -> Result<Vec<String>, String> {
     openai_provider::list_models(&provider, &key).await
 }
 
+/// REAL connectivity check (Mason 08-02): openai_models() for OpenRouter hits a
+/// PUBLIC endpoint that returns success with no key — the "Test" button lied.
+/// This one actually round-trips auth.
+#[tauri::command]
+async fn provider_verify_key(provider: String) -> Result<(), String> {
+    let key = keychain::get_key(&provider)?;
+    if key.trim().is_empty() { return Err("stored key is empty".into()); }
+    if provider == "anthropic" { return anthropic_models().await.map(|_| ()); }
+    openai_provider::verify_key(&provider, &key).await
+}
+
 /// Per-agent selected model. "" = auto (prefer haiku, else first available).
 /// M1.1: folder→agent then read from SQLite agent_settings.
 #[tauri::command]
@@ -1173,20 +1185,25 @@ fn set_selected_model(db: tauri::State<writer::Db>, folder: String, model: Strin
 }
 
 /// Full per-agent selection (provider + model). Empty provider = anthropic.
+/// BUG FIX (Mason 08-02): this read the VESTIGIAL agent_settings table, but the
+/// Agents tab (the only editing surface) writes agent.model/agent.provider on
+/// the AGENT row — so switching a model in the UI never changed what Chat used.
+/// The agent profile is the single source of truth now; agent_settings remains
+/// only for non-selection knobs (auto_remember).
 #[tauri::command]
 fn get_selection(db: tauri::State<writer::Db>, folder: String) -> Result<serde_json::Value, String> {
     let agent_id = agent_for_folder(&db, &folder)?;
-    let s = repo::load_settings(&db, &agent_id)?;
-    Ok(serde_json::json!({ "provider": s.provider, "model": s.model }))
+    let a = repo::get_agent(&db, &agent_id)?.ok_or("agent not found")?;
+    Ok(serde_json::json!({ "provider": a.provider, "model": a.model }))
 }
 
 #[tauri::command]
 fn set_selection(db: tauri::State<writer::Db>, folder: String, provider: String, model: String) -> Result<(), String> {
     let agent_id = agent_for_folder(&db, &folder)?;
-    let mut s = repo::load_settings(&db, &agent_id)?;
-    s.provider = provider;
-    s.model = model;
-    repo::save_settings(&db, &agent_id, s)
+    let mut a = repo::get_agent(&db, &agent_id)?.ok_or("agent not found")?;
+    a.provider = provider;
+    a.model = model;
+    repo::update_agent(&db, a)
 }
 
 // --- AGENTS (multi-agent profiles) -----------------------------------------
@@ -1340,6 +1357,17 @@ fn chat_attach_file(
     Ok(rel)
 }
 
+/// STOP BUTTON: the UI calls this when the user clicks Stop mid-turn. `channel`
+/// is the SAME per-conversation event channel id the Chat pane already passes
+/// to agent_stream (myConvId in turns.ts) -- the cancel registry is keyed by
+/// it, so this reaches the exact turn the button belongs to. Returns whether a
+/// live turn was actually found and signaled (false = nothing to stop, e.g. it
+/// had already finished -- not an error, just a no-op).
+#[tauri::command]
+fn agent_stop(cancel_reg: tauri::State<'_, cancel::CancelRegistry>, channel: String) -> bool {
+    cancel_reg.request_stop(&channel)
+}
+
 /// Build Anthropic content BLOCKS for attached files. Images become image
 /// blocks (model vision), PDFs document blocks, small text files inline text,
 /// anything else a descriptive note (the agent can still use file tools on it).
@@ -1369,6 +1397,47 @@ fn attachment_blocks(broker: &Arc<Broker>, agent_id: &str, rels: &[String]) -> V
                 blocks.push(serde_json::json!({ "type": "text", "text": format!("[attached PDF: {name}]") }));
                 blocks.push(serde_json::json!({ "type": "document", "source": { "type": "base64", "media_type": "application/pdf", "data": base64::engine::general_purpose::STANDARD.encode(&bytes) } }));
             }
+        } else if let Ok(text) = String::from_utf8(bytes.clone()) {
+            let capped: String = text.chars().take(30_000).collect();
+            blocks.push(serde_json::json!({ "type": "text", "text": format!("[attached file: {name} ({rel})]\n\n{capped}") }));
+        } else {
+            blocks.push(serde_json::json!({ "type": "text", "text": format!("[attached binary file: {name} — stored at {rel} ({} bytes); use your file/shell tools on it as needed]", bytes.len()) }));
+        }
+    }
+    blocks
+}
+
+/// Build OpenAI/OpenRouter content PARTS for attached files (Chat Completions
+/// vision format: {type:"image_url", image_url:{url:"data:<mime>;base64,..."}}).
+/// Mirrors attachment_blocks() but in the wire shape OpenAI-compatible APIs
+/// expect — this was MISSING entirely (attachments silently vanished on
+/// OpenAI/OpenRouter/DeepSeek: the file saved into the jail fine via
+/// chat_attach_file, but the turn never read it back in). PDFs are NOT inlined
+/// (chat/completions has no standard inline-PDF content part, unlike Anthropic's
+/// document block) — we say so plainly instead of guessing at an unsupported
+/// shape; the model still has file tools to read it if needed.
+fn attachment_blocks_openai(broker: &Arc<Broker>, agent_id: &str, rels: &[String]) -> Vec<serde_json::Value> {
+    let mut blocks = Vec::new();
+    for rel in rels {
+        let abs = match broker.resolve(agent_id, rel, broker::Mode::Read) { Ok(a) => a, Err(_) => continue };
+        let bytes = match std::fs::read(&abs) { Ok(b) => b, Err(_) => continue };
+        let name = abs.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+        let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        use base64::Engine;
+        let media = match ext.as_str() {
+            "png" => Some("image/png"), "jpg" | "jpeg" => Some("image/jpeg"),
+            "gif" => Some("image/gif"), "webp" => Some("image/webp"), _ => None,
+        };
+        if let Some(m) = media {
+            if bytes.len() > 4_800_000 {
+                blocks.push(serde_json::json!({ "type": "text", "text": format!("[attachment '{name}' is an image over the vision size limit — use file tools on {rel} instead]") }));
+            } else {
+                blocks.push(serde_json::json!({ "type": "text", "text": format!("[attached image: {name}]") }));
+                let data_url = format!("data:{m};base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes));
+                blocks.push(serde_json::json!({ "type": "image_url", "image_url": { "url": data_url } }));
+            }
+        } else if ext == "pdf" {
+            blocks.push(serde_json::json!({ "type": "text", "text": format!("[attached PDF '{name}' — stored at {rel}; this provider's chat API has no inline-PDF vision format, use read_file/shell tools on it if you need its contents]") }));
         } else if let Ok(text) = String::from_utf8(bytes.clone()) {
             let capped: String = text.chars().take(30_000).collect();
             blocks.push(serde_json::json!({ "type": "text", "text": format!("[attached file: {name} ({rel})]\n\n{capped}") }));
@@ -2939,6 +3008,7 @@ async fn agent_stream(
     db: tauri::State<'_, writer::Db>,
     drain: tauri::State<'_, drainer::DrainSignal>,
     browser_state: tauri::State<'_, browser::BrowserProc>,
+    cancel_reg: tauri::State<'_, cancel::CancelRegistry>,
     channel: String,
     prompt: String,
     history: serde_json::Value,
@@ -2952,6 +3022,13 @@ async fn agent_stream(
     use tauri::Emitter;
     let broker = broker.inner().clone();
     let provider_kind = provider.unwrap_or_default();
+
+    // STOP BUTTON: register this turn's cancel flag under its event channel.
+    // The guard's Drop removes the entry on ANY exit path (this fn has many:
+    // early `?`, explicit `return Ok`/`return Err`, natural fall-through at the
+    // bottom of each provider branch) so a finished turn never leaves a stale
+    // flag behind to falsely cancel a later turn reusing the same channel.
+    let (_cancel_guard, cancel_flag) = cancel::CancelGuard::new(cancel_reg.inner().clone(), channel.clone());
 
     // ---- PER-SESSION LANE (M1.1) -------------------------------------------
     // Serialize turns for THIS session: if another turn is already running on
@@ -3141,14 +3218,36 @@ async fn agent_stream(
         let pdf_cfg = pdf_config_for(&app, folder.as_deref());
         let sys = format!("{AGENT_SYSTEM}{extra_block}{reg_instr}");
         let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
-        messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": prompt }));
+        // ATTACHMENTS (bug fix — these were SILENTLY DROPPED on OpenAI/OpenRouter:
+        // the Anthropic branch built real content blocks from `attachments`, this
+        // branch never even looked at the parameter). Same OpenAI vision wire shape
+        // (image_url data: URLs) as any other OpenAI-compatible call.
+        let att = attachments.clone().unwrap_or_default();
+        if att.is_empty() {
+            messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": prompt }));
+        } else {
+            let mut content = vec![serde_json::json!({ "type": "text", "text": prompt })];
+            content.extend(attachment_blocks_openai(&broker, &scope_id, &att));
+            messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": content }));
+        }
         let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("model: {model}") });
 
-        for _ in 0..8 {
-            let (assistant, _stop) = openai_provider::openai_stream_turn(
-                &provider_kind, &key, &model, &sys, &messages, &tools,
+        let mut finished_naturally = false;
+        for _ in 0..20 {
+            let stream_result = openai_provider::openai_stream_turn(
+                &provider_kind, &key, &model, &sys, &messages, &tools, Some(&cancel_flag),
                 |ev| { let _ = app.emit(&channel, &ev); },
-            ).await?;
+            ).await;
+            if let Err(e) = &stream_result {
+                if e == "__CANCELLED__" {
+                    messages.as_array_mut().unwrap().push(serde_json::json!({
+                        "role": "assistant", "content": "⏹️ stopped by user"
+                    }));
+                    finished_naturally = true;
+                    break;
+                }
+            }
+            let (assistant, _stop) = stream_result?;
 
             // Push the assistant message (OpenAI-native shape, may carry tool_calls).
             messages.as_array_mut().unwrap().push(assistant.clone());
@@ -3215,8 +3314,31 @@ async fn agent_stream(
                 }
             }
 
+            // CLEO-GUARD:assistant-toolcalls (2026-08-02) — if the assistant carried
+            // tool_calls but they were all empty (id/name not captured — a
+            // reasoning-model wire quirk), do NOT push a half-built tool pairing
+            // and loop; surface a clear error instead of a confusing 400 on the
+            // next send.
+            if had_tools {
+                let allEmpty = assistant.get("tool_calls")
+                    .and_then(|tc| tc.as_array())
+                    .map(|arr| arr.iter().all(|c| c.get("id").and_then(|i| i.as_str()).unwrap_or("").is_empty()
+                                              || c.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("").is_empty()))
+                    .unwrap_or(true);
+                if allEmpty {
+                    return Err(format!(
+                        "{provider_kind} emitted a tool_call whose capture came back empty (id/name missing) —                          this model's streamed tool-use isn't fully supported. Try a different model, or                          disable the tool that triggered the call."
+                    ));
+                }
+            }
             if had_tools { continue; }
+            finished_naturally = true;
             break;
+        }
+        if !finished_naturally {
+            let warn = "\u{26A0}\u{FE0F} stopped after 20 tool-call rounds without a final answer this turn — say 'continue' to pick it back up, or ask me to use task_continue for long jobs.".to_string();
+            let _ = app.emit(&channel, &provider::StreamEvent::Info { text: warn.clone() });
+            messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": warn }));
         }
 
         // Snapshot AFTER the turn's writes, labeled with the prompt (C4).
@@ -3274,11 +3396,22 @@ async fn agent_stream(
     let emit = |ev: &provider::StreamEvent| { let _ = app.emit(&channel, ev); };
     emit(&provider::StreamEvent::Info { text: format!("model: {model}") });
 
-    for _ in 0..8 {
-        let (content, stop) = provider::anthropic_stream_turn(
-            &key, &model, &anthropic_sys, &messages, &tools,
+    let mut finished_naturally = false;
+    for _ in 0..20 {
+        let stream_result = provider::anthropic_stream_turn(
+            &key, &model, &anthropic_sys, &messages, &tools, Some(&cancel_flag),
             |ev| { let _ = app.emit(&channel, &ev); },
-        ).await?;
+        ).await;
+        if let Err(e) = &stream_result {
+            if e == "__CANCELLED__" {
+                messages.as_array_mut().unwrap().push(serde_json::json!({
+                    "role": "assistant", "content": [{ "type": "text", "text": "⏹️ stopped by user" }]
+                }));
+                finished_naturally = true;
+                break;
+            }
+        }
+        let (content, stop) = stream_result?;
 
         messages.as_array_mut().unwrap().push(serde_json::json!({
             "role": "assistant", "content": content.clone()
@@ -3390,7 +3523,13 @@ async fn agent_stream(
             // tool cycle; otherwise send results once and finish this turn.
             if stop == "tool_use" { continue; }
         }
+        finished_naturally = true;
         break;
+    }
+    if !finished_naturally {
+        let warn = "\u{26A0}\u{FE0F} stopped after 20 tool-call rounds without a final answer this turn — say 'continue' to pick it back up, or ask me to use task_continue for long jobs.".to_string();
+        emit(&provider::StreamEvent::Info { text: warn.clone() });
+        messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": [{ "type": "text", "text": warn }] }));
     }
 
     // SAVE POINT (C4) part 2: snapshot the folder AFTER the turn's writes, labeled
@@ -3641,7 +3780,7 @@ pub async fn run_headless_turn(
             // human path emits — so an open pane WATCHES the work happen (tokens +
             // tool cards), not just a rail spinner.
             let (content, stop) = provider::anthropic_stream_turn(
-                &key, &model, &system, &messages, &tools,
+                &key, &model, &system, &messages, &tools, None,
                 |ev| { let _ = app.emit(&stream_channel, &ev); },
             ).await?;
             messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": content.clone() }));
@@ -3826,6 +3965,11 @@ pub fn run() {
     // register a DIFFERENT type => 'state not managed'.
     let browser_proc = browser::BrowserProc::new();
 
+    // STOP BUTTON: the turn-cancellation registry (see cancel.rs). Managed as
+    // state so both agent_stream (registers/checks the flag) and the new
+    // agent_stop command (flips it from the UI's Stop click) share ONE map.
+    let cancel_registry = cancel::CancelRegistry::new();
+
     // PRO MODE (2026-07-31): the exec broker — the ONLY code with process-spawn
     // authority. The daemon (Seatbelt deny-exec) requests spawns over the broker
     // WS; only THIS spawns. cwd-pinned to the agent scope, env-scrubbed. Managed
@@ -3845,9 +3989,12 @@ pub fn run() {
         .manage(drain_signal.clone())
         .manage(sched_signal.clone())
         .manage(browser_proc)
+        .manage(cancel_registry)
         .invoke_handler(tauri::generate_handler![
             whisper::transcribe_audio_b64,
             chat_attach_file,
+            agent_stop,
+            provider_verify_key,
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
             agent_stream, reveal_in_finder, get_selected_model, set_selected_model,

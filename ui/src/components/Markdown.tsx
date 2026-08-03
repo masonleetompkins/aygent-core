@@ -7,6 +7,45 @@
 //
 // Shared across surfaces (Chat now; any future transcript/preview reuses it).
 import type { ReactNode } from "react";
+import { invoke } from "@tauri-apps/api/core";
+
+// FILE PATHS ARE CLICKABLE (Mason 08-02): any file path the agent mentions in
+// a reply -- in prose OR inside `code` -- opens Finder at that location, the
+// same reveal_in_finder command the tool-call cards already use. Resolved
+// THROUGH THE JAIL BROKER on the Rust side (Mode::Read, "default" scope, same
+// as ToolCard) -- an out-of-scope path is refused there, not here; this is
+// just the UI trigger.
+async function revealPath(p: string) {
+  try { await invoke("reveal_in_finder", { path: p }); }
+  catch (err) { alert("Couldn't open in Finder: " + String(err)); }
+}
+
+function PathLink({ path, mono }: { path: string; mono?: boolean }) {
+  return (
+    <button
+      onClick={() => void revealPath(path)}
+      title={`Reveal "${path}" in Finder`}
+      style={{
+        font: "inherit", fontFamily: mono ? inlineCode.fontFamily : "inherit",
+        fontSize: mono ? inlineCode.fontSize : "inherit",
+        background: mono ? inlineCode.background : "none",
+        padding: mono ? inlineCode.padding : 0,
+        borderRadius: mono ? inlineCode.borderRadius : 0,
+        border: mono ? inlineCode.border : "none",
+        color: "var(--accent)", cursor: "pointer", textDecoration: "underline",
+        textUnderlineOffset: 2, textAlign: "left",
+      }}
+    >{path}</button>
+  );
+}
+
+// A token "looks like a file path" if it has a directory separator + a
+// plausible extension, OR is a bare filename with a recognized extension.
+// Deliberately conservative (an allowlist of extensions, not "any dot") so we
+// don't misfire on version numbers, sentence-ending abbreviations, etc.
+const PATH_EXT = "md|txt|json|jsonc|ts|tsx|js|jsx|rs|py|toml|yaml|yml|css|scss|html|pdf|png|jpe?g|gif|webp|svg|csv|log|sh|lock|app|zip|db|sqlite|mp3|mp4|wav|m4a|webm|plist|conf|cfg|ini";
+const PATH_WITH_SLASH_RE = new RegExp(`^\.{0,2}\/?(?:[\w.-]+\/)+[\w.-]+\.(?:${PATH_EXT})\b`, "i");
+const BARE_FILE_RE = new RegExp(`^[\w-]+\.(?:${PATH_EXT})\b`, "i");
 
 // Inline formatting: **bold**, *italic* / _italic_, `code`, [text](url).
 // Parsed with a single tokenizer pass so nesting like **bold `code`** works.
@@ -22,11 +61,24 @@ function renderInline(text: string, keyBase: string): ReactNode[] {
     { re: /^__([^_]+)__/, render: (m) => <strong>{renderInline(m[1], `${keyBase}-b2${k}`)}</strong> },
     { re: /^\*([^*]+)\*/, render: (m) => <em>{renderInline(m[1], `${keyBase}-i${k}`)}</em> },
     { re: /^_([^_]+)_/, render: (m) => <em>{renderInline(m[1], `${keyBase}-i2${k}`)}</em> },
-    { re: /^`([^`]+)`/, render: (m) => <code style={inlineCode}>{m[1]}</code> },
+    // `code` spans: if the content LOOKS LIKE A FILE PATH, make it a clickable
+    // Finder-reveal link (monospaced, same look as before) instead of inert code.
+    {
+      re: /^`([^`]+)`/,
+      render: (m) => (PATH_WITH_SLASH_RE.test(m[1]) || BARE_FILE_RE.test(m[1]))
+        ? <PathLink path={m[1]} mono />
+        : <code style={inlineCode}>{m[1]}</code>,
+    },
     {
       re: /^\[([^\]]+)\]\(([^)]+)\)/,
       render: (m) => <a href={m[2]} style={link} target="_blank" rel="noreferrer">{m[1]}</a>,
     },
+    // Bare paths mentioned in PLAIN PROSE (not backtick-wrapped): a directory-
+    // style path (has a `/`) OR a bare filename with a recognized extension.
+    // Tried near the end of the pattern list so it never steals a token that a
+    // more specific rule (bold/italic/code/link) should have claimed first.
+    { re: PATH_WITH_SLASH_RE, render: (m) => <PathLink path={m[0]} /> },
+    { re: BARE_FILE_RE, render: (m) => <PathLink path={m[0]} /> },
   ];
 
   let buf = "";

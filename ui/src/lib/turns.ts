@@ -168,6 +168,19 @@ export type RunArgs = {
 };
 
 /**
+ * STOP BUTTON: ask the backend to cancel the in-flight turn on this channel.
+ * Fire-and-forget from the UI's perspective -- the actual turn winds down when
+ * the Rust side notices the flag (next network chunk) and pushes a final
+ * "stopped by user" message through the SAME event channel, so the UI's normal
+ * finalize path (runTurn's `finally`) handles cleanup exactly like any other
+ * turn ending. No local status flip here: that would race the real one.
+ */
+export async function stopTurn(channel: string): Promise<boolean> {
+  try { return await invoke<boolean>("agent_stop", { channel }); }
+  catch { return false; }
+}
+
+/**
  * Start a turn for an agent. Owns the event listener + accumulator in the store
  * so the stream is captured whether or not the agent is being viewed. Resolves
  * with the final provider-format history (also written into the store).

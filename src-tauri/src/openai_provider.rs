@@ -64,6 +64,30 @@ pub async fn list_models(provider: &str, api_key: &str) -> Result<Vec<String>, S
     Ok(ids)
 }
 
+/// Actually verify a key works — unlike `list_models`, which for OpenRouter
+/// hits a PUBLIC endpoint that returns 200 with a full model list even with an
+/// empty/garbage key (confirmed live 2026-08-02: no auth header, still 200).
+/// OpenRouter's /key endpoint DOES require auth (confirmed: 401 with none) —
+/// use that to actually prove the key works. OpenAI has no equivalent "whoami"
+/// on the same base, so /models (which IS auth-gated there) still applies.
+pub async fn verify_key(provider: &str, api_key: &str) -> Result<(), String> {
+    if provider == "openrouter" {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build().map_err(|e| format!("http: {e}"))?;
+        let resp = client.get(format!("{OPENROUTER_BASE}/key")).bearer_auth(api_key)
+            .send().await.map_err(|e| format!("request failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("openrouter {status}: {text}"));
+        }
+        Ok(())
+    } else {
+        list_models(provider, api_key).await.map(|_| ())
+    }
+}
+
 /// Convert our internal Anthropic-style tool schema to OpenAI `tools` format.
 /// Ours: [{name, description, input_schema}]  ->  OpenAI:
 /// [{type:"function", function:{name, description, parameters}}]
@@ -108,6 +132,18 @@ fn build_openai_messages(system: &str, messages: &serde_json::Value) -> Vec<serd
                         .collect();
                     if !tool_blocks.is_empty() {
                         for b in tool_blocks {
+                            // CLEO-GUARD (2026-08-02): only emit a tool result if it references a
+                            // REAL preceding assistant tool_call (non-empty, matching id). Some
+                            // reasoning models (gpt-5.6-sol) yield orphaned tool blocks; drop them.
+                            let tcid = b.get("tool_use_id").and_then(|x| x.as_str()).unwrap_or("");
+                            let prevOk = !tcid.is_empty()
+                                && out.last()
+                                    .and_then(|pm| pm.get("tool_calls"))
+                                    .and_then(|tc| tc.as_array())
+                                    .map(|arr| arr.iter().any(|c| c.get("id").and_then(|i| i.as_str()) == Some(tcid)))
+                                    .unwrap_or(false);
+                            if (!prevOk) { continue; }
+
                             out.push(json!({
                                 "role": "tool",
                                 "tool_call_id": b.get("tool_use_id").cloned().unwrap_or(json!("")),
@@ -117,7 +153,22 @@ fn build_openai_messages(system: &str, messages: &serde_json::Value) -> Vec<serd
                         continue;
                     }
                 }
-                // Plain user text (string or array of text blocks).
+                // Plain user content: a string, OR an array of blocks that may include
+                // our attachment blocks ({type:"text"} / {type:"image_url",image_url:{url}}
+                // from attachment_blocks_openai in lib.rs). BUG FIX: this used to call
+                // flatten_text(), which reduces the array to a joined STRING — silently
+                // stripping any image_url block right back out, so an attached image
+                // still vanished even after lib.rs started building it. OpenAI's Chat
+                // Completions API accepts multipart content verbatim in this shape, so
+                // pass the array through as-is; only flatten when it's plain text blocks
+                // with nothing else (keeps prior behavior/log shape for the common case).
+                if let Some(blocks) = content.as_array() {
+                    let has_media = blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str()) != Some("text"));
+                    if has_media {
+                        out.push(json!({ "role": "user", "content": blocks }));
+                        continue;
+                    }
+                }
                 out.push(json!({ "role": "user", "content": flatten_text(&content) }));
                 continue;
             }
@@ -160,7 +211,7 @@ pub async fn complete(provider: &str, api_key: &str, model: &str, user_msg: &str
     let no_tools = json!([]);
     let mut text = String::new();
     let (assistant, _stop) = openai_stream_turn(
-        provider, api_key, model, "", &messages, &no_tools,
+        provider, api_key, model, "", &messages, &no_tools, None,
         |ev| {
             if let StreamEvent::TextDelta { text: t } = &ev { text.push_str(t); }
         },
@@ -177,14 +228,26 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
     system: &str,
     messages: &serde_json::Value,
     tools: &serde_json::Value,
+    cancel: Option<&crate::cancel::CancelFlag>,
     mut on_event: F,
 ) -> Result<(serde_json::Value, String), String> {
-    let body = json!({
+    let tools_json = tools_to_openai(tools);
+    let mut body = json!({
         "model": model,
         "messages": build_openai_messages(system, messages),
-        "tools": tools_to_openai(tools),
+        "tools": tools_json,
         "stream": true,
     });
+    // BUG FIX (Mason 08-02): OpenAI's reasoning-family models (o-series, gpt-5.x
+    // "reasoning" variants) reject function tools on /v1/chat/completions unless
+    // reasoning_effort is explicitly "none" — 400 "Function tools with
+    // reasoning_effort are not supported ... use /v1/responses or set
+    // reasoning_effort to 'none'". We need tool-use for the agent loop, so set
+    // it whenever tools are present. Only OpenAI proper defines this param;
+    // OpenRouter passes it through fine but doesn't require it — harmless either way.
+    if !tools_json.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+        body["reasoning_effort"] = json!("none");
+    }
 
     // No-redirect client (see list_models): keeps the bearer token attached so
     // OpenRouter doesn't 401 with "Missing Authentication header" on a redirect.
@@ -213,12 +276,25 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
     let mut stop_reason = String::from("stop");
 
     let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
+    // BUG FIX (same class as provider.rs): buffer RAW BYTES, not a String. The
+    // old code ran `String::from_utf8_lossy(&bytes)` on every raw network chunk
+    // BEFORE buffering -- a multi-byte UTF-8 character split across two chunks
+    // (very likely with a model like DeepSeek that streams a lot of non-ASCII
+    // tokens) got mangled into replacement-character junk on EACH half
+    // independently. This is the most likely cause of the "tons of random
+    // numbers and letters" report. We now only decode once a complete LINE
+    // (the `\n` boundary is pure ASCII, so it can't split a char) is assembled.
+    let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
+        // STOP BUTTON: see provider.rs — same per-chunk cancel check.
+        if cancel.map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
+            on_event(StreamEvent::Done { stop_reason: "cancelled".into() });
+            return Err("__CANCELLED__".into());
+        }
         let bytes = chunk.map_err(|e| format!("stream error: {e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(pos) = buf.find('\n') {
-            let line = buf[..pos].to_string();
+        buf.extend_from_slice(&bytes);
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&buf[..pos]).into_owned();
             buf.drain(..pos + 1);
             let line = line.trim();
             let Some(data) = line.strip_prefix("data:") else { continue };

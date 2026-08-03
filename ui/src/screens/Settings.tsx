@@ -465,10 +465,11 @@ function ProviderRow({ provider, label, placeholder }: { provider: string; label
   async function test() {
     setMsg("testing…");
     try {
-      const models = provider === "anthropic"
-        ? await invoke<string[]>("anthropic_models")
-        : await invoke<string[]>("openai_models", { provider });
-      setMsg(`✓ connected · ${models.length} models`);
+      // provider_verify_key actually round-trips auth (Mason 08-02: OpenRouter's
+      // old check hit a PUBLIC /models endpoint that says "connected" even for
+      // an empty/bad key — this was silently lying).
+      await invoke("provider_verify_key", { provider });
+      setMsg("✓ key verified — auth works");
     } catch (e) { setMsg("✗ " + String(e)); }
   }
   return (

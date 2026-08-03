@@ -163,6 +163,14 @@ pub fn provider_supports_streaming(provider: &str) -> bool {
     matches!(provider, "anthropic" | "openai" | "openrouter" | "ollama")
 }
 
+/// Find the byte-offset of the next SSE frame delimiter (a blank line, i.e.
+/// \n\n or \r\n\r\n) in a raw byte buffer. Operating on bytes (not a decoded
+/// String) means we never risk splitting a multi-byte UTF-8 character while
+/// searching -- the delimiter itself is pure ASCII.
+fn find_double_newline(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\n\n")
+}
+
 /// Stream one Anthropic turn. Calls `on_event` for each normalized StreamEvent
 /// as it arrives off the wire. Assembles tool_use input deltas into a single
 /// ToolUse event. Returns the assistant `content` array (for history) + stop.
@@ -172,6 +180,7 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
     system: &str,
     messages: &serde_json::Value,
     tools: &serde_json::Value,
+    cancel: Option<&crate::cancel::CancelFlag>,
     mut on_event: F,
 ) -> Result<(serde_json::Value, String), String> {
     let body = json!({
@@ -214,7 +223,14 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
     let mut stop_reason = String::from("end_turn");
 
     let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
+    // BUG FIX: buffer RAW BYTES, not a String. The old code did
+    // `String::from_utf8_lossy(&bytes)` on every raw network chunk BEFORE
+    // buffering -- if a multi-byte UTF-8 character (very common in non-English
+    // text, which is exactly what triggered this) straddled a chunk boundary,
+    // each half got independently mangled into U+FFFD replacement junk. Now we
+    // only decode once a COMPLETE SSE frame is assembled, so a split char is
+    // reassembled correctly before decoding.
+    let mut buf: Vec<u8> = Vec::new();
     // Whether we saw a terminal message_stop. If the stream closes WITHOUT one
     // (final frame lacked a trailing "\n\n", so it was never parsed), we drain
     // the remainder below and synthesize Done — otherwise the UI spinner hangs
@@ -222,12 +238,23 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
     let mut saw_done = false;
 
     while let Some(chunk) = stream.next().await {
+        // STOP BUTTON: check the cancel flag on every chunk so a user-requested
+        // stop takes effect the instant the next byte arrives, not after the
+        // model finishes its whole turn. Drop the connection + return a distinct
+        // error the caller (agent_stream) recognizes as "cancelled", not a crash.
+        if cancel.map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
+            on_event(StreamEvent::Done { stop_reason: "cancelled".into() });
+            return Err("__CANCELLED__".into());
+        }
         let bytes = chunk.map_err(|e| format!("stream error: {e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
+        buf.extend_from_slice(&bytes);
 
         // SSE frames are separated by blank lines; each has `data: {...}` lines.
-        while let Some(pos) = buf.find("\n\n") {
-            let frame = buf[..pos].to_string();
+        // Find the frame boundary in BYTES first, then decode just that slice --
+        // `buf` up to `pos` is guaranteed complete (the boundary itself is ASCII
+        // "\n\n"), so decoding here can never split a multi-byte character.
+        while let Some(pos) = find_double_newline(&buf) {
+            let frame = String::from_utf8_lossy(&buf[..pos]).into_owned();
             buf.drain(..pos + 2);
             for line in frame.lines() {
                 let line = line.trim_start();
@@ -332,8 +359,9 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
     // lacks a trailing "\n\n", so it never matched the delimiter loop above and
     // sits unparsed in `buf`. Parse whatever remains, using "\n" boundaries so a
     // dangling frame is still handled.
-    if !buf.trim().is_empty() {
-        for line in buf.lines() {
+    let tail = String::from_utf8_lossy(&buf).into_owned();
+    if !tail.trim().is_empty() {
+        for line in tail.lines() {
             let line = line.trim_start();
             let Some(data) = line.strip_prefix("data:") else { continue };
             let data = data.trim();
