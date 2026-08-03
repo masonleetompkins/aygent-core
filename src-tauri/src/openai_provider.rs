@@ -271,6 +271,8 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
     // deltas: each has an index, and (on the first delta) id + function.name,
     // then function.arguments arrives in pieces we concatenate.
     let mut text = String::new();
+    // indexes whose ToolUseStart already fired (live-args streaming)
+    let mut started: std::collections::HashSet<u64> = std::collections::HashSet::new();
     // index -> (id, name, arguments-so-far)
     let mut tool_acc: std::collections::BTreeMap<u64, (String, String, String)> = std::collections::BTreeMap::new();
     let mut stop_reason = String::from("stop");
@@ -324,7 +326,24 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
                     if let Some(id) = tc.get("id").and_then(|i| i.as_str()) { if !id.is_empty() { entry.0 = id.to_string(); } }
                     if let Some(f) = tc.get("function") {
                         if let Some(n) = f.get("name").and_then(|n| n.as_str()) { if !n.is_empty() { entry.1 = n.to_string(); } }
-                        if let Some(a) = f.get("arguments").and_then(|a| a.as_str()) { entry.2.push_str(a); }
+                        if let Some(a) = f.get("arguments").and_then(|a| a.as_str()) {
+                            entry.2.push_str(a);
+                            // Live args streaming (parity with the Anthropic parser):
+                            // fire ToolUseStart once id+name are known, then route
+                            // each fragment as a ToolUseDelta to that card.
+                            if !entry.0.is_empty() && !entry.1.is_empty() {
+                                if started.insert(idx) {
+                                    on_event(StreamEvent::ToolUseStart { id: entry.0.clone(), name: entry.1.clone() });
+                                    // The fragments BEFORE start fired (id/name mid-assembly)
+                                    // are already in entry.2 — replay them so nothing is lost.
+                                    if entry.2.len() > a.len() {
+                                        let backlog = entry.2[..entry.2.len() - a.len()].to_string();
+                                        if !backlog.is_empty() { on_event(StreamEvent::ToolUseDelta { id: entry.0.clone(), text: backlog }); }
+                                    }
+                                }
+                                if !a.is_empty() { on_event(StreamEvent::ToolUseDelta { id: entry.0.clone(), text: a.to_string() }); }
+                            }
+                        }
                     }
                 }
             }

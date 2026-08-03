@@ -3179,17 +3179,23 @@ async fn agent_stream(
             if calls.is_empty() { break; } // no tool wanted → done
 
             // Execute each call through the SAME jailed broker + emit UI events.
+            // Local calls have no provider tool_use id — synthesize one so the
+            // ToolResult binds to its exact card (parity with cloud paths).
             let mut results_text = String::new();
-            for c in &calls {
+            for (ci, c) in calls.iter().enumerate() {
+                let call_id = format!("local-{turn}-{ci}");
                 let _ = app.emit(&channel, &serde_json::json!({
-                    "kind": "ToolUse", "name": c.name,
+                    "kind": "ToolUse", "id": call_id, "name": c.name,
                     "input": c.input,
                 }));
                 let (result, is_err) = exec_tool_cfg(&broker, &scope_id, &c.name, &c.input, &pdf_cfg);
                 let path_s = c.input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
                 let _ = app.emit(&channel, &serde_json::json!({
-                    "kind": "ToolResult", "name": c.name, "path": path_s,
-                    "ok": !is_err, "detail": if is_err { result.clone() } else { String::new() }
+                    "kind": "ToolResult", "id": call_id, "name": c.name, "path": path_s,
+                    "ok": !is_err,
+                    // Bounded output preview on success too (was error-only),
+                    // same contract as the cloud providers' activity cards.
+                    "detail": if is_err { result.clone() } else { result.chars().take(2000).collect::<String>() }
                 }));
                 results_text.push_str(&local_tools::format_tool_result(&cap.format, &c.name, &result, is_err));
                 results_text.push('\n');
