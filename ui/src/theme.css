@@ -112,3 +112,21 @@ body {
   animation: aygent-blocked-pulse 1.4s ease-out infinite;
   border-radius: var(--radius-control);
 }
+
+
+/* THIN SCROLLBARS (Mason 08-02): the default WebKit scrollbar was wide enough
+   to cover message text at the right edge of the chat pane. Slim + translucent
+   -- visible when you need it, invisible in feel otherwise. */
+.aygent-scroll {
+  scrollbar-width: thin; /* Firefox */
+  scrollbar-color: rgba(var(--accent-rgb), 0.25) transparent;
+}
+.aygent-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+.aygent-scroll::-webkit-scrollbar-track { background: transparent; }
+.aygent-scroll::-webkit-scrollbar-thumb {
+  background: rgba(var(--accent-rgb), 0.25);
+  border-radius: 999px;
+}
+.aygent-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(var(--accent-rgb), 0.45);
+}

@@ -622,7 +622,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
         {/* Messages bottom-align: newest sits just above the input, older scroll
            up (justifyContent flex-end + margin-top auto on the list wrapper). */}
-        <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", paddingRight: 6 }}>
+        <div ref={scrollRef} className="aygent-scroll" style={{ flex: 1, overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", padding: "4px 10px 14px 4px" }}>
           <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 14 }}>
           {msgs.length === 0 && !running && !blocked && (
             <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
@@ -777,10 +777,14 @@ function HistorySidebar({
   return (
     <div style={{
       width: 230, flexShrink: 0, display: "flex", flexDirection: "column", gap: 8,
+      height: "100%",
+      // Bleed past App.tsx's 28px top/bottom content padding so the divider
+      // reaches the literal top and bottom of the window, not just this pane.
+      marginTop: -28, marginBottom: -28, paddingTop: 28, paddingBottom: 28,
       borderLeft: "var(--border-width) solid var(--line)", paddingLeft: 14,
     }}>
       <Button onClick={onNew} disabled={busy}>+ New chat</Button>
-      <div ref={listElRef} style={{ overflowY: "auto", display: "flex", flexDirection: "column", gap: 4, marginTop: 4 }}>
+      <div ref={listElRef} className="aygent-scroll" style={{ overflowY: "auto", display: "flex", flexDirection: "column", gap: 4, marginTop: 4, flex: 1, minHeight: 0 }}>
         {convs.length === 0 && (
           <p style={{ ...hint, fontSize: 13, color: "var(--text-faint)" }}>No chats yet.</p>
         )}
