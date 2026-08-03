@@ -7,7 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Button } from "../components/ui";
 import { Icon, type IconName } from "../components/Icon";
 import { Markdown } from "../components/Markdown";
-import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion } from "../lib/turns";
+import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion, stopTurn } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
 
 type ToolLine = { name: string; path: string; ok?: boolean; detail?: string };
@@ -281,6 +281,10 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // "local" routes to the in-app llama.cpp engine. Loaded on folder change and
   // re-checked on each send so a Settings change applies without a reload.
   const modelRef = useRef<string>("");
+  // STOP BUTTON: the channel id of the turn currently in flight on this pane
+  // (set right before runTurn, cleared after) so the Stop button -- rendered
+  // outside send()'s closure -- knows exactly which turn to cancel.
+  const runningChannelRef = useRef<string | null>(null);
   const providerRef = useRef<string>("");
 
   useEffect(() => { scrollRef.current?.scrollTo({ top: 1e9, behavior: "smooth" }); }, [msgs]);
@@ -503,6 +507,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       } catch { /* keep last */ }
     }
 
+    runningChannelRef.current = channel;
     try {
       // runTurn OWNS the listener + accumulator in the App-level store, so the
       // stream keeps landing even if you navigate away. It resolves with the
@@ -535,11 +540,23 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
         msgsRef.current = finalMsgs; setMsgs(finalMsgs);
       }
       void persistFor(myConvId, finalMsgs, historyRef.current);
+      runningChannelRef.current = null;
     } catch (err) {
       const errMsgs: Msg[] = [...withUser, { role: "assistant", text: `✗ ${String(err)}`, tools: [], streaming: false }];
       if (agentId === myAgent && convIdRef.current === myConvId) { msgsRef.current = errMsgs; setMsgs(errMsgs); }
       void persistFor(myConvId, errMsgs, historyRef.current);
+      runningChannelRef.current = null;
     }
+  }
+
+  // STOP BUTTON: cancel whatever turn is currently in flight on THIS pane.
+  // Fire-and-forget -- the turn winds down on its own (the backend notices the
+  // cancel flag on the next network chunk and finishes cleanly with a
+  // "stopped by user" message), which flows through the normal runTurn/finally
+  // path exactly like any other turn ending. Nothing to await here.
+  function stop() {
+    const ch = runningChannelRef.current;
+    if (ch) void stopTurn(ch);
   }
 
   const blocked = !folder || !keySet;
@@ -720,7 +737,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               borderRadius: "var(--radius-control)", color: "var(--text)", padding: "10px 12px",
               fontSize: 15, fontFamily: "inherit",
             }} />
-          <Button onClick={send} disabled={blocked || running}>{running ? "…" : "Send"}</Button>
+          <Button onClick={running ? stop : send} disabled={blocked || (!running && !input.trim())}>{running ? "Stop" : "Send"}</Button>
         </div>
       </div>
 

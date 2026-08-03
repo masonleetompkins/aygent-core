@@ -153,7 +153,22 @@ fn build_openai_messages(system: &str, messages: &serde_json::Value) -> Vec<serd
                         continue;
                     }
                 }
-                // Plain user text (string or array of text blocks).
+                // Plain user content: a string, OR an array of blocks that may include
+                // our attachment blocks ({type:"text"} / {type:"image_url",image_url:{url}}
+                // from attachment_blocks_openai in lib.rs). BUG FIX: this used to call
+                // flatten_text(), which reduces the array to a joined STRING — silently
+                // stripping any image_url block right back out, so an attached image
+                // still vanished even after lib.rs started building it. OpenAI's Chat
+                // Completions API accepts multipart content verbatim in this shape, so
+                // pass the array through as-is; only flatten when it's plain text blocks
+                // with nothing else (keeps prior behavior/log shape for the common case).
+                if let Some(blocks) = content.as_array() {
+                    let has_media = blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str()) != Some("text"));
+                    if has_media {
+                        out.push(json!({ "role": "user", "content": blocks }));
+                        continue;
+                    }
+                }
                 out.push(json!({ "role": "user", "content": flatten_text(&content) }));
                 continue;
             }
@@ -196,7 +211,7 @@ pub async fn complete(provider: &str, api_key: &str, model: &str, user_msg: &str
     let no_tools = json!([]);
     let mut text = String::new();
     let (assistant, _stop) = openai_stream_turn(
-        provider, api_key, model, "", &messages, &no_tools,
+        provider, api_key, model, "", &messages, &no_tools, None,
         |ev| {
             if let StreamEvent::TextDelta { text: t } = &ev { text.push_str(t); }
         },
@@ -213,6 +228,7 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
     system: &str,
     messages: &serde_json::Value,
     tools: &serde_json::Value,
+    cancel: Option<&crate::cancel::CancelFlag>,
     mut on_event: F,
 ) -> Result<(serde_json::Value, String), String> {
     let tools_json = tools_to_openai(tools);
@@ -260,12 +276,25 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
     let mut stop_reason = String::from("stop");
 
     let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
+    // BUG FIX (same class as provider.rs): buffer RAW BYTES, not a String. The
+    // old code ran `String::from_utf8_lossy(&bytes)` on every raw network chunk
+    // BEFORE buffering -- a multi-byte UTF-8 character split across two chunks
+    // (very likely with a model like DeepSeek that streams a lot of non-ASCII
+    // tokens) got mangled into replacement-character junk on EACH half
+    // independently. This is the most likely cause of the "tons of random
+    // numbers and letters" report. We now only decode once a complete LINE
+    // (the `\n` boundary is pure ASCII, so it can't split a char) is assembled.
+    let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
+        // STOP BUTTON: see provider.rs — same per-chunk cancel check.
+        if cancel.map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
+            on_event(StreamEvent::Done { stop_reason: "cancelled".into() });
+            return Err("__CANCELLED__".into());
+        }
         let bytes = chunk.map_err(|e| format!("stream error: {e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(pos) = buf.find('\n') {
-            let line = buf[..pos].to_string();
+        buf.extend_from_slice(&bytes);
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&buf[..pos]).into_owned();
             buf.drain(..pos + 1);
             let line = line.trim();
             let Some(data) = line.strip_prefix("data:") else { continue };
