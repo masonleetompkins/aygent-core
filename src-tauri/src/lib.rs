@@ -3160,7 +3160,8 @@ async fn agent_stream(
         messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": prompt }));
         let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("model: {model}") });
 
-        for _ in 0..8 {
+        let mut finished_naturally = false;
+        for _ in 0..20 {
             let (assistant, _stop) = openai_provider::openai_stream_turn(
                 &provider_kind, &key, &model, &sys, &messages, &tools,
                 |ev| { let _ = app.emit(&channel, &ev); },
@@ -3249,7 +3250,13 @@ async fn agent_stream(
                 }
             }
             if had_tools { continue; }
-
+            finished_naturally = true;
+            break;
+        }
+        if !finished_naturally {
+            let warn = "\u{26A0}\u{FE0F} stopped after 20 tool-call rounds without a final answer this turn — say 'continue' to pick it back up, or ask me to use task_continue for long jobs.".to_string();
+            let _ = app.emit(&channel, &provider::StreamEvent::Info { text: warn.clone() });
+            messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": warn }));
         }
 
         // Snapshot AFTER the turn's writes, labeled with the prompt (C4).
@@ -3307,7 +3314,8 @@ async fn agent_stream(
     let emit = |ev: &provider::StreamEvent| { let _ = app.emit(&channel, ev); };
     emit(&provider::StreamEvent::Info { text: format!("model: {model}") });
 
-    for _ in 0..8 {
+    let mut finished_naturally = false;
+    for _ in 0..20 {
         let (content, stop) = provider::anthropic_stream_turn(
             &key, &model, &anthropic_sys, &messages, &tools,
             |ev| { let _ = app.emit(&channel, &ev); },
@@ -3423,7 +3431,13 @@ async fn agent_stream(
             // tool cycle; otherwise send results once and finish this turn.
             if stop == "tool_use" { continue; }
         }
+        finished_naturally = true;
         break;
+    }
+    if !finished_naturally {
+        let warn = "\u{26A0}\u{FE0F} stopped after 20 tool-call rounds without a final answer this turn — say 'continue' to pick it back up, or ask me to use task_continue for long jobs.".to_string();
+        emit(&provider::StreamEvent::Info { text: warn.clone() });
+        messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": [{ "type": "text", "text": warn }] }));
     }
 
     // SAVE POINT (C4) part 2: snapshot the folder AFTER the turn's writes, labeled
