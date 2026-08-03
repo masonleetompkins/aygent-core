@@ -3248,8 +3248,33 @@ async fn agent_stream(
         }
         let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("model: {model}") });
 
+        // PRO MODE UNCAPPED (Mason 08-03): same policy as the Anthropic path —
+        // no round cap in Pro Mode; the stall detector replaces it. Non-Pro
+        // keeps the 20-round cap.
+        let pro_uncapped = folder.as_deref().map(|f| pro_mode_enabled(&app, f)).unwrap_or(false);
+        let max_rounds: usize = if pro_uncapped { usize::MAX } else { 20 };
+        let mut rounds: usize = 0;
+        let mut tool_calls_total: usize = 0;
+        let mut last_action: String = String::new();
+        let mut last_sig: String = String::new();
+        let mut same_sig_streak: usize = 0;
+        let mut err_round_streak: usize = 0;
+        let mut stall_reason: Option<String> = None;
         let mut finished_naturally = false;
-        for _ in 0..20 {
+        while rounds < max_rounds {
+            rounds += 1;
+            if pro_uncapped && rounds > 1 && rounds % 25 == 1 {
+                let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("still working — {tool_calls_total} tool calls so far") });
+            }
+            if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                messages.as_array_mut().unwrap().push(serde_json::json!({
+                    "role": "assistant", "content": "⏹️ stopped by user"
+                }));
+                finished_naturally = true;
+                break;
+            }
+            let mut round_calls: usize = 0;
+            let mut round_errs: usize = 0;
             let stream_result = openai_provider::openai_stream_turn(
                 &provider_kind, &key, &model, &sys, &messages, &tools, Some(&cancel_flag),
                 |ev| { let _ = app.emit(&channel, &ev); },
@@ -3317,6 +3342,13 @@ async fn agent_stream(
                         exec_tool_cfg(&broker, &scope_id, &name, &input, &pdf_cfg)
                     };
                     let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                    // STALL DETECTOR bookkeeping (see the Anthropic path).
+                    round_calls += 1;
+                    if is_err { round_errs += 1; }
+                    tool_calls_total += 1;
+                    let sig = format!("{name}:{}", serde_json::to_string(&input).unwrap_or_default());
+                    if sig == last_sig { same_sig_streak += 1; } else { last_sig = sig; same_sig_streak = 1; }
+                    last_action = if path.is_empty() { name.clone() } else { format!("{name} {path}") };
                     let _ = app.emit(&channel, &serde_json::json!({
                         "kind": "ToolResult", "name": name, "path": path,
                         "ok": !is_err, "detail": if is_err { result_text.clone() } else { String::new() }
@@ -3347,12 +3379,34 @@ async fn agent_stream(
                     ));
                 }
             }
-            if had_tools { continue; }
+            if had_tools {
+                if round_calls > 0 && round_errs == round_calls { err_round_streak += 1; } else { err_round_streak = 0; }
+                // STALL DETECTOR (see the Anthropic path): nudge once, then pause.
+                let stalled = same_sig_streak >= 5 || err_round_streak >= 4;
+                if stalled {
+                    if stall_reason.is_none() {
+                        stall_reason = Some(if same_sig_streak >= 5 { "repeating the same call".to_string() } else { "every tool call failing".to_string() });
+                        same_sig_streak = 0; err_round_streak = 0;
+                        messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user",
+                            "content": "[system note] You appear stuck (repeating calls / repeated failures). Change approach, or stop calling tools and summarize where you are and what is blocking you." }));
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
             finished_naturally = true;
             break;
         }
         if !finished_naturally {
-            let warn = "\u{26A0}\u{FE0F} stopped after 20 tool-call rounds without a final answer this turn — say 'continue' to pick it back up, or ask me to use task_continue for long jobs.".to_string();
+            // NEVER a blank or generic ending (Mason 08-03): say WHY, WHAT the
+            // last action was, and HOW MUCH happened.
+            let why = match &stall_reason {
+                Some(r) => format!("stall detected — {r}"),
+                None => format!("hit the {max_rounds}-round tool cap"),
+            };
+            let last = if last_action.is_empty() { String::new() } else { format!(" Last action: {last_action}.") };
+            let warn = format!("\u{26A0}\u{FE0F} paused after {tool_calls_total} tool calls ({why}).{last} Reply to continue.");
             let _ = app.emit(&channel, &provider::StreamEvent::Info { text: warn.clone() });
             messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": warn }));
         }
@@ -3412,8 +3466,36 @@ async fn agent_stream(
     let emit = |ev: &provider::StreamEvent| { let _ = app.emit(&channel, ev); };
     emit(&provider::StreamEvent::Info { text: format!("model: {model}") });
 
+    // PRO MODE UNCAPPED (Mason 08-03): in Pro Mode there is NO round cap — the
+    // loop runs until the model stops calling tools, the user hits Stop, or the
+    // STALL DETECTOR fires (the cap's replacement: a count cap punishes honest
+    // long work; a stall detector catches actual degenerate loops). Non-Pro
+    // keeps the 20-round cap. This is the fix for the "20 continues" session.
+    let pro_uncapped = folder.as_deref().map(|f| pro_mode_enabled(&app, f)).unwrap_or(false);
+    let max_rounds: usize = if pro_uncapped { usize::MAX } else { 20 };
+    let mut rounds: usize = 0;
+    let mut tool_calls_total: usize = 0;
+    let mut last_action: String = String::new();
+    let mut last_sig: String = String::new();   // name+input of the previous tool call
+    let mut same_sig_streak: usize = 0;          // consecutive IDENTICAL calls
+    let mut err_round_streak: usize = 0;         // consecutive rounds where EVERY tool errored
+    let mut stall_reason: Option<String> = None;
     let mut finished_naturally = false;
-    for _ in 0..20 {
+    while rounds < max_rounds {
+        rounds += 1;
+        // Soft checkpoint: long uncapped runs stay legible in the transcript.
+        if pro_uncapped && rounds > 1 && rounds % 25 == 1 {
+            emit(&provider::StreamEvent::Info { text: format!("still working — {tool_calls_total} tool calls so far") });
+        }
+        // STOP between rounds: the stream checks the flag on network chunks, but
+        // a stop pressed DURING local tool execution lands here.
+        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            messages.as_array_mut().unwrap().push(serde_json::json!({
+                "role": "assistant", "content": [{ "type": "text", "text": "⏹️ stopped by user" }]
+            }));
+            finished_naturally = true;
+            break;
+        }
         let stream_result = provider::anthropic_stream_turn(
             &key, &model, &anthropic_sys, &messages, &tools, Some(&cancel_flag),
             |ev| { let _ = app.emit(&channel, &ev); },
@@ -3435,6 +3517,8 @@ async fn agent_stream(
 
         // Execute any tool_use blocks through the broker; emit results live.
         let mut tool_results = Vec::new();
+        let mut round_calls: usize = 0;   // stall detector: calls this round
+        let mut round_errs: usize = 0;    // stall detector: errored calls this round
         if let Some(arr) = content.as_array() {
             for blk in arr {
                 if blk.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
@@ -3510,6 +3594,16 @@ async fn agent_stream(
                         }
                     };
                     let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                    // STALL DETECTOR bookkeeping (Mason 08-03): identical-call streaks
+                    // and all-errored rounds are what distinguish a degenerate loop
+                    // from honest long work — this replaces the blunt 20-round cap
+                    // in Pro Mode.
+                    round_calls += 1;
+                    if is_err { round_errs += 1; }
+                    tool_calls_total += 1;
+                    let sig = format!("{name}:{}", serde_json::to_string(&input).unwrap_or_default());
+                    if sig == last_sig { same_sig_streak += 1; } else { last_sig = sig; same_sig_streak = 1; }
+                    last_action = if path.is_empty() { name.clone() } else { format!("{name} {path}") };
                     // tell the UI the tool's OUTCOME (the ToolUse start already fired)
                     let _ = app.emit(&channel, &serde_json::json!({
                         "kind": "ToolResult", "name": name, "path": path,
@@ -3532,9 +3626,29 @@ async fn agent_stream(
         // assistant message with the dangling tool_use, skip the results, and
         // break — leaving history malformed and 400-ing the NEXT request.
         if !tool_results.is_empty() {
+            // All-errored-round streak (a round where EVERY call failed is the
+            // strongest loop smell; one mixed round of progress resets it).
+            if round_calls > 0 && round_errs == round_calls { err_round_streak += 1; } else { err_round_streak = 0; }
             messages.as_array_mut().unwrap().push(serde_json::json!({
                 "role": "user", "content": tool_results
             }));
+            // STALL DETECTOR: 5 identical consecutive calls, or 4 consecutive
+            // all-errored rounds → first offense injects a course-correct nudge
+            // the model sees with its tool results; a persisting stall pauses the
+            // turn with an HONEST status instead of looping forever.
+            let stalled = same_sig_streak >= 5 || err_round_streak >= 4;
+            if stalled {
+                if stall_reason.is_none() {
+                    stall_reason = Some(if same_sig_streak >= 5 { "repeating the same call".to_string() } else { "every tool call failing".to_string() });
+                    same_sig_streak = 0; err_round_streak = 0;
+                    messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": [{ "type": "text",
+                        "text": "[system note] You appear stuck (repeating calls / repeated failures). Change approach, or stop calling tools and summarize where you are and what is blocking you." }] }));
+                    if stop == "tool_use" { continue; }
+                } else {
+                    // Second stall after the nudge: pause the turn honestly.
+                    break;
+                }
+            }
             // Only keep looping if the model actually wants to continue the
             // tool cycle; otherwise send results once and finish this turn.
             if stop == "tool_use" { continue; }
@@ -3543,7 +3657,15 @@ async fn agent_stream(
         break;
     }
     if !finished_naturally {
-        let warn = "\u{26A0}\u{FE0F} stopped after 20 tool-call rounds without a final answer this turn — say 'continue' to pick it back up, or ask me to use task_continue for long jobs.".to_string();
+        // NEVER a blank or generic ending (Mason 08-03): say WHY the turn ended,
+        // WHAT the last action was, and HOW MUCH happened — the reader should
+        // not need to diagnose the loop from silence.
+        let why = match &stall_reason {
+            Some(r) => format!("stall detected — {r}"),
+            None => format!("hit the {max_rounds}-round tool cap"),
+        };
+        let last = if last_action.is_empty() { String::new() } else { format!(" Last action: {last_action}.") };
+        let warn = format!("\u{26A0}\u{FE0F} paused after {tool_calls_total} tool calls ({why}).{last} Reply to continue.");
         emit(&provider::StreamEvent::Info { text: warn.clone() });
         messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": [{ "type": "text", "text": warn }] }));
     }
