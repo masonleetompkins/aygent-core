@@ -94,19 +94,6 @@ pub fn list(db: &Db) -> Result<Vec<ConnectionRow>, String> {
     Ok(out)
 }
 
-/// Is `provider` connected AND enabled for this agent? Drives whether the
-/// provider's tools appear in the agent's tool list.
-pub fn provider_enabled_for_agent(db: &Db, agent_id: &str, provider: &str) -> bool {
-    let Ok(conn) = db.reader() else { return false };
-    conn.query_row(
-        "SELECT 1 FROM connection c JOIN agent_connection ac ON ac.connection_id = c.id
-         WHERE c.provider = ?1 AND c.status = 'connected' AND ac.agent_id = ?2 AND ac.enabled = 1
-         LIMIT 1",
-        params![provider, agent_id],
-        |_| Ok(true),
-    ).optional().ok().flatten().unwrap_or(false)
-}
-
 /// SELF-HOSTED BUILD: resolve a GitHub PAT + login for `git push`/`git pull`.
 /// Prefers a connection enabled for `agent_id`; falls back to ANY connected
 /// GitHub connection (Mason's personal harness — one login is the norm). Returns
