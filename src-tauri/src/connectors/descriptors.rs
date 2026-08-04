@@ -97,7 +97,7 @@ const GITHUB: Connector = Connector {
             body: "",
             raw_params: &[],
             params: &[],
-            render: Render::Items { root: "", line: "- {full_name}{private} · {description}", empty: "No repositories found." },
+            render: Render::Items { root: "", line: "- {full_name} · {description}", empty: "No repositories found." },
         },
         ConnectorTool {
             base_override: "",

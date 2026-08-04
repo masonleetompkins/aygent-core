@@ -174,14 +174,19 @@ pub async fn call(
     let text = resp.text().await.unwrap_or_default();
 
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        // Actionable, not just the status code. 403 on these APIs usually means
-        // "the credential is valid but wasn't granted this" — different fix than
-        // a bad token, so say both.
-        return Err(format!(
-            "{} rejected the request ({}). The saved credential may be expired, or may not \
-             have permission for this. Reconnect {} in Connections, or re-check its scopes.",
-            c.label, status.as_u16(), c.label
-        ));
+        // PASS THE PROVIDER'S OWN MESSAGE THROUGH. It usually names the exact
+        // cause, and a generic "reconnect the credential" can send the user to
+        // re-do the one thing that isn't broken (seen live: Drive worked while
+        // Calendar 403'd because that API was simply disabled in the project).
+        let detail = extract_error(&text);
+        let hint = if status == reqwest::StatusCode::UNAUTHORIZED {
+            "The saved credential is being rejected — reconnect it in Connections."
+        } else {
+            "The credential is valid but this request was refused. Common causes: the API isn't \
+             enabled for the project, the token lacks a required scope, or the resource wasn't \
+             shared with this account."
+        };
+        return Err(format!("{} error {}{detail}\n{hint}", c.label, status.as_u16()));
     }
     if !status.is_success() {
         let detail = extract_error(&text);
