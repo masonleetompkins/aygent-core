@@ -18,6 +18,9 @@ use tauri::Manager; // for app.path().resource_dir() (bundled daemon/seatbelt lo
 pub struct DaemonState {
     pub ws_token: String,
     pub ws_port: Mutex<Option<u16>>,
+    /// The live daemon process, so we can shut it down cleanly on quit.
+    /// (Was `std::mem::forget(child)` — which orphaned Node on every exit.)
+    pub child: Mutex<Option<std::process::Child>>,
 }
 
 /// Find the absolute path to `node` (Seatbelt needs the concrete binary path;
@@ -205,6 +208,22 @@ pub fn spawn_daemon(
     }
 
     eprintln!("[aygent] daemon spawned (jailed={jailed}) entry={daemon_entry}");
-    std::mem::forget(child);
+    // KEEP the handle (never `mem::forget` it) so shutdown() can stop the
+    // daemon deterministically instead of orphaning it.
+    *state.child.lock().unwrap() = Some(child);
     Ok(())
+}
+
+/// Stop the daemon. Idempotent and best-effort: called on app exit, where the
+/// only unacceptable outcome is hanging or panicking. SIGKILL via `kill()` is
+/// fine here — the daemon holds no unflushed state of its own (all durable
+/// state lives in the Rust-side SQLite writer).
+pub fn shutdown(state: &DaemonState) {
+    let child = state.child.lock().ok().and_then(|mut c| c.take());
+    if let Some(mut child) = child {
+        let _ = child.kill();
+        // Reap it so it can't linger as a zombie attached to a dead parent.
+        let _ = child.wait();
+        eprintln!("[aygent] daemon stopped");
+    }
 }

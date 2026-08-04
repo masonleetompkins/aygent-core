@@ -109,10 +109,18 @@ export function describeToolUse(name: string, input: any): { summary: string; bo
 }
 export type TurnMsg = { role: "user" | "assistant"; text: string; tools?: ToolCard[]; streaming?: boolean; from?: string };
 
+/** One ordered entry in a turn. Text segments and tool calls interleave in the
+ *  order they actually arrived, so a note sits with the calls it belongs to. */
+export type TurnItem =
+  | { kind: "text"; text: string }
+  | { kind: "tool"; tool: ToolCard };
+
 export type TurnState = {
   status: "idle" | "running";
-  liveText: string;          // accumulated streamed tokens for the in-flight assistant msg
-  liveTools: ToolCard[];     // tool cards for the in-flight turn
+  liveText: string;          // accumulated streamed tokens (back-compat: full prose)
+  liveTools: ToolCard[];     // tool cards for the in-flight turn (back-compat: all cards)
+  /** ORDERED view of the same data — what the chat actually renders. */
+  timeline?: TurnItem[];
   info?: string;             // latest info line (model, save point…)
   memory?: string;           // 🧠 auto-capture note for THIS turn (shown under the user msg)
   error?: string;
@@ -145,25 +153,71 @@ const IDLE: TurnState = { status: "idle", liveText: "", liveTools: [] };
 // headless listeners). Returns true if the event was one of ours.
 function handleToolStream(cur: AgentSlot, kind: string | null, m: any): boolean {
   if (kind === "ToolUseStart") {
-    cur.turn = { ...cur.turn, status: "running", liveTools: [...cur.turn.liveTools, { id: m.id, name: m.name, running: true, summary: `⚙ ${m.name}…`, rawArgs: "" }] };
+    cur.turn = { ...appendTool(cur.turn, { id: m.id, name: m.name, running: true, summary: `⚙ ${m.name}…`, rawArgs: "" }), status: "running" };
     emit();
     return true;
   }
   if (kind === "ToolUseDelta") {
-    const tools = [...cur.turn.liveTools];
+    const tools = cur.turn.liveTools;
     for (let i = tools.length - 1; i >= 0; i--) {
       if (tools[i].id === m.id && tools[i].running) {
         const rawArgs = (tools[i].rawArgs ?? "") + (m.text ?? "");
         const body = capBody(liveBodyFromPartialArgs(tools[i].name, rawArgs));
-        tools[i] = { ...tools[i], rawArgs, body: body ?? tools[i].body };
+        cur.turn = patchTool(cur.turn, i, { rawArgs, body: body ?? tools[i].body });
         break;
       }
     }
-    cur.turn = { ...cur.turn, liveTools: tools };
     emit();
     return true;
   }
   return false;
+}
+
+// --- TIMELINE MAINTENANCE --------------------------------------------------
+// Every mutation goes through these so the ordered timeline can never drift
+// out of sync with liveText/liveTools.
+
+/** Append streamed tokens to the CURRENT text segment (or open a new one). */
+function appendText(t: TurnState, chunk: string): TurnState {
+  const timeline = [...(t.timeline ?? [])];
+  const last = timeline[timeline.length - 1];
+  if (last && last.kind === "text") {
+    timeline[timeline.length - 1] = { kind: "text", text: last.text + chunk };
+  } else {
+    timeline.push({ kind: "text", text: chunk });
+  }
+  return { ...t, liveText: t.liveText + chunk, timeline };
+}
+
+/** Append a NEW tool card. This also closes the open text segment, which is
+ *  what keeps "summary, then the calls it describes" readable. */
+function appendTool(t: TurnState, tool: ToolCard): TurnState {
+  return {
+    ...t,
+    liveTools: [...t.liveTools, tool],
+    timeline: [...(t.timeline ?? []), { kind: "tool", tool }],
+  };
+}
+
+/** Update an existing card in place (streaming args, ToolResult) in BOTH views. */
+function patchTool(t: TurnState, idx: number, patch: Partial<ToolCard>): TurnState {
+  const liveTools = [...t.liveTools];
+  if (idx < 0 || idx >= liveTools.length) return t;
+  const updated = { ...liveTools[idx], ...patch };
+  liveTools[idx] = updated;
+
+  // Find the matching timeline entry: prefer id, fall back to positional match
+  // among tool entries (ids are absent for some local providers).
+  const timeline = [...(t.timeline ?? [])];
+  let seen = -1;
+  for (let i = 0; i < timeline.length; i++) {
+    const e = timeline[i];
+    if (e.kind !== "tool") continue;
+    seen++;
+    const idMatch = updated.id && e.tool.id === updated.id;
+    if (idMatch || seen === idx) { timeline[i] = { kind: "tool", tool: updated }; break; }
+  }
+  return { ...t, liveTools, timeline };
 }
 
 // Finalize the streaming card when the assembled ToolUse arrives: replace the
@@ -172,16 +226,15 @@ function handleToolStream(cur: AgentSlot, kind: string | null, m: any): boolean 
 // providers emit ToolUse only).
 function upsertToolUse(cur: AgentSlot, m: any): void {
   const d = describeToolUse(m.name, m.input);
-  const tools = [...cur.turn.liveTools];
+  const tools = cur.turn.liveTools;
   for (let i = tools.length - 1; i >= 0; i--) {
     if (tools[i].id === m.id && tools[i].running) {
-      tools[i] = { ...tools[i], path: m.input?.path, summary: d.summary, body: d.body, rawArgs: undefined };
-      cur.turn = { ...cur.turn, status: "running", liveTools: tools };
+      cur.turn = { ...patchTool(cur.turn, i, { path: m.input?.path, summary: d.summary, body: d.body, rawArgs: undefined }), status: "running" };
       emit();
       return;
     }
   }
-  cur.turn = { ...cur.turn, status: "running", liveTools: [...tools, { id: m.id, name: m.name, path: m.input?.path, running: true, summary: d.summary, body: d.body }] };
+  cur.turn = { ...appendTool(cur.turn, { id: m.id, name: m.name, path: m.input?.path, running: true, summary: d.summary, body: d.body }), status: "running" };
   emit();
 }
 
@@ -234,15 +287,15 @@ async function attachHeadless(agentId: string) {
     if (kind === "InboundMessage") {
       // The peer's message arriving — surfaced as a live inbound bubble.
       cur.inbound = { fromName: m.fromName || m.from, text: m.text };
-      cur.turn = { ...cur.turn, status: "running", liveText: "", liveTools: [] };
+      cur.turn = { ...cur.turn, status: "running", liveText: "", liveTools: [], timeline: [] };
       emit();
-    } else if (kind === "TextDelta") { cur.turn = { ...cur.turn, status: "running", liveText: cur.turn.liveText + text }; emit(); }
+    } else if (kind === "TextDelta") { cur.turn = { ...appendText(cur.turn, text), status: "running" }; emit(); }
     else if (kind === "Info") { cur.turn = { ...cur.turn, status: "running", info: text }; emit(); }
     else if (kind === "ToolUse") { upsertToolUse(cur, m); }
     else if (kind === "ToolResult") {
-      const tools = [...cur.turn.liveTools];
-      for (let i = tools.length - 1; i >= 0; i--) { if ((m.id ? tools[i].id === m.id : tools[i].name === m.name) && tools[i].running) { tools[i] = { ...tools[i], path: m.path || tools[i].path, ok: m.ok, detail: m.detail, running: false }; break; } }
-      cur.turn = { ...cur.turn, liveTools: tools }; emit();
+      const tools = cur.turn.liveTools;
+      for (let i = tools.length - 1; i >= 0; i--) { if ((m.id ? tools[i].id === m.id : tools[i].name === m.name) && tools[i].running) { cur.turn = patchTool(cur.turn, i, { path: m.path || tools[i].path, ok: m.ok, detail: m.detail, running: false }); break; } }
+      emit();
     }
   });
   headlessUnlisten.set(agentId, un);
@@ -317,7 +370,7 @@ export async function stopTurn(channel: string): Promise<boolean> {
 export async function runTurn(a: RunArgs): Promise<unknown[]> {
   const s = slot(a.agentId);
   // Reset this agent's live turn.
-  s.turn = { status: "running", liveText: "", liveTools: [] };
+  s.turn = { status: "running", liveText: "", liveTools: [], timeline: [] };
   emit();
 
   // Tear down any stale listener, then attach a fresh one that writes into the store.
@@ -330,16 +383,16 @@ export async function runTurn(a: RunArgs): Promise<unknown[]> {
     const kind = m.kind || (m.TextDelta ? "TextDelta" : m.Info ? "Info" : m.ToolUseStart ? "ToolUseStart" : m.ToolUseDelta ? "ToolUseDelta" : m.ToolUse ? "ToolUse" : m.ToolResult ? "ToolResult" : m.Done ? "Done" : null);
     const text = m.text ?? m.TextDelta?.text ?? m.Info?.text ?? "";
     if (handleToolStream(cur, kind, m)) return;
-    if (kind === "TextDelta") { cur.turn = { ...cur.turn, liveText: cur.turn.liveText + text }; emit(); }
+    if (kind === "TextDelta") { cur.turn = appendText(cur.turn, text); emit(); }
     else if (kind === "Info") { cur.turn = { ...cur.turn, info: text }; emit(); }
     else if (kind === "MemoryCaptured") { cur.turn = { ...cur.turn, memory: m.text }; emit(); }
     else if (kind === "ToolUse") { upsertToolUse(cur, m); }
     else if (kind === "ToolResult") {
-      const tools = [...cur.turn.liveTools];
+      const tools = cur.turn.liveTools;
       // mark the last matching running tool done (id-matched when available;
       // spread keeps summary/body)
-      for (let i = tools.length - 1; i >= 0; i--) { if ((m.id ? tools[i].id === m.id : tools[i].name === m.name) && tools[i].running) { tools[i] = { ...tools[i], path: m.path || tools[i].path, ok: m.ok, detail: m.detail, running: false }; break; } }
-      cur.turn = { ...cur.turn, liveTools: tools }; emit();
+      for (let i = tools.length - 1; i >= 0; i--) { if ((m.id ? tools[i].id === m.id : tools[i].name === m.name) && tools[i].running) { cur.turn = patchTool(cur.turn, i, { path: m.path || tools[i].path, ok: m.ok, detail: m.detail, running: false }); break; } }
+      emit();
     }
   });
   s.unlisten = un;

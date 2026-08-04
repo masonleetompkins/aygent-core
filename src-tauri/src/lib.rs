@@ -4448,6 +4448,31 @@ pub fn run() {
             });
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running AYGENT");
+        .build(tauri::generate_context!())
+        .expect("error while building AYGENT")
+        .run(|app_handle, event| match event {
+            // The user asked to quit (Cmd+Q / menu). Stop the daemon BEFORE the
+            // process tears down, so we never exit with a live orphaned child —
+            // that is what macOS was reporting as "stopped unexpectedly".
+            tauri::RunEvent::ExitRequested { .. } => {
+                if let Some(state) = app_handle.try_state::<Arc<supervisor::DaemonState>>() {
+                    supervisor::shutdown(&state);
+                }
+            }
+            // Closing the LAST window should quit. On macOS the default is to
+            // keep running with no windows (right for document apps, wrong for
+            // AYGENT — Mason: "clicking the red X keeps it running in the
+            // background"). Exit explicitly once no windows remain.
+            tauri::RunEvent::WindowEvent {
+                event: tauri::WindowEvent::Destroyed, ..
+            } => {
+                if app_handle.webview_windows().is_empty() {
+                    if let Some(state) = app_handle.try_state::<Arc<supervisor::DaemonState>>() {
+                        supervisor::shutdown(&state);
+                    }
+                    app_handle.exit(0);
+                }
+            }
+            _ => {}
+        });
 }

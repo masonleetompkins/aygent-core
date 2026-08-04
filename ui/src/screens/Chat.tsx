@@ -8,6 +8,7 @@ import { Button } from "../components/ui";
 import { Icon, type IconName } from "../components/Icon";
 import { Markdown } from "../components/Markdown";
 import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion, stopTurn } from "../lib/turns";
+import type { TurnItem } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
 
 type ToolLine = { name: string; path: string; ok?: boolean; detail?: string; summary?: string; body?: string; running?: boolean };
@@ -16,7 +17,7 @@ type Msg =
   // ASSISTANT message it's when the turn COMPLETED (set at finalize, not at
   // first token), which is what the timestamp in the margin claims to mean.
   | { role: "user"; text: string; memory?: string; at?: number }
-  | { role: "assistant"; text: string; tools: ToolLine[]; streaming?: boolean; at?: number };
+  | { role: "assistant"; text: string; tools: ToolLine[]; streaming?: boolean; at?: number; timeline?: TurnItem[] };
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 
@@ -613,7 +614,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
         : "(no reply text came back from the model this turn — try asking a follow-up)";
       const finalMsgs: Msg[] = [
         ...withUserMem,
-        { role: "assistant", text: done.liveText || emptyReplyText, tools: done.liveTools as ToolLine[], streaming: false, at: Date.now() },
+        { role: "assistant", text: done.liveText || emptyReplyText, tools: done.liveTools as ToolLine[], timeline: done.timeline, streaming: false, at: Date.now() },
       ];
       // Only overwrite the visible pane if we're STILL viewing this agent+conv.
       if (agentId === myAgent && convIdRef.current === myConvId) {
@@ -720,6 +721,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               role: "assistant",
               text: turn.liveText,
               tools: turn.liveTools.map((t) => ({ name: t.name, path: t.path ?? "", ok: t.ok, detail: t.detail, summary: t.summary, body: t.body, running: t.running })),
+              timeline: turn.timeline,
               streaming: true,
             }} />
           )}
@@ -1055,10 +1057,38 @@ function BubbleBody({ m, isUser, memory }: { m: Msg; isUser: boolean; memory?: s
         padding: "12px 15px",
         display: "flex", flexDirection: "column", gap: 8,
       }}>
-        {!isUser && m.role === "assistant" && m.tools.map((t, i) => <ToolCard key={i} t={t} />)}
-        {m.text && (isUser
-          ? <span style={{ whiteSpace: "pre-wrap", lineHeight: 1.55, fontSize: 15 }}>{m.text}</span>
-          : <Markdown text={m.text} />)}
+        {/* ORDERED RENDER (Mason 08-04): when a timeline exists, draw tool cards
+            and prose in the order they actually happened, so each note sits with
+            the calls it describes instead of every card being hoisted to the top.
+            Consecutive tool calls stay visually stacked (tight gap); a text
+            segment gets breathing room above it. Falls back to the old
+            all-cards-then-all-text layout for conversations saved before this. */}
+        {!isUser && m.role === "assistant" && m.timeline && m.timeline.length > 0 ? (
+          m.timeline.map((item, i) => {
+            if (item.kind === "tool") {
+              const prevWasTool = i > 0 && m.timeline![i - 1].kind === "tool";
+              return (
+                <div key={i} style={{ marginTop: prevWasTool ? 4 : 10 }}>
+                  <ToolCard t={item.tool as ToolLine} />
+                </div>
+              );
+            }
+            const text = item.text.trim();
+            if (!text) return null;
+            return (
+              <div key={i} style={{ marginTop: i === 0 ? 0 : 10 }}>
+                <Markdown text={text} />
+              </div>
+            );
+          })
+        ) : (
+          <>
+            {!isUser && m.role === "assistant" && m.tools.map((t, i) => <ToolCard key={i} t={t} />)}
+            {m.text && (isUser
+              ? <span style={{ whiteSpace: "pre-wrap", lineHeight: 1.55, fontSize: 15 }}>{m.text}</span>
+              : <Markdown text={m.text} />)}
+          </>
+        )}
         {!isUser && m.role === "assistant" && m.streaming && !m.text && <Thinking />}
       </div>
       {memory && (
