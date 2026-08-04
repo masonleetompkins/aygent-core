@@ -1158,9 +1158,9 @@ const SLACK: Connector = Connector {
 
 const GOOGLE: Connector = Connector {
     id: "google",
-    label: "Google Calendar & Drive",
+    label: "Google Workspace",
     category: "Productivity",
-    blurb: "Manage calendar events, read Docs, read and write Sheets — for anything shared with the agent's Google identity.",
+    blurb: "Manage calendar events, read Docs, read and write Sheets, build Slides decks — for anything shared with the agent's Google identity.",
     auth_kind: "service_account_json",
     auth_fields: &[AuthField {
         key: "service_account_json",
@@ -1172,9 +1172,10 @@ const GOOGLE: Connector = Connector {
     credential_url: "https://console.cloud.google.com/iam-admin/serviceaccounts",
     docs_url: "https://developers.google.com/identity/protocols/oauth2/service-account",
     setup_steps: &[
-        "In Google Cloud, create a service account and add a JSON key. Enable the Calendar and Drive APIs.",
+        "In Google Cloud, create a service account and add a JSON key. Enable the APIs you want: Calendar, Drive, Sheets, Slides.",
         "Paste the JSON key here.",
         "IMPORTANT: share each calendar or Drive folder WITH the service account's ...iam.gserviceaccount.com email. It is a separate identity and sees nothing until you do.",
+        "To let it CREATE files, share a folder with Editor access — the agent has no Drive storage of its own and can only create inside folders you own.",
     ],
     write_warning: "The agent will be able to create and change events on calendars you shared with it.",
     base_url: "https://www.googleapis.com",
@@ -1331,6 +1332,86 @@ const GOOGLE: Connector = Connector {
                 ToolParam { name: "event_id", ty: "string", description: "Event id to delete.", required: true },
             ],
             render: Render::One { line: "Event deleted." },
+        },
+        // --- SLIDES -----------------------------------------------------------
+        ConnectorTool {
+            danger: false, b64_params: &[], raw_params: &[],
+            base_override: "https://slides.googleapis.com",
+            name: "google_read_presentation",
+            description: "Read a Google Slides presentation — its slides, their layouts, and all \
+                          text on them. Pass the presentation's Drive file id.",
+            access: Access::Read,
+            method: "GET",
+            path: "/v1/presentations/{presentation_id}",
+            query: &[],
+            body: "",
+            params: &[ToolParam { name: "presentation_id", ty: "string", description: "Presentation id (its Drive file id).", required: true }],
+            render: Render::Json,
+        },
+        ConnectorTool {
+            danger: false, b64_params: &[], raw_params: &["parents"],
+            base_override: "",
+            // Created through DRIVE, not the Slides endpoint, because a service
+            // account has no storage of its own — a deck must be created inside a
+            // folder a human shared with it, so the storage is charged to them.
+            // (Verified live: the Slides create endpoint returns "The user's Drive
+            // storage quota has been exceeded" and offers no way to set a parent.)
+            name: "google_create_presentation",
+            description: "Create a Google Slides presentation INSIDE a folder you've shared with the \
+                          agent. `parents` is a JSON array with that folder's Drive id, e.g. \
+                          [\"1AbC…\"] — required, because the agent has no Drive storage of its own \
+                          and can only create files in folders you own. Use \
+                          google_find_drive_files to get the folder id. Returns the new deck's id \
+                          for google_edit_presentation.",
+            access: Access::Write,
+            method: "POST",
+            path: "/drive/v3/files",
+            query: &[("fields", "id,name,webViewLink")],
+            body: "{\"name\":\"{title}\",\"mimeType\":\"application/vnd.google-apps.presentation\",\"parents\":{parents}}",
+            params: &[
+                ToolParam { name: "title", ty: "string", description: "Presentation title.", required: true },
+                ToolParam { name: "parents", ty: "string", description: "JSON array with the id of a shared folder to create it in, e.g. [\"1AbC…\"].", required: true },
+            ],
+            render: Render::One { line: "Created {name}\n{webViewLink}" },
+        },
+        ConnectorTool {
+            danger: false, b64_params: &[], raw_params: &["parents"],
+            base_override: "",
+            name: "google_create_doc",
+            description: "Create a Google Doc or Sheet inside a folder you've shared with the agent. \
+                          `kind` is 'document' or 'spreadsheet'. `parents` is a JSON array with the \
+                          folder's Drive id — required, since the agent has no storage of its own.",
+            access: Access::Write,
+            method: "POST",
+            path: "/drive/v3/files",
+            query: &[("fields", "id,name,webViewLink")],
+            body: "{\"name\":\"{title}\",\"mimeType\":\"application/vnd.google-apps.{kind}\",\"parents\":{parents}}",
+            params: &[
+                ToolParam { name: "title", ty: "string", description: "File title.", required: true },
+                ToolParam { name: "kind", ty: "string", description: "'document' or 'spreadsheet'.", required: true },
+                ToolParam { name: "parents", ty: "string", description: "JSON array with the id of a shared folder, e.g. [\"1AbC…\"].", required: true },
+            ],
+            render: Render::One { line: "Created {name}\n{webViewLink}" },
+        },
+        ConnectorTool {
+            danger: false, b64_params: &[], raw_params: &["requests"],
+            base_override: "https://slides.googleapis.com",
+            name: "google_edit_presentation",
+            description: "Edit a Google Slides presentation with a batch of requests — add slides, \
+                          insert text, create shapes, replace text, delete objects. `requests` is a \
+                          JSON array of Slides API request objects, e.g. \
+                          [{\"createSlide\":{}},{\"insertText\":{\"objectId\":\"…\",\"text\":\"Hello\"}}]. \
+                          Read the presentation first to get object ids.",
+            access: Access::Write,
+            method: "POST",
+            path: "/v1/presentations/{presentation_id}:batchUpdate",
+            query: &[],
+            body: "{\"requests\":{requests}}",
+            params: &[
+                ToolParam { name: "presentation_id", ty: "string", description: "Presentation id.", required: true },
+                ToolParam { name: "requests", ty: "string", description: "JSON array of Slides API request objects.", required: true },
+            ],
+            render: Render::Json,
         },
         // --- DRIVE ------------------------------------------------------------
         ConnectorTool {

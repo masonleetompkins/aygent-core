@@ -53,7 +53,8 @@ struct Claims {
 /// Google", it is "full control of exactly what you handed it".
 const SCOPES: &str = "https://www.googleapis.com/auth/calendar \
                       https://www.googleapis.com/auth/drive \
-                      https://www.googleapis.com/auth/spreadsheets";
+                      https://www.googleapis.com/auth/spreadsheets \
+                      https://www.googleapis.com/auth/presentations";
 
 struct Cached {
     token: String,
