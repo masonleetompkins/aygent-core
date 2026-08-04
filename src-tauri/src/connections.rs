@@ -718,3 +718,82 @@ pub fn disabled_tools_by_connection(
     let rows = stmt.query_map(params![agent_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)));
     match rows { Ok(it) => it.flatten().collect(), Err(_) => vec![] }
 }
+
+#[cfg(test)]
+mod one_gate_tests {
+    use crate::writer::Db;
+
+    struct TmpDir(std::path::PathBuf);
+    impl Drop for TmpDir {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn db_with_notion() -> (Db, TmpDir) {
+        let base = std::env::temp_dir().join(format!("aygent-gate-{}", crate::dashboard::new_id()));
+        std::fs::create_dir_all(&base).expect("mkdir");
+        let dir = TmpDir(base.clone());
+        let db = Db::start(base).expect("db start");
+        db.write(|conn| {
+            conn.execute_batch(
+                "INSERT INTO agent (id, name, created_at) VALUES ('a1','Cleo',0);
+                 INSERT INTO connection (provider,kind,auth_kind,label,account,nickname,scopes,config_json,key_ref,status,created_at,updated_at)
+                   VALUES ('notion','api','pat','Notion','ws','Mason','','{}','notion-ws','connected',1,1);",
+            ).map_err(|e| e.to_string())?;
+            Ok(())
+        }).expect("seed");
+        (db, dir)
+    }
+
+    /// THE REGRESSION. Mason connected Notion, the UI listed all ~20 capabilities
+    /// as ON, and the agent said "my Notion connection is read-only, I can't
+    /// create anything". Two gates (access_mode AND the off-list) disagreed.
+    ///
+    /// This asserts the two now come from ONE source: what the switch panel shows
+    /// enabled is exactly what the agent is granted — even when a legacy row is
+    /// still sitting at access_mode='read'.
+    #[test]
+    fn switch_panel_and_agent_grant_cannot_disagree() {
+        let (db, _d) = db_with_notion();
+        super::set_agent_enabled(&db, "a1", 1, true).unwrap();
+
+        // Simulate the legacy state that caused the bug: a row left at 'read'.
+        super::set_access_mode(&db, "a1", 1, false).unwrap();
+        assert_eq!(super::access_for_agent(&db, "a1", "notion").unwrap(), "read");
+
+        // What the UI shows as enabled == everything not in the off-list.
+        let off = super::disabled_tools(&db, "a1", "notion");
+        let def = crate::connectors::by_id("notion").unwrap();
+        let ui_shows_on: Vec<&str> = def
+            .all_tools()
+            .filter(|t| !off.contains(t.name))
+            .map(|t| t.name)
+            .collect();
+
+        // What the agent is actually granted (same call the agent loop makes).
+        let granted: Vec<&str> = def.tools_granted(true, &off).map(|t| t.name).collect();
+
+        assert_eq!(
+            ui_shows_on, granted,
+            "the switch panel and the agent's tool list must be the same set"
+        );
+        assert!(
+            granted.contains(&"notion_create_page"),
+            "a stale access_mode='read' must NOT withhold write tools any more"
+        );
+    }
+
+    /// Switching a tool off must remove it from BOTH the panel and the grant.
+    #[test]
+    fn switching_off_removes_it_from_both_views() {
+        let (db, _d) = db_with_notion();
+        super::set_agent_enabled(&db, "a1", 1, true).unwrap();
+        super::set_tool_enabled(&db, "a1", 1, "notion_trash_page", false).unwrap();
+
+        let off = super::disabled_tools(&db, "a1", "notion");
+        let def = crate::connectors::by_id("notion").unwrap();
+        let granted: Vec<&str> = def.tools_granted(true, &off).map(|t| t.name).collect();
+
+        assert!(!granted.contains(&"notion_trash_page"), "switched-off tool must not be granted");
+        assert!(granted.contains(&"notion_create_page"), "others stay available");
+    }
+}

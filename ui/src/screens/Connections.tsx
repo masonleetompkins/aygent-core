@@ -104,6 +104,14 @@ export function Connections({ agentId }: { agentId: string | null }) {
       await refresh();
     } catch (e) { setErr(String(e)); }
   }
+  async function setReadOnly(c: Connection, readOnly: boolean) {
+    if (!agentId) return;
+    setErr(null);
+    try {
+      await invoke("connection_set_read_only", { agentId, connectionId: c.id, readOnly });
+      await refresh();
+    } catch (e) { setErr(String(e)); }
+  }
   async function setToolEnabled(c: Connection, toolName: string, on: boolean) {
     if (!agentId) return;
     setErr(null);
@@ -227,10 +235,23 @@ export function Connections({ agentId }: { agentId: string | null }) {
 
                       {isOpen && (
                         <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 6 }}>
-                          <p style={{ ...faint, margin: "2px 0 6px" }}>
-                            Everything is on by default. Switch off anything you'd rather the agent
-                            couldn't do.
-                          </p>
+                          <div style={{
+                            display: "flex", alignItems: "center", gap: 8,
+                            margin: "2px 0 8px", flexWrap: "wrap",
+                          }}>
+                            <p style={{ ...faint, margin: 0, flex: 1, minWidth: 220 }}>
+                              Everything is on by default. Switch off anything you'd rather the agent
+                              couldn't do — this list is exactly what it can call.
+                            </p>
+                            <Button
+                              variant="secondary"
+                              onClick={() => setReadOnly(activeAcct, ts.tools.some((t) => t.access === "Write" && t.enabled))}
+                            >
+                              {ts.tools.some((t) => t.access === "Write" && t.enabled)
+                                ? "Make read-only"
+                                : "Allow writes again"}
+                            </Button>
+                          </div>
                           {ts.tools.map((t) => (
                             <label key={t.name} style={{
                               display: "flex", alignItems: "flex-start", gap: 8, padding: "6px 8px",

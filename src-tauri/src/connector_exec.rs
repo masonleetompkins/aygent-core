@@ -6,7 +6,7 @@
 // jailed daemon (the "brain") never receives a credential, only rendered text.
 // Same model as the path broker: the sandbox asks, Rust decides.
 
-use crate::connectors::{self, Access, Connector, ConnectorTool, Render};
+use crate::connectors::{self, Connector, ConnectorTool};
 use crate::writer::Db;
 
 /// Resolved credential material for one connection: secret fields (from the
@@ -40,16 +40,20 @@ pub async fn exec(
     //   2. if the tool writes, the agent's access_mode is 'write'
     // Write tools aren't normally even in the tool list, but a model can
     // hallucinate a name — so re-check here. Never trust the caller's list.
-    let access = match crate::connections::access_for_agent(db, agent_id, conn_def.id) {
-        Ok(a) => a,
-        Err(e) => return (e, true),
-    };
-    if tool.access == Access::Write && access != "write" {
+    // The connection must be enabled for this agent at all.
+    if let Err(e) = crate::connections::access_for_agent(db, agent_id, conn_def.id) {
+        return (e, true);
+    }
+    // AUTHORIZATION, from the SAME source that built the tool list: the per-tool
+    // off-list. Re-checked here because a model can hallucinate a tool name it
+    // was never given. (This used to check access_mode instead — a second gate,
+    // which is how the UI and the agent came to disagree.)
+    let off = crate::connections::disabled_tools(db, agent_id, conn_def.id);
+    if off.contains(name) {
         return (
             format!(
-                "`{name}` changes data in {}, and this agent only has READ access. \
-                 Turn on \"Allow write actions\" for {} in Connections to permit it.",
-                conn_def.label, conn_def.label
+                "`{name}` is switched off for this agent. Turn it back on under {} in Connections.",
+                conn_def.label
             ),
             true,
         );

@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 /// Current schema version. Bump when adding a migration step below.
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// The DB file name under <app_data>.
 pub const DB_FILE: &str = "aygent.db";
@@ -223,6 +223,25 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("migrate v11: {e}"))?;
         set_version(conn, 11)?;
         v = 11;
+    }
+
+    if v < 12 {
+        // FIX THE v11 MIGRATION. v11 flipped the DEFAULT to 'write' but left
+        // existing rows alone, reasoning that "someone who deliberately chose
+        // read-only keeps it". That reasoning was wrong: nobody chose read-only,
+        // they were read-only because v10's default WAS read. I preserved a
+        // default and called it a choice — so every connection made before the
+        // flip stayed crippled, which is exactly the complaint the change was
+        // supposed to fix (Mason connected Notion, saw all capabilities listed as
+        // on, and the agent still said "I'm read-only").
+        //
+        // Per-tool switches are the single gate now, and this table is empty for
+        // everyone (the feature is one build old), so promoting every row to
+        // 'write' cannot discard a real user choice.
+        conn.execute_batch(SCHEMA_V12)
+            .map_err(|e| format!("migrate v12: {e}"))?;
+        set_version(conn, 12)?;
+        v = 12;
     }
 
     let _ = v;
@@ -650,4 +669,13 @@ CREATE TABLE IF NOT EXISTS connection_tool_off (
   FOREIGN KEY (agent_id) REFERENCES agent(id) ON DELETE CASCADE,
   FOREIGN KEY (connection_id) REFERENCES connection(id) ON DELETE CASCADE
 );
+"#;
+
+/// SCHEMA v12 — promote every existing connection to full capability.
+///
+/// `access_mode` no longer gates tool assembly at all (the per-tool off-list is
+/// the only gate), but it is still read as an enablement sanity check, and stale
+/// 'read' values are confusing to anyone reading the DB. Normalize them.
+const SCHEMA_V12: &str = r#"
+UPDATE agent_connection SET access_mode = 'write' WHERE access_mode = 'read';
 "#;

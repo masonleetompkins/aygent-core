@@ -942,6 +942,33 @@ fn connection_tool_states(
     Ok(serde_json::json!(out))
 }
 
+/// Bulk switch: turn every WRITE tool of a connection off (read-only) or back on.
+/// This replaces the old access_mode toggle — expressed in the same per-tool
+/// storage everything else reads, so it cannot disagree with the switch panel.
+#[tauri::command]
+fn connection_set_read_only(
+    db: tauri::State<writer::Db>,
+    agent_id: String,
+    connection_id: i64,
+    read_only: bool,
+) -> Result<(), String> {
+    let provider: String = {
+        let conn = db.reader()?;
+        conn.query_row(
+            "SELECT provider FROM connection WHERE id = ?1",
+            rusqlite::params![connection_id],
+            |r| r.get(0),
+        ).map_err(|e| format!("unknown connection: {e}"))?
+    };
+    let def = connectors::by_id(&provider)
+        .ok_or_else(|| format!("unknown connector `{provider}`"))?;
+    for t in def.all_tools() {
+        if t.access != connectors::Access::Write { continue; }
+        connections::set_tool_enabled(&db, &agent_id, connection_id, t.name, !read_only)?;
+    }
+    Ok(())
+}
+
 /// Turn WRITE access on/off for one (agent, connection). Read is the default and
 /// write tools are not even added to the agent's tool list until this is on.
 #[tauri::command]
@@ -1995,11 +2022,10 @@ fn capabilities_list(
     // Read the same way the agent loop does, so the inventory can't drift from
     // what the model is actually given.
     if let Some(aid) = agent_id.as_deref() {
-        for (provider, access) in connections::enabled_providers_for_agent(&db, aid) {
+        for (provider, _legacy_access) in connections::enabled_providers_for_agent(&db, aid) {
             let Some(def) = connectors::by_id(&provider) else { continue };
-            let write = access == "write";
             let off = connections::disabled_tools(&db, aid, &provider);
-            for t in def.tools_granted(write, &off) {
+            for t in def.tools_granted(true, &off) {
                 items.push(serde_json::json!({
                     "name": t.name, "display_name": t.name, "description": t.description,
                     "origin": "connection", "source": def.label, "enabled": true,
@@ -3147,25 +3173,21 @@ fn agent_tools_for_full(
     // agent in read mode is never even offered a destructive call.
     if let Some((db, agent_id)) = conn_ctx {
         let mut connected: Vec<String> = Vec::new();
-        for (provider, access) in connections::enabled_providers_for_agent(db, agent_id) {
+        for (provider, _legacy_access) in connections::enabled_providers_for_agent(db, agent_id) {
             let Some(def) = connectors::by_id(&provider) else { continue };
-            let write = access == "write";
-            // Per-tool switches: a tool the user turned OFF is never offered to
-            // the model. This is the real control surface now that connecting an
-            // account grants full capability.
+            // SINGLE SOURCE OF TRUTH: the per-tool off-list. `access_mode` used to
+            // ALSO gate this, which meant a legacy row left at 'read' silently
+            // withheld every write tool while the Connections screen showed them
+            // all switched on. Two gates for one question always drift; the
+            // switches are the control surface, so they are the only gate.
             let off = connections::disabled_tools(db, agent_id, &provider);
             let mut names: Vec<&str> = Vec::new();
-            for t in def.tools_granted(write, &off) {
+            for t in def.tools_granted(true, &off) {
                 tools.push(connectors::tool_schema(t));
                 names.push(t.name);
             }
             if names.is_empty() { continue; }
-            connected.push(format!(
-                "{} ({}): {}",
-                def.label,
-                if write { "read+write" } else { "read-only" },
-                names.join(", ")
-            ));
+            connected.push(format!("{}: {}", def.label, names.join(", ")));
         }
         if !connected.is_empty() {
             extra_instructions.push_str(&format!(
@@ -4591,6 +4613,7 @@ pub fn run() {
             connection_set_agent_enabled, connection_enabled_for_agent,
             connectors_catalog, connector_connect, connection_agent_state,
             connection_set_write, connection_set_tool_enabled, connection_tool_states,
+            connection_set_read_only,
             memory_get_auto_remember, memory_set_auto_remember,
             pro_mode_get, pro_mode_set, shell_procs, shell_kill_proc,
             github_git_auth,
