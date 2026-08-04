@@ -115,19 +115,39 @@ export function useGridDrag(
   };
 }
 
-/** The bottom-right resize grip. Drawn with borders only — no image, no icon
- *  font — so it inherits the accent/line tokens like everything else. */
+/** The bottom-right resize grip.
+ *
+ *  HIT AREA vs MARK are deliberately separate. The visible mark is small and
+ *  inset well clear of the card's 14px corner radius — pushed into the corner it
+ *  read as a rendering artifact fighting the rounded edge, not an affordance.
+ *  The transparent hit target stays generous (20px) so it's still easy to grab;
+ *  shrinking the glyph should not make the gesture fussier.
+ *
+ *  Borders only — no image, no icon font — so it inherits the line token and
+ *  follows light/dark/accent for free.
+ */
 export function ResizeGrip({ onPointerDown }: { onPointerDown: (e: React.PointerEvent) => void }) {
   return (
     <div
       onPointerDown={onPointerDown}
       title="Drag to resize"
       style={{
-        position: "absolute", right: 3, bottom: 3, width: 16, height: 16,
-        cursor: "nwse-resize", opacity: 0.45,
-        borderRight: "2px solid var(--line)", borderBottom: "2px solid var(--line)",
-        borderBottomRightRadius: 4,
+        position: "absolute", right: 0, bottom: 0, width: 20, height: 20,
+        cursor: "nwse-resize",
+        display: "flex", alignItems: "flex-end", justifyContent: "flex-end",
+        padding: 7,               // <- the breathing room away from the corner
+        boxSizing: "border-box",
       }}
-    />
+      onMouseEnter={(e) => { const m = e.currentTarget.firstElementChild as HTMLElement | null; if (m) m.style.opacity = "0.7"; }}
+      onMouseLeave={(e) => { const m = e.currentTarget.firstElementChild as HTMLElement | null; if (m) m.style.opacity = "0.3"; }}
+    >
+      {/* the mark: a 6px right-angle tick, quiet until you approach it */}
+      <div style={{
+        width: 6, height: 6, opacity: 0.3,
+        borderRight: "1.5px solid var(--line)",
+        borderBottom: "1.5px solid var(--line)",
+        transition: "opacity 120ms ease",
+      }} />
+    </div>
   );
 }
