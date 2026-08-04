@@ -169,6 +169,21 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         v = 8;
     }
 
+    if v < 9 {
+        // DASHBOARDS (M1). One dashboard per agent (Mason's call: no tabs in v1),
+        // modules as validated JSON specs, plus a revision log so "undo that"
+        // after a bad prompt is trivial — the fastest way to hate a
+        // prompt-driven builder is one emit nuking an hour of work.
+        //
+        // NOTE: no interval/ttl/next_fire_at column ANYWHERE in here, on
+        // purpose. Dashboards are pull-only (see dashboard.rs safety rule);
+        // recurrence lives in scheduler.rs where spend is explicit.
+        conn.execute_batch(SCHEMA_V9)
+            .map_err(|e| format!("migrate v9: {e}"))?;
+        set_version(conn, 9)?;
+        v = 9;
+    }
+
     let _ = v;
     Ok(())
 }
@@ -487,4 +502,58 @@ CREATE TABLE IF NOT EXISTS agent_mount (
   FOREIGN KEY (agent_id) REFERENCES agent(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_agent_mount_agent ON agent_mount(agent_id);
+"#;
+
+/// SCHEMA v9 (DASHBOARDS) — a configurable, prompt-built dashboard per agent.
+///
+/// `dashboard` is 1:1 with an agent (UNIQUE agent_id). `dashboard_module` holds
+/// one validated ModuleSpec per row: `kind` is denormalized into a column for
+/// cheap filtering while `spec_json` stays the source of truth (scheduler.rs
+/// precedent — typed enum as JSON => new variants need no migration).
+///
+/// `cached_json` + `fetched_at` exist because dashboards are PULL-ONLY: nothing
+/// refreshes on a timer, so a module MUST be able to render its last known
+/// value instantly on load (stale but honest, never a spinner wall) and show
+/// how old it is.
+///
+/// `dashboard_revision` is an append-only log of whole-dashboard snapshots,
+/// written before every mutation, so undo/restore is a read not a diff.
+const SCHEMA_V9: &str = r#"
+CREATE TABLE IF NOT EXISTS dashboard (
+  id          TEXT PRIMARY KEY,
+  agent_id    TEXT NOT NULL UNIQUE,   -- 1:1 with the agent (v1: no tabs)
+  title       TEXT NOT NULL DEFAULT 'Dashboard',
+  created_at  INTEGER NOT NULL DEFAULT 0,
+  updated_at  INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY (agent_id) REFERENCES agent(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS dashboard_module (
+  id            TEXT PRIMARY KEY,
+  dashboard_id  TEXT NOT NULL,
+  kind          TEXT NOT NULL,               -- denormalized from spec_json
+  title         TEXT NOT NULL DEFAULT '',
+  x             INTEGER NOT NULL DEFAULT 0,  -- 12-col grid
+  y             INTEGER NOT NULL DEFAULT 0,
+  w             INTEGER NOT NULL DEFAULT 4,
+  h             INTEGER NOT NULL DEFAULT 4,
+  spec_json     TEXT NOT NULL,               -- the full validated ModuleSpec
+  cached_json   TEXT,                        -- last fetched value (pull-only)
+  fetched_at    INTEGER,                     -- when that value was fetched
+  error         TEXT,                        -- last refresh error, if any
+  created_at    INTEGER NOT NULL DEFAULT 0,
+  updated_at    INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY (dashboard_id) REFERENCES dashboard(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_dash_module_dash ON dashboard_module(dashboard_id);
+
+CREATE TABLE IF NOT EXISTS dashboard_revision (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  dashboard_id  TEXT NOT NULL,
+  modules_json  TEXT NOT NULL,   -- full snapshot of all modules, pre-change
+  summary       TEXT NOT NULL DEFAULT '',
+  created_at    INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY (dashboard_id) REFERENCES dashboard(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_dash_rev_dash ON dashboard_revision(dashboard_id, id DESC);
 "#;

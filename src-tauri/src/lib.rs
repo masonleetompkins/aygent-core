@@ -29,6 +29,7 @@ mod connections;
 mod savepoint;
 mod context_docs;
 mod conversations;
+mod dashboard; // DASHBOARDS: prompt-built, spec-driven, pull-only (never auto-runs a model).
 mod db;
 mod drainer;
 mod lanes;
@@ -4303,6 +4304,9 @@ pub fn run() {
             browser::set_browser_hittest, browser::browser_engine_info,
             openai_models, tools_list, tools_upsert, tools_delete, tools_set_enabled,
             tools_config, tools_set_config,
+            dashboard::dashboard_load, dashboard::dashboard_upsert_module,
+            dashboard::dashboard_remove_module, dashboard::dashboard_arrange,
+            dashboard::dashboard_undo,
             savepoint_snapshot, savepoint_timeline, savepoint_rewind,
             savepoint_undo, savepoint_redo,
             savepoint_get_retention, savepoint_set_retention, savepoint_purge,

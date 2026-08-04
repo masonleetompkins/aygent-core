@@ -6,6 +6,7 @@ import { type AgentProfile } from "./components/AgentSwitcher";
 import { Agents } from "./screens/Agents";
 import { Settings } from "./screens/Settings";
 import { Chat } from "./screens/Chat";
+import { Dashboard } from "./screens/Dashboard";
 import { Browser } from "./screens/Browser";
 import { SavePoints } from "./screens/SavePoints";
 import { Tools } from "./screens/Tools";
@@ -226,6 +227,9 @@ export function App() {
            child measures its frozen intrinsic size (the Browser pane was stuck
            at its large-window rect because this chain couldn't shrink). */}
         <div style={{ padding: "28px 32px", flex: 1, minHeight: 0, minWidth: 0, display: "flex", flexDirection: "column" }}>
+          {screen === "dashboard" && (
+            <Dashboard agentId={activeAgent?.id ?? null} agentName={activeAgent?.name} />
+          )}
           {screen === "chat" && (
             <Chat
               keySet={keySet}

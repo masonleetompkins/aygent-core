@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import { Icon, type IconName } from "./Icon";
 
 export type ScreenId =
-  | "chat" | "browser" | "agents" | "tools" | "settings" | "scheduler" | "connections" | "savepoints";
+  | "dashboard" | "chat" | "browser" | "agents" | "tools" | "settings" | "scheduler" | "connections" | "savepoints";
 
 export type NavGroup = "agent" | "global";
 export interface NavItem { id: ScreenId; label: string; icon: IconName; enabled: boolean; group: NavGroup; }
@@ -14,6 +14,9 @@ export interface NavItem { id: ScreenId; label: string; icon: IconName; enabled:
 //  • "This Agent"  — scoped to the agent(s) you're viewing (its folder/history)
 //  • "Global"      — app-wide (roster, connectors, app settings)
 export const NAV: NavItem[] = [
+  // Dashboard sits ABOVE Chat: it is the at-a-glance view of the agent, so it
+  // reads first. Per-agent (group "agent") — switching agents swaps dashboards.
+  { id: "dashboard", label: "Dashboard", icon: "chart", enabled: true, group: "agent" },
   { id: "chat", label: "Chat", icon: "chat", enabled: true, group: "agent" },
   { id: "browser", label: "AYGENT Browser", icon: "globe", enabled: true, group: "agent" },
   { id: "tools", label: "Tools", icon: "tools", enabled: true, group: "agent" },
