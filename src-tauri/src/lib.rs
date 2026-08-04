@@ -502,12 +502,19 @@ fn broker_probe(
 #[tauri::command]
 fn reveal_in_finder(
     broker: tauri::State<Arc<Broker>>,
+    db: tauri::State<writer::Db>,
     path: String,
 ) -> Result<(), String> {
     // Read-mode resolution is the right check: revealing is a read-ish action,
     // and it proves the file is inside the jail before we hand it to the OS.
+    // Resolve against the ACTIVE agent's scope first (the "default" legacy scope
+    // can point at a stale folder if the agent folder moved — Mason 08-03: file
+    // tools and shell diverged for exactly this reason), fall back to "default".
+    let scope: String = repo::get_active_agent(&db).ok().flatten()
+        .map(|a| a.id).unwrap_or_else(|| "default".into());
     let real = broker
-        .resolve("default", &path, broker::Mode::Read)
+        .resolve(&scope, &path, broker::Mode::Read)
+        .or_else(|_| broker.resolve("default", &path, broker::Mode::Read))
         .map_err(|e| format!("refused by jail: {e:?}"))?;
     let real_os = real.as_os_str();
 
@@ -1049,9 +1056,10 @@ fn conv_reorder(
 #[tauri::command]
 fn savepoint_snapshot(
     broker: tauri::State<Arc<Broker>>,
+    db: tauri::State<writer::Db>,
     label: String,
 ) -> Result<Option<String>, String> {
-    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+    let root = active_savepoint_root(&broker, &db)?;
     savepoint::snapshot(&root, &label)
 }
 
@@ -1059,8 +1067,9 @@ fn savepoint_snapshot(
 #[tauri::command]
 fn savepoint_timeline(
     broker: tauri::State<Arc<Broker>>,
+    db: tauri::State<writer::Db>,
 ) -> Result<savepoint::Timeline, String> {
-    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+    let root = active_savepoint_root(&broker, &db)?;
     savepoint::timeline(&root)
 }
 
@@ -1069,23 +1078,24 @@ fn savepoint_timeline(
 #[tauri::command]
 fn savepoint_rewind(
     broker: tauri::State<Arc<Broker>>,
+    db: tauri::State<writer::Db>,
     target: String,
 ) -> Result<(), String> {
-    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+    let root = active_savepoint_root(&broker, &db)?;
     savepoint::rewind(&root, &target)
 }
 
 /// Undo: step the cursor one save point back and restore that state.
 #[tauri::command]
-fn savepoint_undo(broker: tauri::State<Arc<Broker>>) -> Result<Option<String>, String> {
-    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+fn savepoint_undo(broker: tauri::State<Arc<Broker>>, db: tauri::State<writer::Db>) -> Result<Option<String>, String> {
+    let root = active_savepoint_root(&broker, &db)?;
     savepoint::undo(&root)
 }
 
 /// Redo: step the cursor one save point forward and restore that state.
 #[tauri::command]
-fn savepoint_redo(broker: tauri::State<Arc<Broker>>) -> Result<Option<String>, String> {
-    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+fn savepoint_redo(broker: tauri::State<Arc<Broker>>, db: tauri::State<writer::Db>) -> Result<Option<String>, String> {
+    let root = active_savepoint_root(&broker, &db)?;
     savepoint::redo(&root)
 }
 
@@ -1118,8 +1128,8 @@ fn savepoint_set_retention(broker: tauri::State<Arc<Broker>>, db: tauri::State<w
 
 /// Purge ALL save-point history for the folder (user's files untouched).
 #[tauri::command]
-fn savepoint_purge(broker: tauri::State<Arc<Broker>>) -> Result<(), String> {
-    let root = broker.root_for("default").map_err(|e| format!("{e:?}"))?;
+fn savepoint_purge(broker: tauri::State<Arc<Broker>>, db: tauri::State<writer::Db>) -> Result<(), String> {
+    let root = active_savepoint_root(&broker, &db)?;
     savepoint::purge_all(&root)
 }
 
@@ -2227,7 +2237,7 @@ async fn agent_run(
                         }
                         } // end step-overrun-guard else (step not already satisfied)
                     } else { match name {
-                        "read_file" => match broker.resolve_and_open("default", path, broker::Mode::Read) {
+                        "read_file" => match broker.resolve_and_open(resolved_agent.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Read) {
                             Ok(mut f) => {
                                 use std::io::Read;
                                 let mut s = String::new();
@@ -2240,10 +2250,10 @@ async fn agent_run(
                         },
                         "write_file" => {
                             let cnt = input.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                            if let Ok(real) = broker.resolve("default", path, broker::Mode::Write) {
+                            if let Ok(real) = broker.resolve(resolved_agent.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Write) {
                                 if let Some(parent) = real.parent() { let _ = std::fs::create_dir_all(parent); }
                             }
-                            match broker.resolve_and_open("default", path, broker::Mode::Write) {
+                            match broker.resolve_and_open(resolved_agent.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Write) {
                                 Ok(mut f) => {
                                     use std::io::Write as _;
                                     match f.write_all(cnt.as_bytes()) {
@@ -2254,7 +2264,7 @@ async fn agent_run(
                                 Err(e) => (format!("refused by jail: {e:?}"), true),
                             }
                         }
-                        "list_files" => match broker.resolve("default", path, broker::Mode::Read) {
+                        "list_files" => match broker.resolve(resolved_agent.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Read) {
                             Ok(real) => match std::fs::read_dir(&real) {
                                 Ok(rd) => {
                                     let names: Vec<String> = rd.filter_map(|e| e.ok())
@@ -2479,6 +2489,13 @@ fn exec_tool_cfg(
     input: &serde_json::Value,
     pdf_config: &serde_json::Value,
 ) -> (String, bool) {
+    // SCOPE KEY (Mason 08-03): file tools used the legacy "default" scope while
+    // shell exec used the per-agent scope — when the agent folder moved, the two
+    // roots DIVERGED (writes landed in a ghost folder the user never saw). Use
+    // the agent's own scope, but fall back to "default" if it was never
+    // registered — that guard is what the 07-28 'refused by jail on files that
+    // plainly exist' bug was about; NoScope is the only case that falls back.
+    let agent_id: &str = if broker.root_for(agent_id).is_ok() { agent_id } else { "default" };
     let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
     match name {
         "read_file" => match broker.resolve_and_open(agent_id, path, broker::Mode::Read) {
@@ -2494,10 +2511,10 @@ fn exec_tool_cfg(
         },
         "write_file" => {
             let cnt = input.get("content").and_then(|c| c.as_str()).unwrap_or("");
-            if let Ok(real) = broker.resolve("default", path, broker::Mode::Write) {
+            if let Ok(real) = broker.resolve(agent_id, path, broker::Mode::Write) {
                 if let Some(parent) = real.parent() { let _ = std::fs::create_dir_all(parent); }
             }
-            match broker.resolve_and_open("default", path, broker::Mode::Write) {
+            match broker.resolve_and_open(agent_id, path, broker::Mode::Write) {
                 Ok(mut f) => {
                     use std::io::Write as _;
                     match f.write_all(cnt.as_bytes()) {
@@ -2519,14 +2536,13 @@ fn exec_tool_cfg(
             if from.is_empty() || to.is_empty() {
                 return ("rename_file needs `from` and `to` paths".into(), true);
             }
-            // Source + destination both jailed. Use the SAME scope key the other
-            // working file tools use ("default") — bug (Mason 07-28): resolving
-            // against agent_id hit an unset scope -> 'refused by jail' on files
-            // that plainly exist. read_file/write_file/list_files all use "default".
-            let src = match broker.resolve("default", from, broker::Mode::Read) {
+            // Source + destination both jailed, same checked scope key as every
+            // other file tool (per-agent scope, "default" only if unregistered —
+            // see the scope-key note at the top of exec_tool_cfg, Mason 08-03).
+            let src = match broker.resolve(agent_id, from, broker::Mode::Read) {
                 Ok(p) => p, Err(e) => return (format!("source refused by jail: {e:?}"), true),
             };
-            let dst = match broker.resolve("default", to, broker::Mode::Write) {
+            let dst = match broker.resolve(agent_id, to, broker::Mode::Write) {
                 Ok(p) => p, Err(e) => return (format!("destination refused by jail: {e:?}"), true),
             };
             if !src.exists() { return (format!("'{from}' does not exist"), true); }
@@ -2542,7 +2558,7 @@ fn exec_tool_cfg(
         "delete_file" => {
             let target = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
             if target.is_empty() { return ("delete_file needs a `path`".into(), true); }
-            let real = match broker.resolve("default", target, broker::Mode::Write) {
+            let real = match broker.resolve(agent_id, target, broker::Mode::Write) {
                 Ok(p) => p, Err(e) => return (format!("refused by jail: {e:?}"), true),
             };
             if !real.exists() { return (format!("'{target}' does not exist"), true); }
@@ -2552,7 +2568,7 @@ fn exec_tool_cfg(
                 Err(e) => (format!("delete failed: {e}"), true),
             }
         }
-        "list_files" => match broker.resolve("default", path, broker::Mode::Read) {
+        "list_files" => match broker.resolve(agent_id, path, broker::Mode::Read) {
             Ok(real) => {
                 if real.is_file() {
                     // Clean guidance instead of a raw 'Not a directory (os error
@@ -2580,7 +2596,7 @@ fn exec_tool_cfg(
             let out_path = input.get("output_path").and_then(|p| p.as_str())
                 .or_else(|| input.get("path").and_then(|p| p.as_str()))
                 .unwrap_or("document.pdf");
-            match broker.resolve("default", out_path, broker::Mode::Write) {
+            match broker.resolve(agent_id, out_path, broker::Mode::Write) {
                 Ok(real) => {
                     if let Some(parent) = real.parent() { let _ = std::fs::create_dir_all(parent); }
                     match pdf_tool::generate(title, content, &real, pdf_config) {
@@ -3163,17 +3179,23 @@ async fn agent_stream(
             if calls.is_empty() { break; } // no tool wanted → done
 
             // Execute each call through the SAME jailed broker + emit UI events.
+            // Local calls have no provider tool_use id — synthesize one so the
+            // ToolResult binds to its exact card (parity with cloud paths).
             let mut results_text = String::new();
-            for c in &calls {
+            for (ci, c) in calls.iter().enumerate() {
+                let call_id = format!("local-{turn}-{ci}");
                 let _ = app.emit(&channel, &serde_json::json!({
-                    "kind": "ToolUse", "name": c.name,
+                    "kind": "ToolUse", "id": call_id, "name": c.name,
                     "input": c.input,
                 }));
                 let (result, is_err) = exec_tool_cfg(&broker, &scope_id, &c.name, &c.input, &pdf_cfg);
                 let path_s = c.input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
                 let _ = app.emit(&channel, &serde_json::json!({
-                    "kind": "ToolResult", "name": c.name, "path": path_s,
-                    "ok": !is_err, "detail": if is_err { result.clone() } else { String::new() }
+                    "kind": "ToolResult", "id": call_id, "name": c.name, "path": path_s,
+                    "ok": !is_err,
+                    // Bounded output preview on success too (was error-only),
+                    // same contract as the cloud providers' activity cards.
+                    "detail": if is_err { result.clone() } else { result.chars().take(2000).collect::<String>() }
                 }));
                 results_text.push_str(&local_tools::format_tool_result(&cap.format, &c.name, &result, is_err));
                 results_text.push('\n');
@@ -3232,8 +3254,33 @@ async fn agent_stream(
         }
         let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("model: {model}") });
 
+        // PRO MODE UNCAPPED (Mason 08-03): same policy as the Anthropic path —
+        // no round cap in Pro Mode; the stall detector replaces it. Non-Pro
+        // keeps the 20-round cap.
+        let pro_uncapped = folder.as_deref().map(|f| pro_mode_enabled(&app, f)).unwrap_or(false);
+        let max_rounds: usize = if pro_uncapped { usize::MAX } else { 20 };
+        let mut rounds: usize = 0;
+        let mut tool_calls_total: usize = 0;
+        let mut last_action: String = String::new();
+        let mut last_sig: String = String::new();
+        let mut same_sig_streak: usize = 0;
+        let mut err_round_streak: usize = 0;
+        let mut stall_reason: Option<String> = None;
         let mut finished_naturally = false;
-        for _ in 0..20 {
+        while rounds < max_rounds {
+            rounds += 1;
+            if pro_uncapped && rounds > 1 && rounds % 25 == 1 {
+                let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("still working — {tool_calls_total} tool calls so far") });
+            }
+            if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                messages.as_array_mut().unwrap().push(serde_json::json!({
+                    "role": "assistant", "content": "⏹️ stopped by user"
+                }));
+                finished_naturally = true;
+                break;
+            }
+            let mut round_calls: usize = 0;
+            let mut round_errs: usize = 0;
             let stream_result = openai_provider::openai_stream_turn(
                 &provider_kind, &key, &model, &sys, &messages, &tools, Some(&cancel_flag),
                 |ev| { let _ = app.emit(&channel, &ev); },
@@ -3301,9 +3348,20 @@ async fn agent_stream(
                         exec_tool_cfg(&broker, &scope_id, &name, &input, &pdf_cfg)
                     };
                     let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                    // STALL DETECTOR bookkeeping (see the Anthropic path).
+                    round_calls += 1;
+                    if is_err { round_errs += 1; }
+                    tool_calls_total += 1;
+                    let sig = format!("{name}:{}", serde_json::to_string(&input).unwrap_or_default());
+                    if sig == last_sig { same_sig_streak += 1; } else { last_sig = sig; same_sig_streak = 1; }
+                    last_action = if path.is_empty() { name.clone() } else { format!("{name} {path}") };
                     let _ = app.emit(&channel, &serde_json::json!({
-                        "kind": "ToolResult", "name": name, "path": path,
-                        "ok": !is_err, "detail": if is_err { result_text.clone() } else { String::new() }
+                        "kind": "ToolResult", "id": id, "name": name, "path": path,
+                        "ok": !is_err,
+                        // Bounded output for the expanded activity card (Mason 08-03):
+                        // errors in full flavor, successes as a 2000-char preview —
+                        // the full result still goes to the model / logs regardless.
+                        "detail": if is_err { result_text.clone() } else { result_text.chars().take(2000).collect::<String>() }
                     }));
                     // OpenAI expects tool results as {role:"tool", tool_call_id, content};
                     // build_openai_messages translates our tool_result blocks into that.
@@ -3331,12 +3389,34 @@ async fn agent_stream(
                     ));
                 }
             }
-            if had_tools { continue; }
+            if had_tools {
+                if round_calls > 0 && round_errs == round_calls { err_round_streak += 1; } else { err_round_streak = 0; }
+                // STALL DETECTOR (see the Anthropic path): nudge once, then pause.
+                let stalled = same_sig_streak >= 5 || err_round_streak >= 4;
+                if stalled {
+                    if stall_reason.is_none() {
+                        stall_reason = Some(if same_sig_streak >= 5 { "repeating the same call".to_string() } else { "every tool call failing".to_string() });
+                        same_sig_streak = 0; err_round_streak = 0;
+                        messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user",
+                            "content": "[system note] You appear stuck (repeating calls / repeated failures). Change approach, or stop calling tools and summarize where you are and what is blocking you." }));
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
             finished_naturally = true;
             break;
         }
         if !finished_naturally {
-            let warn = "\u{26A0}\u{FE0F} stopped after 20 tool-call rounds without a final answer this turn — say 'continue' to pick it back up, or ask me to use task_continue for long jobs.".to_string();
+            // NEVER a blank or generic ending (Mason 08-03): say WHY, WHAT the
+            // last action was, and HOW MUCH happened.
+            let why = match &stall_reason {
+                Some(r) => format!("stall detected — {r}"),
+                None => format!("hit the {max_rounds}-round tool cap"),
+            };
+            let last = if last_action.is_empty() { String::new() } else { format!(" Last action: {last_action}.") };
+            let warn = format!("\u{26A0}\u{FE0F} paused after {tool_calls_total} tool calls ({why}).{last} Reply to continue.");
             let _ = app.emit(&channel, &provider::StreamEvent::Info { text: warn.clone() });
             messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": warn }));
         }
@@ -3375,7 +3455,7 @@ async fn agent_stream(
     // so it correctly represents "the state produced by this prompt." This fixes
     // the bug where a turn's writes were absorbed (mislabeled) into the NEXT
     // turn's pre-snapshot, or lost entirely if they were the last edit.
-    if let Ok(root) = broker.root_for("default") {
+    if let Ok(root) = broker.root_for(&scope_id) {
         let _ = savepoint::snapshot(&root, "baseline");
     }
 
@@ -3396,8 +3476,36 @@ async fn agent_stream(
     let emit = |ev: &provider::StreamEvent| { let _ = app.emit(&channel, ev); };
     emit(&provider::StreamEvent::Info { text: format!("model: {model}") });
 
+    // PRO MODE UNCAPPED (Mason 08-03): in Pro Mode there is NO round cap — the
+    // loop runs until the model stops calling tools, the user hits Stop, or the
+    // STALL DETECTOR fires (the cap's replacement: a count cap punishes honest
+    // long work; a stall detector catches actual degenerate loops). Non-Pro
+    // keeps the 20-round cap. This is the fix for the "20 continues" session.
+    let pro_uncapped = folder.as_deref().map(|f| pro_mode_enabled(&app, f)).unwrap_or(false);
+    let max_rounds: usize = if pro_uncapped { usize::MAX } else { 20 };
+    let mut rounds: usize = 0;
+    let mut tool_calls_total: usize = 0;
+    let mut last_action: String = String::new();
+    let mut last_sig: String = String::new();   // name+input of the previous tool call
+    let mut same_sig_streak: usize = 0;          // consecutive IDENTICAL calls
+    let mut err_round_streak: usize = 0;         // consecutive rounds where EVERY tool errored
+    let mut stall_reason: Option<String> = None;
     let mut finished_naturally = false;
-    for _ in 0..20 {
+    while rounds < max_rounds {
+        rounds += 1;
+        // Soft checkpoint: long uncapped runs stay legible in the transcript.
+        if pro_uncapped && rounds > 1 && rounds % 25 == 1 {
+            emit(&provider::StreamEvent::Info { text: format!("still working — {tool_calls_total} tool calls so far") });
+        }
+        // STOP between rounds: the stream checks the flag on network chunks, but
+        // a stop pressed DURING local tool execution lands here.
+        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            messages.as_array_mut().unwrap().push(serde_json::json!({
+                "role": "assistant", "content": [{ "type": "text", "text": "⏹️ stopped by user" }]
+            }));
+            finished_naturally = true;
+            break;
+        }
         let stream_result = provider::anthropic_stream_turn(
             &key, &model, &anthropic_sys, &messages, &tools, Some(&cancel_flag),
             |ev| { let _ = app.emit(&channel, &ev); },
@@ -3419,6 +3527,8 @@ async fn agent_stream(
 
         // Execute any tool_use blocks through the broker; emit results live.
         let mut tool_results = Vec::new();
+        let mut round_calls: usize = 0;   // stall detector: calls this round
+        let mut round_errs: usize = 0;    // stall detector: errored calls this round
         if let Some(arr) = content.as_array() {
             for blk in arr {
                 if blk.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
@@ -3494,10 +3604,24 @@ async fn agent_stream(
                         }
                     };
                     let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                    // STALL DETECTOR bookkeeping (Mason 08-03): identical-call streaks
+                    // and all-errored rounds are what distinguish a degenerate loop
+                    // from honest long work — this replaces the blunt 20-round cap
+                    // in Pro Mode.
+                    round_calls += 1;
+                    if is_err { round_errs += 1; }
+                    tool_calls_total += 1;
+                    let sig = format!("{name}:{}", serde_json::to_string(&input).unwrap_or_default());
+                    if sig == last_sig { same_sig_streak += 1; } else { last_sig = sig; same_sig_streak = 1; }
+                    last_action = if path.is_empty() { name.clone() } else { format!("{name} {path}") };
                     // tell the UI the tool's OUTCOME (the ToolUse start already fired)
                     let _ = app.emit(&channel, &serde_json::json!({
-                        "kind": "ToolResult", "name": name, "path": path,
-                        "ok": !is_err, "detail": if is_err { result_text.clone() } else { String::new() }
+                        "kind": "ToolResult", "id": id, "name": name, "path": path,
+                        "ok": !is_err,
+                        // Bounded output for the expanded activity card (Mason 08-03):
+                        // errors in full flavor, successes as a 2000-char preview —
+                        // the full result still goes to the model / logs regardless.
+                        "detail": if is_err { result_text.clone() } else { result_text.chars().take(2000).collect::<String>() }
                     }));
                     tool_results.push(serde_json::json!({
                         "type": "tool_result", "tool_use_id": id,
@@ -3516,9 +3640,29 @@ async fn agent_stream(
         // assistant message with the dangling tool_use, skip the results, and
         // break — leaving history malformed and 400-ing the NEXT request.
         if !tool_results.is_empty() {
+            // All-errored-round streak (a round where EVERY call failed is the
+            // strongest loop smell; one mixed round of progress resets it).
+            if round_calls > 0 && round_errs == round_calls { err_round_streak += 1; } else { err_round_streak = 0; }
             messages.as_array_mut().unwrap().push(serde_json::json!({
                 "role": "user", "content": tool_results
             }));
+            // STALL DETECTOR: 5 identical consecutive calls, or 4 consecutive
+            // all-errored rounds → first offense injects a course-correct nudge
+            // the model sees with its tool results; a persisting stall pauses the
+            // turn with an HONEST status instead of looping forever.
+            let stalled = same_sig_streak >= 5 || err_round_streak >= 4;
+            if stalled {
+                if stall_reason.is_none() {
+                    stall_reason = Some(if same_sig_streak >= 5 { "repeating the same call".to_string() } else { "every tool call failing".to_string() });
+                    same_sig_streak = 0; err_round_streak = 0;
+                    messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": [{ "type": "text",
+                        "text": "[system note] You appear stuck (repeating calls / repeated failures). Change approach, or stop calling tools and summarize where you are and what is blocking you." }] }));
+                    if stop == "tool_use" { continue; }
+                } else {
+                    // Second stall after the nudge: pause the turn honestly.
+                    break;
+                }
+            }
             // Only keep looping if the model actually wants to continue the
             // tool cycle; otherwise send results once and finish this turn.
             if stop == "tool_use" { continue; }
@@ -3527,7 +3671,15 @@ async fn agent_stream(
         break;
     }
     if !finished_naturally {
-        let warn = "\u{26A0}\u{FE0F} stopped after 20 tool-call rounds without a final answer this turn — say 'continue' to pick it back up, or ask me to use task_continue for long jobs.".to_string();
+        // NEVER a blank or generic ending (Mason 08-03): say WHY the turn ended,
+        // WHAT the last action was, and HOW MUCH happened — the reader should
+        // not need to diagnose the loop from silence.
+        let why = match &stall_reason {
+            Some(r) => format!("stall detected — {r}"),
+            None => format!("hit the {max_rounds}-round tool cap"),
+        };
+        let last = if last_action.is_empty() { String::new() } else { format!(" Last action: {last_action}.") };
+        let warn = format!("\u{26A0}\u{FE0F} paused after {tool_calls_total} tool calls ({why}).{last} Reply to continue.");
         emit(&provider::StreamEvent::Info { text: warn.clone() });
         messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": [{ "type": "text", "text": warn }] }));
     }
@@ -3877,9 +4029,10 @@ pub async fn run_headless_turn(
     let conv_id = continue_conv.clone().unwrap_or_else(|| format!("inbox-{agent_id}"));
     let existing = repo::load_conversation(db, &conv_id).ok();
     let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
-    let inbound_text = if is_continue { format!("\u{23F0} resumed: {}", msg_body) }
-        else { format!("\u{1F4E8} from {from_name}: {}", msg_body) };
-    ui_msgs.push(serde_json::json!({ "role": "user", "from": from_name, "text": inbound_text }));
+    // NOTE (Mason 08-03, double-bubble fix): the inbound "resumed:"/"from X:"
+    // user bubble was ALREADY persisted by the dispatch-time visibility block
+    // before the turn ran — appending it again here rendered every wake-up
+    // twice. Only the assistant reply is new at end-of-turn.
     ui_msgs.push(serde_json::json!({ "role": "assistant", "text": reply_display, "tools": [] }));
     // Real history: prior history + this turn's messages (framed user + all
     // assistant/tool turns we accumulated in `messages`). `messages` starts with
@@ -3908,11 +4061,11 @@ pub async fn run_headless_turn(
 /// fails before it could reply (Atlas #5 cause 3: no key/model → rail rings then
 /// silence). Now the user sees WHY in the thread instead of a blank rail.
 pub fn persist_inbox_error(db: &writer::Db, agent_id: &str, msg: &mailbox::Message, err: &str) {
-    let from_name = repo::get_agent(db, &msg.from_agent).ok().flatten().map(|a| a.name).unwrap_or_else(|| msg.from_agent.clone());
     let conv_id = format!("inbox-{agent_id}");
     let existing = repo::load_conversation(db, &conv_id).ok();
     let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
-    ui_msgs.push(serde_json::json!({ "role": "user", "from": from_name, "text": format!("\u{1F4E8} from {from_name}: {}", msg.body) }));
+    // (Mason 08-03) Do NOT re-append the inbound bubble — dispatch-time
+    // visibility already persisted it before the turn failed.
     ui_msgs.push(serde_json::json!({ "role": "assistant", "text": format!("⚠️ Couldn't process this message: {err}. (Check this agent has a provider key + model set.)"), "tools": [] }));
     let conv = repo::Conversation {
         id: conv_id, agent_id: agent_id.to_string(),

@@ -10,7 +10,7 @@ import { Markdown } from "../components/Markdown";
 import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion, stopTurn } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
 
-type ToolLine = { name: string; path: string; ok?: boolean; detail?: string };
+type ToolLine = { name: string; path: string; ok?: boolean; detail?: string; summary?: string; body?: string; running?: boolean };
 type Msg =
   | { role: "user"; text: string; memory?: string }
   | { role: "assistant"; text: string; tools: ToolLine[]; streaming?: boolean };
@@ -320,7 +320,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
   function newConv() {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    setConv(id); setMessages([]); historyRef.current = [];
+    // CONTEXT MODE (2026-08-03): "isolated" (default) starts a truly fresh
+    // session — empty provider history, zero cross-chat token cost.
+    // "continuous" carries the CURRENT chat's provider history into the new
+    // one, so the agent picks up mid-thought (the user opted into the token
+    // cost in the Agents pane). The visible transcript always starts clean
+    // either way — only the model-facing context differs.
+    const carry = agent?.context_mode === "continuous" ? historyRef.current : [];
+    setConv(id); setMessages([]); historyRef.current = carry;
   }
 
   async function openConv(id: string) {
@@ -642,7 +649,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
             <Bubble m={{
               role: "assistant",
               text: turn.liveText,
-              tools: turn.liveTools.map((t) => ({ name: t.name, path: t.path ?? "", ok: t.ok, detail: t.detail })),
+              tools: turn.liveTools.map((t) => ({ name: t.name, path: t.path ?? "", ok: t.ok, detail: t.detail, summary: t.summary, body: t.body, running: t.running })),
               streaming: true,
             }} />
           )}
@@ -932,41 +939,89 @@ function Bubble({ m }: { m: Msg }) {
 }
 
 function ToolCard({ t }: { t: ToolLine }) {
+  const [userOpen, setUserOpen] = useState<boolean | null>(null); // null = no manual toggle yet
   const pending = t.ok === undefined;
+  // Live behavior (Mason 08-03): the RUNNING card auto-expands so you watch the
+  // work happen; it auto-collapses when done. A manual click wins over both.
+  const open = userOpen !== null ? userOpen : (!!t.running && !!t.body);
+  const setOpen = (f: (o: boolean) => boolean) => setUserOpen(f(open));
+  const paneRef = useRef<HTMLDivElement | null>(null);
+  // Follow the stream: keep the pane pinned to the bottom while content grows
+  // during a live call. Finished cards never yank the reader's scroll.
+  useEffect(() => {
+    if (open && t.running && paneRef.current) paneRef.current.scrollTop = paneRef.current.scrollHeight;
+  }, [open, t.running, t.body]);
   const color = pending ? "var(--text-muted)" : t.ok ? "var(--ok)" : "var(--danger)";
   // A path is "revealable" once the call succeeded and points at a real file
   // (list_files on '.' or a refused call has nothing useful to reveal).
   const revealable = t.ok === true && !!t.path && t.path !== ".";
+  const expandable = !!(t.body || t.detail);
 
   async function reveal() {
-    try { await invoke("reveal_in_finder", { path: t.path }); }
-    catch (err) { console.warn("reveal failed:", err); }
+    try { await invoke("reveal_in_finder", { path: t.path }); } catch { /* jail refused — ignore */ }
   }
+
+  // Collapsed row: real context, not just the tool name (Mason 08-03: "every
+  // command just said 'shell run'"). summary is built in turns.ts from the
+  // full tool input; older history rows without one fall back to name(path).
+  const label = t.summary || `⚙ ${t.name}(${t.path || ""})`;
 
   return (
     <div style={{
-      display: "flex", alignItems: "center", gap: 8,
       fontFamily: "ui-monospace, monospace", fontSize: 12.5,
       border: `var(--border-width) solid ${color}`, color,
-      borderRadius: "var(--radius-control)", padding: "6px 10px",
-      background: "var(--bg)",
+      borderRadius: "var(--radius-control)",
+      background: "var(--bg)", overflow: "hidden",
     }}>
-      <span>
-        ⚙ {t.name}(
-        {revealable ? (
+      <div
+        onClick={() => { if (expandable) setOpen((o) => !o); }}
+        style={{
+          display: "flex", alignItems: "center", gap: 8, padding: "6px 10px",
+          cursor: expandable ? "pointer" : "default", userSelect: "none",
+        }}
+        title={expandable ? (open ? "Collapse" : "Expand") : undefined}
+      >
+        {expandable && (
+          <span style={{ fontSize: 10, opacity: 0.7, transform: open ? "rotate(90deg)" : "none", transition: "transform 120ms" }}>▶</span>
+        )}
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{label}</span>
+        {revealable && (
           <button
-            onClick={reveal}
+            onClick={(e) => { e.stopPropagation(); void reveal(); }}
             title="Reveal in Finder"
             style={{
               font: "inherit", color: "inherit", background: "none", border: "none",
-              padding: 0, cursor: "pointer", textDecoration: "underline",
-              textUnderlineOffset: 2,
+              padding: 0, cursor: "pointer", textDecoration: "underline", textUnderlineOffset: 2,
+              maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
             }}
           >{t.path}</button>
-        ) : t.path}
-        )
-      </span>
-      <span style={{ marginLeft: "auto" }}>{pending ? "…" : t.ok ? "✓" : `✗ ${t.detail || "refused"}`}</span>
+        )}
+        <span style={{ flexShrink: 0 }}>{pending ? "…" : t.ok ? "✓" : "✗"}</span>
+      </div>
+      {/* Collapsed error hint: the first line of a failure is visible WITHOUT
+          expanding — failures shouldn't hide. */}
+      {!open && t.ok === false && t.detail && (
+        <div style={{ padding: "0 10px 6px 10px", opacity: 0.85, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {t.detail.split("\n")[0].slice(0, 160)}
+        </div>
+      )}
+      {/* Expanded pane: bounded height, scrolls internally — watch code/output
+          without the transcript growing by thousands of lines. */}
+      {open && (
+        <div ref={paneRef} style={{
+          borderTop: `var(--border-width) solid ${color}`,
+          maxHeight: 300, overflow: "auto", padding: "8px 10px",
+          color: "var(--text)", background: "var(--surface)",
+        }}>
+          {t.body && (
+            <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 12 }}>{t.body}</pre>
+          )}
+          {t.body && t.detail && <div style={{ height: 8 }} />}
+          {t.detail && (
+            <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 12, opacity: 0.85 }}>{t.detail}</pre>
+          )}
+        </div>
+      )}
     </div>
   );
 }

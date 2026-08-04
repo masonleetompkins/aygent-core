@@ -170,6 +170,7 @@ export function AgentForm({
   const [folder, setFolder] = useState(initial?.folder_path ?? "");
   const [model, setModel] = useState(initial?.model ?? "");
   const [provider, setProvider] = useState(initial?.provider ?? "anthropic");
+  const [contextMode, setContextMode] = useState(initial?.context_mode ?? "isolated");
   const [systemPrompt, setSystemPrompt] = useState(initial?.system_prompt ?? "");
   const [saving, setSaving] = useState(false);
 
@@ -210,7 +211,7 @@ export function AgentForm({
       try {
         const created = await invoke<AgentProfile>("agents_create", {
           name: name.trim(), icon, color, folderPath: folder, model, provider,
-          contextMode: "isolated", systemPrompt,
+          contextMode, systemPrompt,
         });
         setSavedId(created.id);
         onRosterChange?.(); // new chip appears in the rail immediately
@@ -393,14 +394,14 @@ export function AgentForm({
       if (initial) {
         const updated: AgentProfile = {
           ...initial, name: name.trim(), icon, color,
-          folder_path: folder, model, provider, system_prompt: systemPrompt,
+          folder_path: folder, model, provider, context_mode: contextMode, system_prompt: systemPrompt,
         };
         await invoke("agents_update", { profile: updated });
         onDone(updated);
       } else {
         const created = await invoke<AgentProfile>("agents_create", {
           name: name.trim(), icon, color, folderPath: folder, model, provider,
-          contextMode: "isolated", systemPrompt,
+          contextMode, systemPrompt,
         });
         onDone(created);
       }
@@ -522,6 +523,20 @@ export function AgentForm({
             )}
           </label>
         </div>
+
+        {/* CONTEXT MODE (2026-08-03): how much conversation context this agent
+           carries between chats. Wired end-to-end now (was a dead column). */}
+        <label style={fieldLabel}>Context mode
+          <select value={contextMode} onChange={(e) => setContextMode(e.target.value)} style={selectStyle}>
+            <option value="isolated">Isolated — each chat starts fresh (recommended)</option>
+            <option value="continuous">Continuous — new chats carry context forward</option>
+          </select>
+          <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>
+            {contextMode === "continuous"
+              ? "A new chat inherits the running context of the chat you started it from — the agent picks up mid-thought without re-explaining. Tradeoff: that carried history rides into every message, so each turn costs more tokens and cost grows with the thread. Best for one ongoing project where continuity matters more than price."
+              : "Each chat is its own session: nothing from other chats is sent with it, so tokens stay cheap and context stays clean. The agent still keeps long-term memory (its Memory notes) across all chats. The right default for most use."}
+          </span>
+        </label>
 
         {/* PRO MODE consent (scary-honest). Only meaningful once a folder is set. */}
         <div style={{
