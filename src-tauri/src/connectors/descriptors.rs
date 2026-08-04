@@ -1532,7 +1532,14 @@ const SUPABASE: Connector = Connector {
     base_url: "{project_url}/rest/v1",
     auth_header: "Authorization",
     auth_value: "Bearer {service_key}",
-    headers: &[("apikey", "{service_key}"), ("Content-Type", "application/json")],
+    headers: &[
+        ("apikey", "{service_key}"),
+        ("Content-Type", "application/json"),
+        // Make writes ECHO the affected row(s). Without this PostgREST returns an
+        // empty body on insert/update, so a successful write is indistinguishable
+        // from a no-op — a bad signal for the model and the user alike.
+        ("Prefer", "return=representation"),
+    ],
     validate: Some(ValidateSpec {
         method: "GET",
         url: "{project_url}/rest/v1/",
@@ -1586,7 +1593,7 @@ const SUPABASE: Connector = Connector {
                 ToolParam { name: "table", ty: "string", description: "Table name.", required: true },
                 ToolParam { name: "values", ty: "string", description: "JSON object or array of objects.", required: true },
             ],
-            render: Render::Json,
+            render: Render::Items { root: "", line: "inserted: {id}{slug}{email}", empty: "Insert succeeded (0 rows returned)." },
         },
         ConnectorTool {
             danger: false, b64_params: &[], raw_params: &["values"], base_override: "",
