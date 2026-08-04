@@ -1882,6 +1882,119 @@ fn local_tool_capability(path: String) -> gguf::ToolCapability {
     gguf::detect_tool_capability(&path)
 }
 
+// --- CAPABILITY INVENTORY -------------------------------------------------
+// ONE answer to "what can my agent actually do?", assembled from all origins:
+//
+//   built-in    native Rust (files, pdf, fetch_url, whisper) + always-on core
+//   connection  contributed by an enabled Connection (github_list_prs, …)
+//   mcp         discovered from an MCP server (not yet implemented — the
+//               inventory is built to carry it so the UI doesn't change later)
+//
+// SKILLS ARE NOT HERE. A skill is saved instructions ("how I want work done"),
+// not a machine capability, and it holds no credential. Mixing them was the
+// confusing part of the old Tools tab: `kind='composed'` entries looked like
+// tools but behaved like procedures. They get their own list.
+//
+// This is DERIVED state — it never stores anything. The truth lives in the tools
+// registry, the connection tables, and the connector descriptors.
+
+/// The always-available core tools. These aren't in the tools registry (they're
+/// unconditional in the agent loop), but a user asking "what can my agent do?"
+/// must see them or the answer is a lie.
+const CORE_TOOLS: &[(&str, &str, &str)] = &[
+    ("read_file", "Read files", "Read a UTF-8 text file inside the agent folder."),
+    ("write_file", "Write files", "Create or overwrite a text file inside the agent folder."),
+    ("list_files", "List files", "List directory entries inside the agent folder."),
+    ("rename_file", "Rename / move files", "Rename or move a file inside the agent folder."),
+    ("delete_file", "Delete files", "Delete a file inside the agent folder."),
+];
+
+/// The full capability inventory for one agent, grouped by ORIGIN.
+#[tauri::command]
+fn capabilities_list(
+    app: tauri::AppHandle,
+    db: tauri::State<writer::Db>,
+    agent_id: Option<String>,
+    folder: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let ad = app_data(&app)?;
+    let mut items: Vec<serde_json::Value> = Vec::new();
+
+    // 1. CORE — jailed file tools, always on, cannot be disabled.
+    for (name, label, desc) in CORE_TOOLS {
+        items.push(serde_json::json!({
+            "name": name, "display_name": label, "description": desc,
+            "origin": "built-in", "source": "Core", "enabled": true,
+            "toggleable": false, "access": "Write", "id": format!("core.{name}"),
+        }));
+    }
+
+    // 2. BUILT-IN REGISTRY TOOLS — pdf, whisper, fetch_url. Toggleable per agent.
+    let enabled_map = agent_id.as_ref()
+        .map(|a| tools_registry::load_enabled(&ad, &tools_registry::Scope::new(a, folder.as_deref())))
+        .unwrap_or_default();
+    for t in tools_registry::load_registry(&ad) {
+        // Composed entries are SKILLS now — excluded from the tool inventory.
+        if t.kind == "composed" { continue; }
+        let on = match enabled_map.get(&t.id) { Some(v) => *v, None => t.builtin };
+        items.push(serde_json::json!({
+            "name": t.name, "display_name": t.display_name, "description": t.description,
+            "origin": "built-in", "source": "Built-in", "enabled": on,
+            "toggleable": true, "access": "Write", "id": t.id,
+            "has_config": !tools_registry::config_schema(&t.id).as_array().map(|a| a.is_empty()).unwrap_or(true),
+        }));
+    }
+
+    // 3. CONNECTION TOOLS — contributed by whatever is enabled for THIS agent.
+    // Read the same way the agent loop does, so the inventory can't drift from
+    // what the model is actually given.
+    if let Some(aid) = agent_id.as_deref() {
+        for (provider, access) in connections::enabled_providers_for_agent(&db, aid) {
+            let Some(def) = connectors::by_id(&provider) else { continue };
+            let write = access == "write";
+            for t in def.tools_for(write) {
+                items.push(serde_json::json!({
+                    "name": t.name, "display_name": t.name, "description": t.description,
+                    "origin": "connection", "source": def.label, "enabled": true,
+                    "toggleable": false, "id": format!("conn.{}.{}", def.id, t.name),
+                    "access": if t.access == connectors::Access::Write { "Write" } else { "Read" },
+                }));
+            }
+        }
+    }
+
+    // 4. MCP — placeholder shape, deliberately empty until the client lands.
+
+    Ok(serde_json::json!(items))
+}
+
+/// SKILLS — saved procedures (instructions + an allowed subset of real tools).
+/// Same storage as before (`kind: "composed"` in the tools registry); this is a
+/// clearer name and a separate list, not a migration.
+#[tauri::command]
+fn skills_list(
+    app: tauri::AppHandle,
+    agent_id: Option<String>,
+    folder: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let ad = app_data(&app)?;
+    let enabled = agent_id.as_ref()
+        .map(|a| tools_registry::load_enabled(&ad, &tools_registry::Scope::new(a, folder.as_deref())))
+        .unwrap_or_default();
+    let out: Vec<serde_json::Value> = tools_registry::load_registry(&ad).iter()
+        .filter(|t| t.kind == "composed")
+        .map(|t| {
+            let on = enabled.get(&t.id).copied().unwrap_or(false);
+            serde_json::json!({
+                "id": t.id, "name": t.name, "display_name": t.display_name,
+                "description": t.description, "instructions": t.instructions,
+                "allowed_tools": t.allowed_tools, "enabled": on, "builtin": t.builtin,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!(out))
+}
+
 // --- TOOLS registry (extensible agent capabilities) ------------------------
 // (uses the existing `app_data` helper defined earlier)
 
@@ -3060,11 +3173,13 @@ fn agent_tools_for_full(
                 "builtin" => {
                     if let Some(schema) = builtin_tool_schema(&t.name) { tools.push(schema); }
                 }
+                // A SKILL (stored as kind "composed" — the storage name predates
+                // the rename; the UI calls these Skills). It is exposed as a
+                // named tool the model invokes by following its saved
+                // instructions using only the base tools it's allowed. A skill
+                // grants no new capability: it's a way of working, not a
+                // credential or a new reach.
                 "composed" => {
-                    // A composed tool is exposed as a named tool the model can
-                    // "invoke" by following its saved instructions using the base
-                    // tools it's allowed. We surface it as a no-arg-ish tool plus
-                    // an instruction block so the model knows what it does.
                     tools.push(serde_json::json!({
                         "name": t.name,
                         "description": t.description,
@@ -4396,6 +4511,7 @@ pub fn run() {
             browser::set_browser_hittest, browser::browser_engine_info,
             openai_models, tools_list, tools_upsert, tools_delete, tools_set_enabled,
             tools_config, tools_set_config,
+            capabilities_list, skills_list,
             dashboard::dashboard_load, dashboard::dashboard_upsert_module,
             dashboard::dashboard_remove_module, dashboard::dashboard_arrange,
             dashboard::dashboard_undo,

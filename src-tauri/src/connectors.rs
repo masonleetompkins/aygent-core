@@ -360,3 +360,54 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod inventory_tests {
+    /// The Tools screen must show EXACTLY what the agent loop gives the model.
+    /// If the inventory drifts from the real tool list, the UI becomes a lie —
+    /// and this is the specific direction that matters: a WRITE tool listed (or
+    /// granted) while the connection is in read mode.
+    #[test]
+    fn read_mode_inventory_contains_no_write_tools() {
+        for c in crate::connectors::catalog() {
+            let read_names: Vec<&str> = c.tools_for(false).map(|t| t.name).collect();
+            for t in c.tools.iter().filter(|t| t.access == crate::connectors::Access::Write) {
+                assert!(
+                    !read_names.contains(&t.name),
+                    "{} would show write tool {} in read mode",
+                    c.id, t.name
+                );
+            }
+        }
+    }
+
+    /// Every connector tool must be resolvable by name, or the inventory can
+    /// display a row whose button does nothing when clicked.
+    #[test]
+    fn every_listed_connector_tool_is_executable() {
+        for c in crate::connectors::catalog() {
+            for t in c.tools {
+                let found = crate::connectors::lookup_tool(t.name);
+                assert!(found.is_some(), "{} is listed but not routable", t.name);
+                let (owner, _) = found.unwrap();
+                assert_eq!(owner.id, c.id, "{} routes to the wrong connector", t.name);
+            }
+        }
+    }
+
+    /// Dashboard buttons may only ever run READ tools. Derived from the registry,
+    /// so this guards every future connector automatically.
+    #[test]
+    fn dashboard_buttons_never_get_a_write_tool() {
+        let allowed = crate::dashboard_data::button_tools();
+        for c in crate::connectors::catalog() {
+            for t in c.tools.iter().filter(|t| t.access == crate::connectors::Access::Write) {
+                assert!(
+                    !allowed.contains(&t.name),
+                    "write tool {} must not be runnable from a dashboard button",
+                    t.name
+                );
+            }
+        }
+    }
+}

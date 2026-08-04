@@ -19,7 +19,7 @@ export const NAV: NavItem[] = [
   { id: "dashboard", label: "Dashboard", icon: "chart", enabled: true, group: "agent" },
   { id: "chat", label: "Chat", icon: "chat", enabled: true, group: "agent" },
   { id: "browser", label: "AYGENT Browser", icon: "globe", enabled: true, group: "agent" },
-  { id: "tools", label: "Tools", icon: "tools", enabled: true, group: "agent" },
+  { id: "tools", label: "Tools & Skills", icon: "tools", enabled: true, group: "agent" },
   { id: "scheduler", label: "Scheduler", icon: "scheduler", enabled: true, group: "agent" },
   { id: "savepoints", label: "Save Points", icon: "savepoints", enabled: true, group: "agent" },
   { id: "agents", label: "Agents", icon: "agents", enabled: true, group: "global" },
