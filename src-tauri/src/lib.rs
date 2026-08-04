@@ -4029,9 +4029,10 @@ pub async fn run_headless_turn(
     let conv_id = continue_conv.clone().unwrap_or_else(|| format!("inbox-{agent_id}"));
     let existing = repo::load_conversation(db, &conv_id).ok();
     let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
-    let inbound_text = if is_continue { format!("\u{23F0} resumed: {}", msg_body) }
-        else { format!("\u{1F4E8} from {from_name}: {}", msg_body) };
-    ui_msgs.push(serde_json::json!({ "role": "user", "from": from_name, "text": inbound_text }));
+    // NOTE (Mason 08-03, double-bubble fix): the inbound "resumed:"/"from X:"
+    // user bubble was ALREADY persisted by the dispatch-time visibility block
+    // before the turn ran — appending it again here rendered every wake-up
+    // twice. Only the assistant reply is new at end-of-turn.
     ui_msgs.push(serde_json::json!({ "role": "assistant", "text": reply_display, "tools": [] }));
     // Real history: prior history + this turn's messages (framed user + all
     // assistant/tool turns we accumulated in `messages`). `messages` starts with
@@ -4060,11 +4061,11 @@ pub async fn run_headless_turn(
 /// fails before it could reply (Atlas #5 cause 3: no key/model → rail rings then
 /// silence). Now the user sees WHY in the thread instead of a blank rail.
 pub fn persist_inbox_error(db: &writer::Db, agent_id: &str, msg: &mailbox::Message, err: &str) {
-    let from_name = repo::get_agent(db, &msg.from_agent).ok().flatten().map(|a| a.name).unwrap_or_else(|| msg.from_agent.clone());
     let conv_id = format!("inbox-{agent_id}");
     let existing = repo::load_conversation(db, &conv_id).ok();
     let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
-    ui_msgs.push(serde_json::json!({ "role": "user", "from": from_name, "text": format!("\u{1F4E8} from {from_name}: {}", msg.body) }));
+    // (Mason 08-03) Do NOT re-append the inbound bubble — dispatch-time
+    // visibility already persisted it before the turn failed.
     ui_msgs.push(serde_json::json!({ "role": "assistant", "text": format!("⚠️ Couldn't process this message: {err}. (Check this agent has a provider key + model set.)"), "tools": [] }));
     let conv = repo::Conversation {
         id: conv_id, agent_id: agent_id.to_string(),
