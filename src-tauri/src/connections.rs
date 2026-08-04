@@ -203,7 +203,12 @@ pub fn disconnect(db: &Db, id: i64) -> Result<(), String> {
             .optional().map_err(|e| format!("lookup: {e}"))?
     };
     if let Some(kr) = key_ref {
-        for slot in ["token", "access", "refresh"] { delete_token(&kr, slot); }
+        for slot in ["token", "access", "refresh", "service_account_json", "service_key", "project_url"] {
+            delete_token(&kr, slot);
+        }
+        // Drop any minted-token cache too, so a disconnect takes effect NOW
+        // rather than whenever the cached hour happens to run out.
+        crate::google_auth::forget("google");
     }
     db.write(move |conn| {
         conn.execute("DELETE FROM connection WHERE id = ?1", params![id])
@@ -400,9 +405,19 @@ pub async fn connect_connector(
     }
     let ctx = serde_json::Value::Object(values.clone());
 
-    // Validate against the live API so a bad credential is caught at PASTE time,
-    // not on the agent's first call an hour later.
-    let account = validate_credential(def, &ctx).await?;
+    // Validate at PASTE time so a bad credential fails in the dialog, not on the
+    // agent's first call an hour later. Service accounts are validated LOCALLY:
+    // the identity IS a field of the key file, and a wrong-file mistake (an OAuth
+    // client secret) is diagnosable without any network round trip.
+    let account = if def.auth_kind == "service_account_json" {
+        let raw = values
+            .get("service_account_json")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        crate::google_auth::identity_from_key(raw)?
+    } else {
+        validate_credential(def, &ctx).await?
+    };
 
     // key_ref namespaces the keychain per ACCOUNT, so a personal and a work
     // token for the same provider never collide.

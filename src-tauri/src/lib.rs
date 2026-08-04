@@ -46,6 +46,7 @@ mod migrate_json;
 mod repo;
 mod writer;
 mod gguf;
+mod google_auth; // GOOGLE service accounts: RS256 JWT -> access token (the one credential we must MINT, not paste).
 mod hardware;
 mod keychain;
 mod local_provider;

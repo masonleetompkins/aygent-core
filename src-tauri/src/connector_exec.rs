@@ -55,10 +55,32 @@ pub async fn exec(
         );
     }
 
-    let creds = match crate::connections::creds_for_agent(db, agent_id, conn_def.id) {
+    let mut creds = match crate::connections::creds_for_agent(db, agent_id, conn_def.id) {
         Ok(c) => c,
         Err(e) => return (e, true),
     };
+
+    // SERVICE-ACCOUNT AUTH: the stored credential is an RSA private key, not a
+    // bearer token. Exchange it for a short-lived access token (cached ~1h) and
+    // expose it as {access_token} for the descriptor's auth_value template. The
+    // key itself never leaves this side of the boundary.
+    if conn_def.auth_kind == "service_account_json" {
+        let key_json = creds
+            .fields
+            .get("service_account_json")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if key_json.is_empty() {
+            return ("the saved Google service-account key couldn't be read — reconnect it in Connections.".into(), true);
+        }
+        match crate::google_auth::access_token(&key_json, conn_def.id).await {
+            Ok(tok) => {
+                creds.fields.insert("access_token".into(), serde_json::Value::String(tok));
+            }
+            Err(e) => return (e, true),
+        }
+    }
 
     match call(conn_def, tool, args, &creds).await {
         Ok(text) => (text, false),

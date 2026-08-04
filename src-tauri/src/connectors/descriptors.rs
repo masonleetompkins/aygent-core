@@ -376,8 +376,68 @@ const GOOGLE: Connector = Connector {
     auth_header: "Authorization",
     auth_value: "Bearer {access_token}",
     headers: &[],
+    // Validation happens BEFORE any HTTP: google_auth::identity_from_key parses
+    // the pasted JSON and names the mistake (an OAuth client secret is the common
+    // mix-up). connect_connector special-cases this auth_kind.
     validate: None,
-    tools: &[],
+    tools: &[
+        ConnectorTool {
+            name: "google_list_calendars",
+            description: "List the Google calendars this agent can see. Only calendars SHARED with \
+                          the service account's email address appear here.",
+            access: Access::Read,
+            method: "GET",
+            path: "/calendar/v3/users/me/calendarList",
+            query: &[],
+            body: "",
+            params: &[],
+            render: Render::Items {
+                root: "items",
+                line: "- {summary} (id {id})",
+                empty: "No calendars visible. Share a calendar WITH the service account's \
+                        ...iam.gserviceaccount.com address, then try again.",
+            },
+        },
+        ConnectorTool {
+            name: "google_upcoming_events",
+            description: "List upcoming events on a Google calendar. Pass calendar_id from \
+                          google_list_calendars, or 'primary'. Use for \"what's on my schedule?\".",
+            access: Access::Read,
+            method: "GET",
+            path: "/calendar/v3/calendars/{calendar_id}/events",
+            query: &[
+                ("maxResults", "20"),
+                ("orderBy", "startTime"),
+                ("singleEvents", "true"),
+                ("timeMin", "{time_min}"),
+            ],
+            body: "",
+            params: &[
+                ToolParam { name: "calendar_id", ty: "string", description: "Calendar id, or 'primary'.", required: true },
+                ToolParam { name: "time_min", ty: "string", description: "RFC3339 lower bound, e.g. 2026-08-05T00:00:00Z.", required: true },
+            ],
+            render: Render::Items {
+                root: "items",
+                line: "- {start.dateTime}{start.date} · {summary}",
+                empty: "Nothing scheduled in that window.",
+            },
+        },
+        ConnectorTool {
+            name: "google_find_drive_files",
+            description: "Search Google Drive files shared with this agent by name.",
+            access: Access::Read,
+            method: "GET",
+            path: "/drive/v3/files",
+            query: &[("q", "name contains '{query}'"), ("pageSize", "25"), ("fields", "files(id,name,mimeType,modifiedTime)")],
+            body: "",
+            params: &[ToolParam { name: "query", ty: "string", description: "Words in the file name.", required: true }],
+            render: Render::Items {
+                root: "files",
+                line: "- {name} · {mimeType} · id {id}",
+                empty: "No matching files shared with the service account.",
+            },
+        },
+    ],
 };
 
 // ---------------------------------------------------------------------------

@@ -57,7 +57,8 @@ chrono-tz = "0.10"                  # M1.8 scheduler: IANA timezone db (compute 
 rusqlite = { version = "0.32", features = ["bundled"] }  # M1.1 STATE SPINE: SQLite compiled IN (zero user setup, matches git2/llama.cpp philosophy). App state lives Rust-side (the daemon is Seatbelt-jailed w/ no ambient fs) behind a single-writer actor (Atlas C6). WAL + busy_timeout. Replaces the per-folder JSON stores.
 base64 = "0.22"                     # M1.4: decode context-doc uploads (UI reads file -> base64 -> Rust decodes + stores app-data-side, out of the jail)
 zip = { version = "2", default-features = false, features = ["deflate"] }  # BROWSER Slice 0: unzip the Chrome-for-Testing archive we fetch from Google's CDN into AYGENT's managed browser dir (install-nothing). deflate-only keeps it lean; CfT zips are standard deflate.
-sha2 = "0.10"                      # BROWSER Slice 0: verify the downloaded Chrome-for-Testing zip against the per-file SHA-256 CfT publishes in its known-good JSON (integrity gate, honors the contract's "SHA-256 verify").
+sha2 = "0.10"
+jsonwebtoken = "9"                 # GOOGLE service accounts: sign the RS256 JWT assertion that is exchanged for an access token. Service-account auth avoids Google OAuth app verification entirely, but requires real crypto -> a dependency, not a descriptor.                      # BROWSER Slice 0: verify the downloaded Chrome-for-Testing zip against the per-file SHA-256 CfT publishes in its known-good JSON (integrity gate, honors the contract's "SHA-256 verify").
 urlencoding = "2"                   # (unused placeholder removed if not needed) — kept minimal
 dirs = "6"                          # BROWSER downloads: resolve the user's ~/Downloads (WebKit-download-friendly dir) for the on_download destination. Already in the tree via wry (v6.0.0 in Cargo.lock); declared direct so browser.rs uses dirs::download_dir()/home_dir() without lock churn.
 
