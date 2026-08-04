@@ -46,12 +46,31 @@ impl Mode {
     }
 }
 
-/// One scoped root per agent (from the macOS security-scoped bookmark).
+/// A READ-ONLY mount: another folder this agent may READ but never write.
+///
+/// This is how two agents share context while keeping separate homes (the
+/// alternative — pointing both agents at one folder — makes them stomp each
+/// other's memory/ and daily notes, and contaminates any A/B comparison
+/// between models). A mount is resolved by the SAME fail-closed kernel as the
+/// primary root; the only difference is that write modes are refused outright.
+#[derive(Clone)]
+pub struct Mount {
+    /// Canonical, data-volume-resolved path (same contract as `root`).
+    pub root: PathBuf,
+    /// Display label for UI/diagnostics (e.g. the source agent's name).
+    pub label: String,
+}
+
+/// One scoped root per agent (from the macOS security-scoped bookmark), plus
+/// zero or more READ-ONLY mounts of other folders.
 #[derive(Clone)]
 pub struct AgentScope {
     pub agent_id: String,
     pub root: PathBuf,        // canonical, data-volume-resolved
     pub bookmark_stale: bool, // Atlas C2: handle explicitly, fail closed if stale
+    /// Read-only shared context. Tried ONLY after the primary root misses, and
+    /// ONLY for read modes. Never writable — see resolve().
+    pub mounts: Vec<Mount>,
 }
 
 pub struct Broker {
@@ -83,10 +102,30 @@ impl Broker {
     /// security-scoped bookmark resolves). `root` must already be canonicalized
     /// by the caller against the data volume.
     pub fn set_scope(&self, agent_id: &str, root: PathBuf, bookmark_stale: bool) {
-        self.scopes.lock().unwrap().insert(
+        let mut scopes = self.scopes.lock().unwrap();
+        // Preserve any already-registered mounts: re-registering a scope (boot,
+        // folder change, agent save) must not silently drop shared context.
+        let mounts = scopes.get(agent_id).map(|s| s.mounts.clone()).unwrap_or_default();
+        scopes.insert(
             agent_id.to_string(),
-            AgentScope { agent_id: agent_id.to_string(), root, bookmark_stale },
+            AgentScope { agent_id: agent_id.to_string(), root, bookmark_stale, mounts },
         );
+    }
+
+    /// Replace an agent's READ-ONLY mounts. Callers pass canonical paths (same
+    /// contract as `set_scope`). A mount equal to the agent's own root is
+    /// dropped — it would be a no-op that only confuses diagnostics.
+    pub fn set_mounts(&self, agent_id: &str, mounts: Vec<Mount>) {
+        let mut scopes = self.scopes.lock().unwrap();
+        if let Some(scope) = scopes.get_mut(agent_id) {
+            let own = scope.root.clone();
+            scope.mounts = mounts.into_iter().filter(|m| m.root != own).collect();
+        }
+    }
+
+    /// An agent's read-only mounts (empty if none / no scope).
+    pub fn mounts_for(&self, agent_id: &str) -> Vec<Mount> {
+        self.scopes.lock().unwrap().get(agent_id).map(|s| s.mounts.clone()).unwrap_or_default()
     }
 
     /// Atomically resolve + admit/refuse. Returns the canonical in-scope path
@@ -97,7 +136,46 @@ impl Broker {
         if scope.bookmark_stale {
             return Err(BrokerError::StaleBookmark); // never silently widen scope
         }
-        Self::resolve_within(&scope.root, requested, mode)
+
+        // The agent's OWN root always wins: a mount can never shadow or
+        // intercept a path the agent legitimately owns.
+        let primary = Self::resolve_within(&scope.root, requested, mode);
+
+        // WRITE ATTEMPTS NEVER FALL THROUGH TO A MOUNT. Shared context is
+        // strictly read-only, so a write is always answered by the primary
+        // root (admitted there, or refused there) — never redirected into
+        // someone else's folder.
+        if scope.mounts.is_empty() || mode.is_write() {
+            return primary;
+        }
+
+        // READ FALLBACK. Subtlety worth stating, because it made the first
+        // implementation of this a no-op: resolve_within ADMITS paths that
+        // don't exist yet (it has to — that's how a file gets created). So a
+        // read of "notes.md" always "succeeds" against the primary root even
+        // when the agent has no such file, and the mounts would never be
+        // consulted. The correct rule is about EXISTENCE, not admission:
+        //   - primary path exists  -> use it (own root wins, always)
+        //   - primary path missing -> the first mount that actually HAS the
+        //                             file answers the read
+        //   - nobody has it        -> return the primary result, so the error
+        //                             (or the in-root miss) reads honestly and
+        //                             no mount path leaks into the message
+        if let Ok(p) = &primary {
+            if p.exists() {
+                return Ok(p.clone());
+            }
+        }
+        for m in &scope.mounts {
+            // Same fail-closed kernel per mount: traversal, symlink escape and
+            // forbidden prefixes all still apply inside a mount.
+            if let Ok(p) = Self::resolve_within(&m.root, requested, mode) {
+                if p.exists() {
+                    return Ok(p);
+                }
+            }
+        }
+        primary
     }
 
     /// Pure resolution logic — no I/O side effects beyond reading link/stat
@@ -398,6 +476,111 @@ mod tests {
     // These prove the atomic O_NOFOLLOW layer survives an active attacker, not
     // just correct resolution. (Part F tests 8 + 9.)
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // SHARED CONTEXT (read-only mounts). These are the security tests for the
+    // "two agents, one project" feature: a mount must grant READS and NEVER a
+    // write, and must never shadow the agent's own root.
+    // -----------------------------------------------------------------------
+
+    fn broker_with_mount(root: &Path, mount: &Path) -> Arc<Broker> {
+        let b = Broker::new();
+        b.set_scope("a1", root.to_path_buf(), false);
+        b.set_mounts("a1", vec![Mount { root: mount.to_path_buf(), label: "shared".into() }]);
+        b
+    }
+
+    #[test]
+    fn mount_read_is_admitted() {
+        // The whole point: agent A reads a file that only exists in agent B's
+        // folder, without B's folder being A's root.
+        let root = tmp_root();
+        let shared = tmp_root();
+        fs::write(shared.join("notes.md"), b"shared knowledge").unwrap();
+
+        let b = broker_with_mount(&root, &shared);
+        let r = b.resolve("a1", "notes.md", Mode::Read);
+        assert!(r.is_ok(), "expected mount read to be admitted, got {r:?}");
+        assert_eq!(r.unwrap(), shared.join("notes.md"));
+    }
+
+    #[test]
+    fn mount_write_never_lands_in_the_mount() {
+        // THE critical guarantee. A mounted folder is READ-ONLY. Writing a name
+        // that exists ONLY in the mount must resolve into the agent's OWN root
+        // (creating its own copy) — never into the shared folder.
+        let root = tmp_root();
+        let shared = tmp_root();
+        fs::write(shared.join("notes.md"), b"shared knowledge").unwrap();
+
+        let b = broker_with_mount(&root, &shared);
+        let got = b.resolve("a1", "notes.md", Mode::Write).unwrap();
+        assert!(got.starts_with(&root), "write escaped into a mount: {got:?}");
+        assert!(!got.starts_with(&shared), "write escaped into a mount: {got:?}");
+
+        // The shared file is untouched by a write through the mount.
+        assert_eq!(fs::read_to_string(shared.join("notes.md")).unwrap(), "shared knowledge");
+    }
+
+    #[test]
+    fn mount_read_of_missing_file_does_not_leak_mount_path() {
+        // A file nobody has: the answer must come from the agent's own root, so
+        // the error/path never reveals a mounted folder's location.
+        let root = tmp_root();
+        let shared = tmp_root();
+        let b = broker_with_mount(&root, &shared);
+        let got = b.resolve("a1", "nope.md", Mode::Read).unwrap();
+        assert!(got.starts_with(&root), "leaked a mount path: {got:?}");
+    }
+
+    #[test]
+    fn mount_never_shadows_own_root() {
+        // Same relative name in both places: the agent's OWN file must win, so
+        // a mount can never intercept a path the agent legitimately owns.
+        let root = tmp_root();
+        let shared = tmp_root();
+        fs::write(root.join("notes.md"), b"mine").unwrap();
+        fs::write(shared.join("notes.md"), b"theirs").unwrap();
+
+        let b = broker_with_mount(&root, &shared);
+        let got = b.resolve("a1", "notes.md", Mode::Read).unwrap();
+        assert_eq!(got, root.join("notes.md"));
+        assert_eq!(fs::read_to_string(got).unwrap(), "mine");
+    }
+
+    #[test]
+    fn mount_still_refuses_traversal() {
+        // A mount is resolved by the SAME kernel: `..` escapes stay refused.
+        let root = tmp_root();
+        let shared = tmp_root();
+        let b = broker_with_mount(&root, &shared);
+        let r = b.resolve("a1", "../outside.md", Mode::Read);
+        assert!(matches!(r, Err(BrokerError::Traversal)), "got {r:?}");
+    }
+
+    #[test]
+    fn set_scope_preserves_mounts() {
+        // Re-registering a scope (boot, folder change, agent save) must not
+        // silently drop shared context.
+        let root = tmp_root();
+        let shared = tmp_root();
+        fs::write(shared.join("notes.md"), b"x").unwrap();
+        let b = broker_with_mount(&root, &shared);
+
+        b.set_scope("a1", root.to_path_buf(), false); // re-register
+        assert_eq!(b.mounts_for("a1").len(), 1, "mounts dropped on re-register");
+        assert!(b.resolve("a1", "notes.md", Mode::Read).is_ok());
+    }
+
+    #[test]
+    fn self_mount_is_dropped() {
+        // Mounting your own root is a no-op, not a duplicate scope.
+        let root = tmp_root();
+        let b = Broker::new();
+        b.set_scope("a1", root.to_path_buf(), false);
+        b.set_mounts("a1", vec![Mount { root: root.clone(), label: "self".into() }]);
+        assert!(b.mounts_for("a1").is_empty());
+    }
 
     /// A broker scoped to a root, for exercising resolve_and_open directly.
     fn broker_with_scope(root: &Path) -> Arc<Broker> {

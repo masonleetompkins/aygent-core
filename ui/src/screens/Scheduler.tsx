@@ -124,9 +124,9 @@ export function Scheduler({ agentId }: { agentId: string | null }) {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <h2 style={{ fontSize: "var(--text-h1)", fontWeight: "var(--weight-heading)", margin: 0 }}>Scheduler</h2>
         <div style={{ display: "flex", gap: 8 }}>
-          <Button variant="secondary" onClick={refresh}>↻ Refresh</Button>
+          <Button variant="secondary" onClick={refresh}>Refresh</Button>
           <Button variant="secondary" onClick={togglePauseAll}>
-            {paused ? "▶ Resume all" : "⏸ Pause all"}
+            {paused ? "Resume all" : "Pause all"}
           </Button>
           <Button onClick={() => setAdding(true)} disabled={!agentId}>+ New schedule</Button>
         </div>
@@ -151,13 +151,16 @@ export function Scheduler({ agentId }: { agentId: string | null }) {
       {list.map((s) => (
         <Card key={s.id} title={undefined}>
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-            <span style={{ fontSize: 16 }}>{s.enabled ? "🟢" : "⚪"}</span>
+            <span title={s.enabled ? "Enabled" : "Paused"} style={{
+              width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
+              background: s.enabled ? "var(--ok)" : "var(--text-faint)",
+            }} />
             <b style={{ fontSize: 15 }}>{s.name}</b>
             <Pill tone="muted">{specSummary(s.kind, s.spec_json)}</Pill>
             <span style={{ ...hint, fontSize: 13 }}>next: {s.enabled ? fmtWhen(s.next_fire_at) : "—"}</span>
             {s.last_status && <Pill tone={statusTone(s.last_status)}>{s.last_status}</Pill>}
             <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
-              <Button onClick={() => runNow(s)}>▶ Run now</Button>
+              <Button onClick={() => runNow(s)}>Run now</Button>
               <Button variant="secondary" onClick={() => toggleOne(s)}>{s.enabled ? "Pause" : "Resume"}</Button>
               <Button variant="secondary" onClick={() => showRuns(s.id)}>History</Button>
               <Button variant="secondary" onClick={() => resetLimits(s)}>Reset limits</Button>
@@ -292,7 +295,7 @@ function AddSchedule({ agentId, onClose, onSaved }: { agentId: string; onClose: 
       )}
 
       <button onClick={() => setAdvanced(!advanced)} style={{ ...hint, background: "none", border: "none", cursor: "pointer", textAlign: "left", padding: 0, marginTop: 6 }}>
-        {advanced ? "▾" : "▸"} Advanced (limits & cost ceiling)
+        {advanced ? "Hide" : "Show"} advanced (limits & cost ceiling)
       </button>
       {advanced && (
         <div style={{ display: "flex", flexDirection: "column", gap: 8, paddingLeft: 8 }}>

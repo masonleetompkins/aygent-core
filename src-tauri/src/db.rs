@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 /// Current schema version. Bump when adding a migration step below.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// The DB file name under <app_data>.
 pub const DB_FILE: &str = "aygent.db";
@@ -155,6 +155,18 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("migrate v7: {e}"))?;
         set_version(conn, 7)?;
         v = 7;
+    }
+
+    if v < 8 {
+        // SHARED CONTEXT: read-only mounts. An agent may MOUNT another agent's
+        // folder (or any folder under the root) to READ its memory/context
+        // without being able to write it. Keeps homes separate — so two models
+        // can work the same project without stomping each other's memory, and
+        // an A/B comparison isn't contaminated by shared writes.
+        conn.execute_batch(SCHEMA_V8)
+            .map_err(|e| format!("migrate v8: {e}"))?;
+        set_version(conn, 8)?;
+        v = 8;
     }
 
     let _ = v;
@@ -454,4 +466,25 @@ CREATE TABLE IF NOT EXISTS agent_connection (
 /// (capture is salience+novelty gated = conservative). ALTER ADD, forward-only.
 const SCHEMA_V7: &str = r#"
 ALTER TABLE agent_settings ADD COLUMN auto_remember INTEGER NOT NULL DEFAULT 1;
+"#;
+
+/// SCHEMA v8 (shared context) — read-only mounts. Each row grants `agent_id`
+/// READ access to `path`. Writes are refused by the broker regardless of what
+/// is in this table (the kernel enforces it; this table only says WHAT to try).
+///
+/// `source_agent_id` is set when the mount came from picking another AGENT
+/// (vs an arbitrary folder), so the UI can show "Cleo's folder" and keep the
+/// path fresh if that agent's folder moves. NULL for a raw folder mount.
+const SCHEMA_V8: &str = r#"
+CREATE TABLE IF NOT EXISTS agent_mount (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id        TEXT NOT NULL,
+  path            TEXT NOT NULL,
+  label           TEXT NOT NULL DEFAULT '',
+  source_agent_id TEXT,
+  created_at      INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (agent_id, path),
+  FOREIGN KEY (agent_id) REFERENCES agent(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_agent_mount_agent ON agent_mount(agent_id);
 "#;

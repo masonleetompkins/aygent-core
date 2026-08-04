@@ -9,6 +9,7 @@ import { Chat } from "./screens/Chat";
 import { Browser } from "./screens/Browser";
 import { SavePoints } from "./screens/SavePoints";
 import { Tools } from "./screens/Tools";
+import { applyAppIcon } from "./lib/appIcon";
 import { Scheduler } from "./screens/Scheduler";
 import { Connections } from "./screens/Connections";
 import { Onboarding } from "./screens/Onboarding";
@@ -80,6 +81,10 @@ export function App() {
   }, [screen, rosterRefresh]);
 
   useEffect(() => { const t = initTheme(); setMode(t.mode); setAccent(t.accent); }, []);
+  // DYNAMIC APP ICON: redraw + install whenever the theme changes (and once on
+  // boot, after initTheme populates these). Fire-and-forget — a themed Dock
+  // icon is a nicety and must never block or break startup.
+  useEffect(() => { void applyAppIcon(mode, accent); }, [mode, accent]);
   // Start the standing watcher for inter-agent (headless) turns so their live
   // stream is captured into the per-agent store even though the UI didn't start
   // them — this is what makes you WATCH agents talk to each other.
@@ -245,7 +250,7 @@ export function App() {
           {screen === "savepoints" && <SavePoints folder={folder} />}
           {screen === "scheduler" && <Scheduler agentId={activeAgent?.id ?? null} />}
           {screen === "connections" && <Connections agentId={activeAgent?.id ?? null} />}
-          {screen === "tools" && <Tools folder={folder} />}
+          {screen === "tools" && <Tools folder={folder} agentId={activeAgent?.id ?? null} />}
           {screen === "browser" && <Browser />}
         </div>
       </div>

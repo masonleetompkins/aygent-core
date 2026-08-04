@@ -16,20 +16,22 @@ type Tool = {
   enabled: boolean;
 };
 
-export function Tools({ folder }: { folder: string | null }) {
+export function Tools({ folder, agentId }: { folder: string | null; agentId: string | null }) {
   const [tools, setTools] = useState<Tool[]>([]);
   const [editing, setEditing] = useState<Tool | null>(null);
   const [configuring, setConfiguring] = useState<Tool | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
 
   async function refresh() {
-    try { setTools(await invoke<Tool[]>("tools_list", { folder })); } catch { /* ignore */ }
+    try { setTools(await invoke<Tool[]>("tools_list", { agentId, folder })); } catch { /* ignore */ }
   }
-  useEffect(() => { refresh(); /* eslint-disable-next-line */ }, [folder]);
+  useEffect(() => { refresh(); /* eslint-disable-next-line */ }, [folder, agentId]);
 
   async function toggle(t: Tool) {
-    if (!folder) { setMsg("Pick an Agent Folder first (tools enable per folder)."); return; }
-    try { await invoke("tools_set_enabled", { folder, id: t.id, on: !t.enabled }); await refresh(); }
+    // Tool state belongs to the AGENT, not the folder: two agents sharing a
+    // folder must keep independent toggles.
+    if (!agentId) { setMsg("Select an agent first (tools enable per agent)."); return; }
+    try { await invoke("tools_set_enabled", { agentId, folder, id: t.id, on: !t.enabled }); await refresh(); }
     catch (e) { setMsg("✗ " + String(e)); }
   }
   async function del(t: Tool) {
@@ -85,7 +87,7 @@ export function Tools({ folder }: { folder: string | null }) {
       </div>
 
       {configuring && (
-        <ToolConfig tool={configuring} folder={folder} onClose={() => setConfiguring(null)} />
+        <ToolConfig tool={configuring} folder={folder} agentId={agentId} onClose={() => setConfiguring(null)} />
       )}
 
       {editing && (
@@ -103,15 +105,15 @@ export function Tools({ folder }: { folder: string | null }) {
 // backend declares it; the UI is generic). Values save per folder. This is the
 // reusable pattern every future tool inherits.
 type ConfigField = { key: string; label: string; type: string; default: any; help?: string; options?: string[]; min?: number; max?: number };
-function ToolConfig({ tool, folder, onClose }: { tool: Tool; folder: string | null; onClose: () => void }) {
+function ToolConfig({ tool, folder, agentId, onClose }: { tool: Tool; folder: string | null; agentId: string | null; onClose: () => void }) {
   const [schema, setSchema] = useState<ConfigField[]>([]);
   const [values, setValues] = useState<Record<string, any>>({});
   const [fonts, setFonts] = useState<string[]>([]);
   const [saved, setSaved] = useState(false);
 
   useEffect(() => {
-    if (!folder) return;
-    invoke<{ schema: ConfigField[]; values: Record<string, any>; fonts: string[] }>("tools_config", { folder, id: tool.id })
+    if (!agentId) return;
+    invoke<{ schema: ConfigField[]; values: Record<string, any>; fonts: string[] }>("tools_config", { agentId, folder, id: tool.id })
       .then((r) => {
         setSchema(r.schema || []);
         setFonts(r.fonts || []);
@@ -120,16 +122,16 @@ function ToolConfig({ tool, folder, onClose }: { tool: Tool; folder: string | nu
         for (const f of r.schema || []) { if (v[f.key] === undefined) v[f.key] = f.default; }
         setValues(v);
       }).catch(() => {});
-  }, [tool.id, folder]);
+  }, [tool.id, folder, agentId]);
 
   async function save() {
-    if (!folder) return;
-    try { await invoke("tools_set_config", { folder, id: tool.id, values }); setSaved(true); setTimeout(() => setSaved(false), 1500); }
+    if (!agentId) return;
+    try { await invoke("tools_set_config", { agentId, folder, id: tool.id, values }); setSaved(true); setTimeout(() => setSaved(false), 1500); }
     catch { /* ignore */ }
   }
   function set(k: string, v: any) { setValues((x) => ({ ...x, [k]: v })); }
 
-  if (!folder) return <Card title={`Configure ${tool.display_name}`}><p style={hint}>Pick an Agent Folder first.</p><Button variant="secondary" onClick={onClose}>Close</Button></Card>;
+  if (!agentId) return <Card title={`Configure ${tool.display_name}`}><p style={hint}>Select an agent first.</p><Button variant="secondary" onClick={onClose}>Close</Button></Card>;
   if (schema.length === 0) return <Card title={`Configure ${tool.display_name}`}><p style={hint}>This tool has no settings.</p><Button variant="secondary" onClick={onClose}>Close</Button></Card>;
 
   return (

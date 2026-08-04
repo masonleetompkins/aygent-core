@@ -19,8 +19,11 @@ export type IconName =
 
 // The curated set offered as agent icons (order = swatch order in the picker).
 export const AGENT_ICONS: IconName[] = [
-  "sparkles", "brain", "bolt", "book", "flask", "briefcase",
-  "palette", "chart", "leaf", "compass", "rocket", "star", "terminal", "globe",
+  // NOTE: "brain" and "palette" are intentionally absent from the PICKER
+  // (Mason 08-04) but remain defined in PATHS below, so an agent already saved
+  // with one keeps rendering correctly instead of showing an empty glyph.
+  "sparkles", "bolt", "book", "flask", "briefcase",
+  "chart", "leaf", "compass", "rocket", "star", "terminal", "globe",
 ];
 
 // 24x24 viewBox paths. Stroked, round caps/joins — reads like SF Symbols.
