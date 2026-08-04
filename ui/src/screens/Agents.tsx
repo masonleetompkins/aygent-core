@@ -190,6 +190,50 @@ export function AgentForm({
   const [savedId, setSavedId] = useState<string | null>(initial?.id ?? null);
   const savingDraftRef = useRef<Promise<string | null> | null>(null);
 
+  // SHARED CONTEXT: read-only mounts of OTHER agents' folders. This is how a
+  // second agent (different model) can read everything the first one knows
+  // about a project without sharing a home — separate memory/, separate daily
+  // notes, no write collisions, and an honest A/B comparison between models.
+  type MountRow = { id: number; path: string; label: string; source_agent_id: string | null; ok: boolean };
+  const [mounts, setMounts] = useState<MountRow[]>([]);
+  const [allAgents, setAllAgents] = useState<AgentProfile[]>([]);
+  const [mountBusy, setMountBusy] = useState(false);
+  const [mountMsg, setMountMsg] = useState("");
+
+  async function loadMounts() {
+    const id = savedId;
+    if (!id) { setMounts([]); return; }
+    try { setMounts((await invoke<MountRow[]>("agent_mounts_list", { agentId: id })) || []); }
+    catch { setMounts([]); }
+  }
+  useEffect(() => { void loadMounts(); /* eslint-disable-next-line */ }, [savedId]);
+  useEffect(() => {
+    invoke<{ agents: AgentProfile[]; activeId: string }>("agents_list")
+      .then((r) => setAllAgents(r.agents || [])).catch(() => setAllAgents([]));
+  }, []);
+
+  async function addAgentMount(sourceId: string) {
+    const id = await ensureSaved();
+    if (!id) { setMountMsg("Save the agent first."); return; }
+    const src = allAgents.find((a) => a.id === sourceId);
+    if (!src) return;
+    setMountBusy(true); setMountMsg("");
+    try {
+      await invoke("agent_mount_add", {
+        agentId: id, path: src.folder_path, label: src.name, sourceAgentId: src.id,
+      });
+      await loadMounts();
+    } catch (e) { setMountMsg("✗ " + String(e)); }
+    finally { setMountBusy(false); }
+  }
+
+  async function removeMount(mountId: number) {
+    setMountBusy(true);
+    try { await invoke("agent_mount_remove", { id: mountId }); await loadMounts(); }
+    catch (e) { setMountMsg("✗ " + String(e)); }
+    finally { setMountBusy(false); }
+  }
+
   // M1.4 #4: per-agent context documents (uploaded reference files).
   const [ctxDocs, setCtxDocs] = useState<Array<{ id: number; filename: string; bytes: number; char_count: number }>>([]);
   const [ctxBusy, setCtxBusy] = useState(false);
@@ -610,6 +654,62 @@ export function AgentForm({
             </span>
           </label>
           {!initial?.id && <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Save the agent first, then attach documents.</span>}
+        </div>
+
+        {/* SHARED CONTEXT — read-only mounts of other agents' folders. */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "12px 14px" }}>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>🔗 Shared context</div>
+          <span style={{ ...hint, fontSize: 12 }}>
+            Let this agent <strong>read</strong> another agent’s folder — its memory, notes and project
+            files — while keeping its own home. Read-only: it can never write there, so two agents can
+            work the same project without overwriting each other’s memory.
+          </span>
+
+          {mounts.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {mounts.map((m) => (
+                <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+                  <span style={{ fontSize: 11, padding: "1px 6px", borderRadius: 4, background: "var(--bg)", border: "var(--border-width) solid var(--line)", color: "var(--text-faint)" }}>read-only</span>
+                  <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={m.path}>
+                    {m.label || m.path}
+                  </span>
+                  {!m.ok && <span style={{ fontSize: 11, color: "var(--danger)" }}>folder missing</span>}
+                  <button onClick={() => removeMount(m.id)} title="Remove" disabled={mountBusy}
+                    style={{ background: "none", border: "none", cursor: "pointer", color: "var(--danger)", fontSize: 13 }}>✕</button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {(() => {
+            const mine = new Set(mounts.map((m) => m.source_agent_id).filter(Boolean));
+            const available = allAgents.filter(
+              (a) => !a.archived && a.folder_path && a.id !== savedId && !mine.has(a.id),
+            );
+            if (available.length === 0) {
+              return (
+                <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>
+                  {allAgents.length <= 1
+                    ? "Create a second agent to share context with."
+                    : "All other agents are already mounted."}
+                </span>
+              );
+            }
+            return (
+              <select
+                value=""
+                disabled={mountBusy}
+                onChange={(e) => { const v = e.target.value; if (v) void addAgentMount(v); e.currentTarget.value = ""; }}
+                style={selectStyle}
+              >
+                <option value="">+ Give this agent read access to…</option>
+                {available.map((a) => (
+                  <option key={a.id} value={a.id}>{a.icon ? a.icon + " " : ""}{a.name}</option>
+                ))}
+              </select>
+            );
+          })()}
+          {mountMsg && <span style={{ fontSize: 12, color: "var(--danger)" }}>{mountMsg}</span>}
         </div>
 
         {/* IMPORT MEMORY — bring an existing memory vault into this agent + ingest. */}

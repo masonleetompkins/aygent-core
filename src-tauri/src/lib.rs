@@ -471,12 +471,58 @@ fn restore_agent_folder(
 /// or vanished folder is skipped (fail-closed: no scope = the broker refuses).
 fn register_all_agent_scopes(db: &writer::Db, broker: &Arc<Broker>) {
     let agents = match repo::list_agents(db) { Ok(a) => a, Err(_) => return };
-    for a in agents {
+    for a in &agents {
         if a.archived || a.folder_path.is_empty() { continue; }
         let path = std::path::PathBuf::from(&a.folder_path);
         if !path.is_dir() { continue; }
         let canonical = std::fs::canonicalize(&path).unwrap_or(path);
         broker.set_scope(&a.id, canonical, false);
+    }
+    // Scopes must exist BEFORE mounts (set_mounts is a no-op without a scope).
+    register_all_agent_mounts(db, broker);
+}
+
+/// SHARED CONTEXT: register every agent's READ-ONLY mounts. Run after scopes,
+/// and again whenever mounts change. A mount whose folder vanished is skipped
+/// (fail-closed — a missing mount reads as "no shared context", never as a
+/// widened jail). When a mount names a SOURCE AGENT, that agent's CURRENT
+/// folder wins over the stored path, so moving an agent's folder doesn't leave
+/// stale mounts pointing at the old location (the 08-03 ghost-folder lesson:
+/// never let two code paths disagree about where an agent lives).
+fn register_all_agent_mounts(db: &writer::Db, broker: &Arc<Broker>) {
+    let mounts = match repo::all_mounts(db) { Ok(m) => m, Err(_) => return };
+    if mounts.is_empty() {
+        // Still clear stale mounts from a previous registration.
+        if let Ok(agents) = repo::list_agents(db) {
+            for a in agents { broker.set_mounts(&a.id, vec![]); }
+        }
+        return;
+    }
+    let agents = repo::list_agents(db).unwrap_or_default();
+    let folder_of = |id: &str| -> Option<String> {
+        agents.iter().find(|a| a.id == id && !a.archived)
+            .map(|a| a.folder_path.clone())
+            .filter(|f| !f.is_empty())
+    };
+
+    let mut by_agent: std::collections::HashMap<String, Vec<broker::Mount>> =
+        std::collections::HashMap::new();
+    for m in mounts {
+        // Prefer the source agent's live folder over the stored path.
+        let raw = m.source_agent_id.as_deref()
+            .and_then(folder_of)
+            .unwrap_or_else(|| m.path.clone());
+        let path = std::path::PathBuf::from(&raw);
+        if !path.is_dir() { continue; }
+        let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+        by_agent.entry(m.agent_id.clone()).or_default().push(broker::Mount {
+            root: canonical,
+            label: if m.label.is_empty() { raw } else { m.label.clone() },
+        });
+    }
+    // Apply to every agent (including those with zero mounts, to clear stale).
+    for a in &agents {
+        broker.set_mounts(&a.id, by_agent.remove(&a.id).unwrap_or_default());
     }
 }
 
@@ -1266,6 +1312,73 @@ fn agents_update(db: tauri::State<writer::Db>, broker: tauri::State<'_, Arc<Brok
     Ok(())
 }
 
+// ── Shared context (read-only mounts) ──────────────────────────────────────
+
+/// List an agent's read-only mounts, annotated with whether the folder is
+/// currently reachable (so the UI can show a broken mount honestly).
+#[tauri::command]
+fn agent_mounts_list(
+    db: tauri::State<writer::Db>,
+    agent_id: String,
+) -> Result<serde_json::Value, String> {
+    let mounts = repo::list_mounts(&db, &agent_id)?;
+    let agents = repo::list_agents(&db).unwrap_or_default();
+    let out: Vec<serde_json::Value> = mounts.into_iter().map(|m| {
+        let live = m.source_agent_id.as_deref()
+            .and_then(|sid| agents.iter().find(|a| a.id == sid))
+            .map(|a| a.folder_path.clone())
+            .filter(|f| !f.is_empty())
+            .unwrap_or_else(|| m.path.clone());
+        serde_json::json!({
+            "id": m.id,
+            "path": live,
+            "label": m.label,
+            "source_agent_id": m.source_agent_id,
+            "ok": std::path::Path::new(&live).is_dir(),
+        })
+    }).collect();
+    Ok(serde_json::json!(out))
+}
+
+/// Mount another folder (or another agent's folder) READ-ONLY for this agent.
+/// Refuses self-mounts and non-directories. The broker enforces read-only —
+/// this only records the intent.
+#[tauri::command]
+fn agent_mount_add(
+    db: tauri::State<writer::Db>,
+    broker: tauri::State<Arc<Broker>>,
+    agent_id: String,
+    path: String,
+    label: String,
+    source_agent_id: Option<String>,
+) -> Result<(), String> {
+    if agent_id.is_empty() { return Err("no agent".into()); }
+    if source_agent_id.as_deref() == Some(agent_id.as_str()) {
+        return Err("an agent can't mount itself".into());
+    }
+    let p = std::path::Path::new(&path);
+    if !p.is_dir() { return Err(format!("not a folder: {path}")); }
+    let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    // Mounting your own root is a no-op; say so instead of silently dropping it.
+    if let Ok(own) = broker.root_for(&agent_id) {
+        if own == canonical { return Err("that's this agent's own folder".into()); }
+    }
+    repo::add_mount(&db, &agent_id, &canonical.to_string_lossy(), &label, source_agent_id)?;
+    register_all_agent_mounts(&db, &broker);
+    Ok(())
+}
+
+#[tauri::command]
+fn agent_mount_remove(
+    db: tauri::State<writer::Db>,
+    broker: tauri::State<Arc<Broker>>,
+    id: i64,
+) -> Result<(), String> {
+    repo::remove_mount(&db, id)?;
+    register_all_agent_mounts(&db, &broker);
+    Ok(())
+}
+
 #[tauri::command]
 fn agents_delete(db: tauri::State<writer::Db>, lanes: tauri::State<lanes::Lanes>, id: String) -> Result<(), String> {
     // Drop any conversation lanes the UI won't reference again is handled per
@@ -1710,10 +1823,12 @@ fn local_tool_capability(path: String) -> gguf::ToolCapability {
 /// Full registry (builtins + user tools) with each tool's enabled-state for a
 /// folder folded in.
 #[tauri::command]
-fn tools_list(app: tauri::AppHandle, folder: Option<String>) -> Result<serde_json::Value, String> {
+fn tools_list(app: tauri::AppHandle, agent_id: Option<String>, folder: Option<String>) -> Result<serde_json::Value, String> {
     let ad = app_data(&app)?;
     let all = tools_registry::load_registry(&ad);
-    let enabled = folder.as_ref().map(|f| tools_registry::load_enabled(&ad, f)).unwrap_or_default();
+    let enabled = agent_id.as_ref()
+        .map(|a| tools_registry::load_enabled(&ad, &tools_registry::Scope::new(a, folder.as_deref())))
+        .unwrap_or_default();
     let out: Vec<serde_json::Value> = all.iter().map(|t| {
         let on = match enabled.get(&t.id) { Some(v) => *v, None => t.builtin };
         serde_json::json!({
@@ -1738,25 +1853,28 @@ fn tools_delete(app: tauri::AppHandle, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn tools_set_enabled(app: tauri::AppHandle, folder: String, id: String, on: bool) -> Result<(), String> {
-    tools_registry::set_enabled(&app_data(&app)?, &folder, &id, on)
+fn tools_set_enabled(app: tauri::AppHandle, agent_id: String, folder: Option<String>, id: String, on: bool) -> Result<(), String> {
+    let scope = tools_registry::Scope::new(&agent_id, folder.as_deref());
+    tools_registry::set_enabled(&app_data(&app)?, &scope, &id, on)
 }
 
 /// A tool's config SCHEMA (what settings it exposes) + the folder's saved VALUES.
 #[tauri::command]
-fn tools_config(app: tauri::AppHandle, folder: String, id: String) -> Result<serde_json::Value, String> {
+fn tools_config(app: tauri::AppHandle, agent_id: String, folder: Option<String>, id: String) -> Result<serde_json::Value, String> {
     let ad = app_data(&app)?;
+    let scope = tools_registry::Scope::new(&agent_id, folder.as_deref());
     Ok(serde_json::json!({
         "schema": tools_registry::config_schema(&id),
-        "values": tools_registry::tool_config(&ad, &folder, &id),
+        "values": tools_registry::tool_config(&ad, &scope, &id),
         "fonts": pdf_tool::system_fonts(),
     }))
 }
 
 /// Save a tool's config values for a folder.
 #[tauri::command]
-fn tools_set_config(app: tauri::AppHandle, folder: String, id: String, values: serde_json::Value) -> Result<(), String> {
-    tools_registry::set_tool_config(&app_data(&app)?, &folder, &id, values)
+fn tools_set_config(app: tauri::AppHandle, agent_id: String, folder: Option<String>, id: String, values: serde_json::Value) -> Result<(), String> {
+    let scope = tools_registry::Scope::new(&agent_id, folder.as_deref());
+    tools_registry::set_tool_config(&app_data(&app)?, &scope, &id, values)
 }
 
 /// Delete a downloaded local model by filename.
@@ -2764,14 +2882,14 @@ fn builtin_tool_schema(name: &str) -> Option<serde_json::Value> {
 /// Assemble the tool list for a turn: base file tools + any ENABLED registry
 /// tools for this folder. Also returns composed-tool instructions to append to
 /// the system prompt. `app` provides the app-data dir for the registry.
-fn agent_tools_for(app: &tauri::AppHandle, folder: Option<&str>) -> (serde_json::Value, String) {
-    agent_tools_for_ex(app, folder, false)
+fn agent_tools_for(app: &tauri::AppHandle, agent_id: Option<&str>, folder: Option<&str>) -> (serde_json::Value, String) {
+    agent_tools_for_ex(app, agent_id, folder, false)
 }
 
 /// M1.4: like agent_tools_for but adds the inter-agent `send_message` tool when
 /// `has_peers` is true (the agent has at least one other agent to talk to).
-fn agent_tools_for_ex(app: &tauri::AppHandle, folder: Option<&str>, has_peers: bool) -> (serde_json::Value, String) {
-    agent_tools_for_full(app, folder, has_peers, None)
+fn agent_tools_for_ex(app: &tauri::AppHandle, agent_id: Option<&str>, folder: Option<&str>, has_peers: bool) -> (serde_json::Value, String) {
+    agent_tools_for_full(app, agent_id, folder, has_peers, None)
 }
 
 /// Full assembler that ALSO adds connection tools (e.g. GitHub) when the agent
@@ -2779,6 +2897,7 @@ fn agent_tools_for_ex(app: &tauri::AppHandle, folder: Option<&str>, has_peers: b
 /// per-agent enablement; None keeps the old behavior (no connection tools).
 fn agent_tools_for_full(
     app: &tauri::AppHandle,
+    agent_id: Option<&str>,
     folder: Option<&str>,
     has_peers: bool,
     conn_ctx: Option<(&writer::Db, &str)>,
@@ -2840,8 +2959,9 @@ fn agent_tools_for_full(
         }
     }
 
-    if let (Ok(ad), Some(f)) = (app_data(app), folder) {
-        for t in tools_registry::enabled_tools(&ad, f) {
+    if let (Ok(ad), Some(aid)) = (app_data(app), agent_id) {
+        let scope = tools_registry::Scope::new(aid, folder);
+        for t in tools_registry::enabled_tools(&ad, &scope) {
             match t.kind.as_str() {
                 "builtin" => {
                     if let Some(schema) = builtin_tool_schema(&t.name) { tools.push(schema); }
@@ -2983,9 +3103,10 @@ fn browser_policy_set(app: tauri::AppHandle, folder: String, domains: Vec<String
 
 /// The PDF tool's per-folder config ({} if unavailable). Passed into exec so the
 /// agent's generate_pdf calls honor the user's font/color/page settings.
-fn pdf_config_for(app: &tauri::AppHandle, folder: Option<&str>) -> serde_json::Value {
-    if let (Ok(ad), Some(f)) = (app_data(app), folder) {
-        tools_registry::tool_config(&ad, f, "builtin.pdf")
+fn pdf_config_for(app: &tauri::AppHandle, agent_id: Option<&str>, folder: Option<&str>) -> serde_json::Value {
+    if let (Ok(ad), Some(aid)) = (app_data(app), agent_id) {
+        let scope = tools_registry::Scope::new(aid, folder);
+        tools_registry::tool_config(&ad, &scope, "builtin.pdf")
     } else {
         serde_json::json!({})
     }
@@ -3155,8 +3276,8 @@ async fn agent_stream(
         }
         // Enabled registry tools (e.g. PDF) contribute extra instructions the
         // local model should know about, appended to its native tool prompt.
-        let (_reg_tools, reg_instr) = agent_tools_for(&app, folder.as_deref());
-        let pdf_cfg = pdf_config_for(&app, folder.as_deref());
+        let (_reg_tools, reg_instr) = agent_tools_for(&app, Some(&scope_id), folder.as_deref());
+        let pdf_cfg = pdf_config_for(&app, Some(&scope_id), folder.as_deref());
         let base_sys = format!("{AGENT_SYSTEM_LOCAL}{extra_block}{reg_instr}");
         let sys = local_tools::system_prompt_with_tools(&base_sys, &cap.format);
 
@@ -3236,8 +3357,8 @@ async fn agent_stream(
             let _ = savepoint::snapshot(&root, "baseline");
         }
 
-        let (tools, reg_instr) = agent_tools_for_full(&app, folder.as_deref(), !roster.is_empty(), Some((&db, &scope_id)));
-        let pdf_cfg = pdf_config_for(&app, folder.as_deref());
+        let (tools, reg_instr) = agent_tools_for_full(&app, Some(&scope_id), folder.as_deref(), !roster.is_empty(), Some((&db, &scope_id)));
+        let pdf_cfg = pdf_config_for(&app, Some(&scope_id), folder.as_deref());
         let sys = format!("{AGENT_SYSTEM}{extra_block}{reg_instr}");
         let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
         // ATTACHMENTS (bug fix — these were SILENTLY DROPPED on OpenAI/OpenRouter:
@@ -3459,7 +3580,7 @@ async fn agent_stream(
         let _ = savepoint::snapshot(&root, "baseline");
     }
 
-    let (tools, reg_instr) = agent_tools_for_full(&app, folder.as_deref(), !roster.is_empty(), Some((&db, &scope_id)));
+    let (tools, reg_instr) = agent_tools_for_full(&app, Some(&scope_id), folder.as_deref(), !roster.is_empty(), Some((&db, &scope_id)));
     let anthropic_sys = format!("{AGENT_SYSTEM}{extra_block}{reg_instr}");
     let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
     // ATTACHMENTS (Mason 08-01): images/PDFs/text ride INTO the model as real
@@ -3905,8 +4026,8 @@ pub async fn run_headless_turn(
     let system = format!("{AGENT_SYSTEM}{persona}{roster_block}{context_block}");
 
     // Tools: base file tools + send_message (has_peers = it has a roster).
-    let (tools, _reg) = agent_tools_for_ex(app, Some(&agent.folder_path), !roster.is_empty());
-    let pdf_cfg = pdf_config_for(app, Some(&agent.folder_path));
+    let (tools, _reg) = agent_tools_for_ex(app, Some(&agent.id), Some(&agent.folder_path), !roster.is_empty());
+    let pdf_cfg = pdf_config_for(app, Some(&agent.id), Some(&agent.folder_path));
 
     // Resolve provider/model (recipient's own; fallback anthropic auto/haiku).
     let provider_kind = if agent.provider.is_empty() { "anthropic".to_string() } else { agent.provider.clone() };
@@ -4175,6 +4296,7 @@ pub fn run() {
             conv_list, conv_load, conv_save, conv_delete, conv_reorder,
             agents_list, agents_create, agents_update, agents_delete,
             agents_set_active, agents_get_active, agents_sharing_folder,
+            agent_mounts_list, agent_mount_add, agent_mount_remove,
             agent_context_add, agent_context_list, agent_context_remove,
             agent_generate_soul,
             mailbox_pending_counts, mailbox_take_next, mailbox_roster,

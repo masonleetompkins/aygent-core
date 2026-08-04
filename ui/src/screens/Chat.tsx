@@ -175,11 +175,11 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   const [toolNames, setToolNames] = useState<string[]>([]);
   useEffect(() => {
     const base = ["read_file", "write_file", "list_files", "rename_file", "delete_file", "task_continue"];
-    if (!folder) { setToolNames(base); return; }
-    invoke<Array<{ name: string; enabled: boolean }>>("tools_list", { folder })
+    if (!agentId) { setToolNames(base); return; }
+    invoke<Array<{ name: string; enabled: boolean }>>("tools_list", { agentId, folder })
       .then((ts) => setToolNames([...base, ...ts.filter((t) => t.enabled && t.name).map((t) => t.name)]))
       .catch(() => setToolNames(base));
-  }, [folder]);
+  }, [folder, agentId]);
   const [toolTag, setToolTag] = useState<{ query: string; matches: string[]; sel: number; start: number } | null>(null);
 
   // #3 auto-grow: single-line by default, grows with content up to a sane cap.

@@ -245,7 +245,7 @@ export function App() {
           {screen === "savepoints" && <SavePoints folder={folder} />}
           {screen === "scheduler" && <Scheduler agentId={activeAgent?.id ?? null} />}
           {screen === "connections" && <Connections agentId={activeAgent?.id ?? null} />}
-          {screen === "tools" && <Tools folder={folder} />}
+          {screen === "tools" && <Tools folder={folder} agentId={activeAgent?.id ?? null} />}
           {screen === "browser" && <Browser />}
         </div>
       </div>

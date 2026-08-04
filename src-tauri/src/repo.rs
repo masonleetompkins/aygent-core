@@ -269,6 +269,113 @@ pub fn agents_sharing_folder(db: &Db, folder_path: &str, exclude_id: &str) -> Re
         .collect())
 }
 
+// ── Shared context: read-only mounts ────────────────────────────────────────
+
+/// A folder an agent may READ but never write. The unit of "share your context
+/// with another agent without merging your homes".
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentMount {
+    pub id: i64,
+    pub agent_id: String,
+    pub path: String,
+    #[serde(default)]
+    pub label: String,
+    /// Set when this mount points at another AGENT's folder (vs a raw folder),
+    /// so the UI can label it and re-resolve if that agent's folder moves.
+    #[serde(default)]
+    pub source_agent_id: Option<String>,
+    #[serde(default)]
+    pub created_at: i64,
+}
+
+pub fn list_mounts(db: &Db, agent_id: &str) -> Result<Vec<AgentMount>, String> {
+    let conn = db.reader()?;
+    let mut st = conn
+        .prepare(
+            "SELECT id, agent_id, path, label, source_agent_id, created_at
+             FROM agent_mount WHERE agent_id = ?1 ORDER BY created_at ASC, id ASC",
+        )
+        .map_err(|e| format!("list_mounts prepare: {e}"))?;
+    let rows = st
+        .query_map(params![agent_id], |r| {
+            Ok(AgentMount {
+                id: r.get(0)?,
+                agent_id: r.get(1)?,
+                path: r.get(2)?,
+                label: r.get(3)?,
+                source_agent_id: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })
+        .map_err(|e| format!("list_mounts query: {e}"))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| format!("list_mounts row: {e}"))?);
+    }
+    Ok(out)
+}
+
+/// Add a read-only mount. Idempotent on (agent_id, path).
+pub fn add_mount(
+    db: &Db,
+    agent_id: &str,
+    path: &str,
+    label: &str,
+    source_agent_id: Option<String>,
+) -> Result<(), String> {
+    let (agent_id, path, label) = (agent_id.to_string(), path.to_string(), label.to_string());
+    let ts = now();
+    db.write(move |c| {
+        c.execute(
+            "INSERT INTO agent_mount (agent_id, path, label, source_agent_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(agent_id, path) DO UPDATE SET
+               label = excluded.label,
+               source_agent_id = excluded.source_agent_id",
+            params![agent_id, path, label, source_agent_id, ts],
+        )
+        .map_err(|e| format!("add_mount: {e}"))?;
+        Ok(())
+    })
+}
+
+pub fn remove_mount(db: &Db, id: i64) -> Result<(), String> {
+    db.write(move |c| {
+        c.execute("DELETE FROM agent_mount WHERE id = ?1", params![id])
+            .map_err(|e| format!("remove_mount: {e}"))?;
+        Ok(())
+    })
+}
+
+/// Every mount for every agent — used at boot to register broker mounts in one
+/// pass (mirrors register_all_agent_scopes).
+pub fn all_mounts(db: &Db) -> Result<Vec<AgentMount>, String> {
+    let conn = db.reader()?;
+    let mut st = conn
+        .prepare(
+            "SELECT id, agent_id, path, label, source_agent_id, created_at
+             FROM agent_mount ORDER BY agent_id, created_at ASC, id ASC",
+        )
+        .map_err(|e| format!("all_mounts prepare: {e}"))?;
+    let rows = st
+        .query_map([], |r| {
+            Ok(AgentMount {
+                id: r.get(0)?,
+                agent_id: r.get(1)?,
+                path: r.get(2)?,
+                label: r.get(3)?,
+                source_agent_id: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })
+        .map_err(|e| format!("all_mounts query: {e}"))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| format!("all_mounts row: {e}"))?);
+    }
+    Ok(out)
+}
+
 // ── Conversations ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
