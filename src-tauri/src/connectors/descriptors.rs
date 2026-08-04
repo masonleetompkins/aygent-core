@@ -584,18 +584,20 @@ const NOTION: Connector = Connector {
             name: "notion_create_page",
             description: "Create a new Notion page. Parent is either a page (nests under it) or a \
                           database (creates a row). For a database parent, `properties` must match \
-                          the schema — read it with notion_get_database first. `content` is markdown \
-                          for the page body.",
+                          the schema — read it with notion_get_database first. `children` is an \
+                          optional array of block objects for the body; for plain text use \
+                          [{\"object\":\"block\",\"type\":\"paragraph\",\"paragraph\":{\"rich_text\":[{\"type\":\"text\",\"text\":{\"content\":\"…\"}}]}}], \
+                          or omit it and call notion_append_content afterwards to write markdown.",
             access: Access::Write,
             method: "POST",
             path: "/pages",
             query: &[],
-            body: "{\"parent\":{parent},\"properties\":{properties},\"content\":\"{content}\"}",
-            raw_params: &["parent", "properties"],
+            body: "{\"parent\":{parent},\"properties\":{properties},\"children\":{children}}",
+            raw_params: &["parent", "properties", "children"],
             params: &[
                 ToolParam { name: "parent", ty: "string", description: "JSON parent, e.g. {\"page_id\":\"…\"} or {\"database_id\":\"…\"}.", required: true },
-                ToolParam { name: "properties", ty: "string", description: "JSON properties object. For a page parent, at minimum a title property.", required: true },
-                ToolParam { name: "content", ty: "string", description: "Page body as markdown.", required: false },
+                ToolParam { name: "properties", ty: "string", description: "JSON properties object. For a page parent, at minimum {\"title\":[{\"text\":{\"content\":\"My title\"}}]}.", required: true },
+                ToolParam { name: "children", ty: "string", description: "Optional JSON array of Notion block objects for the page body.", required: false },
             ],
             render: Render::One { line: "Created page {id}\n{url}" },
         },
@@ -604,19 +606,19 @@ const NOTION: Connector = Connector {
             b64_params: &[],
             danger: false,
             name: "notion_append_content",
-            description: "Append markdown content to the end of a Notion page. The simplest way to \
-                          add text, headings, lists, or code to a page.",
+            description: "Append markdown to the end of a Notion page — the simplest way to add \
+                          text, headings, lists, or code. Use \\n for line breaks.",
             access: Access::Write,
             method: "PATCH",
             path: "/pages/{page_id}/markdown",
             query: &[],
-            body: "{\"content\":\"{content}\",\"mode\":\"append\"}",
+            body: "{\"type\":\"insert_content\",\"insert_content\":{\"content\":\"{content}\",\"position\":{\"type\":\"end\"}}}",
             raw_params: &[],
             params: &[
                 ToolParam { name: "page_id", ty: "string", description: "Page id.", required: true },
                 ToolParam { name: "content", ty: "string", description: "Markdown to append.", required: true },
             ],
-            render: Render::One { line: "Appended to {id}." },
+            render: Render::One { line: "Appended to page {id}." },
         },
         ConnectorTool {
             base_override: "",
@@ -624,18 +626,39 @@ const NOTION: Connector = Connector {
             danger: false,
             name: "notion_replace_content",
             description: "REPLACE a Notion page's entire content with new markdown. Use for a full \
-                          rewrite; use notion_append_content to add without destroying what's there.",
+                          rewrite; use notion_append_content to add without destroying what's there, \
+                          or notion_edit_content for a targeted find-and-replace.",
             access: Access::Write,
             method: "PATCH",
             path: "/pages/{page_id}/markdown",
             query: &[],
-            body: "{\"content\":\"{content}\",\"mode\":\"replace\"}",
+            body: "{\"type\":\"replace_content\",\"replace_content\":{\"new_str\":\"{content}\"}}",
             raw_params: &[],
             params: &[
                 ToolParam { name: "page_id", ty: "string", description: "Page id.", required: true },
                 ToolParam { name: "content", ty: "string", description: "The new full markdown content.", required: true },
             ],
-            render: Render::One { line: "Replaced content of {id}." },
+            render: Render::One { line: "Replaced content of page {id}." },
+        },
+        ConnectorTool {
+            danger: false, b64_params: &[], base_override: "",
+            // Notion's RECOMMENDED edit path: search-and-replace, so a targeted
+            // change doesn't require rewriting (and risking) the whole page.
+            name: "notion_edit_content",
+            description: "Make targeted edits to a Notion page by find-and-replace. `content_updates` \
+                          is a JSON array like [{\"old_str\":\"text to find\",\"new_str\":\"replacement\"}]. \
+                          Preferred over replacing the whole page. old_str must match exactly.",
+            access: Access::Write,
+            method: "PATCH",
+            path: "/pages/{page_id}/markdown",
+            query: &[],
+            body: "{\"type\":\"update_content\",\"update_content\":{\"content_updates\":{content_updates}}}",
+            raw_params: &["content_updates"],
+            params: &[
+                ToolParam { name: "page_id", ty: "string", description: "Page id.", required: true },
+                ToolParam { name: "content_updates", ty: "string", description: "JSON array of {old_str, new_str} objects. Add \"replace_all_matches\":true if old_str appears more than once.", required: true },
+            ],
+            render: Render::One { line: "Edited page {id}." },
         },
         ConnectorTool {
             base_override: "",
@@ -702,7 +725,8 @@ const NOTION: Connector = Connector {
             danger: false,
             name: "notion_move_page",
             description: "Move a page to a new parent — reorganize the workspace, re-nest pages, or \
-                          move a row into another database.",
+                          move a row into another database. Only regular pages can be moved, not \
+                          databases.",
             access: Access::Write,
             method: "POST",
             path: "/pages/{page_id}/move",
@@ -711,7 +735,7 @@ const NOTION: Connector = Connector {
             raw_params: &["parent"],
             params: &[
                 ToolParam { name: "page_id", ty: "string", description: "Page to move.", required: true },
-                ToolParam { name: "parent", ty: "string", description: "JSON new parent, e.g. {\"page_id\":\"…\"}.", required: true },
+                ToolParam { name: "parent", ty: "string", description: "JSON new parent WITH a type discriminator: {\"type\":\"page_id\",\"page_id\":\"…\"} to nest under a page, or {\"type\":\"data_source_id\",\"data_source_id\":\"…\"} to move into a database (get the data_source_id from notion_get_database — database_id does NOT work here).", required: true },
             ],
             render: Render::One { line: "Moved page {id}." },
         },
