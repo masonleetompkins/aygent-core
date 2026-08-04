@@ -1567,7 +1567,7 @@ const SUPABASE: Connector = Connector {
             params: &[
                 ToolParam { name: "table", ty: "string", description: "Table name.", required: true },
                 ToolParam { name: "select", ty: "string", description: "Columns, e.g. 'id,name'. Omit for all.", required: false },
-                ToolParam { name: "limit", ty: "number", description: "Max rows (default 50).", required: false },
+                ToolParam { name: "limit", ty: "number", description: "Max rows to return. Omit to use the server default; set it on large tables.", required: false },
                 ToolParam { name: "order", ty: "string", description: "Sort, e.g. 'created_at.desc'.", required: false },
             ],
             render: Render::Json,

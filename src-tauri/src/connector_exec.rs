@@ -151,11 +151,23 @@ pub async fn call(
     for (k, v) in c.headers {
         req = req.header(*k, connectors::fill(v, &ctx));
     }
-    // Query params, templated (GitHub's search `q` embeds args).
+    // Query params, templated (GitHub's search `q` embeds args). A param whose
+    // value came from a {placeholder} that resolved to EMPTY is dropped — sending
+    // `order=` makes PostgREST 400 with "failed to parse order ()", and the user
+    // never supplied an order at all. Constant params (no placeholder) are always
+    // sent, even if a descriptor deliberately used "".
     let q: Vec<(String, String)> = t
         .query
         .iter()
-        .map(|(k, v)| (k.to_string(), connectors::fill(v, &ctx)))
+        .filter_map(|(k, v)| {
+            let filled = connectors::fill(v, &ctx);
+            let is_templated = v.contains('{');
+            if is_templated && filled.trim().is_empty() {
+                None // optional arg not supplied → omit the whole param
+            } else {
+                Some((k.to_string(), filled))
+            }
+        })
         .collect();
     if !q.is_empty() {
         req = req.query(&q);
@@ -448,5 +460,37 @@ mod raw_tests {
         assert!(v.get("branch").is_none());
         assert_eq!(v["message"], "commit");
         assert_eq!(v["content"], "abc");
+    }
+
+    /// A query param whose {placeholder} resolves to empty must be DROPPED, not
+    /// sent as `key=`. Found live: supabase_select without an `order` arg sent
+    /// `order=` and PostgREST 400'd with "failed to parse order ()". Constant
+    /// params (no placeholder) are always kept.
+    #[test]
+    fn empty_templated_query_params_are_dropped_constants_kept() {
+        let ctx = serde_json::json!({ "select": "id,name", "limit": "", "order": "" });
+        let query: &[(&str, &str)] = &[
+            ("select", "{select}"),   // supplied  -> kept
+            ("limit", "{limit}"),     // empty arg -> dropped
+            ("order", "{order}"),     // empty arg -> dropped
+            ("apikey", "constant"),   // constant  -> kept even though no arg
+        ];
+        let out: Vec<(String, String)> = query
+            .iter()
+            .filter_map(|(k, v)| {
+                let filled = crate::connectors::fill(v, &ctx);
+                let templated = v.contains('{');
+                if templated && filled.trim().is_empty() {
+                    None
+                } else {
+                    Some((k.to_string(), filled))
+                }
+            })
+            .collect();
+        let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"select"), "supplied param kept");
+        assert!(keys.contains(&"apikey"), "constant param kept");
+        assert!(!keys.contains(&"limit"), "empty templated param dropped");
+        assert!(!keys.contains(&"order"), "empty templated param dropped");
     }
 }
