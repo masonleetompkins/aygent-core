@@ -26,6 +26,8 @@ mod paths;     // CONFIG RELOCATION: root-folder pointer + state-dir seam + onbo
 mod history;
 mod catalog;
 mod connections;
+mod connectors; // CONNECTOR REGISTRY: a provider is data (descriptor), not code.
+mod connector_exec; // One generic HTTP executor for every registry connector.
 mod savepoint;
 mod context_docs;
 mod conversations;
@@ -2931,14 +2933,36 @@ fn agent_tools_for_full(
         extra_instructions.push_str(dashboard::tool_instructions());
     }
 
+    // CONNECTION TOOLS, registry-driven. Every connected+enabled provider
+    // contributes its tools from its descriptor — no per-provider code here.
+    // Write tools appear ONLY when the agent's access_mode is 'write', so an
+    // agent in read mode is never even offered a destructive call.
     if let Some((db, agent_id)) = conn_ctx {
-        if connections::provider_enabled_for_agent(db, agent_id, "github") {
-            tools.push(serde_json::json!({
-                "name": "github_list_prs",
-                "description": "List YOUR open GitHub pull requests (authored by you across all repos). Use when the user asks about their PRs / what they're working on. No arguments.",
-                "input_schema": { "type": "object", "properties": {} }
-            }));
-            extra_instructions.push_str("\n\nYou have GitHub connected: use github_list_prs to read the user's open pull requests.");
+        let mut connected: Vec<String> = Vec::new();
+        for (provider, access) in connections::enabled_providers_for_agent(db, agent_id) {
+            let Some(def) = connectors::by_id(&provider) else { continue };
+            let write = access == "write";
+            let mut names: Vec<&str> = Vec::new();
+            for t in def.tools_for(write) {
+                tools.push(connectors::tool_schema(t));
+                names.push(t.name);
+            }
+            if names.is_empty() { continue; }
+            connected.push(format!(
+                "{} ({}): {}",
+                def.label,
+                if write { "read+write" } else { "read-only" },
+                names.join(", ")
+            ));
+        }
+        if !connected.is_empty() {
+            extra_instructions.push_str(&format!(
+                "\n\nCONNECTED ACCOUNTS — you may call these tools to read or act on the \
+                 user's real accounts:\n- {}\nThese hit live services on the user's behalf. \
+                 If a tool reports it needs write access, tell the user to enable it in \
+                 Connections rather than trying another route.",
+                connected.join("\n- ")
+            ));
         }
     }
 
@@ -3714,10 +3738,12 @@ async fn agent_stream(
                             Err(e) => (format!("send failed: {e}"), true),
                         };
                         r
-                    } else if name == "github_list_prs" {
-                        // Connection tool: token attached Rust-side. Async GitHub
-                        // call, so run it directly (we're already in async here).
-                        connections::github_list_prs(&db, &scope_id).await
+                    } else if connectors::is_connector_tool(&name) {
+                        // Registry-driven: one path for every connected service.
+                        // The credential is resolved from the keychain and
+                        // attached HERE, on the privileged side — the jailed
+                        // brain never receives a token.
+                        connector_exec::exec(&db, &scope_id, &name, &input).await
                     } else if name == "transcribe_audio" {
                         // Whisper (task #6): resolve the audio THROUGH THE JAIL
                         // (read mode), then the async API call. Key from Keychain.

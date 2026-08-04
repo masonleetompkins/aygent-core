@@ -4,13 +4,16 @@
 // the privileged Rust side attaches it to the outbound API call at call time —
 // same trust model as the path broker + fetch_url, applied to authenticated APIs.
 //
-// SLICE 1 SCOPE (GitHub-first, the smallest end-to-end proof):
-//   connect via PAT paste -> validate GET /user -> store token in keychain ->
-//   github_list_prs tool (token-attached, Rust-side) -> enable per agent ->
-//   agent uses it live. No OAuth loopback, no verification: fastest shape proof.
+// NOW REGISTRY-DRIVEN (see connectors.rs): this module owns CREDENTIALS —
+// keychain storage, per-agent account resolution, read/write access mode. The
+// per-provider HTTP details live in connector descriptors, and one generic
+// executor (connector_exec.rs) runs them. Adding a provider touches neither.
 //
-// Per Atlas: a PER-PROVIDER AUTH ADAPTER. GitHub = pat (no loopback/refresh).
-// Google = oauth_pkce (Slice 3). auth_kind drives connect/refresh/revoke.
+// PER-AGENT ACCOUNTS: multiple accounts per provider coexist (a personal GitHub
+// and a work GitHub), distinguished by `nickname` and namespaced in the keychain
+// by `key_ref`. At most ONE may be enabled per (agent, provider) — enforced by a
+// unique index in schema v10, because a wrong-credential bug does not fail
+// loudly, it succeeds against the wrong account.
 
 use crate::writer::Db;
 use rusqlite::{params, OptionalExtension};
@@ -104,41 +107,23 @@ pub fn provider_enabled_for_agent(db: &Db, agent_id: &str, provider: &str) -> bo
 /// GitHub connection (Mason's personal harness — one login is the norm). Returns
 /// (token, login). Used by github_git_auth to seed the osxkeychain git helper.
 pub fn resolve_github_push_token(db: &Db, agent_id: Option<&str>) -> Result<(String, String), String> {
-    // Try the per-agent path first when we have an agent id.
-    if let Some(aid) = agent_id {
-        if let Ok((tok, _id)) = token_for_agent_provider(db, aid, "github") {
-            let login = github_login_for(db)?;
-            return Ok((tok, login));
-        }
-    }
-    // Fall back to the first connected GitHub connection.
-    let key_ref: String = {
+    // NO CROSS-AGENT FALLBACK. This used to fall back to "any connected GitHub
+    // account" when the per-agent lookup missed — which, once a work account
+    // exists alongside a personal one, means an agent could push with a token it
+    // was never granted. A wrong-credential bug does not fail loudly, it
+    // SUCCEEDS against the wrong account, so this refuses instead of guessing.
+    let aid = agent_id.ok_or(
+        "no agent identity for this git operation — cannot choose a GitHub account safely",
+    )?;
+    let (token, cid) = token_for_agent_provider(db, aid, "github")?;
+    let login = {
         let conn = db.reader()?;
-        conn.query_row(
-            "SELECT key_ref FROM connection WHERE provider='github' AND status='connected' \
-             ORDER BY updated_at DESC LIMIT 1",
-            [],
-            |r| r.get(0),
-        ).optional().map_err(|e| format!("resolve github: {e}"))?
-         .ok_or("no connected GitHub account — connect one in Connections first")?
+        let key_ref: String = conn
+            .query_row("SELECT key_ref FROM connection WHERE id = ?1", params![cid], |r| r.get(0))
+            .map_err(|e| format!("resolve github login: {e}"))?;
+        key_ref.strip_prefix("github-").unwrap_or(&key_ref).to_string()
     };
-    let token = read_token(&key_ref, "token")?;
-    // key_ref is "github-<login>"; strip the prefix for the login.
-    let login = key_ref.strip_prefix("github-").unwrap_or(&key_ref).to_string();
     Ok((token, login))
-}
-
-/// The login of the most-recently-updated connected GitHub connection.
-fn github_login_for(db: &Db) -> Result<String, String> {
-    let conn = db.reader()?;
-    let key_ref: String = conn.query_row(
-        "SELECT key_ref FROM connection WHERE provider='github' AND status='connected' \
-         ORDER BY updated_at DESC LIMIT 1",
-        [],
-        |r| r.get(0),
-    ).optional().map_err(|e| format!("github login: {e}"))?
-     .ok_or("no connected GitHub account")?;
-    Ok(key_ref.strip_prefix("github-").unwrap_or(&key_ref).to_string())
 }
 
 /// Resolve the live bearer token for a provider enabled on this agent (reads the
@@ -149,7 +134,7 @@ fn token_for_agent_provider(db: &Db, agent_id: &str, provider: &str) -> Result<(
         conn.query_row(
             "SELECT c.id, c.key_ref FROM connection c JOIN agent_connection ac ON ac.connection_id = c.id
              WHERE c.provider = ?1 AND c.status = 'connected' AND ac.agent_id = ?2 AND ac.enabled = 1
-             LIMIT 1",
+             ORDER BY c.updated_at DESC, c.id DESC LIMIT 1",
             params![provider, agent_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         ).optional().map_err(|e| format!("resolve conn: {e}"))?
@@ -268,60 +253,228 @@ pub async fn connect_github_pat(db: &Db, token: &str) -> Result<(i64, String), S
 }
 
 // ---------------------------------------------------------------------------
-// GITHUB TOOLS (Rust-side, token-attached). Slice 1 = github_list_prs.
+// CONNECTIONS v2 — per-agent accounts, access mode, generic credentials.
+// Used by connector_exec for every registry-driven provider. The functions
+// above are the GitHub-specific originals (kept: git push auth needs them).
 // ---------------------------------------------------------------------------
 
-/// List the user's open pull requests (authored by them, across all repos) via
-/// the GitHub search API. Token attached Rust-side; the jailed brain only gets
-/// the formatted result. Returns (text, is_error).
-pub async fn github_list_prs(db: &Db, agent_id: &str) -> (String, bool) {
-    let (token, _cid) = match token_for_agent_provider(db, agent_id, "github") {
-        Ok(t) => t,
-        Err(e) => return (e, true),
+/// The access mode ('read' | 'write') for this agent's enabled connection to
+/// `provider`. Errors if there is no enabled connection — callers treat that as
+/// "the tool isn't available", which is the correct fail-closed behavior.
+pub fn access_for_agent(db: &Db, agent_id: &str, provider: &str) -> Result<String, String> {
+    let conn = db.reader()?;
+    conn.query_row(
+        "SELECT COALESCE(ac.access_mode,'read') FROM connection c
+         JOIN agent_connection ac ON ac.connection_id = c.id
+         WHERE c.provider = ?1 AND c.status = 'connected'
+           AND ac.agent_id = ?2 AND ac.enabled = 1
+         ORDER BY c.updated_at DESC, c.id DESC LIMIT 1",
+        params![provider, agent_id],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| format!("access mode: {e}"))?
+    .ok_or_else(|| format!("no {provider} connection is enabled for this agent"))
+}
+
+/// Set read/write mode for one (agent, connection) pair.
+pub fn set_access_mode(db: &Db, agent_id: &str, connection_id: i64, write: bool) -> Result<(), String> {
+    let (a, c) = (agent_id.to_string(), connection_id);
+    let mode = if write { "write" } else { "read" };
+    db.write(move |conn| {
+        let n = conn.execute(
+            "UPDATE agent_connection SET access_mode = ?3 WHERE agent_id = ?1 AND connection_id = ?2",
+            params![a, c, mode],
+        ).map_err(|e| format!("set access_mode: {e}"))?;
+        if n == 0 {
+            return Err("enable this connection for the agent first".to_string());
+        }
+        Ok(())
+    })
+}
+
+/// Resolve ALL credential material for this agent's enabled connection to
+/// `provider`: secret fields from the keychain + non-secret fields from
+/// config_json. Multi-field by design (Supabase needs URL + key).
+pub fn creds_for_agent(
+    db: &Db,
+    agent_id: &str,
+    provider: &str,
+) -> Result<crate::connector_exec::Creds, String> {
+    let (key_ref, config_json): (String, String) = {
+        let conn = db.reader()?;
+        conn.query_row(
+            "SELECT c.key_ref, c.config_json FROM connection c
+             JOIN agent_connection ac ON ac.connection_id = c.id
+             WHERE c.provider = ?1 AND c.status = 'connected'
+               AND ac.agent_id = ?2 AND ac.enabled = 1
+             ORDER BY c.updated_at DESC, c.id DESC LIMIT 1",
+            params![provider, agent_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| format!("resolve connection: {e}"))?
+        .ok_or_else(|| format!("no {provider} connection is enabled for this agent"))?
     };
-    let client = match reqwest::Client::builder().user_agent("AYGENT/0.1").build() {
-        Ok(c) => c,
-        Err(e) => return (format!("http: {e}"), true),
+
+    let mut fields = serde_json::Map::new();
+    // Non-secret config first (project URLs, account ids).
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&config_json) {
+        for (k, v) in map { fields.insert(k, v); }
+    }
+    // Then the secrets, from the keychain, keyed by the descriptor's field names.
+    let def = crate::connectors::by_id(provider)
+        .ok_or_else(|| format!("unknown connector `{provider}`"))?;
+    for f in def.auth_fields {
+        if !f.secret { continue; }
+        let val = read_token(&key_ref, f.key)
+            .or_else(|_| read_token(&key_ref, "token")) // legacy GitHub slot
+            .map_err(|_| format!(
+                "the saved {} credential couldn't be read from your keychain — reconnect it in Connections.",
+                def.label
+            ))?;
+        fields.insert(f.key.to_string(), serde_json::Value::String(val));
+    }
+    Ok(crate::connector_exec::Creds { fields })
+}
+
+/// Which providers are enabled for this agent, with their access mode. Drives
+/// tool-list assembly in the agent loop (one query instead of N probes).
+pub fn enabled_providers_for_agent(db: &Db, agent_id: &str) -> Vec<(String, String)> {
+    let Ok(conn) = db.reader() else { return vec![] };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT c.provider, COALESCE(ac.access_mode,'read') FROM connection c
+         JOIN agent_connection ac ON ac.connection_id = c.id
+         WHERE c.status = 'connected' AND ac.agent_id = ?1 AND ac.enabled = 1",
+    ) else { return vec![] };
+    let rows = stmt.query_map(params![agent_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    });
+    match rows { Ok(it) => it.flatten().collect(), Err(_) => vec![] }
+}
+
+/// Generic connect for any registry connector: validate the credential, learn
+/// which ACCOUNT it belongs to, store secrets in the keychain, upsert the row.
+/// `values` maps auth-field key -> user-entered value.
+pub async fn connect_connector(
+    db: &Db,
+    provider: &str,
+    nickname: &str,
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(i64, String), String> {
+    let def = crate::connectors::by_id(provider)
+        .ok_or_else(|| format!("unknown connector `{provider}`"))?;
+
+    for f in def.auth_fields {
+        let v = values.get(f.key).and_then(|v| v.as_str()).unwrap_or("").trim();
+        if v.is_empty() {
+            return Err(format!("{} is required.", f.label));
+        }
+    }
+    let ctx = serde_json::Value::Object(values.clone());
+
+    // Validate against the live API so a bad credential is caught at PASTE time,
+    // not on the agent's first call an hour later.
+    let account = validate_credential(def, &ctx).await?;
+
+    // key_ref namespaces the keychain per ACCOUNT, so a personal and a work
+    // token for the same provider never collide.
+    let slug: String = account
+        .chars()
+        .map(|ch| if ch.is_alphanumeric() { ch.to_ascii_lowercase() } else { '-' })
+        .collect();
+    let key_ref = format!("{provider}-{}", slug.trim_matches('-'));
+
+    let mut config = serde_json::Map::new();
+    for f in def.auth_fields {
+        let v = values.get(f.key).and_then(|v| v.as_str()).unwrap_or("").trim();
+        if f.secret {
+            store_token(&key_ref, f.key, v)?;
+        } else {
+            config.insert(f.key.to_string(), serde_json::Value::String(v.to_string()));
+        }
+    }
+
+    let nick = if nickname.trim().is_empty() { account.clone() } else { nickname.trim().to_string() };
+    let label = format!("{} ({})", def.label, nick);
+    let (prov, kr, lbl, acct, nk) =
+        (provider.to_string(), key_ref.clone(), label, account.clone(), nick);
+    let auth_kind = def.auth_kind.to_string();
+    let cfg = serde_json::to_string(&serde_json::Value::Object(config)).unwrap_or_else(|_| "{}".into());
+
+    let id = db.write(move |conn| {
+        // Same account reconnecting = replace (a token refresh, not a new account).
+        conn.execute("DELETE FROM connection WHERE provider=?1 AND key_ref=?2", params![prov, kr])
+            .map_err(|e| format!("clear old: {e}"))?;
+        conn.execute(
+            "INSERT INTO connection (provider,kind,auth_kind,label,account,nickname,scopes,config_json,key_ref,status,created_at,updated_at)
+             VALUES (?1,'api',?2,?3,?4,?5,'',?6,?7,'connected',?8,?8)",
+            params![prov, auth_kind, lbl, acct, nk, cfg, kr, now()],
+        ).map_err(|e| format!("insert conn: {e}"))?;
+        Ok(conn.last_insert_rowid())
+    })?;
+    Ok((id, account))
+}
+
+/// Run the descriptor's validation call and return the account identity.
+async fn validate_credential(
+    def: &crate::connectors::Connector,
+    ctx: &serde_json::Value,
+) -> Result<String, String> {
+    let Some(v) = def.validate.as_ref() else {
+        return Ok(def.label.to_string());
     };
-    // Open PRs authored by the authenticated user, newest first.
-    let url = "https://api.github.com/search/issues?q=is:open+is:pr+author:@me&sort=updated&order=desc&per_page=20";
-    let resp = match client
-        .get(url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return (format!("github request: {e}"), true),
-    };
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return ("GitHub token was rejected (401) — reconnect GitHub in Connections.".into(), true);
+    let client = reqwest::Client::builder()
+        .user_agent("AYGENT/0.1")
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("http: {e}"))?;
+    let url = crate::connectors::fill(v.url, ctx);
+    let method = reqwest::Method::from_bytes(v.method.as_bytes())
+        .map_err(|_| "bad validate method".to_string())?;
+    let mut req = client.request(method, &url);
+    if !def.auth_header.is_empty() {
+        req = req.header(def.auth_header, crate::connectors::fill(def.auth_value, ctx));
     }
-    if !resp.status().is_success() {
-        return (format!("GitHub error: HTTP {}", resp.status()), true);
+    for (k, val) in def.headers {
+        req = req.header(*k, crate::connectors::fill(val, ctx));
     }
-    let body: serde_json::Value = match resp.json().await {
-        Ok(b) => b,
-        Err(e) => return (format!("github decode: {e}"), true),
-    };
-    let items = body.get("items").and_then(|i| i.as_array()).cloned().unwrap_or_default();
-    if items.is_empty() {
-        return ("You have no open pull requests.".into(), false);
+    if !v.body.is_empty() {
+        let body: serde_json::Value = serde_json::from_str(&crate::connectors::fill(v.body, ctx))
+            .map_err(|e| format!("validate body: {e}"))?;
+        req = req.json(&body);
     }
-    let mut out = format!("Your open pull requests ({}):\n", items.len());
-    for it in &items {
-        let title = it.get("title").and_then(|t| t.as_str()).unwrap_or("(untitled)");
-        let num = it.get("number").and_then(|n| n.as_i64()).unwrap_or(0);
-        let html_url = it.get("html_url").and_then(|u| u.as_str()).unwrap_or("");
-        // Derive repo "owner/name" from the html_url or repository_url.
-        let repo = it
-            .get("repository_url")
-            .and_then(|u| u.as_str())
-            .and_then(|u| u.strip_prefix("https://api.github.com/repos/"))
-            .unwrap_or("");
-        out.push_str(&format!("- {repo}#{num}: {title}\n  {html_url}\n"));
+    let resp = req.send().await.map_err(|e| format!("{} request: {e}", def.label))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(format!(
+            "{} rejected that credential (401). Check it's valid and not expired.",
+            def.label
+        ));
     }
-    (out.trim_end().to_string(), false)
+    if status == reqwest::StatusCode::FORBIDDEN {
+        // 403 means the credential is real but under-permissioned — a different
+        // fix than a bad token, so don't collapse them into one message.
+        return Err(format!(
+            "{} accepted the credential but refused this request (403) — it's probably missing a \
+             permission. Re-check the scopes in the setup steps.",
+            def.label
+        ));
+    }
+    if !status.is_success() {
+        return Err(format!("{} validation failed: HTTP {}", def.label, status.as_u16()));
+    }
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    if v.identity_path.is_empty() {
+        return Ok(def.label.to_string());
+    }
+    let ident = crate::connectors::dig(&body, v.identity_path)
+        .and_then(|x| match x {
+            serde_json::Value::String(s) => Some(s.clone()),
+            other if !other.is_null() => Some(other.to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|| def.label.to_string());
+    Ok(ident)
 }

@@ -488,7 +488,16 @@ mod tests {
 /// a dashboard is a control surface, not a second shell. Anything that writes,
 /// deletes, or executes is absent on purpose — those belong in Chat where the
 /// user sees the full reasoning, or behind an approved Exec module.
-pub const BUTTON_TOOLS: &[&str] = &["fetch_url", "read_file", "list_files", "github_list_prs"];
+pub const BASE_BUTTON_TOOLS: &[&str] = &["fetch_url", "read_file", "list_files"];
+
+/// Tools a dashboard button may invoke: the base set plus every READ-ONLY
+/// connector tool. Derived from the registry, so adding a connector can never
+/// accidentally hand a WRITE tool to a one-click dashboard button.
+pub fn button_tools() -> Vec<&'static str> {
+    let mut v = BASE_BUTTON_TOOLS.to_vec();
+    v.extend(crate::connectors::read_tool_names());
+    v
+}
 
 #[tauri::command]
 pub async fn dashboard_run_tool(
@@ -497,10 +506,11 @@ pub async fn dashboard_run_tool(
     tool: String,
     args: serde_json::Value,
 ) -> Result<String, String> {
-    if !BUTTON_TOOLS.contains(&tool.as_str()) {
+    let allowed = button_tools();
+    if !allowed.contains(&tool.as_str()) {
         return Err(format!(
             "`{tool}` can't be run from a dashboard button (allowed: {})",
-            BUTTON_TOOLS.join(", ")
+            allowed.join(", ")
         ));
     }
     match tool.as_str() {
@@ -509,9 +519,10 @@ pub async fn dashboard_run_tool(
             let res = crate::web::fetch(url).await?;
             Ok(res.text.chars().take(2000).collect())
         }
-        "github_list_prs" => {
+        // Any read-only connector tool, registry-driven.
+        t if crate::connectors::is_connector_tool(t) => {
             // Returns the tool convention (text, is_error) — not a Result.
-            let (text, is_err) = crate::connections::github_list_prs(&db, &agent_id).await;
+            let (text, is_err) = crate::connector_exec::exec(&db, &agent_id, t, &args).await;
             if is_err { return Err(text); }
             Ok(text.chars().take(2000).collect())
         }

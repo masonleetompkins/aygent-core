@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 /// Current schema version. Bump when adding a migration step below.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// The DB file name under <app_data>.
 pub const DB_FILE: &str = "aygent.db";
@@ -182,6 +182,28 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("migrate v9: {e}"))?;
         set_version(conn, 9)?;
         v = 9;
+    }
+
+    if v < 10 {
+        // CONNECTIONS v2 — PER-AGENT ACCOUNTS + READ/WRITE.
+        //
+        // Two real problems this fixes:
+        //   1. Multiple accounts per provider (Cleo = personal GitHub, a work
+        //      agent = the company GitHub). The rows already supported it, but
+        //      nothing NAMED them, so the UI couldn't tell them apart and
+        //      token_for_agent_provider() picked one with an unordered LIMIT 1.
+        //      `nickname` makes the account human-identifiable.
+        //   2. Write access was all-or-nothing. `access_mode` gates write tools
+        //      per (agent, connection): read is the default, write is opt-in.
+        //
+        // The uniqueness INDEX is the important line: at most ONE enabled
+        // connection per (agent, provider) is enforced by the DATABASE, not by
+        // careful callers. A wrong-credential bug doesn't fail loudly, it
+        // SUCCEEDS against the wrong account — so ambiguity must be impossible.
+        conn.execute_batch(SCHEMA_V10)
+            .map_err(|e| format!("migrate v10: {e}"))?;
+        set_version(conn, 10)?;
+        v = 10;
     }
 
     let _ = v;
@@ -556,4 +578,36 @@ CREATE TABLE IF NOT EXISTS dashboard_revision (
   FOREIGN KEY (dashboard_id) REFERENCES dashboard(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_dash_rev_dash ON dashboard_revision(dashboard_id, id DESC);
+"#;
+
+/// SCHEMA v10 (CONNECTIONS v2 — per-agent accounts + read/write gating).
+///
+/// `nickname` names an account ("Personal", "Work / Stan") so two GitHub
+/// connections are distinguishable in the UI and in errors.
+///
+/// `access_mode` is per (agent, connection): 'read' (default) or 'write'.
+/// Write connector tools are never even added to an agent's tool list unless
+/// this says 'write' — the model cannot call what it was not given.
+///
+/// The partial unique index enforces AT MOST ONE ENABLED connection per
+/// (agent, provider). Without it, "which GitHub token did the agent just push
+/// with?" has no deterministic answer.
+const SCHEMA_V10: &str = r#"
+ALTER TABLE connection ADD COLUMN nickname TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_connection ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'read';
+
+-- Backfill: existing rows get their account (or provider) as the nickname so
+-- nothing shows up blank after upgrade.
+UPDATE connection SET nickname = COALESCE(NULLIF(account, ''), provider)
+  WHERE nickname = '';
+
+-- Denormalized provider on the join row so the invariant is expressible as a
+-- plain unique index (SQLite can't index across a join).
+ALTER TABLE agent_connection ADD COLUMN provider TEXT NOT NULL DEFAULT '';
+UPDATE agent_connection SET provider = (
+  SELECT c.provider FROM connection c WHERE c.id = agent_connection.connection_id
+) WHERE provider = '';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_conn_one_enabled_per_provider
+  ON agent_connection(agent_id, provider) WHERE enabled = 1;
 "#;
