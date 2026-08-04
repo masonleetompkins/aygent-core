@@ -1593,7 +1593,7 @@ const SUPABASE: Connector = Connector {
                 ToolParam { name: "table", ty: "string", description: "Table name.", required: true },
                 ToolParam { name: "values", ty: "string", description: "JSON object or array of objects.", required: true },
             ],
-            render: Render::Items { root: "", line: "inserted: {id}{slug}{email}", empty: "Insert succeeded (0 rows returned)." },
+            render: Render::Items { root: "", line: "inserted row — id {id} {slug} {email}", empty: "Insert succeeded (no row returned)." },
         },
         ConnectorTool {
             danger: false, b64_params: &[], raw_params: &["values"], base_override: "",
