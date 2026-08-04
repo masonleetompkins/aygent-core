@@ -59,6 +59,9 @@ pub struct ConnectionRow {
     pub kind: String,
     pub auth_kind: String,
     pub label: String,
+    /// User-chosen name for the ACCOUNT ("Personal", "Work / Stan"). This is what
+    /// makes two connections to the same provider distinguishable in the UI.
+    pub nickname: String,
     pub account: Option<String>,
     pub scopes: Option<String>,
     pub status: String,
@@ -68,7 +71,8 @@ pub struct ConnectionRow {
 pub fn list(db: &Db) -> Result<Vec<ConnectionRow>, String> {
     let conn = db.reader()?;
     let mut stmt = conn
-        .prepare("SELECT id, provider, kind, auth_kind, label, account, scopes, status FROM connection ORDER BY created_at ASC")
+        .prepare("SELECT id, provider, kind, auth_kind, label, COALESCE(nickname,''), account, scopes, status \
+                  FROM connection ORDER BY provider ASC, created_at ASC")
         .map_err(|e| format!("prep list: {e}"))?;
     let rows = stmt
         .query_map([], |r| {
@@ -78,9 +82,10 @@ pub fn list(db: &Db) -> Result<Vec<ConnectionRow>, String> {
                 kind: r.get(2)?,
                 auth_kind: r.get(3)?,
                 label: r.get(4)?,
-                account: r.get(5)?,
-                scopes: r.get(6)?,
-                status: r.get(7)?,
+                nickname: r.get(5)?,
+                account: r.get(6)?,
+                scopes: r.get(7)?,
+                status: r.get(8)?,
             })
         })
         .map_err(|e| format!("query list: {e}"))?;
@@ -148,10 +153,32 @@ fn token_for_agent_provider(db: &Db, agent_id: &str, provider: &str) -> Result<(
 pub fn set_agent_enabled(db: &Db, agent_id: &str, connection_id: i64, enabled: bool) -> Result<(), String> {
     let (a, c) = (agent_id.to_string(), connection_id);
     db.write(move |conn| {
+        // The denormalized `provider` column is what the uniqueness index keys
+        // on. It MUST be populated here — an unset provider makes the index
+        // match everything on '' and the one-account-per-provider invariant
+        // silently guards nothing. (Caught by its own test: the first version of
+        // this function omitted it and the "reject a second account" assertion
+        // failed. The invariant was decorative until this line existed.)
+        let provider: String = conn
+            .query_row("SELECT provider FROM connection WHERE id = ?1", params![c], |r| r.get(0))
+            .map_err(|e| format!("unknown connection {c}: {e}"))?;
+
+        // SWITCHING ACCOUNTS is the common case, not an error: enabling the work
+        // GitHub for an agent should disable its personal one rather than hit a
+        // constraint violation the user can't act on. Disable siblings FIRST, in
+        // the same transaction, so there is never a moment with two enabled.
+        if enabled {
+            conn.execute(
+                "UPDATE agent_connection SET enabled = 0
+                 WHERE agent_id = ?1 AND provider = ?2 AND connection_id != ?3",
+                params![a, provider, c],
+            ).map_err(|e| format!("clear sibling accounts: {e}"))?;
+        }
+
         conn.execute(
-            "INSERT INTO agent_connection (agent_id, connection_id, enabled) VALUES (?1,?2,?3)
+            "INSERT INTO agent_connection (agent_id, connection_id, enabled, provider) VALUES (?1,?2,?3,?4)
              ON CONFLICT(agent_id, connection_id) DO UPDATE SET enabled = excluded.enabled",
-            params![a, c, if enabled { 1 } else { 0 }],
+            params![a, c, if enabled { 1 } else { 0 }, provider],
         ).map_err(|e| format!("set agent_connection: {e}"))?;
         Ok(())
     })
@@ -477,4 +504,110 @@ async fn validate_credential(
         })
         .unwrap_or_else(|| def.label.to_string());
     Ok(ident)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::writer::Db;
+
+    /// Self-cleaning temp dir (mirrors dashboard_data.rs::tests).
+    struct TmpDir(std::path::PathBuf);
+    impl Drop for TmpDir {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    /// A real DB at the real migrated schema, with one agent and TWO GitHub
+    /// accounts — the exact shape of "personal GitHub vs work GitHub".
+    fn temp_db() -> (Db, TmpDir) {
+        let base = std::env::temp_dir().join(format!("aygent-conn-{}", crate::dashboard::new_id()));
+        std::fs::create_dir_all(&base).expect("mkdir");
+        let dir = TmpDir(base.clone());
+        let db = Db::start(base).expect("db start");
+        db.write(|conn| {
+            conn.execute_batch(
+                "INSERT INTO agent (id, name, created_at) VALUES ('a1','Cleo',0);
+                 INSERT INTO agent (id, name, created_at) VALUES ('a2','Work',0);
+                 INSERT INTO connection (provider,kind,auth_kind,label,account,nickname,scopes,config_json,key_ref,status,created_at,updated_at)
+                   VALUES ('github','api','pat','GitHub (Personal)','@mason','Personal','','{}','github-mason','connected',1,1);
+                 INSERT INTO connection (provider,kind,auth_kind,label,account,nickname,scopes,config_json,key_ref,status,created_at,updated_at)
+                   VALUES ('github','api','pat','GitHub (Work)','@mason-work','Work / Stan','','{}','github-mason-work','connected',2,2);",
+            ).map_err(|e| e.to_string())?;
+            Ok(())
+        }).expect("seed");
+        (db, dir)
+    }
+
+    /// THE INVARIANT. Two GitHub accounts may exist, but an agent may have only
+    /// ONE enabled at a time — enforced by a unique index so it holds even when a
+    /// caller forgets. A wrong-credential bug doesn't fail loudly; it SUCCEEDS
+    /// against the wrong account.
+    #[test]
+    fn one_enabled_account_per_agent_and_provider() {
+        let (db, _d) = temp_db();
+        super::set_agent_enabled(&db, "a1", 1, true).expect("first enable");
+
+        let second = db.write(|conn| {
+            conn.execute(
+                "INSERT INTO agent_connection (agent_id, connection_id, enabled, provider) \
+                 VALUES ('a1',2,1,'github')",
+                [],
+            ).map_err(|e| e.to_string())?;
+            Ok(())
+        });
+        assert!(second.is_err(), "a second ENABLED github for one agent must be rejected by the DB");
+    }
+
+    /// The point of per-agent accounts: Cleo uses the personal token, the work
+    /// agent uses the corporate one, simultaneously and without leaking.
+    #[test]
+    fn different_agents_may_use_different_accounts() {
+        let (db, _d) = temp_db();
+        super::set_agent_enabled(&db, "a1", 1, true).unwrap();
+        super::set_agent_enabled(&db, "a2", 2, true).expect("second agent may enable the OTHER account");
+
+        let conn = db.reader().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_connection WHERE enabled = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "both agents keep their own account enabled");
+    }
+
+    /// Write access must be an explicit act, never a default.
+    #[test]
+    fn access_mode_defaults_to_read_and_write_is_opt_in() {
+        let (db, _d) = temp_db();
+        super::set_agent_enabled(&db, "a1", 1, true).unwrap();
+        assert_eq!(super::access_for_agent(&db, "a1", "github").unwrap(), "read");
+
+        super::set_access_mode(&db, "a1", 1, true).unwrap();
+        assert_eq!(super::access_for_agent(&db, "a1", "github").unwrap(), "write");
+
+        super::set_access_mode(&db, "a1", 1, false).unwrap();
+        assert_eq!(super::access_for_agent(&db, "a1", "github").unwrap(), "read");
+    }
+
+    /// An agent with NO enabled connection must get a clear refusal, not a
+    /// silent fallback to somebody else's credentials. This is the regression
+    /// guard for the ANY-connection fallback that used to live in
+    /// resolve_github_push_token.
+    #[test]
+    fn no_enabled_connection_fails_closed_instead_of_borrowing_one() {
+        let (db, _d) = temp_db();
+        // a2 has nothing enabled, but two connected GitHub accounts exist.
+        let err = super::access_for_agent(&db, "a2", "github").unwrap_err();
+        assert!(err.contains("no github connection"), "{err}");
+
+        let push = super::resolve_github_push_token(&db, Some("a2"));
+        assert!(push.is_err(), "an agent with no GitHub must NOT inherit another agent's token");
+    }
+
+    /// Enabled-provider listing drives tool assembly; it must report the mode so
+    /// write tools stay hidden in read mode.
+    #[test]
+    fn enabled_providers_reports_access_mode() {
+        let (db, _d) = temp_db();
+        super::set_agent_enabled(&db, "a1", 1, true).unwrap();
+        let list = super::enabled_providers_for_agent(&db, "a1");
+        assert_eq!(list, vec![("github".to_string(), "read".to_string())]);
+    }
 }

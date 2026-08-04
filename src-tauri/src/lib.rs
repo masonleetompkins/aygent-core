@@ -860,6 +860,54 @@ fn connection_enabled_for_agent(db: tauri::State<writer::Db>, agent_id: String) 
     connections::enabled_ids_for_agent(&db, &agent_id)
 }
 
+/// The connector CATALOG (all descriptors, non-secret by construction). Drives
+/// the Connections screen: cards, setup steps, auth fields, per-tool access.
+#[tauri::command]
+fn connectors_catalog() -> Vec<&'static connectors::Connector> {
+    connectors::catalog().iter().collect()
+}
+
+/// Connect ANY registry connector. `values` maps auth-field key -> value.
+/// Validates against the live API (so a bad credential fails at paste time, not
+/// mid-turn an hour later) and captures which ACCOUNT it belongs to.
+#[tauri::command]
+async fn connector_connect(
+    db: tauri::State<'_, writer::Db>,
+    provider: String,
+    nickname: String,
+    values: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let map = values.as_object().cloned().unwrap_or_default();
+    let (id, account) = connections::connect_connector(&db, &provider, &nickname, &map).await?;
+    Ok(serde_json::json!({ "id": id, "account": account }))
+}
+
+/// Per-agent connection state for the UI: which are enabled and in what mode.
+#[tauri::command]
+fn connection_agent_state(
+    db: tauri::State<writer::Db>,
+    agent_id: String,
+) -> Result<serde_json::Value, String> {
+    let enabled = connections::enabled_ids_for_agent(&db, &agent_id)?;
+    let modes: Vec<serde_json::Value> = connections::enabled_providers_for_agent(&db, &agent_id)
+        .into_iter()
+        .map(|(p, m)| serde_json::json!({ "provider": p, "access_mode": m }))
+        .collect();
+    Ok(serde_json::json!({ "enabled_ids": enabled, "providers": modes }))
+}
+
+/// Turn WRITE access on/off for one (agent, connection). Read is the default and
+/// write tools are not even added to the agent's tool list until this is on.
+#[tauri::command]
+fn connection_set_write(
+    db: tauri::State<writer::Db>,
+    agent_id: String,
+    connection_id: i64,
+    write: bool,
+) -> Result<(), String> {
+    connections::set_access_mode(&db, &agent_id, connection_id, write)
+}
+
 // ---- M1.8 Scheduler: CRUD (Slice 2) --------------------------------------
 // Real schedules come from the UI now (the Slice-1 auto-seed is retired). Two
 // kinds the user builds: a HEARTBEAT (interval + "keep conversation context")
@@ -4374,6 +4422,8 @@ pub fn run() {
             scheduler_reset_counters,
             github_connect, connections_list, connection_disconnect,
             connection_set_agent_enabled, connection_enabled_for_agent,
+            connectors_catalog, connector_connect, connection_agent_state,
+            connection_set_write,
             memory_get_auto_remember, memory_set_auto_remember,
             pro_mode_get, pro_mode_set, shell_procs, shell_kill_proc,
             github_git_auth,
