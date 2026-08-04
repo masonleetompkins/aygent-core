@@ -19,6 +19,7 @@ mod cef_geometry;
 #[cfg(all(target_os = "macos", feature = "engine-cef"))]
 pub mod cef_app_mac;
 mod broker;
+mod dock_icon;
 mod broker_ws;
 mod exec;      // PRO MODE: the process-spawn broker (shell.exec). Only Rust spawns.
 mod paths;     // CONFIG RELOCATION: root-folder pointer + state-dir seam + onboarding paths.
@@ -1310,6 +1311,18 @@ fn agents_update(db: tauri::State<writer::Db>, broker: tauri::State<'_, Arc<Brok
     // Folder may have changed — re-register all scopes so the jail tracks it.
     register_all_agent_scopes(&db, &broker);
     Ok(())
+}
+
+/// DYNAMIC APP ICON: install a PNG (base64 from the UI's canvas render) as the
+/// running app's Dock icon. Called whenever the theme (light/dark + accent)
+/// changes, so the icon always matches the app's look.
+#[tauri::command]
+fn set_app_icon(png_b64: String) -> Result<(), String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(png_b64.trim())
+        .map_err(|e| format!("bad icon base64: {e}"))?;
+    dock_icon::set_dock_icon_png(&bytes)
 }
 
 // ── Shared context (read-only mounts) ──────────────────────────────────────
@@ -4297,6 +4310,7 @@ pub fn run() {
             agents_list, agents_create, agents_update, agents_delete,
             agents_set_active, agents_get_active, agents_sharing_folder,
             agent_mounts_list, agent_mount_add, agent_mount_remove,
+            set_app_icon,
             agent_context_add, agent_context_list, agent_context_remove,
             agent_generate_soul,
             mailbox_pending_counts, mailbox_take_next, mailbox_roster,

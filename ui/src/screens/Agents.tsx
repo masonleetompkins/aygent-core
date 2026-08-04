@@ -165,7 +165,7 @@ export function AgentForm({
   onRosterChange?: () => void;
 }) {
   const [name, setName] = useState(initial?.name ?? "");
-  const [icon, setIcon] = useState(initial?.icon ?? "🤖");
+  const [icon, setIcon] = useState(initial?.icon ?? "sparkles");
   const [color, setColor] = useState(initial?.color ?? "#5b8cff");
   const [folder, setFolder] = useState(initial?.folder_path ?? "");
   const [model, setModel] = useState(initial?.model ?? "");
@@ -633,7 +633,7 @@ export function AgentForm({
 
         {/* M1.4 #4: Per-agent context documents. */}
         <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "12px 14px" }}>
-          <div style={{ fontSize: 13, fontWeight: 600 }}>📎 Context documents</div>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>Context documents</div>
           <span style={{ ...hint, fontSize: 12 }}>Reference files this agent always has in mind (text, markdown, code, JSON…). Stored privately — never inside your folder.</span>
           {ctxDocs.length > 0 && (
             <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
@@ -658,7 +658,7 @@ export function AgentForm({
 
         {/* SHARED CONTEXT — read-only mounts of other agents' folders. */}
         <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "12px 14px" }}>
-          <div style={{ fontSize: 13, fontWeight: 600 }}>🔗 Shared context</div>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>Shared context</div>
           <span style={{ ...hint, fontSize: 12 }}>
             Let this agent <strong>read</strong> another agent’s folder — its memory, notes and project
             files — while keeping its own home. Read-only: it can never write there, so two agents can
@@ -704,7 +704,7 @@ export function AgentForm({
               >
                 <option value="">+ Give this agent read access to…</option>
                 {available.map((a) => (
-                  <option key={a.id} value={a.id}>{a.icon ? a.icon + " " : ""}{a.name}</option>
+                  <option key={a.id} value={a.id}>{a.name}</option>
                 ))}
               </select>
             );
@@ -714,7 +714,7 @@ export function AgentForm({
 
         {/* IMPORT MEMORY — bring an existing memory vault into this agent + ingest. */}
         <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "12px 14px" }}>
-          <div style={{ fontSize: 13, fontWeight: 600 }}>🧠 Import memory</div>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>Import memory</div>
           <span style={{ ...hint, fontSize: 12 }}>
             Bring an existing memory vault (Memory/ + Daily/ notes) into this agent’s folder and
             index it. Use this to port an agent to a new machine, or give a fresh agent a past.

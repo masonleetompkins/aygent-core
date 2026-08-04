@@ -81,10 +81,10 @@ libc = "0.2"                        # atomic openat/O_NOFOLLOW fd layer (M0.2c)
 # NSView frame against the LIVE window contentView (ground truth), instead of
 # trusting wry's child-positioning math (titlebar/flip mismatches burned us).
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSResponder", "NSGraphics", "NSApplication", "NSEvent"] }
+objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSResponder", "NSGraphics", "NSApplication", "NSEvent", "NSImage"] }  # NSImage: dynamic Dock icon
 # NSValue -> NSNumber (setDrawsBackground KVC), NSString -> ns_string! macro:
 # both needed by cef_geometry's punchout (engine-cef). Harmless when unused.
-objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSValue", "NSString"] }
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSValue", "NSString", "NSData"] }  # NSData: dynamic Dock icon (decode PNG bytes from the UI canvas)
 # CALayer for premium rounded corners on the WKWebView's own backing layer
 # (cornerRadius + masksToBounds). Already in the tree via tauri/wry; declare it
 # directly so NSView::layer()'s CALayer methods are in scope.

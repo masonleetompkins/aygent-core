@@ -12,8 +12,11 @@ import type { AgentProfile } from "../components/AgentSwitcher";
 
 type ToolLine = { name: string; path: string; ok?: boolean; detail?: string; summary?: string; body?: string; running?: boolean };
 type Msg =
-  | { role: "user"; text: string; memory?: string }
-  | { role: "assistant"; text: string; tools: ToolLine[]; streaming?: boolean };
+  // `at` = epoch ms. For a USER message it's when they hit send; for an
+  // ASSISTANT message it's when the turn COMPLETED (set at finalize, not at
+  // first token), which is what the timestamp in the margin claims to mean.
+  | { role: "user"; text: string; memory?: string; at?: number }
+  | { role: "assistant"; text: string; tools: ToolLine[]; streaming?: boolean; at?: number };
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 
@@ -132,6 +135,13 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   const [rec, setRec] = useState<"idle" | "recording" | "transcribing">("idle");
   const recRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  // PUSH-TO-TALK (Mason 08-04): hold ` (or ~) to record, release to transcribe;
+  // TAP it to send. Both the button and the key go through startRec/stopRec so
+  // there is exactly one recording implementation to keep correct.
+  // `ptt` tracks a held key so keydown auto-repeat doesn't start N recorders.
+  const pttRef = useRef<{ down: boolean; start: number; recording: boolean }>({ down: false, start: 0, recording: false });
+  const HOLD_MS = 220; // under this = a tap (send), over = a hold (record)
+
   async function toggleMic() {
     if (rec === "recording") { recRef.current?.stop(); return; }
     if (rec !== "idle") return;
@@ -170,6 +180,58 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       alert("Mic unavailable: " + why);
     }
   }
+
+  // ---- Push-to-talk on ` / ~ -------------------------------------------
+  // Hold to record (release -> Whisper -> input box). Tap to send.
+  // Deliberately NOT active while the textarea has focus: a backtick typed
+  // into a message (```code```) must stay a backtick. Use it from anywhere
+  // else in the pane.
+  useEffect(() => {
+    if (blocked) return;
+    const isBacktick = (e: KeyboardEvent) => e.code === "Backquote" || e.key === "`" || e.key === "~";
+    const typing = () => document.activeElement === taRef.current;
+
+    async function onDown(e: KeyboardEvent) {
+      if (!isBacktick(e) || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (typing()) return;              // let the user type a real backtick
+      if (pttRef.current.down) return;   // ignore auto-repeat
+      e.preventDefault();
+      pttRef.current = { down: true, start: Date.now(), recording: false };
+      // Only START recording once the key has been held past the tap window,
+      // otherwise a quick tap would spin the mic up and immediately tear it
+      // down (and on macOS that flashes the mic indicator for no reason).
+      window.setTimeout(() => {
+        if (pttRef.current.down && !pttRef.current.recording && rec === "idle") {
+          pttRef.current.recording = true;
+          void toggleMic(); // starts recording
+        }
+      }, HOLD_MS);
+    }
+
+    function onUp(e: KeyboardEvent) {
+      if (!isBacktick(e) || !pttRef.current.down) return;
+      if (typing()) { pttRef.current.down = false; return; }
+      e.preventDefault();
+      const held = Date.now() - pttRef.current.start;
+      const wasRecording = pttRef.current.recording;
+      pttRef.current = { down: false, start: 0, recording: false };
+
+      if (wasRecording) {
+        // Release ends the recording; onstop transcribes into the input box.
+        recRef.current?.stop();
+      } else if (held < HOLD_MS) {
+        // A TAP: send whatever is in the box.
+        if (!running && input.trim()) void send();
+      }
+    }
+
+    window.addEventListener("keydown", onDown);
+    window.addEventListener("keyup", onUp);
+    return () => {
+      window.removeEventListener("keydown", onDown);
+      window.removeEventListener("keyup", onUp);
+    };
+  });
 
   // ---- Task #8: #tool tagging (mirrors @mentions) ----
   const [toolNames, setToolNames] = useState<string[]>([]);
@@ -373,12 +435,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       await refreshList();
     } catch { /* ignore */ }
   }
-  async function renameConv(id: string) {
-    const cur = convs.find((x) => x.id === id);
-    const next = window.prompt("Rename chat", cur?.title || "");
-    if (next == null) return;
-    await saveConvTitle(id, next);
-  }
+  // Which sidebar row is being renamed inline. window.prompt() looks like the
+  // obvious tool here and is what this used to call — but it is a NO-OP in
+  // Tauri's macOS WKWebView (it returns null immediately), so the pencil in the
+  // history sidebar silently did nothing while the header field worked fine.
+  // Same bug class as the ghost folder: two paths to one action, only one of
+  // them exercised. Inline editing works in every webview.
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  function renameConv(id: string) { setRenamingId(id); }
   // Rename the CURRENTLY OPEN chat (from the inline header field).
   async function renameCurrent(next: string) {
     if (!convId) return;
@@ -497,7 +561,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     // streaming bubble below — a placeholder here matched that bubble's
     // suppression condition and blocked live streaming entirely (bug: responses
     // appeared all-at-once). Cleo 2026-07-31.
-    const withUser: Msg[] = [...msgsRef.current, { role: "user", text: prompt }];
+    const withUser: Msg[] = [...msgsRef.current, { role: "user", text: prompt, at: Date.now() }];
     msgsRef.current = withUser;
     setMsgs(withUser);
     void persist(withUser); // thread appears in the sidebar immediately
@@ -549,7 +613,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
         : "(no reply text came back from the model this turn — try asking a follow-up)";
       const finalMsgs: Msg[] = [
         ...withUserMem,
-        { role: "assistant", text: done.liveText || emptyReplyText, tools: done.liveTools as ToolLine[], streaming: false },
+        { role: "assistant", text: done.liveText || emptyReplyText, tools: done.liveTools as ToolLine[], streaming: false, at: Date.now() },
       ];
       // Only overwrite the visible pane if we're STILL viewing this agent+conv.
       if (agentId === myAgent && convIdRef.current === myConvId) {
@@ -558,7 +622,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       void persistFor(myConvId, finalMsgs, historyRef.current);
       runningChannelRef.current = null;
     } catch (err) {
-      const errMsgs: Msg[] = [...withUser, { role: "assistant", text: `✗ ${String(err)}`, tools: [], streaming: false }];
+      const errMsgs: Msg[] = [...withUser, { role: "assistant", text: `✗ ${String(err)}`, tools: [], streaming: false, at: Date.now() }];
       if (agentId === myAgent && convIdRef.current === myConvId) { msgsRef.current = errMsgs; setMsgs(errMsgs); }
       void persistFor(myConvId, errMsgs, historyRef.current);
       runningChannelRef.current = null;
@@ -596,15 +660,21 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     <div style={{ display: "flex", height: "100%", minHeight: 0, gap: "var(--space-4)" }}>
       {/* MAIN CHAT COLUMN. In multi-pane mode it flexes to share width; solo it
          stays centered. height:100% + flex so the input pins to the bottom. */}
-      <div style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0, minHeight: 0, maxWidth: multi ? "none" : 720, margin: multi ? 0 : "0 auto" }}>
+      {/* WIDTH (Mason 08-04): the old `maxWidth: 720` left ~25% dead space on
+          each side of a wide window. Now the column is fluid — it fills the
+          available space and only reins in on very large displays, leaving a
+          5-10% breathing margin instead of 50%. The messages, the input row and
+          the buttons all live inside this column, so they share one measurement
+          and stay aligned by construction. */}
+      <div style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0, minHeight: 0, width: "100%", maxWidth: multi ? "none" : 1600, margin: multi ? 0 : "0 auto" }}>
         {/* Header: agent name (multi) or "Chat" + editable chat name underneath.
            In multi-pane, each pane is labeled with its AGENT so you always know
            who you're talking to; a close button removes just this pane. */}
         <div style={{ margin: "0 0 var(--space-3)", flexShrink: 0, display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
           <div style={{ minWidth: 0 }}>
             <h2 style={{ fontSize: "var(--text-h1)", fontWeight: "var(--weight-heading)", margin: 0, display: "flex", alignItems: "center", gap: 8, overflow: "hidden" }}>
-              {multi && <span style={{ color: "var(--accent)", display: "flex" }}><Icon name={(agent?.icon as IconName) || "sparkles"} size={20} /></span>}
-              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{multi ? (agent?.name || "Agent") : "Chat"}</span>
+              <span style={{ color: "var(--accent)", display: "flex" }}><Icon name={(agent?.icon as IconName) || "sparkles"} size={20} /></span>
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent?.name || "Agent"}</span>
             </h2>
             <ChatTitle
               title={convs.find((c) => c.id === convId)?.title || ""}
@@ -629,7 +699,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
         {/* Messages bottom-align: newest sits just above the input, older scroll
            up (justifyContent flex-end + margin-top auto on the list wrapper). */}
-        <div ref={scrollRef} className="aygent-scroll" style={{ flex: 1, overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", padding: "6px 28px 36px 28px" }}>
+        <div ref={scrollRef} className="aygent-scroll" style={{ flex: 1, overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", padding: "6px 8px 36px 8px" }}>
           <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 14 }}>
           {msgs.length === 0 && !running && !blocked && (
             <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
@@ -658,14 +728,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
         {/* Task #5: attachment chips above the input */}
         {attachments.length > 0 && (
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8, padding: "0 8px" }}>
             {attachments.map((a) => (
               <span key={a.name} style={{
                 display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12,
                 padding: "4px 10px", borderRadius: 999, border: "var(--border-width) solid var(--line)",
                 background: "var(--surface)", color: a.pending ? "var(--text-faint)" : "var(--text)",
               }}>
-                📎 {a.name}{a.pending ? "…" : ""}
+                {a.name}{a.pending ? "…" : ""}
                 {!a.pending && (
                   <button onClick={() => setAttachments((x) => x.filter((y) => y.name !== a.name))}
                     style={{ background: "none", border: "none", cursor: "pointer", padding: 0, color: "var(--text-muted)" }}>✕</button>
@@ -674,7 +744,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
             ))}
           </div>
         )}
-        <div style={{ display: "flex", gap: 8, marginTop: "var(--space-3)", flexShrink: 0, alignItems: "flex-end", position: "relative" }}>
+        <div style={{ display: "flex", gap: 8, marginTop: "var(--space-3)", flexShrink: 0, alignItems: "flex-end", position: "relative", padding: "0 8px" }}>
           {/* Task #8: #tool picker (mirrors the @ picker) */}
           {toolTag && toolTag.matches.length > 0 && (
             <div style={{
@@ -762,6 +832,8 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
         <HistorySidebar
           convs={convs} activeId={convId} busy={running} dragId={dragId} overId={overId}
           listElRef={listElRef}
+          renamingId={renamingId}
+          onCommitRename={(id, title) => { setRenamingId(null); void saveConvTitle(id, title); }}
           onNew={newConv} onOpen={openConv} onDelete={deleteConv} onRename={renameConv}
           onPin={togglePin} onPointerDragStart={startPointerDrag}
         />
@@ -771,11 +843,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 }
 
 function HistorySidebar({
-  convs, activeId, busy, dragId, overId, listElRef, onNew, onOpen, onDelete, onRename, onPin, onPointerDragStart,
+  convs, activeId, busy, dragId, overId, listElRef, renamingId, onCommitRename,
+  onNew, onOpen, onDelete, onRename, onPin, onPointerDragStart,
 }: {
   convs: ConvMeta[]; activeId: string | null; busy: boolean;
   dragId: string | null; overId: string | null;
   listElRef: React.RefObject<HTMLDivElement>;
+  renamingId: string | null;
+  onCommitRename: (id: string, title: string) => void;
   onNew: () => void; onOpen: (id: string) => void; onDelete: (id: string) => void;
   onRename: (id: string) => void;
   onPin: (id: string) => void;
@@ -804,6 +879,8 @@ function HistorySidebar({
           <HistoryItem
             key={c.id} c={c} active={c.id === activeId}
             dragging={dragId === c.id} isOver={overId === c.id && dragId !== null && dragId !== c.id}
+            renaming={renamingId === c.id}
+            onCommitRename={(t) => onCommitRename(c.id, t)}
             onOpen={() => onOpen(c.id)} onDelete={() => onDelete(c.id)} onRename={() => onRename(c.id)} onPin={() => onPin(c.id)}
             onPointerDown={(e) => onPointerDragStart(c.id, e)}
           />
@@ -814,9 +891,10 @@ function HistorySidebar({
 }
 
 function HistoryItem({
-  c, active, dragging, isOver, onOpen, onDelete, onRename, onPin, onPointerDown,
+  c, active, dragging, isOver, renaming, onCommitRename, onOpen, onDelete, onRename, onPin, onPointerDown,
 }: {
   c: ConvMeta; active: boolean; dragging: boolean; isOver: boolean;
+  renaming: boolean; onCommitRename: (title: string) => void;
   onOpen: () => void; onDelete: () => void; onRename: () => void; onPin: () => void;
   onPointerDown: (e: React.PointerEvent) => void;
 }) {
@@ -844,9 +922,29 @@ function HistoryItem({
         title={c.pinned ? "Unpin" : "Pin to top"}
         style={{ background: "none", border: "none", cursor: "pointer", padding: 0, display: "flex", color: c.pinned ? "var(--accent)" : "var(--text-muted)", opacity: c.pinned ? 1 : hover ? 0.6 : 0 }}
       ><Icon name={c.pinned ? "pin-fill" : "pin"} size={13} /></button>
-      <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", color: "var(--text)" }}>
-        {c.title || "Untitled"}
-      </span>
+      {renaming ? (
+        <input
+          autoFocus
+          defaultValue={c.title || ""}
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+          onBlur={(e) => onCommitRename(e.currentTarget.value)}
+          onKeyDown={(e) => {
+            e.stopPropagation();
+            if (e.key === "Enter") { e.preventDefault(); onCommitRename(e.currentTarget.value); }
+            if (e.key === "Escape") { e.preventDefault(); onCommitRename(c.title || ""); }
+          }}
+          style={{
+            flex: 1, minWidth: 0, background: "var(--bg)", color: "var(--text)",
+            border: "var(--border-width) solid var(--accent)", borderRadius: 4,
+            padding: "2px 6px", fontSize: 13, fontFamily: "inherit",
+          }}
+        />
+      ) : (
+        <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", color: "var(--text)" }}>
+          {c.title || "Untitled"}
+        </span>
+      )}
       {hover && (
         <>
           <button
@@ -908,13 +1006,45 @@ function ChatTitle({ title, disabled, onRename }: { title: string; disabled: boo
   );
 }
 
+/** HH:MM:SS in the user's locale, 24h so it's a fixed width in the margin. */
+function fmtClock(ms?: number): string {
+  if (!ms) return "";
+  const d = new Date(ms);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/** Fixed-width gutter stamp. Reserves its width even when empty so bubbles
+ *  don't shift horizontally between stamped and unstamped messages. */
+function Stamp({ at }: { at?: number }) {
+  return (
+    <span style={{
+      width: 62, flexShrink: 0, textAlign: "center",
+      fontSize: 11, lineHeight: "20px", color: "var(--text-faint)",
+      fontVariantNumeric: "tabular-nums", userSelect: "none",
+    }}>{fmtClock(at)}</span>
+  );
+}
+
 function Bubble({ m }: { m: Msg }) {
   const isUser = m.role === "user";
   const memory = isUser && m.role === "user" ? m.memory : undefined;
+  // The stamp lives OUTSIDE the bubble column, in the margin: to the LEFT of
+  // the agent's replies and to the RIGHT of the user's prompts.
   return (
-    <div style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start" }}>
+    <div style={{ display: "flex", alignItems: "flex-start", justifyContent: isUser ? "flex-end" : "flex-start", gap: 2, width: "100%" }}>
+      {!isUser && <Stamp at={m.at} />}
+      <BubbleBody m={m} isUser={isUser} memory={memory} />
+      {isUser && <Stamp at={m.at} />}
+    </div>
+  );
+}
+
+function BubbleBody({ m, isUser, memory }: { m: Msg; isUser: boolean; memory?: string }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start", minWidth: 0, flex: 1 }}>
       <div style={{
-        maxWidth: "82%",
+        maxWidth: "88%",
         minWidth: 0,
         overflowWrap: "anywhere",
         background: isUser ? "var(--accent)" : "var(--surface)",
