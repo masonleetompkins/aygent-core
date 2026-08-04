@@ -102,6 +102,15 @@ pub async fn call(
     for (k, v) in creds.fields.iter() {
         ctx.entry(k.clone()).or_insert_with(|| v.clone());
     }
+    // Base64 params (GitHub file contents). Done here so a model never has to
+    // encode by hand — that would be a reliability tax for zero benefit.
+    for key in t.b64_params {
+        if let Some(serde_json::Value::String(plain)) = ctx.get(*key).cloned() {
+            use base64::Engine;
+            let enc = base64::engine::general_purpose::STANDARD.encode(plain.as_bytes());
+            ctx.insert((*key).to_string(), serde_json::Value::String(enc));
+        }
+    }
     let ctx = serde_json::Value::Object(ctx);
 
     // Required-arg check up front: a clear message beats a provider 400.
@@ -116,7 +125,8 @@ pub async fn call(
         }
     }
 
-    let base = connectors::fill(c.base_url, &ctx);
+    let base_tpl = if t.base_override.is_empty() { c.base_url } else { t.base_override };
+    let base = connectors::fill(base_tpl, &ctx);
     let path = connectors::fill(t.path, &ctx);
     let url = format!("{}{}", base.trim_end_matches('/'), path);
 
@@ -148,9 +158,10 @@ pub async fn call(
     }
     // Body for writes / GraphQL. Templated then parsed so we send real JSON.
     if !t.body.is_empty() {
-        let filled = fill_json(t.body, &ctx);
-        let body: serde_json::Value = serde_json::from_str(&filled)
+        let filled = fill_json_with_raw(t.body, &ctx, t.raw_params)?;
+        let mut body: serde_json::Value = serde_json::from_str(&filled)
             .map_err(|e| format!("building request body: {e}"))?;
+        prune_empty(&mut body);
         req = req.json(&body);
     }
 
@@ -186,6 +197,58 @@ pub async fn call(
         }
     }
     Ok(connectors::render(&t.render, &body))
+}
+
+/// Fill a JSON body template where SOME params carry JSON structure.
+///
+/// Two substitution modes, deliberately:
+///   * normal params are ESCAPED (a quote in a title can't corrupt the body)
+///   * `raw` params are SPLICED VERBATIM so the model can send real structure —
+///     a block tree, a property schema, a query filter. Each is validated as
+///     parseable JSON first, so "raw" never means "unchecked".
+fn fill_json_with_raw(
+    tpl: &str,
+    ctx: &serde_json::Value,
+    raw: &[&str],
+) -> Result<String, String> {
+    // Validate + normalize every raw param up front. A model that sends
+    // malformed JSON gets a precise error naming the argument, not a confusing
+    // failure about the whole request body.
+    let mut normalized = serde_json::Map::new();
+    if let Some(obj) = ctx.as_object() {
+        for (k, v) in obj {
+            if !raw.contains(&k.as_str()) {
+                normalized.insert(k.clone(), v.clone());
+                continue;
+            }
+            let parsed = match v {
+                // Already structured (a good model sends real JSON) — use as-is.
+                serde_json::Value::Object(_) | serde_json::Value::Array(_) => v.clone(),
+                serde_json::Value::String(s) if !s.trim().is_empty() => {
+                    serde_json::from_str::<serde_json::Value>(s).map_err(|e| {
+                        format!("the `{k}` argument must be valid JSON — {e}")
+                    })?
+                }
+                _ => serde_json::Value::Null,
+            };
+            normalized.insert(k.clone(), parsed);
+        }
+    }
+    let nctx = serde_json::Value::Object(normalized);
+
+    // Splice raw placeholders first (verbatim), then escape the rest.
+    let mut out = tpl.to_string();
+    for key in raw {
+        let needle = format!("{{{key}}}");
+        if !out.contains(&needle) { continue; }
+        let val = crate::connectors::dig(&nctx, key)
+            .filter(|v| !v.is_null())
+            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".into()))
+            // An omitted optional structure must leave valid JSON behind.
+            .unwrap_or_else(|| "null".into());
+        out = out.replace(&needle, &val);
+    }
+    Ok(fill_json(&out, &nctx))
 }
 
 /// Fill a JSON template, escaping substituted values so a quote or newline in a
@@ -233,6 +296,25 @@ fn fill_json(tpl: &str, ctx: &serde_json::Value) -> String {
     out
 }
 
+/// Drop keys whose value is an empty string or null from a request body.
+///
+/// Optional params leave `"sha":""` behind when the model omits them, and APIs
+/// reject that outright ("sha is not a valid string") — a confusing failure for
+/// something the user never typed. A template can't know which optionals were
+/// supplied, so the body is cleaned after filling instead.
+fn prune_empty(v: &mut serde_json::Value) {
+    if let Some(obj) = v.as_object_mut() {
+        obj.retain(|_, val| match val {
+            serde_json::Value::String(s) => !s.is_empty(),
+            serde_json::Value::Null => false,
+            _ => true,
+        });
+        for (_, val) in obj.iter_mut() {
+            prune_empty(val);
+        }
+    }
+}
+
 /// Pull a human message out of an error body (each API nests it differently).
 fn extract_error(text: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
@@ -274,5 +356,88 @@ mod tests {
     fn extract_error_reads_common_shapes() {
         assert_eq!(extract_error(r#"{"message":"Bad credentials"}"#), ": Bad credentials");
         assert_eq!(extract_error(r#"{"error":{"message":"nope"}}"#), ": nope");
+    }
+}
+
+#[cfg(test)]
+mod raw_tests {
+    use super::*;
+
+    /// Structure must survive intact. This is the whole point of raw params: a
+    /// Notion block tree or property schema has to arrive as JSON STRUCTURE, not
+    /// as an escaped string — escaping it (the default path) would send Notion a
+    /// string where it expects an array, and every rich write would fail.
+    #[test]
+    fn raw_params_splice_as_structure_not_string() {
+        let ctx = serde_json::json!({
+            "children": "[{\"type\":\"paragraph\"}]"
+        });
+        let out = fill_json_with_raw("{\"children\":{children}}", &ctx, &["children"]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed["children"].is_array(), "must be an array, got {}", parsed["children"]);
+        assert_eq!(parsed["children"][0]["type"], "paragraph");
+    }
+
+    /// A model that sends already-structured JSON (not a string) must work too.
+    #[test]
+    fn raw_params_accept_real_json_values() {
+        let ctx = serde_json::json!({ "properties": { "Name": { "title": {} } } });
+        let out = fill_json_with_raw("{\"properties\":{properties}}", &ctx, &["properties"]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed["properties"]["Name"]["title"].is_object());
+    }
+
+    /// Malformed JSON must fail with a message naming the ARGUMENT, so the model
+    /// can correct that specific field instead of guessing at the whole request.
+    #[test]
+    fn malformed_raw_param_names_the_argument() {
+        let ctx = serde_json::json!({ "filter": "{not valid json" });
+        let err = fill_json_with_raw("{\"filter\":{filter}}", &ctx, &["filter"]).unwrap_err();
+        assert!(err.contains("filter"), "{err}");
+    }
+
+    /// An omitted optional structure must leave VALID json behind (null), not a
+    /// dangling `{filter}` that breaks the whole body.
+    #[test]
+    fn omitted_raw_param_becomes_null_and_is_pruned() {
+        let ctx = serde_json::json!({ "database_id": "abc" });
+        let out = fill_json_with_raw(
+            "{\"filter\":{filter},\"page_size\":50}", &ctx, &["filter"],
+        ).unwrap();
+        let mut parsed: serde_json::Value = serde_json::from_str(&out)
+            .expect("body must stay parseable when an optional structure is omitted");
+        prune_empty(&mut parsed);
+        assert!(parsed.get("filter").is_none(), "null optional should be pruned away");
+        assert_eq!(parsed["page_size"], 50);
+    }
+
+    /// Text params must STILL be escaped even alongside raw ones — a quote in a
+    /// page title can't be allowed to break the JSON.
+    #[test]
+    fn text_params_are_still_escaped_alongside_raw() {
+        let ctx = serde_json::json!({
+            "content": "he said \"hi\"",
+            "children": "[]"
+        });
+        let out = fill_json_with_raw(
+            "{\"content\":\"{content}\",\"children\":{children}}", &ctx, &["children"],
+        ).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("must stay valid JSON");
+        assert_eq!(parsed["content"], "he said \"hi\"");
+        assert!(parsed["children"].is_array());
+    }
+
+    /// Empty optional strings must be REMOVED, not sent as "". GitHub rejects
+    /// `"sha":""` outright, which would look like a bug the user caused.
+    #[test]
+    fn prune_empty_removes_unset_optionals() {
+        let mut v = serde_json::json!({
+            "message": "commit", "sha": "", "branch": "", "content": "abc"
+        });
+        prune_empty(&mut v);
+        assert!(v.get("sha").is_none());
+        assert!(v.get("branch").is_none());
+        assert_eq!(v["message"], "commit");
+        assert_eq!(v["content"], "abc");
     }
 }

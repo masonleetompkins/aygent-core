@@ -897,6 +897,51 @@ fn connection_agent_state(
     Ok(serde_json::json!({ "enabled_ids": enabled, "providers": modes }))
 }
 
+/// Switch ONE connector tool on or off for an (agent, connection). This is the
+/// primary control surface: connecting an account grants full capability, and the
+/// user removes individual tools from here.
+#[tauri::command]
+fn connection_set_tool_enabled(
+    db: tauri::State<writer::Db>,
+    agent_id: String,
+    connection_id: i64,
+    tool_name: String,
+    on: bool,
+) -> Result<(), String> {
+    connections::set_tool_enabled(&db, &agent_id, connection_id, &tool_name, on)
+}
+
+/// Every tool a connected provider COULD offer, with its current on/off state —
+/// the switch list. Must include OFF tools, or there is no way to switch one back
+/// on.
+#[tauri::command]
+fn connection_tool_states(
+    db: tauri::State<writer::Db>,
+    agent_id: String,
+) -> Result<serde_json::Value, String> {
+    let off: std::collections::HashSet<(i64, String)> =
+        connections::disabled_tools_by_connection(&db, &agent_id).into_iter().collect();
+    let mut out = Vec::new();
+    for row in connections::list(&db)? {
+        let Some(def) = connectors::by_id(&row.provider) else { continue };
+        let tools: Vec<serde_json::Value> = def.all_tools().map(|t| {
+            serde_json::json!({
+                "name": t.name,
+                "description": t.description,
+                "access": if t.access == connectors::Access::Write { "Write" } else { "Read" },
+                "danger": t.danger,
+                "enabled": !off.contains(&(row.id, t.name.to_string())),
+            })
+        }).collect();
+        out.push(serde_json::json!({
+            "connection_id": row.id,
+            "provider": row.provider,
+            "tools": tools,
+        }));
+    }
+    Ok(serde_json::json!(out))
+}
+
 /// Turn WRITE access on/off for one (agent, connection). Read is the default and
 /// write tools are not even added to the agent's tool list until this is on.
 #[tauri::command]
@@ -1953,7 +1998,8 @@ fn capabilities_list(
         for (provider, access) in connections::enabled_providers_for_agent(&db, aid) {
             let Some(def) = connectors::by_id(&provider) else { continue };
             let write = access == "write";
-            for t in def.tools_for(write) {
+            let off = connections::disabled_tools(&db, aid, &provider);
+            for t in def.tools_granted(write, &off) {
                 items.push(serde_json::json!({
                     "name": t.name, "display_name": t.name, "description": t.description,
                     "origin": "connection", "source": def.label, "enabled": true,
@@ -3104,8 +3150,12 @@ fn agent_tools_for_full(
         for (provider, access) in connections::enabled_providers_for_agent(db, agent_id) {
             let Some(def) = connectors::by_id(&provider) else { continue };
             let write = access == "write";
+            // Per-tool switches: a tool the user turned OFF is never offered to
+            // the model. This is the real control surface now that connecting an
+            // account grants full capability.
+            let off = connections::disabled_tools(db, agent_id, &provider);
             let mut names: Vec<&str> = Vec::new();
-            for t in def.tools_for(write) {
+            for t in def.tools_granted(write, &off) {
                 tools.push(connectors::tool_schema(t));
                 names.push(t.name);
             }
@@ -4540,7 +4590,7 @@ pub fn run() {
             github_connect, connections_list, connection_disconnect,
             connection_set_agent_enabled, connection_enabled_for_agent,
             connectors_catalog, connector_connect, connection_agent_state,
-            connection_set_write,
+            connection_set_write, connection_set_tool_enabled, connection_tool_states,
             memory_get_auto_remember, memory_set_auto_remember,
             pro_mode_get, pro_mode_set, shell_procs, shell_kill_proc,
             github_git_auth,

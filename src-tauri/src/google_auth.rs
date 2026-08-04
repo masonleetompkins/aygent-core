@@ -44,11 +44,16 @@ struct Claims {
     iat: u64,
 }
 
-/// The scopes we request. READ-ONLY: this connector's tools only read, so asking
-/// for write scope would be requesting authority we never use — and a token is a
-/// liability proportional to what it can do.
-const SCOPES: &str = "https://www.googleapis.com/auth/calendar.readonly \
-                      https://www.googleapis.com/auth/drive.readonly";
+/// The scopes we request. Full calendar/drive/sheets access, because the
+/// connector now offers create/update/delete tools — read-only scopes would make
+/// every write fail with a confusing 403 that looks like a sharing problem.
+///
+/// Scope is still bounded by SHARING: a service account can only touch calendars
+/// and files explicitly shared with its address, so this is not "access to all of
+/// Google", it is "full control of exactly what you handed it".
+const SCOPES: &str = "https://www.googleapis.com/auth/calendar \
+                      https://www.googleapis.com/auth/drive \
+                      https://www.googleapis.com/auth/spreadsheets";
 
 struct Cached {
     token: String,

@@ -162,8 +162,13 @@ pub fn set_agent_enabled(db: &Db, agent_id: &str, connection_id: i64, enabled: b
             ).map_err(|e| format!("clear sibling accounts: {e}"))?;
         }
 
+        // FULL CAPABILITY ON CONNECT. A new grant is 'write' because handing over
+        // a credential means "let my agent use this service". ON CONFLICT does NOT
+        // touch access_mode, so a user who deliberately switched to read-only
+        // keeps that when toggling the connection off and on.
         conn.execute(
-            "INSERT INTO agent_connection (agent_id, connection_id, enabled, provider) VALUES (?1,?2,?3,?4)
+            "INSERT INTO agent_connection (agent_id, connection_id, enabled, provider, access_mode)
+             VALUES (?1,?2,?3,?4,'write')
              ON CONFLICT(agent_id, connection_id) DO UPDATE SET enabled = excluded.enabled",
             params![a, c, if enabled { 1 } else { 0 }, provider],
         ).map_err(|e| format!("set agent_connection: {e}"))?;
@@ -574,18 +579,61 @@ mod tests {
         assert_eq!(n, 2, "both agents keep their own account enabled");
     }
 
-    /// Write access must be an explicit act, never a default.
+    /// FULL CAPABILITY ON CONNECT. Handing over a credential means "let my agent
+    /// use this service", so a new grant is 'write'. The user narrows it after,
+    /// per tool — that's what the switches are for.
     #[test]
-    fn access_mode_defaults_to_read_and_write_is_opt_in() {
+    fn new_grants_get_full_capability() {
         let (db, _d) = temp_db();
         super::set_agent_enabled(&db, "a1", 1, true).unwrap();
-        assert_eq!(super::access_for_agent(&db, "a1", "github").unwrap(), "read");
+        assert_eq!(
+            super::access_for_agent(&db, "a1", "github").unwrap(),
+            "write",
+            "connecting an account must grant full capability, not read-only"
+        );
+    }
 
-        super::set_access_mode(&db, "a1", 1, true).unwrap();
-        assert_eq!(super::access_for_agent(&db, "a1", "github").unwrap(), "write");
-
+    /// A deliberate switch back to read-only must SURVIVE toggling the connection
+    /// off and on — otherwise the new default would silently re-grant writes to
+    /// someone who explicitly refused them.
+    #[test]
+    fn a_deliberate_read_only_choice_is_not_overwritten() {
+        let (db, _d) = temp_db();
+        super::set_agent_enabled(&db, "a1", 1, true).unwrap();
         super::set_access_mode(&db, "a1", 1, false).unwrap();
         assert_eq!(super::access_for_agent(&db, "a1", "github").unwrap(), "read");
+
+        // Toggle off and back on: the user's choice must persist.
+        super::set_agent_enabled(&db, "a1", 1, false).unwrap();
+        super::set_agent_enabled(&db, "a1", 1, true).unwrap();
+        assert_eq!(
+            super::access_for_agent(&db, "a1", "github").unwrap(),
+            "read",
+            "re-enabling must not silently restore write access"
+        );
+    }
+
+    /// Per-tool switches are the real control surface: turning one off must
+    /// remove it from what the agent is given, and turning it on must restore it.
+    #[test]
+    fn per_tool_switches_add_and_remove_capability() {
+        let (db, _d) = temp_db();
+        super::set_agent_enabled(&db, "a1", 1, true).unwrap();
+        assert!(super::disabled_tools(&db, "a1", "github").is_empty(),
+                "everything is on by default");
+
+        super::set_tool_enabled(&db, "a1", 1, "github_merge_pr", false).unwrap();
+        let off = super::disabled_tools(&db, "a1", "github");
+        assert!(off.contains("github_merge_pr"));
+
+        // And the connector must actually withhold it.
+        let def = crate::connectors::by_id("github").unwrap();
+        let granted: Vec<&str> = def.tools_granted(true, &off).map(|t| t.name).collect();
+        assert!(!granted.contains(&"github_merge_pr"), "a switched-off tool must not be granted");
+        assert!(granted.contains(&"github_create_pr"), "other tools stay on");
+
+        super::set_tool_enabled(&db, "a1", 1, "github_merge_pr", true).unwrap();
+        assert!(super::disabled_tools(&db, "a1", "github").is_empty(), "switching back on restores it");
     }
 
     /// An agent with NO enabled connection must get a clear refusal, not a
@@ -610,6 +658,63 @@ mod tests {
         let (db, _d) = temp_db();
         super::set_agent_enabled(&db, "a1", 1, true).unwrap();
         let list = super::enabled_providers_for_agent(&db, "a1");
-        assert_eq!(list, vec![("github".to_string(), "read".to_string())]);
+        assert_eq!(list, vec![("github".to_string(), "write".to_string())]);
     }
+}
+
+// ---------------------------------------------------------------------------
+// PER-TOOL SWITCHES. Full capability is the default; this is how a user takes
+// individual tools away. We store what's OFF, so tools added in future releases
+// arrive enabled instead of missing from a stale allow-list.
+// ---------------------------------------------------------------------------
+
+/// Tool names this agent has switched OFF for a provider.
+pub fn disabled_tools(db: &Db, agent_id: &str, provider: &str) -> std::collections::HashSet<String> {
+    let Ok(conn) = db.reader() else { return Default::default() };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT o.tool_name FROM connection_tool_off o
+         JOIN connection c ON c.id = o.connection_id
+         WHERE o.agent_id = ?1 AND c.provider = ?2",
+    ) else { return Default::default() };
+    let rows = stmt.query_map(params![agent_id, provider], |r| r.get::<_, String>(0));
+    match rows { Ok(it) => it.flatten().collect(), Err(_) => Default::default() }
+}
+
+/// Switch one tool on or off for an (agent, connection).
+pub fn set_tool_enabled(
+    db: &Db,
+    agent_id: &str,
+    connection_id: i64,
+    tool_name: &str,
+    on: bool,
+) -> Result<(), String> {
+    let (a, c, t) = (agent_id.to_string(), connection_id, tool_name.to_string());
+    db.write(move |conn| {
+        if on {
+            conn.execute(
+                "DELETE FROM connection_tool_off WHERE agent_id=?1 AND connection_id=?2 AND tool_name=?3",
+                params![a, c, t],
+            ).map_err(|e| format!("enable tool: {e}"))?;
+        } else {
+            conn.execute(
+                "INSERT OR IGNORE INTO connection_tool_off (agent_id, connection_id, tool_name)
+                 VALUES (?1,?2,?3)",
+                params![a, c, t],
+            ).map_err(|e| format!("disable tool: {e}"))?;
+        }
+        Ok(())
+    })
+}
+
+/// All switched-off tool names for an agent, keyed by connection id — for the UI.
+pub fn disabled_tools_by_connection(
+    db: &Db,
+    agent_id: &str,
+) -> Vec<(i64, String)> {
+    let Ok(conn) = db.reader() else { return vec![] };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT connection_id, tool_name FROM connection_tool_off WHERE agent_id = ?1",
+    ) else { return vec![] };
+    let rows = stmt.query_map(params![agent_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)));
+    match rows { Ok(it) => it.flatten().collect(), Err(_) => vec![] }
 }

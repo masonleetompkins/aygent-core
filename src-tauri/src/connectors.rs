@@ -96,6 +96,11 @@ pub enum Render {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectorTool {
+    /// IRREVERSIBLE if called: permanent delete, money movement, sending mail to
+    /// real humans. Shipped ENABLED like everything else (the user asked for full
+    /// capability out of the box) but flagged so the UI can mark it and the
+    /// per-tool switch is an obvious place to look.
+    pub danger: bool,
     /// Globally unique tool name exposed to the model, e.g. "github_list_prs".
     /// Convention: <connector>_<verb>_<noun>.
     pub name: &'static str,
@@ -109,6 +114,18 @@ pub struct ConnectorTool {
     /// JSON body template for writes; {arg} substituted then parsed.
     pub body: &'static str,
     pub params: &'static [ToolParam],
+    /// Params whose value is a JSON *fragment* to splice into the body verbatim
+    /// (block arrays, property schemas, filters). Validated as parseable JSON
+    /// before use — the model can send structure, but not malformed structure.
+    pub raw_params: &'static [&'static str],
+    /// Params to base64-encode before substitution. GitHub's contents API wants
+    /// file bodies base64'd; making the model do it would be a reliability tax
+    /// for no reason.
+    pub b64_params: &'static [&'static str],
+    /// Overrides the connector's base_url for this tool. Some providers span
+    /// hosts (Google Sheets is sheets.googleapis.com while Calendar and Drive are
+    /// www.googleapis.com) while sharing one credential.
+    pub base_override: &'static str,
     pub render: Render,
 }
 
@@ -153,6 +170,22 @@ impl Connector {
         self.tools
             .iter()
             .filter(move |t| write || t.access == Access::Read)
+    }
+
+    /// Tools actually granted to an agent: access mode, minus anything the user
+    /// switched off by name. `disabled` holds fully-qualified tool names.
+    pub fn tools_granted<'a>(
+        &'a self,
+        write: bool,
+        disabled: &'a std::collections::HashSet<String>,
+    ) -> impl Iterator<Item = &'a ConnectorTool> {
+        self.tools_for(write).filter(move |t| !disabled.contains(t.name))
+    }
+
+    /// Every tool this connector could ever offer — for the UI's switch list,
+    /// which must show OFF tools too or you can't turn them back on.
+    pub fn all_tools(&self) -> impl Iterator<Item = &ConnectorTool> {
+        self.tools.iter()
     }
 }
 
@@ -407,6 +440,107 @@ mod inventory_tests {
                     "write tool {} must not be runnable from a dashboard button",
                     t.name
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod catalog_integrity {
+    /// A connector must never silently DISAPPEAR from the catalog.
+    ///
+    /// This exists because I destroyed the Slack connector with an over-wide
+    /// text replacement while editing its neighbor, and only noticed because the
+    /// compiler happened to catch a dangling reference in the ALL array. Had
+    /// Slack been last in that list, it would have vanished quietly and the only
+    /// symptom would have been a missing card in the UI.
+    #[test]
+    fn every_expected_connector_is_present() {
+        const EXPECTED: &[&str] = &[
+            "github", "notion", "linear", "google", "slack",
+            "supabase", "stripe", "resend", "cloudflare", "vercel",
+        ];
+        for id in EXPECTED {
+            assert!(
+                super::by_id(id).is_some(),
+                "connector `{id}` is missing from the catalog — did an edit clobber it?"
+            );
+        }
+        assert_eq!(
+            super::catalog().len(),
+            EXPECTED.len(),
+            "catalog size changed — update EXPECTED deliberately, don't let it drift"
+        );
+    }
+
+    /// Every connector must offer real capability. Shipping a connector with a
+    /// couple of read-only tools was the exact complaint that prompted this work:
+    /// "hardly useful". Four is a floor, not a target.
+    #[test]
+    fn no_connector_is_trivially_small() {
+        for c in super::catalog() {
+            assert!(
+                c.tools.len() >= 4,
+                "{} has only {} tools — a connected account should unlock real capability",
+                c.id,
+                c.tools.len()
+            );
+        }
+    }
+
+    /// Anything that can change or destroy user data must be marked Write, so the
+    /// per-tool switches and the UI labels tell the truth.
+    #[test]
+    fn mutating_methods_are_marked_write() {
+        for c in super::catalog() {
+            for t in c.tools {
+                let mutating = matches!(t.method, "POST" | "PATCH" | "PUT" | "DELETE");
+                // POST is also used for read-only queries (GraphQL, search), so
+                // only DELETE/PATCH/PUT are unambiguously mutations.
+                if matches!(t.method, "PATCH" | "PUT" | "DELETE") {
+                    assert_eq!(
+                        t.access,
+                        super::Access::Write,
+                        "{} uses {} but is marked Read",
+                        t.name,
+                        t.method
+                    );
+                }
+                let _ = mutating;
+            }
+        }
+    }
+
+    /// Descriptions are what the MODEL reads to choose a tool. A vague or missing
+    /// one makes a capability unusable no matter how correct the HTTP call is.
+    #[test]
+    fn every_tool_has_a_usable_description() {
+        for c in super::catalog() {
+            for t in c.tools {
+                assert!(
+                    t.description.len() > 25,
+                    "{} has too thin a description for a model to choose it well",
+                    t.name
+                );
+            }
+        }
+    }
+
+    /// Raw params must actually appear in the body template, or the model is told
+    /// to send structure that gets silently dropped.
+    #[test]
+    fn raw_params_are_referenced_by_the_body() {
+        for c in super::catalog() {
+            for t in c.tools {
+                for r in t.raw_params {
+                    let needle = format!("{{{r}}}");
+                    assert!(
+                        t.body.contains(&needle),
+                        "{}: raw param `{}` never appears in its body template",
+                        t.name,
+                        r
+                    );
+                }
             }
         }
     }

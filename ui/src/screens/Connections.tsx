@@ -38,6 +38,11 @@ type AgentState = {
   enabled_ids: number[];
   providers: { provider: string; access_mode: string }[];
 };
+type ToolState = {
+  name: string; description: string;
+  access: "Read" | "Write"; danger: boolean; enabled: boolean;
+};
+type ConnToolStates = { connection_id: number; provider: string; tools: ToolState[] };
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 const faint = { ...hint, fontSize: 12, color: "var(--text-faint)" } as const;
@@ -49,6 +54,8 @@ export function Connections({ agentId }: { agentId: string | null }) {
   const [err, setErr] = useState<string | null>(null);
   const [ok, setOk] = useState<string | null>(null);
   const [connectingTo, setConnectingTo] = useState<Connector | null>(null);
+  const [toolStates, setToolStates] = useState<ConnToolStates[]>([]);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [query, setQuery] = useState("");
 
   async function refresh() {
@@ -59,17 +66,19 @@ export function Connections({ agentId }: { agentId: string | null }) {
       ]);
       setCatalog(cat);
       setConns(list);
-      if (agentId) setState(await invoke<AgentState>("connection_agent_state", { agentId }));
-      else setState({ enabled_ids: [], providers: [] });
+      if (agentId) {
+        setState(await invoke<AgentState>("connection_agent_state", { agentId }));
+        setToolStates(await invoke<ConnToolStates[]>("connection_tool_states", { agentId }));
+      } else {
+        setState({ enabled_ids: [], providers: [] });
+        setToolStates([]);
+      }
     } catch (e) { setErr(String(e)); }
   }
   useEffect(() => { refresh(); /* eslint-disable-next-line */ }, [agentId]);
 
   function accountsFor(providerId: string) {
     return conns.filter((c) => c.provider === providerId);
-  }
-  function modeFor(providerId: string) {
-    return state.providers.find((p) => p.provider === providerId)?.access_mode ?? "read";
   }
 
   // Enabling an account for this agent REPLACES any other account for the same
@@ -95,11 +104,13 @@ export function Connections({ agentId }: { agentId: string | null }) {
       await refresh();
     } catch (e) { setErr(String(e)); }
   }
-  async function setWrite(c: Connection, write: boolean) {
+  async function setToolEnabled(c: Connection, toolName: string, on: boolean) {
     if (!agentId) return;
     setErr(null);
     try {
-      await invoke("connection_set_write", { agentId, connectionId: c.id, write });
+      await invoke("connection_set_tool_enabled", {
+        agentId, connectionId: c.id, toolName, on,
+      });
       await refresh();
     } catch (e) { setErr(String(e)); }
   }
@@ -143,9 +154,7 @@ export function Connections({ agentId }: { agentId: string | null }) {
                          textTransform: "uppercase", color: "var(--text-faint)" }}>{category}</span>
           {items.map((def) => {
             const accounts = accountsFor(def.id);
-            const writeMode = modeFor(def.id) === "write";
             const activeAcct = accounts.find((a) => state.enabled_ids.includes(a.id));
-            const hasWriteTools = def.tools.some((t) => t.access === "Write");
             const setupOnly = def.tools.length === 0;
             return (
               <Card key={def.id} title={def.label}>
@@ -187,41 +196,69 @@ export function Connections({ agentId }: { agentId: string | null }) {
                   </div>
                 )}
 
-                {/* WRITE GATE. Deliberately separate, off by default, and it
-                    states the blast radius instead of a vague "allow writes". */}
-                {activeAcct && hasWriteTools && (
-                  <div style={{
-                    marginTop: 10, padding: 10, borderRadius: "var(--radius-control)",
-                    border: `var(--border-width) solid ${writeMode ? "var(--danger, #b4442f)" : "var(--line)"}`,
-                  }}>
-                    <label style={{ display: "flex", gap: 8, alignItems: "flex-start", cursor: "pointer" }}>
-                      <input type="checkbox" checked={writeMode}
-                             onChange={(e) => setWrite(activeAcct, e.target.checked)} />
-                      <span style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                        <span style={{ fontWeight: 700, fontSize: 14 }}>Allow write actions</span>
-                        <span style={faint}>{def.write_warning}</span>
-                      </span>
-                    </label>
-                  </div>
-                )}
+                {/* CAPABILITIES. Connecting an account grants everything that
+                    account can do — that's what handing over a credential means.
+                    This panel is where a user takes individual tools BACK. Each
+                    row is a switch, so "don't let it delete things" is one click
+                    rather than an all-or-nothing read-only mode. */}
+                {activeAcct && !setupOnly && (() => {
+                  const ts = toolStates.find((t) => t.connection_id === activeAcct.id);
+                  if (!ts) return null;
+                  const on = ts.tools.filter((t) => t.enabled).length;
+                  const key = `${def.id}-${activeAcct.id}`;
+                  const isOpen = expanded[key] ?? false;
+                  return (
+                    <div style={{ marginTop: 10 }}>
+                      <button
+                        onClick={() => setExpanded((x) => ({ ...x, [key]: !isOpen }))}
+                        style={{
+                          display: "flex", alignItems: "center", gap: 8, width: "100%",
+                          padding: "8px 10px", cursor: "pointer", textAlign: "left",
+                          borderRadius: "var(--radius-control)", color: "var(--text)",
+                          border: "var(--border-width) solid var(--line)", background: "transparent",
+                        }}
+                      >
+                        <span style={{ fontWeight: 700, fontSize: 14 }}>
+                          {isOpen ? "▾" : "▸"} {on} of {ts.tools.length} capabilities on
+                        </span>
+                        <span style={{ flex: 1 }} />
+                        <span style={faint}>{isOpen ? "hide" : "customize"}</span>
+                      </button>
 
-                {/* What the agent actually gains. Read tools always, write tools
-                    only listed when write is on — so the list is the truth. */}
-                {activeAcct && !setupOnly && (
-                  <details style={{ marginTop: 8 }}>
-                    <summary style={{ ...faint, cursor: "pointer" }}>
-                      {def.tools.filter((t) => writeMode || t.access === "Read").length} tools available to this agent
-                    </summary>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6 }}>
-                      {def.tools.filter((t) => writeMode || t.access === "Read").map((t) => (
-                        <div key={t.name} style={{ display: "flex", gap: 8, alignItems: "baseline" }}>
-                          <code style={{ fontSize: 12 }}>{t.name}</code>
-                          {t.access === "Write" && <Pill tone="danger">write</Pill>}
+                      {isOpen && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 6 }}>
+                          <p style={{ ...faint, margin: "2px 0 6px" }}>
+                            Everything is on by default. Switch off anything you'd rather the agent
+                            couldn't do.
+                          </p>
+                          {ts.tools.map((t) => (
+                            <label key={t.name} style={{
+                              display: "flex", alignItems: "flex-start", gap: 8, padding: "6px 8px",
+                              borderRadius: "var(--radius-control)", cursor: "pointer",
+                              border: `var(--border-width) solid ${t.enabled ? "var(--line)" : "transparent"}`,
+                              opacity: t.enabled ? 1 : 0.5,
+                            }}>
+                              <input
+                                type="checkbox"
+                                checked={t.enabled}
+                                onChange={(e) => setToolEnabled(activeAcct, t.name, e.target.checked)}
+                                style={{ marginTop: 3 }}
+                              />
+                              <span style={{ display: "flex", flexDirection: "column", gap: 1, flex: 1 }}>
+                                <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                                  <code style={{ fontSize: 12.5, fontWeight: 700 }}>{t.name}</code>
+                                  {t.access === "Write" && <Pill tone="muted">writes</Pill>}
+                                  {t.danger && <Pill tone="danger">can't be undone</Pill>}
+                                </span>
+                                <span style={faint}>{t.description}</span>
+                              </span>
+                            </label>
+                          ))}
                         </div>
-                      ))}
+                      )}
                     </div>
-                  </details>
-                )}
+                  );
+                })()}
 
                 <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
                   <Button variant={accounts.length ? "secondary" : "primary"}

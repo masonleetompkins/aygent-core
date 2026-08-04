@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 /// Current schema version. Bump when adding a migration step below.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// The DB file name under <app_data>.
 pub const DB_FILE: &str = "aygent.db";
@@ -204,6 +204,25 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("migrate v10: {e}"))?;
         set_version(conn, 10)?;
         v = 10;
+    }
+
+    if v < 11 {
+        // FULL CAPABILITY BY DEFAULT + PER-TOOL SWITCHES.
+        //
+        // v10 shipped connections read-only with write as an opt-in toggle. In
+        // practice that meant connecting Notion bought you two tools and no
+        // ability to act — "hardly useful" was the accurate description. If a
+        // user hands us a credential, the intent is for the agent to USE that
+        // service; safety belongs in per-tool control, not a crippled default.
+        //
+        // The OFF list (rather than an allow-list) is the important choice: when
+        // a connector gains tools in a later release they arrive ENABLED, instead
+        // of being invisible because an allow-list written months ago didn't
+        // mention them.
+        conn.execute_batch(SCHEMA_V11)
+            .map_err(|e| format!("migrate v11: {e}"))?;
+        set_version(conn, 11)?;
+        v = 11;
     }
 
     let _ = v;
@@ -610,4 +629,25 @@ UPDATE agent_connection SET provider = (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_conn_one_enabled_per_provider
   ON agent_connection(agent_id, provider) WHERE enabled = 1;
+"#;
+
+/// SCHEMA v11 — write-by-default + per-tool disable list.
+///
+/// `access_mode` default flips to 'write': connecting an account grants the full
+/// capability of that account, which is what handing over a credential means.
+/// Existing rows are LEFT ALONE — someone who deliberately chose read-only keeps
+/// it; only new grants get the new default.
+///
+/// `connection_tool_off` holds individually switched-off tools per (agent,
+/// connection). Absence means enabled, so new tools in future releases are on by
+/// default rather than silently missing.
+const SCHEMA_V11: &str = r#"
+CREATE TABLE IF NOT EXISTS connection_tool_off (
+  agent_id      TEXT NOT NULL,
+  connection_id INTEGER NOT NULL,
+  tool_name     TEXT NOT NULL,
+  PRIMARY KEY (agent_id, connection_id, tool_name),
+  FOREIGN KEY (agent_id) REFERENCES agent(id) ON DELETE CASCADE,
+  FOREIGN KEY (connection_id) REFERENCES connection(id) ON DELETE CASCADE
+);
 "#;
