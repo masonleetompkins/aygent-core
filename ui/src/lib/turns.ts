@@ -66,6 +66,10 @@ function liveBodyFromPartialArgs(name: string, raw: string): string | undefined 
 // write_file can't bloat the conversation store or the DOM. The full content
 // is on disk regardless — render limits are not data loss.
 const BODY_CAP = 16000;
+function safeJson(v: unknown): string {
+  try { return JSON.stringify(v, null, 2); } catch { return ""; }
+}
+
 function capBody(s: string | undefined): string | undefined {
   if (!s) return undefined;
   if (s.length <= BODY_CAP) return s;
@@ -100,6 +104,19 @@ export function describeToolUse(name: string, input: any): { summary: string; bo
     case "shell_kill": return { summary: `⏹ kill ${inp.proc_handle ?? "?"}` };
     case "shell_write": return { summary: `⌨ stdin → ${inp.proc_handle ?? "?"}`, body: capBody(typeof inp.data === "string" ? inp.data : undefined) };
     case "transcribe_audio": return { summary: `🎙 ${inp.path ?? "?"}` };
+    // DASHBOARD (M2): the generic fallback would dump raw spec JSON, which is
+    // both noisy and the most interesting thing to read — so summarize the
+    // human-meaningful part (what module, called what) and keep the spec as the
+    // expandable body.
+    case "dashboard_get": return { summary: "▦ read dashboard" };
+    case "dashboard_add_module":
+      return { summary: `▦ + ${inp.kind ?? "module"} “${inp.title ?? "untitled"}”`, body: capBody(safeJson(inp)) };
+    case "dashboard_update_module":
+      return { summary: `▦ update ${inp.title ? `“${inp.title}”` : (inp.id ?? "module")}`, body: capBody(safeJson(inp)) };
+    case "dashboard_remove_module":
+      return { summary: `▦ remove ${inp.id ?? "module"}` };
+    case "dashboard_arrange":
+      return { summary: `▦ rearrange ${Array.isArray(inp.moves) ? inp.moves.length : 0} module${Array.isArray(inp.moves) && inp.moves.length === 1 ? "" : "s"}`, body: capBody(safeJson(inp)) };
     default: {
       // Unknown/registry tool: show its args compactly instead of nothing.
       let args = ""; try { args = JSON.stringify(inp); } catch { /* ignore */ }

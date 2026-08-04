@@ -2923,6 +2923,13 @@ fn agent_tools_for_full(
 
     // CONNECTION TOOLS (M1.9): if GitHub is connected + enabled for this agent,
     // surface its read tools. Token is attached Rust-side at call time.
+    // DASHBOARD TOOLS (M2): always available when we have an agent identity —
+    // every agent owns exactly one dashboard, so there is nothing to enable.
+    if conn_ctx.is_some() {
+        for schema in dashboard::tool_schemas() { tools.push(schema); }
+        extra_instructions.push_str(dashboard::tool_instructions());
+    }
+
     if let Some((db, agent_id)) = conn_ctx {
         if connections::provider_enabled_for_agent(db, agent_id, "github") {
             tools.push(serde_json::json!({
@@ -3323,7 +3330,11 @@ async fn agent_stream(
                     "kind": "ToolUse", "id": call_id, "name": c.name,
                     "input": c.input,
                 }));
-                let (result, is_err) = exec_tool_cfg(&broker, &scope_id, &c.name, &c.input, &pdf_cfg);
+                let (result, is_err) = if dashboard::is_dashboard_tool(&c.name) {
+                    dashboard::exec_dashboard_tool(&db, &scope_id, &c.name, &c.input)
+                } else {
+                    exec_tool_cfg(&broker, &scope_id, &c.name, &c.input, &pdf_cfg)
+                };
                 let path_s = c.input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
                 let _ = app.emit(&channel, &serde_json::json!({
                     "kind": "ToolResult", "id": call_id, "name": c.name, "path": path_s,
@@ -3479,6 +3490,8 @@ async fn agent_stream(
                                 }
                             }
                         }
+                    } else if dashboard::is_dashboard_tool(&name) {
+                        dashboard::exec_dashboard_tool(&db, &scope_id, &name, &input)
                     } else {
                         exec_tool_cfg(&broker, &scope_id, &name, &input, &pdf_cfg)
                     };
@@ -3721,6 +3734,8 @@ async fn agent_stream(
                                 }
                             }
                         }
+                    } else if dashboard::is_dashboard_tool(&name) {
+                        dashboard::exec_dashboard_tool(&db, &scope_id, &name, &input)
                     } else {
                     // Run the tool inside catch_unwind so a PANIC (e.g. deep in
                     // genpdf table/render) becomes a VISIBLE tool error the model
@@ -4117,6 +4132,8 @@ pub async fn run_headless_turn(
                                     Ok(mailbox::SendResult::Refused { reason }) => (format!("not sent: {reason}"), true),
                                     Err(e) => (format!("send failed: {e}"), true),
                                 }
+                            } else if dashboard::is_dashboard_tool(&name) {
+                                dashboard::exec_dashboard_tool(db, agent_id, &name, &input)
                             } else {
                                 exec_tool_cfg(broker, agent_id, &name, &input, &pdf_cfg)
                             };

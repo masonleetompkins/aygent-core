@@ -843,6 +843,101 @@ mod tests {
         assert_eq!(back.modules[0].id, id);
     }
 
+    // ---- M2: the agent tool layer ----
+
+    #[test]
+    fn add_module_tool_creates_a_visible_module() {
+        let (db, _dir) = temp_db();
+        let (out, err) = exec_dashboard_tool(&db, "a_test", "dashboard_add_module",
+            &v(r#"{"kind":"stat","title":"Open PRs","layout":{"x":0,"y":0,"w":3,"h":3},"source":{"kind":"static","data":{"value":4}}}"#));
+        assert!(!err, "add should succeed: {out}");
+        assert_eq!(load(&db, "a_test").unwrap().modules.len(), 1);
+    }
+
+    #[test]
+    fn a_bad_spec_comes_back_as_repairable_errors_not_a_crash() {
+        // THE REPAIR LOOP. A bogus kind must return is_error=true WITH a field
+        // list, so the model can correct itself instead of the user seeing a
+        // broken card or an apology.
+        let (db, _dir) = temp_db();
+        let (out, err) = exec_dashboard_tool(&db, "a_test", "dashboard_add_module",
+            &v(r#"{"kind":"gauge","title":"Nope"}"#));
+        assert!(err, "invalid spec must be flagged as an error");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("errors must be JSON the model can parse");
+        assert_eq!(parsed["ok"], false);
+        assert!(parsed["errors"][0]["hint"].as_str().unwrap().contains("stat"));
+        assert!(parsed["retry"].is_string(), "must tell the model to retry");
+        // and nothing was written
+        assert_eq!(load(&db, "a_test").unwrap().modules.len(), 0);
+    }
+
+    #[test]
+    fn add_ignores_a_model_supplied_id() {
+        // A model that echoes an existing id on ADD would silently overwrite
+        // that module. Two adds with the same id must yield TWO modules.
+        let (db, _dir) = temp_db();
+        let raw = v(r#"{"id":"collide","kind":"stat","title":"A"}"#);
+        exec_dashboard_tool(&db, "a_test", "dashboard_add_module", &raw);
+        exec_dashboard_tool(&db, "a_test", "dashboard_add_module", &raw);
+        assert_eq!(load(&db, "a_test").unwrap().modules.len(), 2, "add must never overwrite by id");
+    }
+
+    #[test]
+    fn update_is_a_patch_not_a_replace() {
+        // Updating only the title must NOT blank the source/layout the user
+        // already has — the most likely way a "tweak" would destroy work.
+        let (db, _dir) = temp_db();
+        let (out, _) = exec_dashboard_tool(&db, "a_test", "dashboard_add_module",
+            &v(r#"{"kind":"stat","title":"Revenue","layout":{"x":2,"y":1,"w":5,"h":4},"source":{"kind":"static","data":{"value":99}}}"#));
+        let id = serde_json::from_str::<serde_json::Value>(&out).unwrap()["id"].as_str().unwrap().to_string();
+
+        let (_, err) = exec_dashboard_tool(&db, "a_test", "dashboard_update_module",
+            &serde_json::json!({ "id": id, "title": "MRR" }));
+        assert!(!err);
+
+        let m = &load(&db, "a_test").unwrap().modules[0];
+        assert_eq!(m.spec.title, "MRR", "title should change");
+        assert_eq!(m.spec.layout.w, 5, "layout must survive a title-only patch");
+        match &m.spec.source {
+            DataSource::Static { data } => assert_eq!(data["value"], 99, "data must survive a title-only patch"),
+            other => panic!("source was replaced: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_of_a_missing_id_is_a_helpful_error() {
+        let (db, _dir) = temp_db();
+        let (out, err) = exec_dashboard_tool(&db, "a_test", "dashboard_update_module",
+            &serde_json::json!({ "id": "nope", "title": "x" }));
+        assert!(err);
+        assert!(out.contains("dashboard_get"), "should point the model at how to recover: {out}");
+    }
+
+    #[test]
+    fn get_reports_the_next_free_row_for_placement() {
+        // The model needs somewhere to PUT the next card; without this it
+        // stacks everything at y=0 and cards overlap.
+        let (db, _dir) = temp_db();
+        exec_dashboard_tool(&db, "a_test", "dashboard_add_module",
+            &v(r#"{"kind":"stat","title":"A","layout":{"x":0,"y":0,"w":3,"h":3}}"#));
+        let (out, err) = exec_dashboard_tool(&db, "a_test", "dashboard_get", &serde_json::json!({}));
+        assert!(!err);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["module_count"], 1);
+        assert_eq!(parsed["next_free_row"], 3);
+        assert_eq!(parsed["grid_cols"], 12);
+    }
+
+    #[test]
+    fn every_advertised_tool_is_dispatchable() {
+        // Guards the seam: a schema the model can see but the dispatcher can't
+        // route is a silent dead end.
+        for schema in tool_schemas() {
+            let name = schema["name"].as_str().unwrap();
+            assert!(is_dashboard_tool(name), "{name} is advertised but not routed");
+        }
+    }
+
     #[test]
     fn dashboard_is_one_per_agent() {
         let (db, _dir) = temp_db();
@@ -872,4 +967,232 @@ mod tests {
         };
         assert!(edited.is_pending_approval(), "any edit must re-require approval");
     }
+}
+
+// ---------------------------------------------------------------------------
+// M2 — THE AGENT TOOL LAYER
+//
+// Five tools let the model build a dashboard by emitting validated specs. The
+// contract that makes this work is the REPAIR LOOP: a bad emit never reaches
+// the user as a broken card. It comes back as structured `errors` the model
+// fixes on its next round. That is the whole reason modules are specs and not
+// code — JSON can be told exactly what's wrong with it.
+//
+// SAFETY: none of these tools fetch, run, or spend. They only read and write
+// spec rows. A module created here sits inert until a human clicks Refresh.
+// ---------------------------------------------------------------------------
+
+/// The tool schemas handed to the model. Kept in ONE place so the Anthropic,
+/// OpenAI, and local-model paths cannot drift apart.
+pub fn tool_schemas() -> Vec<serde_json::Value> {
+    let kinds = ModuleKind::ALL.join(", ");
+    vec![
+        serde_json::json!({
+            "name": "dashboard_get",
+            "description": "Read the user's current dashboard: every module with its id, kind, title, layout and data source. ALWAYS call this before adding or changing modules, so you build on what's there instead of duplicating it.",
+            "input_schema": { "type": "object", "properties": {} }
+        }),
+        serde_json::json!({
+            "name": "dashboard_add_module",
+            "description": format!(
+                "Add a module to the dashboard. `kind` is one of: {kinds}. \
+                 Layout is a 12-column grid: x is the column (0-11), w is width in columns, \
+                 h is height in ~44px rows. A stat card is usually w:3 h:3; a list or markdown \
+                 card w:5-6 h:5-8. Place new modules where they don't overlap existing ones. \
+                 For `static` data you supply the values directly. NOTHING you create runs \
+                 automatically — the user refreshes when they choose to."
+            ),
+            "input_schema": { "type": "object", "properties": {
+                "kind": { "type": "string", "description": format!("one of: {kinds}") },
+                "title": { "type": "string", "description": "short human label, e.g. \"Open PRs\"" },
+                "layout": { "type": "object", "description": "{x,y,w,h} on a 12-col grid", "properties": {
+                    "x": {"type":"integer"}, "y": {"type":"integer"},
+                    "w": {"type":"integer"}, "h": {"type":"integer"}
+                } },
+                "source": { "type": "object", "description": "{kind:\"static\", data:...} — static is the only source wired today; others are accepted but won't fetch until a later release" },
+                "props": { "type": "object", "description": "presentation options, e.g. {unit:\"$\"} on a stat" },
+                "actions": { "type": "array", "description": "buttons: [{label, action:{kind:\"run_prompt\", prompt:\"...\"}}]", "items": {"type":"object"} }
+            }, "required": ["kind", "title"] }
+        }),
+        serde_json::json!({
+            "name": "dashboard_update_module",
+            "description": "Change an existing module. Pass its `id` (from dashboard_get) plus only the fields you want to change. Use this to retitle, resize, move, or re-point a module rather than deleting and re-adding it.",
+            "input_schema": { "type": "object", "properties": {
+                "id": { "type": "string" },
+                "kind": { "type": "string" }, "title": { "type": "string" },
+                "layout": { "type": "object" }, "source": { "type": "object" },
+                "props": { "type": "object" }, "actions": { "type": "array", "items": {"type":"object"} }
+            }, "required": ["id"] }
+        }),
+        serde_json::json!({
+            "name": "dashboard_remove_module",
+            "description": "Remove a module by id. The change is reversible — the user can undo it — but don't remove things you didn't create unless the user asked.",
+            "input_schema": { "type": "object", "properties": {
+                "id": { "type": "string" }
+            }, "required": ["id"] }
+        }),
+        serde_json::json!({
+            "name": "dashboard_arrange",
+            "description": "Reposition several modules at once on the 12-column grid. Use this to tidy a layout after adding cards, so nothing overlaps and related modules sit together.",
+            "input_schema": { "type": "object", "properties": {
+                "moves": { "type": "array", "description": "[{id, layout:{x,y,w,h}}]", "items": {"type":"object"} }
+            }, "required": ["moves"] }
+        }),
+    ]
+}
+
+pub fn is_dashboard_tool(name: &str) -> bool {
+    matches!(name,
+        "dashboard_get" | "dashboard_add_module" | "dashboard_update_module"
+        | "dashboard_remove_module" | "dashboard_arrange")
+}
+
+/// The instruction block appended to the system prompt when dashboard tools are
+/// live. Short on purpose: the schemas carry the mechanics, this carries taste.
+pub fn tool_instructions() -> &'static str {
+    "\n\nYou can build the user's DASHBOARD with dashboard_get / dashboard_add_module / \
+     dashboard_update_module / dashboard_remove_module / dashboard_arrange. Call dashboard_get \
+     FIRST so you extend what's already there. Prefer a few well-chosen modules over many \
+     noisy ones, give each a specific title, and lay them out so the most important thing is \
+     top-left. If a tool returns `errors`, read them and retry with a corrected spec. Nothing \
+     you add ever runs on its own — the user decides when data refreshes."
+}
+
+/// Execute one dashboard tool. Returns (result_text, is_error) to match the
+/// signature every other tool in the loop uses.
+///
+/// On a validation failure this returns the structured errors as JSON with
+/// is_error=true — that pairing is what drives the repair loop: the model sees
+/// a failure AND exactly which field to fix.
+pub fn exec_dashboard_tool(
+    db: &Db,
+    agent_id: &str,
+    name: &str,
+    input: &serde_json::Value,
+) -> (String, bool) {
+    match name {
+        "dashboard_get" => match load(db, agent_id) {
+            Ok(view) => {
+                // Summarize rather than dumping specs: the model needs ids,
+                // kinds and geometry to place the next card, not cached payloads.
+                let mods: Vec<serde_json::Value> = view.modules.iter().map(|m| serde_json::json!({
+                    "id": m.id,
+                    "kind": m.spec.kind.as_str(),
+                    "title": m.spec.title,
+                    "layout": { "x": m.spec.layout.x, "y": m.spec.layout.y, "w": m.spec.layout.w, "h": m.spec.layout.h },
+                    "source": m.spec.source,
+                })).collect();
+                let next_y = view.modules.iter()
+                    .map(|m| m.spec.layout.y + m.spec.layout.h)
+                    .max().unwrap_or(0);
+                (serde_json::json!({
+                    "module_count": mods.len(),
+                    "grid_cols": GRID_COLS,
+                    "next_free_row": next_y,
+                    "modules": mods,
+                }).to_string(), false)
+            }
+            Err(e) => (format!("could not read dashboard: {e}"), true),
+        },
+
+        "dashboard_add_module" => {
+            let mut raw = input.clone();
+            // An id on an ADD would silently overwrite an existing module.
+            if let Some(o) = raw.as_object_mut() { o.remove("id"); }
+            match validate_module(&raw) {
+                Ok(spec) => {
+                    let summary = format!("add {} \"{}\"", spec.kind.as_str(), spec.title);
+                    let kind = spec.kind.as_str();
+                    let title = spec.title.clone();
+                    match upsert_module(db, agent_id, spec, summary) {
+                        Ok(id) => (serde_json::json!({
+                            "ok": true, "id": id, "kind": kind, "title": title,
+                            "note": "module added and visible to the user immediately"
+                        }).to_string(), false),
+                        Err(e) => (format!("could not save module: {e}"), true),
+                    }
+                }
+                Err(errs) => (spec_error_reply(&errs), true),
+            }
+        }
+
+        "dashboard_update_module" => {
+            let Some(id) = input.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+                return ("dashboard_update_module needs the module `id` (call dashboard_get to find it)".into(), true);
+            };
+            // PATCH semantics: load the current spec and overlay only the keys
+            // the model supplied. A partial update must never blank out fields
+            // it didn't mention.
+            let view = match load(db, agent_id) {
+                Ok(v) => v,
+                Err(e) => return (format!("could not read dashboard: {e}"), true),
+            };
+            let Some(existing) = view.modules.iter().find(|m| m.id == id) else {
+                return (format!("no module with id `{id}` — call dashboard_get for the current list"), true);
+            };
+            let mut merged = match serde_json::to_value(&existing.spec) {
+                Ok(v) => v, Err(e) => return (format!("could not read module: {e}"), true),
+            };
+            if let (Some(m), Some(patch)) = (merged.as_object_mut(), input.as_object()) {
+                for (k, v) in patch {
+                    if k == "id" { continue; }
+                    m.insert(k.clone(), v.clone());
+                }
+            }
+            if let Some(m) = merged.as_object_mut() {
+                m.insert("id".into(), serde_json::Value::String(id.to_string()));
+            }
+            match validate_module(&merged) {
+                Ok(spec) => {
+                    let summary = format!("update \"{}\"", spec.title);
+                    match upsert_module(db, agent_id, spec, summary) {
+                        Ok(_) => (serde_json::json!({ "ok": true, "id": id }).to_string(), false),
+                        Err(e) => (format!("could not save module: {e}"), true),
+                    }
+                }
+                Err(errs) => (spec_error_reply(&errs), true),
+            }
+        }
+
+        "dashboard_remove_module" => {
+            let Some(id) = input.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+                return ("dashboard_remove_module needs the module `id`".into(), true);
+            };
+            match remove_module(db, agent_id, id.to_string()) {
+                Ok(_) => (serde_json::json!({ "ok": true, "removed": id }).to_string(), false),
+                Err(e) => (format!("could not remove module: {e}"), true),
+            }
+        }
+
+        "dashboard_arrange" => {
+            let Some(moves) = input.get("moves").and_then(|m| m.as_array()) else {
+                return ("dashboard_arrange needs `moves`: [{id, layout:{x,y,w,h}}]".into(), true);
+            };
+            let parsed: Vec<(String, Layout)> = moves.iter().filter_map(|m| {
+                let id = m.get("id")?.as_str()?.to_string();
+                let layout: Layout = serde_json::from_value(m.get("layout")?.clone()).ok()?;
+                Some((id, layout))
+            }).collect();
+            if parsed.is_empty() {
+                return ("no valid moves — each needs {id, layout:{x,y,w,h}}".into(), true);
+            }
+            let n = parsed.len();
+            match arrange(db, agent_id, parsed) {
+                Ok(_) => (serde_json::json!({ "ok": true, "moved": n }).to_string(), false),
+                Err(e) => (format!("could not arrange: {e}"), true),
+            }
+        }
+
+        _ => (format!("unknown dashboard tool `{name}`"), true),
+    }
+}
+
+/// Format validation failures for the model. Explicitly tells it to retry —
+/// without that nudge models tend to apologize to the user instead of fixing.
+fn spec_error_reply(errs: &[SpecError]) -> String {
+    serde_json::json!({
+        "ok": false,
+        "errors": errs,
+        "retry": "Fix the listed fields and call the tool again. Do not tell the user it failed — just correct it."
+    }).to_string()
 }
