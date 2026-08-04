@@ -160,12 +160,20 @@ pub async fn call(
         .query
         .iter()
         .filter_map(|(k, v)| {
-            let filled = connectors::fill(v, &ctx);
-            let is_templated = v.contains('{');
-            if is_templated && filled.trim().is_empty() {
-                None // optional arg not supplied → omit the whole param
+            // Both key AND value are templated: PostgREST filters put the COLUMN in
+            // the key ({filter_col}) and the condition in the value ({filter_val}).
+            let key = connectors::fill(k, &ctx);
+            let val = connectors::fill(v, &ctx);
+            let key_templated = k.contains('{');
+            let val_templated = v.contains('{');
+            // Drop the param if a templated side resolved to empty — an omitted
+            // optional filter must not send a malformed "=value" or "col=".
+            if (key_templated && key.trim().is_empty())
+                || (val_templated && val.trim().is_empty())
+            {
+                None
             } else {
-                Some((k.to_string(), filled))
+                Some((key, val))
             }
         })
         .collect();
@@ -492,5 +500,55 @@ mod raw_tests {
         assert!(keys.contains(&"apikey"), "constant param kept");
         assert!(!keys.contains(&"limit"), "empty templated param dropped");
         assert!(!keys.contains(&"order"), "empty templated param dropped");
+    }
+
+    /// Query KEYS are templated, not just values — PostgREST filters put the
+    /// column in the key ({filter_col}=eq.x). Caught mid-delete against Mason's
+    /// real DB: the literal "{filter_col}" was sent and PostgREST 400'd with
+    /// "failed to parse tree path ({filter_col})". A delete that silently sent the
+    /// wrong filter could hit the wrong rows, so this is the dangerous class.
+    #[test]
+    fn query_keys_are_templated_not_just_values() {
+        let ctx = serde_json::json!({ "filter_col": "email", "filter_val": "eq.test@x.com" });
+        let query: &[(&str, &str)] = &[("{filter_col}", "{filter_val}")];
+        let out: Vec<(String, String)> = query
+            .iter()
+            .filter_map(|(k, v)| {
+                let key = crate::connectors::fill(k, &ctx);
+                let val = crate::connectors::fill(v, &ctx);
+                let kt = k.contains('{');
+                let vt = v.contains('{');
+                if (kt && key.trim().is_empty()) || (vt && val.trim().is_empty()) {
+                    None
+                } else {
+                    Some((key, val))
+                }
+            })
+            .collect();
+        assert_eq!(out, vec![("email".to_string(), "eq.test@x.com".to_string())],
+                   "the column must land in the key position, substituted");
+    }
+
+    /// An omitted filter (empty key) drops the whole param — it must NEVER produce
+    /// a filterless DELETE, which would hit every row.
+    #[test]
+    fn empty_filter_key_drops_param_never_deletes_everything() {
+        let ctx = serde_json::json!({ "filter_val": "eq.x" }); // filter_col missing
+        let query: &[(&str, &str)] = &[("{filter_col}", "{filter_val}")];
+        let out: Vec<(String, String)> = query
+            .iter()
+            .filter_map(|(k, v)| {
+                let key = crate::connectors::fill(k, &ctx);
+                let val = crate::connectors::fill(v, &ctx);
+                let kt = k.contains('{');
+                let vt = v.contains('{');
+                if (kt && key.trim().is_empty()) || (vt && val.trim().is_empty()) {
+                    None
+                } else {
+                    Some((key, val))
+                }
+            })
+            .collect();
+        assert!(out.is_empty(), "a missing filter column must drop the param, not send a blank one");
     }
 }
