@@ -20,10 +20,8 @@ import { ModuleBody, ModuleMeta, cardStyle, type ModuleRow } from "../components
 import { IconBtn } from "../components/dashboard/Modules2";
 import { PRESETS } from "../components/dashboard/presets";
 import type { ActionCtx } from "../components/dashboard/actions";
-
-const GRID_COLS = 12;
-const ROW_H = 44;
-const GAP = 16;
+import { useGridDrag, ResizeGrip } from "../components/dashboard/useGridDrag";
+import { GRID_COLS, ROW_H, GAP, type Placed } from "../components/dashboard/gridDrag";
 
 interface DashboardView {
   id: string; agent_id: string; title: string; modules: ModuleRow[];
@@ -136,6 +134,26 @@ export function Dashboard({
       setNote(`Applied “${p.name}”. Nothing has run yet — hit Refresh when you're ready.`);
     } catch (e) { setNote(String(e)); }
   }
+
+  // Geometry the grid actually renders. During a drag this is the live preview
+  // (nothing persisted yet); otherwise it's what's in the database.
+  const placed: Placed[] = useMemo(
+    () => modules.map((m) => ({ id: m.id, ...m.spec.layout })),
+    [modules],
+  );
+
+  const commitMoves = useCallback((moves: Placed[]) => {
+    if (!agentId) return;
+    // ONE arrange call for the whole gesture => one undo step. Per-frame writes
+    // would bury the revision log and make Undo useless.
+    void invoke("dashboard_arrange", {
+      agentId,
+      moves: moves.map((m) => ({ id: m.id, layout: { x: m.x, y: m.y, w: m.w, h: m.h } })),
+    }).then(load).catch((e) => setNote(String(e)));
+  }, [agentId, load]);
+
+  const drag = useGridDrag(placed, commitMoves);
+  const geometry = new Map((drag.preview ?? placed).map((p) => [p.id, p]));
 
   if (!agentId) return <Centered>Pick an agent to see its dashboard.</Centered>;
 
@@ -262,17 +280,35 @@ export function Dashboard({
       {modules.length === 0 && !building ? (
         <EmptyState onPresets={() => setShowPresets(true)} />
       ) : (
-        <div style={{
+        <div ref={drag.gridRef} style={{
           display: "grid", gridTemplateColumns: `repeat(${GRID_COLS}, 1fr)`,
           gridAutoRows: `${ROW_H}px`, gap: GAP, alignContent: "start", paddingBottom: 24,
         }}>
           {modules.map((row) => (
             <section key={row.id} style={{
               ...cardStyle,
-              gridColumn: `${row.spec.layout.x + 1} / span ${row.spec.layout.w}`,
-              gridRow: `span ${row.spec.layout.h}`,
+              // EXPLICIT row placement (not `span`): auto-placement would
+              // reflow cards on its own and fight the drag preview.
+              gridColumn: `${(geometry.get(row.id)?.x ?? 0) + 1} / span ${geometry.get(row.id)?.w ?? 4}`,
+              gridRow: `${(geometry.get(row.id)?.y ?? 0) + 1} / span ${geometry.get(row.id)?.h ?? 4}`,
+              position: "relative",
+              // Lift the dragged card and kill transitions on it, so it tracks
+              // the pointer exactly while its neighbours glide out of the way.
+              zIndex: drag.activeId === row.id ? 10 : 1,
+              boxShadow: drag.activeId === row.id ? "var(--elevation-hover)" : "var(--elevation)",
+              transition: drag.activeId === row.id ? "none" : "box-shadow 150ms ease",
+              userSelect: drag.activeId ? "none" : "auto",
             }}>
-              <header style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+              <header
+                onPointerDown={(e) => {
+                  // Drag from the header only — so buttons, links and text
+                  // selection inside a module still work normally.
+                  const el = e.target as HTMLElement;
+                  if (el.closest("button")) return;
+                  drag.onPointerDown(e, row.id, "move");
+                }}
+                style={{ display: "flex", alignItems: "flex-start", gap: 8, cursor: "grab" }}
+              >
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{
                     fontSize: "var(--text-caption)", letterSpacing: "0.12em", textTransform: "uppercase",
@@ -318,6 +354,7 @@ export function Dashboard({
                   setFormValue={(k, v) => setFormValues((s) => ({ ...s, [k]: v }))}
                 />
               )}
+              <ResizeGrip onPointerDown={(e) => drag.onPointerDown(e, row.id, "resize")} />
             </section>
           ))}
         </div>
