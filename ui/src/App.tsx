@@ -228,7 +228,7 @@ export function App() {
            at its large-window rect because this chain couldn't shrink). */}
         <div style={{ padding: "28px 32px", flex: 1, minHeight: 0, minWidth: 0, display: "flex", flexDirection: "column" }}>
           {screen === "dashboard" && (
-            <Dashboard agentId={activeAgent?.id ?? null} agentName={activeAgent?.name} folder={folder} />
+            <Dashboard agentId={activeAgent?.id ?? null} agentName={activeAgent?.name} folder={folder} onNavigate={(sc) => setScreen(sc as ScreenId)} />
           )}
           {screen === "chat" && (
             <Chat

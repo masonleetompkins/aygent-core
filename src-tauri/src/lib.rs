@@ -29,6 +29,7 @@ mod connections;
 mod savepoint;
 mod context_docs;
 mod conversations;
+mod dashboard_data; // DASHBOARDS M3: pull-only data resolution (bindings/http/exec).
 mod dashboard; // DASHBOARDS: prompt-built, spec-driven, pull-only (never auto-runs a model).
 mod db;
 mod drainer;
@@ -4324,6 +4325,9 @@ pub fn run() {
             dashboard::dashboard_load, dashboard::dashboard_upsert_module,
             dashboard::dashboard_remove_module, dashboard::dashboard_arrange,
             dashboard::dashboard_undo,
+            dashboard_data::dashboard_refresh, dashboard_data::dashboard_refresh_module,
+            dashboard_data::dashboard_approve_exec,
+            dashboard_data::dashboard_run_tool,
             savepoint_snapshot, savepoint_timeline, savepoint_rewind,
             savepoint_undo, savepoint_redo,
             savepoint_get_retention, savepoint_set_retention, savepoint_purge,

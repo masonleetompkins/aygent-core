@@ -10,6 +10,8 @@
 import type { CSSProperties, ReactNode } from "react";
 import { Markdown } from "../Markdown";
 import { Pill } from "../ui";
+import { Table, Chart, Progress, Timeline, Status, Feed, Actions, Form } from "./Modules2";
+import type { ActionCtx, DashAction } from "./actions";
 
 export type ModuleKind =
   | "stat" | "list" | "table" | "markdown" | "chart" | "progress"
@@ -22,7 +24,7 @@ export interface ModuleSpec {
   layout: { x: number; y: number; w: number; h: number };
   source: { kind: string; [k: string]: unknown };
   props?: Record<string, unknown>;
-  actions?: { label: string; action: Record<string, unknown>; tone?: string }[];
+  actions?: { label: string; action: DashAction; tone?: string }[];
 }
 
 export interface ModuleRow {
@@ -168,16 +170,32 @@ export function relTime(ms: number | null): string {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
-const RENDERERS: Partial<Record<ModuleKind, (p: { row: ModuleRow }) => ReactNode>> = {
-  stat: Stat,
-  list: List,
-  markdown: Md,
-};
-
-export function ModuleBody({ row }: { row: ModuleRow }) {
-  const R = RENDERERS[row.spec.kind];
-  if (!R) return <Stub kind={row.spec.kind} />;
-  return <>{R({ row })}</>;
+/// The complete v1 vocabulary. Every kind in ModuleKind resolves to exactly one
+/// reviewed component — a spec cannot summon anything that isn't on this map.
+export function ModuleBody({
+  row, ctx, formValues, setFormValue,
+}: {
+  row: ModuleRow;
+  ctx: ActionCtx;
+  formValues: Record<string, string>;
+  setFormValue: (k: string, v: string) => void;
+}) {
+  const data = moduleData(row);
+  const props = (row.spec.props ?? {}) as Record<string, unknown>;
+  switch (row.spec.kind) {
+    case "stat":      return <Stat row={row} />;
+    case "list":      return <List row={row} />;
+    case "markdown":  return <Md row={row} />;
+    case "table":     return <Table data={data} props={props} />;
+    case "chart":     return <Chart data={data} props={props} />;
+    case "progress":  return <Progress data={data} props={props} />;
+    case "timeline":  return <Timeline data={data} />;
+    case "status":    return <Status data={data} />;
+    case "feed":      return <Feed data={data} />;
+    case "actions":   return <Actions row={row} ctx={ctx} />;
+    case "form":      return <Form row={row} ctx={ctx} values={formValues} setValue={setFormValue} />;
+    default:          return <Stub kind={row.spec.kind} />;
+  }
 }
 
 /// The status line under a module's title. Encodes the cost rule visually: a
