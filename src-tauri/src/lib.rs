@@ -42,6 +42,7 @@ mod vault_write;
 mod web;
 mod whisper;
 mod migrate_json;
+mod remote;   // AYGENT REMOTE: pairing + E2E envelope + Realtime client (masonlee.build/remote).
 mod repo;
 mod writer;
 mod gguf;

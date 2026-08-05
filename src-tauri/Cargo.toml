@@ -41,7 +41,8 @@ serde_json = "1"
 thiserror = "2"
 rand = "0.8"                       # per-session WS token (Atlas C6)
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros"] }  # async command + broker WS
-tokio-tungstenite = "0.24"         # Rust-hosted broker WS server (M0.2b)
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }  # broker WS server (M0.2b) + AYGENT Remote outbound wss:// to Supabase Realtime
+crypto_box = { version = "0.9", features = ["chacha20"] }  # AYGENT REMOTE: X25519 + XChaCha20-Poly1305 sealed envelopes — E2E between browser and this device; the relay only ever carries ciphertext
 futures-util = "0.3"
 keyring = { version = "=3.2.1", features = ["apple-native"] }  # API keys in macOS Keychain (M0.3; never touch JS/WebView). PINNED: later 3.x absorbed the keyring-core rewrite which tightened credential validation -> 'Attribute user is invalid: cannot be empty' + changed apple-native target mapping. Commit Cargo.lock so this never drifts.
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "multipart"], default-features = false }  # Anthropic HTTP (M0.3)
