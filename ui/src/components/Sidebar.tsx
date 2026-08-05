@@ -1,5 +1,6 @@
 // AYGENT sidebar nav (icon + label). SF-Symbol-style line glyphs (no emoji).
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { Icon, type IconName } from "./Icon";
 
 export type ScreenId =
@@ -49,9 +50,7 @@ export function Sidebar({ active, onSelect, showBrowser }: { active: ScreenId; o
       {nav.filter((i) => i.group === "global").map((item) => (
         <NavButton key={item.id} item={item} active={active === item.id} onSelect={onSelect} />
       ))}
-      <div style={{ marginTop: "auto", padding: "10px", fontSize: 11, color: "var(--text-faint)" }}>
-        v0.0.1 · Phase 1
-      </div>
+      <VersionTag />
     </nav>
   );
 }
@@ -87,5 +86,17 @@ function NavButton({ item, active, onSelect }: { item: NavItem; active: boolean;
       <span>{item.label}</span>
       {dim && <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--text-faint)" }}>soon</span>}
     </button>
+  );
+}
+
+/** App version, read from the bundle (tauri.conf.json is the single source
+    of truth — the old hardcoded label drifted). */
+function VersionTag() {
+  const [v, setV] = useState("");
+  useEffect(() => { getVersion().then(setV).catch(() => {}); }, []);
+  return (
+    <div style={{ marginTop: "auto", padding: "10px", fontSize: 11, color: "var(--text-faint)" }}>
+      {v ? `AYGENT v${v}` : "AYGENT"}
+    </div>
   );
 }
