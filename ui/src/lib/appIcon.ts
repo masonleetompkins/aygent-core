@@ -1,6 +1,6 @@
 // AYGENT — DYNAMIC APP ICON (renderer).
 //
-// Mason 08-04: the Dock icon should track the app's theme — a glowing "AY" in
+// Mason 08-04: the Dock icon should track the app's theme — a flat "AY" in
 // the current accent colour, on a black or white ground depending on light or
 // dark mode. The accent is a free-form colour, so pre-rendering every variant
 // as a PNG is impossible; instead we DRAW the icon here on a <canvas> and hand
@@ -48,29 +48,15 @@ export function renderIconPng(mode: "light" | "dark", accent: string): string | 
   ctx.closePath();
   ctx.fill();
 
-  // The GLOW: a soft radial bloom of the accent behind the letters, so the
-  // mark reads as lit rather than flat-printed.
-  const glow = ctx.createRadialGradient(SIZE / 2, SIZE / 2, 0, SIZE / 2, SIZE / 2, SIZE * 0.46);
-  glow.addColorStop(0, hexToRgba(ink, mode === "dark" ? 0.40 : 0.26));
-  glow.addColorStop(0.55, hexToRgba(ink, mode === "dark" ? 0.14 : 0.09));
-  glow.addColorStop(1, hexToRgba(ink, 0));
-  ctx.fillStyle = glow;
-  ctx.fillRect(0, 0, SIZE, SIZE);
-
   // The "AY" wordmark, centred.
   ctx.font = `700 ${Math.round(SIZE * 0.42)}px -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", Arial, sans-serif`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.letterSpacing = `${Math.round(SIZE * 0.01)}px`;
 
-  // Outer bloom pass, then the crisp letterform on top.
-  ctx.shadowColor = hexToRgba(ink, 0.85);
-  ctx.shadowBlur = SIZE * 0.075;
+  // Flat letterform — no glow/shadow (Mason 08-04: same call as the in-app
+  // icons; the bloom read as muddy at Dock size).
   ctx.fillStyle = ink;
-  ctx.fillText("AY", SIZE / 2, SIZE / 2 + SIZE * 0.012);
-  ctx.shadowBlur = SIZE * 0.03;
-  ctx.fillText("AY", SIZE / 2, SIZE / 2 + SIZE * 0.012);
-  ctx.shadowBlur = 0;
   ctx.fillText("AY", SIZE / 2, SIZE / 2 + SIZE * 0.012);
 
   const url = canvas.toDataURL("image/png");

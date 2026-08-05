@@ -136,13 +136,13 @@ fn build_openai_messages(system: &str, messages: &serde_json::Value) -> Vec<serd
                             // REAL preceding assistant tool_call (non-empty, matching id). Some
                             // reasoning models (gpt-5.6-sol) yield orphaned tool blocks; drop them.
                             let tcid = b.get("tool_use_id").and_then(|x| x.as_str()).unwrap_or("");
-                            let prevOk = !tcid.is_empty()
+                            let prev_ok = !tcid.is_empty()
                                 && out.last()
                                     .and_then(|pm| pm.get("tool_calls"))
                                     .and_then(|tc| tc.as_array())
                                     .map(|arr| arr.iter().any(|c| c.get("id").and_then(|i| i.as_str()) == Some(tcid)))
                                     .unwrap_or(false);
-                            if (!prevOk) { continue; }
+                            if !prev_ok { continue; }
 
                             out.push(json!({
                                 "role": "tool",

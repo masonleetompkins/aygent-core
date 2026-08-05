@@ -30,7 +30,6 @@ mod connectors; // CONNECTOR REGISTRY: a provider is data (descriptor), not code
 mod connector_exec; // One generic HTTP executor for every registry connector.
 mod savepoint;
 mod context_docs;
-mod conversations;
 mod dashboard_data; // DASHBOARDS M3: pull-only data resolution (bindings/http/exec).
 mod dashboard; // DASHBOARDS: prompt-built, spec-driven, pull-only (never auto-runs a model).
 mod db;
@@ -54,7 +53,6 @@ mod local_tools;
 mod openai_provider;
 mod pdf_tool;
 mod provider;
-mod settings;
 mod supervisor;
 mod tools_registry;
 
@@ -1194,6 +1192,13 @@ fn conv_save(db: tauri::State<writer::Db>, folder: String, conv: repo::Conversat
 }
 
 /// Delete a conversation (and forget its execution lane).
+#[tauri::command]
+fn conv_rename(db: tauri::State<writer::Db>, id: String, title: String) -> Result<(), String> {
+    let t = title.trim();
+    if t.is_empty() { return Err("title cannot be empty".into()); }
+    repo::rename_conversation(&db, &id, t)
+}
+
 #[tauri::command]
 fn conv_delete(db: tauri::State<writer::Db>, lanes: tauri::State<lanes::Lanes>, id: String) -> Result<(), String> {
     repo::delete_conversation(&db, &id)?;
@@ -3272,11 +3277,6 @@ fn agent_tools_for_full(
     (serde_json::json!(tools), extra_instructions)
 }
 
-/// Back-compat: the base-only tool set (used where no folder/app context).
-fn agent_tools() -> serde_json::Value {
-    serde_json::json!(base_tools())
-}
-
 /// PRO MODE: is shell.exec enabled for this folder's agent? GUI-managed (no
 /// config files) — the scary-honest consent screen writes a flag per folder,
 /// same scheme as browser-policy. Fails closed (missing => false => Folder Mode).
@@ -3787,12 +3787,12 @@ async fn agent_stream(
             // and loop; surface a clear error instead of a confusing 400 on the
             // next send.
             if had_tools {
-                let allEmpty = assistant.get("tool_calls")
+                let all_empty = assistant.get("tool_calls")
                     .and_then(|tc| tc.as_array())
                     .map(|arr| arr.iter().all(|c| c.get("id").and_then(|i| i.as_str()).unwrap_or("").is_empty()
                                               || c.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("").is_empty()))
                     .unwrap_or(true);
-                if allEmpty {
+                if all_empty {
                     return Err(format!(
                         "{provider_kind} emitted a tool_call whose capture came back empty (id/name missing) —                          this model's streamed tool-use isn't fully supported. Try a different model, or                          disable the tool that triggered the call."
                     ));
@@ -4475,7 +4475,7 @@ pub async fn run_headless_turn(
 /// Persist a VISIBLE error into an agent's inbox thread when a headless turn
 /// fails before it could reply (Atlas #5 cause 3: no key/model → rail rings then
 /// silence). Now the user sees WHY in the thread instead of a blank rail.
-pub fn persist_inbox_error(db: &writer::Db, agent_id: &str, msg: &mailbox::Message, err: &str) {
+pub fn persist_inbox_error(db: &writer::Db, agent_id: &str, _msg: &mailbox::Message, err: &str) {
     let conv_id = format!("inbox-{agent_id}");
     let existing = repo::load_conversation(db, &conv_id).ok();
     let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
@@ -4594,7 +4594,7 @@ pub fn run() {
             savepoint_snapshot, savepoint_timeline, savepoint_rewind,
             savepoint_undo, savepoint_redo,
             savepoint_get_retention, savepoint_set_retention, savepoint_purge,
-            conv_list, conv_load, conv_save, conv_delete, conv_reorder,
+            conv_list, conv_load, conv_save, conv_rename, conv_delete, conv_reorder,
             agents_list, agents_create, agents_update, agents_delete,
             agents_set_active, agents_get_active, agents_sharing_folder,
             agent_mounts_list, agent_mount_add, agent_mount_remove,
@@ -4692,7 +4692,7 @@ pub fn run() {
             // how downloads actually happen: our process fetches the bytes and
             // writes them to the agent folder (no WebKit, no sandbox).
             {
-                use tauri::{Listener, Manager};
+                use tauri::Listener;
                 let dl_handle = _app.handle().clone();
                 _app.listen_any("browser:save-request", move |ev| {
                     #[derive(serde::Deserialize)]
@@ -4763,6 +4763,14 @@ pub fn run() {
                     }
                     app_handle.exit(0);
                 }
+            }
+            // Final teardown: CefShutdown must run once, after the run loop
+            // ends — cef_engine::shutdown_engine was written for this but was
+            // never wired (found in the 08 warning sweep). No-op if CEF never
+            // initialized (CEF_READY guard).
+            tauri::RunEvent::Exit => {
+                #[cfg(all(target_os = "macos", feature = "engine-cef"))]
+                cef_engine::shutdown_engine();
             }
             _ => {}
         });

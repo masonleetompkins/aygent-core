@@ -117,8 +117,8 @@ struct PendingCreate {
     tab_id: i64,
     url: String,
     parent_view: usize, // *mut NSView as usize (Send across the post_task hop)
-    x: i32,
-    y: i32,
+    // NOTE: no x/y — the child browser is always at (0,0) INSIDE the wrapper
+    // NSView; the wrapper (cef_geometry) carries the on-screen position.
     w: i32,
     h: i32,
 }
@@ -544,9 +544,9 @@ fn emit_tab_title(app: &AppHandle, tab: Option<i64>, title: &str) {
 /// Create (or reuse) the CEF browser for `tab_id`, parented into `parent_view`
 /// (the app-owned wrapper NSView from cef_geometry) at the given bounds. If the
 /// tab already has a browser, navigate it instead.
-pub fn create_or_navigate(tab_id: i64, url: String, parent_view: *mut std::ffi::c_void, x: i32, y: i32, w: i32, h: i32) {
+pub fn create_or_navigate(tab_id: i64, url: String, parent_view: *mut std::ffi::c_void, w: i32, h: i32) {
     let pending = PendingCreate {
-        tab_id, url, parent_view: parent_view as usize, x, y, w, h,
+        tab_id, url, parent_view: parent_view as usize, w, h,
     };
     run_on_ui(move || create_or_navigate_ui(pending));
 }
@@ -554,7 +554,7 @@ pub fn create_or_navigate(tab_id: i64, url: String, parent_view: *mut std::ffi::
 fn create_or_navigate_ui(p: PendingCreate) {
     // Reuse existing browser for this tab?
     let existing = BROWSERS.with(|m| m.borrow().get(&p.tab_id).cloned());
-    if let Some(mut b) = existing {
+    if let Some(b) = existing {
         if let Some(frame) = b.main_frame() {
             let u = CefString::from(p.url.as_str());
             frame.load_url(Some(&u));
@@ -605,7 +605,7 @@ fn create_or_navigate_ui(p: PendingCreate) {
         None,
         None,
     );
-    if let Some(mut b) = browser {
+    if let Some(b) = browser {
         let ident = b.identifier();
         if let Ok(mut tm) = browser_tab_map().lock() { tm.insert(ident, p.tab_id); }
         BROWSERS.with(|m| { m.borrow_mut().insert(p.tab_id, b); });
@@ -617,7 +617,7 @@ fn create_or_navigate_ui(p: PendingCreate) {
 
 pub fn navigate(tab_id: i64, url: String) {
     run_on_ui(move || {
-        if let Some(mut b) = BROWSERS.with(|m| m.borrow().get(&tab_id).cloned()) {
+        if let Some(b) = BROWSERS.with(|m| m.borrow().get(&tab_id).cloned()) {
             if let Some(frame) = b.main_frame() {
                 frame.load_url(Some(&CefString::from(url.as_str())));
             }
@@ -627,21 +627,21 @@ pub fn navigate(tab_id: i64, url: String) {
 
 pub fn go_back(tab_id: i64) {
     run_on_ui(move || {
-        if let Some(mut b) = BROWSERS.with(|m| m.borrow().get(&tab_id).cloned()) {
+        if let Some(b) = BROWSERS.with(|m| m.borrow().get(&tab_id).cloned()) {
             if b.can_go_back() != 0 { b.go_back(); }
         }
     });
 }
 pub fn go_forward(tab_id: i64) {
     run_on_ui(move || {
-        if let Some(mut b) = BROWSERS.with(|m| m.borrow().get(&tab_id).cloned()) {
+        if let Some(b) = BROWSERS.with(|m| m.borrow().get(&tab_id).cloned()) {
             if b.can_go_forward() != 0 { b.go_forward(); }
         }
     });
 }
 pub fn reload(tab_id: i64) {
     run_on_ui(move || {
-        if let Some(mut b) = BROWSERS.with(|m| m.borrow().get(&tab_id).cloned()) {
+        if let Some(b) = BROWSERS.with(|m| m.borrow().get(&tab_id).cloned()) {
             b.reload();
         }
     });
@@ -649,7 +649,7 @@ pub fn reload(tab_id: i64) {
 
 pub fn close_tab(tab_id: i64) {
     run_on_ui(move || {
-        if let Some(mut b) = BROWSERS.with(|m| m.borrow_mut().remove(&tab_id)) {
+        if let Some(b) = BROWSERS.with(|m| m.borrow_mut().remove(&tab_id)) {
             let ident = b.identifier();
             if let Ok(mut tm) = browser_tab_map().lock() { tm.remove(&ident); }
             if let Some(host) = b.host() {

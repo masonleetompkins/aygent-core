@@ -100,25 +100,10 @@ pub fn state_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// The JSON-store subdir under the state dir (tools/policy/pro-mode files).
-/// Kept as a helper so those stores can be flattened under stores/ later without
-/// touching call sites that only need the state dir.
-pub fn stores_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let d = state_dir(app)?.join("stores");
-    std::fs::create_dir_all(&d).map_err(|e| format!("mkdir stores: {e}"))?;
-    Ok(d)
-}
-
 /// Is a folder already an AYGENT root? (Has the manifest.) Used by onboarding to
 /// DETECT + RESTORE instead of clobbering.
 pub fn is_aygent_root(folder: &Path) -> bool {
     folder.join("aygent-root.json").is_file()
-}
-
-/// Read a folder's root manifest if present.
-pub fn read_manifest(folder: &Path) -> Option<RootManifest> {
-    let text = std::fs::read_to_string(folder.join("aygent-root.json")).ok()?;
-    serde_json::from_str::<RootManifest>(&text).ok()
 }
 
 /// Initialize a folder as an AYGENT root: write the manifest + create the

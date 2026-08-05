@@ -25,7 +25,7 @@
 
 use cef::application_mac::{CefAppProtocol, CrAppControlProtocol, CrAppProtocol};
 use objc2::runtime::{AnyObject, Bool};
-use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, ClassType, DefinedClass};
 use objc2_app_kit::{NSApplication, NSEvent};
 use std::cell::Cell;
 

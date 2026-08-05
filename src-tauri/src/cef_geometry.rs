@@ -163,7 +163,7 @@ pub fn ensure_wrapper(window: &tauri::Window, tab_id: i64, frame: (f64, f64, f64
         }
     }
     let ns_window = window_nswindow(window)?;
-    let content = unsafe { ns_window.contentView()? };
+    let content = ns_window.contentView()?;
     let (x, y, w, h) = frame;
     let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(w.max(1.0), h.max(1.0)));
     let wrapper = AygentCefWrapper::new(mtm, rect);

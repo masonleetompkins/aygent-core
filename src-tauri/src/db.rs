@@ -244,6 +244,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         v = 12;
     }
 
+    debug_assert_eq!(v, SCHEMA_VERSION, "migrate() must end at SCHEMA_VERSION — add the missing step or bump the constant");
     let _ = v;
     Ok(())
 }

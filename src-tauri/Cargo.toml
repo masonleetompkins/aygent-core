@@ -72,7 +72,7 @@ dirs = "6"                          # BROWSER downloads: resolve the user's ~/Do
 # `cef` LIBRARY crate itself compiles on our edition 2021 workspace; only the
 # helper bin + bundler use its build-util. Cargo.lock will gain cef + its deps
 # the first time Mason builds WITH the feature (expected; commit that lock).
-cef = { version = "=151.0.0", features = ["build-util", "sandbox"], optional = true }
+cef = { version = "=151.0.0", features = ["build-util"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"                        # atomic openat/O_NOFOLLOW fd layer (M0.2c)
@@ -82,7 +82,7 @@ libc = "0.2"                        # atomic openat/O_NOFOLLOW fd layer (M0.2c)
 # NSView frame against the LIVE window contentView (ground truth), instead of
 # trusting wry's child-positioning math (titlebar/flip mismatches burned us).
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSResponder", "NSGraphics", "NSApplication", "NSEvent", "NSImage"] }  # NSImage: dynamic Dock icon
+objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSResponder", "NSGraphics", "NSApplication", "NSEvent", "NSImage", "NSWorkspace"] }  # NSImage: dynamic Dock icon; NSWorkspace: persist it onto the .app bundle
 # NSValue -> NSNumber (setDrawsBackground KVC), NSString -> ns_string! macro:
 # both needed by cef_geometry's punchout (engine-cef). Harmless when unused.
 objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSValue", "NSString", "NSData"] }  # NSData: dynamic Dock icon (decode PNG bytes from the UI canvas)
@@ -105,6 +105,10 @@ custom-protocol = ["tauri/custom-protocol"]
 # is excluded and the WKWebView path is used verbatim. This is the instant
 # revert: drop the feature flag and the old engine is back.
 engine-cef = ["dep:cef"]
+# CEF macOS sandbox participation. cfg-checked in cef_engine.rs + the helper
+# bin; OFF today (matches shipped behavior: Settings.no_sandbox=1). Flip by
+# building with --features engine-cef,sandbox.
+sandbox = ["cef/sandbox"]
 # LOCAL-MODEL GPU acceleration. macOS builds turn on Metal; a CUDA PC build can
 # opt in. Kept as features so a headless/CI build can compile CPU-only.
 metal = ["llama-cpp-2/metal"]

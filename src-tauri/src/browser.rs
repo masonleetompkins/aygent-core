@@ -669,8 +669,6 @@ struct RunningBrowser {
 /// Slice 3). The pump task owns the WebSocket; commands talk to it via `tx`.
 struct CdpSession {
     tx: mpsc::UnboundedSender<CdpRequest>,
-    /// Bumped each session so a stale pump can't clobber a newer one.
-    id: u64,
 }
 
 /// One request to the pump: a CDP method + params + a oneshot for the result.
@@ -900,12 +898,14 @@ pub fn current_agent_host() -> String {
 // path all read the SAME per-tab url the WKWebView path tracked via
 // on_page_load. Harmless when engine-cef is off (nothing calls these).
 // ---------------------------------------------------------------------------
+#[cfg(feature = "engine-cef")]
 static TAB_URLS: std::sync::Mutex<Option<std::collections::HashMap<i64, String>>> =
     std::sync::Mutex::new(None);
 
 /// Record the latest committed main-frame url for a tab (called by cef_engine's
 /// DisplayHandler.on_address_change). Also updates the single ACTIVE_TAB_URL if
 /// this is the active tab, so the permission host pre-check stays correct.
+#[cfg(feature = "engine-cef")]
 pub fn note_active_tab_url(tab_id: i64, url: &str) {
     if let Ok(mut g) = TAB_URLS.lock() {
         g.get_or_insert_with(std::collections::HashMap::new)
@@ -918,6 +918,7 @@ pub fn note_active_tab_url(tab_id: i64, url: &str) {
 
 /// The last committed url for a tab ("" if unknown). Used by cef_engine's
 /// title-change handler to upgrade the matching history entry's title.
+#[cfg(feature = "engine-cef")]
 pub fn last_tab_url(tab_id: i64) -> String {
     TAB_URLS
         .lock()
@@ -938,22 +939,6 @@ pub fn is_search_host(host: &str) -> bool {
         || h.contains("bing.com") || h.contains("duckduckgo.com")
         || h.contains("search.brave.com") || h.contains("startpage.com")
         || h.contains("ecosia.org") || h.contains("search.yahoo")
-}
-
-/// FIRE-AND-FORGET action in the ACTIVE tab's embedded webview. `wv.eval()`
-/// runs JS with NO return channel; on EXTERNAL pages (google.com etc) the page
-/// has no `window.__TAURI__` to emit a result back, so ANY round-trip stalls.
-/// For actions (click/type/navigate) we don't need a value â€” run + assume
-/// success. Returns Ok(()) once the eval is dispatched.
-pub fn active_tab_run(app: &tauri::AppHandle, expr: &str) -> Result<(), String> {
-    use tauri::Manager;
-    let id = ACTIVE_TAB_ID.load(std::sync::atomic::Ordering::SeqCst);
-    if id < 0 { return Err("no active browser tab".into()); }
-    let wv = app.get_webview(&tab_label(Some(id))).ok_or("active tab has no open page")?;
-    // Wrap so a page-side exception can't crash anything; result is discarded.
-    let script = format!("(()=>{{ try {{ {expr} }} catch(e) {{}} }})()", expr = expr);
-    eprintln!("[aygent][browser][RUN] tab={id} {:.80}", expr);
-    wv.eval(&script).map_err(|e| format!("eval: {e}"))
 }
 
 /// READ a value from the AUTHORITATIVE agent page â€” the CDP session. This is
@@ -1054,7 +1039,7 @@ async fn ensure_session(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
     {
         let mut guard = state.inner.lock().map_err(|_| "browser state poisoned")?;
         if let Some(rb) = guard.as_mut() {
-            rb.session = Some(CdpSession { tx, id: session_id });
+            rb.session = Some(CdpSession { tx });
         }
     }
 
@@ -1466,7 +1451,7 @@ fn download_event(app: &tauri::AppHandle, event: tauri::webview::DownloadEvent<'
     use tauri::webview::DownloadEvent;
     use tauri::Manager;
     match event {
-        DownloadEvent::Requested { url, destination } => {
+        DownloadEvent::Requested { url, destination: _ } => {
             // Derive a filename from the URL (wry 0.55.1's `Requested` does NOT
             // expose WebKit's suggestedFilename — only `url` + `destination` — so
             // we synthesize one; `sanitize_filename` falls back to a unique
@@ -1759,7 +1744,7 @@ pub async fn webview_open(
             crate::cef_geometry::set_wrapper_hidden(tid, false);
             crate::cef_geometry::front_wrapper(tid);
             crate::cef_geometry::place_wrapper(tid, x, y, width, height, Some(content_h));
-            crate::cef_engine::create_or_navigate(tid, target_c.clone(), parent_ptr, 0, 0, width as i32, height as i32);
+            crate::cef_engine::create_or_navigate(tid, target_c.clone(), parent_ptr, width as i32, height as i32);
             eprintln!("[aygent][cef] webview_open (CEF, main-thread) tab={tid} parent={parent_ptr:?} url={target_c}");
         });
         return Ok(());
@@ -3734,50 +3719,6 @@ async fn active_tab_page_info_cdp(app: &tauri::AppHandle, state: &tauri::State<'
     let r = active_tab_read(app, state, "[document.title||'', location.href||'']").await?;
     let arr: Vec<String> = serde_json::from_str(&r).unwrap_or_default();
     Ok((arr.get(0).cloned().unwrap_or_default(), arr.get(1).cloned().unwrap_or_default()))
-}
-
-/// Read the page title + visible text (agent's primary "sense"). Caps length so
-/// one read can't blow the model context.
-async fn read_page_text(state: &tauri::State<'_, BrowserProc>) -> Result<(String, String), String> {
-    let expr = "JSON.stringify([document.title, (document.body?document.body.innerText:'').slice(0,8000)])";
-    let r = session_call(state, "Runtime.evaluate", serde_json::json!({ "expression": expr, "returnByValue": true })).await?;
-    let s = r["result"]["value"].as_str().ok_or("no page text")?;
-    let arr: Vec<String> = serde_json::from_str(s).map_err(|e| format!("parse page text: {e}"))?;
-    if arr.len() == 2 { Ok((arr[0].clone(), arr[1].clone())) } else { Err("unexpected page text shape".into()) }
-}
-
-/// Agent URL policy (mirrors web.rs is_blocked_host + adds an allowlist).
-/// Fails CLOSED: empty allowlist => nothing allowed.
-fn check_agent_url(url: &str, allowed_domains: &[String]) -> Result<(), String> {
-    let lower = url.to_ascii_lowercase();
-    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-        return Err("agent may only open http(s) URLs".into());
-    }
-    // Extract host.
-    let host = lower
-        .split("://").nth(1).unwrap_or("")
-        .split('/').next().unwrap_or("")
-        .split('@').last().unwrap_or("")
-        .split(':').next().unwrap_or("")
-        .to_string();
-    if host.is_empty() { return Err("could not parse host".into()); }
-    // Block internal/localhost (SSRF).
-    if host == "localhost" || host.starts_with("127.") || host.starts_with("10.")
-        || host.starts_with("192.168.") || host.ends_with(".local") || host == "0.0.0.0"
-        || host.starts_with("169.254.") {
-        return Err("refused: internal/localhost host is not allowed for the agent".into());
-    }
-    // Allowlist: host must equal or be a subdomain of an allowed domain.
-    let ok = allowed_domains.iter().any(|d| {
-        let d = d.trim().to_ascii_lowercase();
-        !d.is_empty() && (host == d || host.ends_with(&format!(".{d}")))
-    });
-    if !ok {
-        return Err(format!(
-            "refused: '{host}' is not in this agent's allowed browsing domains. Add it in the agent's browser policy to let it visit this site."
-        ));
-    }
-    Ok(())
 }
 
 /// SSRF guard only (no allowlist): reject non-http(s) + internal/localhost

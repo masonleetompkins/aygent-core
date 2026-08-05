@@ -455,17 +455,22 @@ pub fn save_conversation(db: &Db, mut conv: Conversation) -> Result<(), String> 
     let msgs = serde_json::to_string(&conv.msgs).map_err(|e| format!("ser msgs: {e}"))?;
     let history = serde_json::to_string(&conv.history).map_err(|e| format!("ser history: {e}"))?;
     db.write(move |c| {
-        // Preserve prior pinned/order when the caller left them unset.
-        let prev: Option<(i64, i64)> = c.query_row(
-            "SELECT pinned, ord FROM conversation WHERE id = ?1",
-            params![conv.id], |r| Ok((r.get(0)?, r.get(1)?)),
+        // Preserve prior pinned/order when the caller left them unset — and the
+        // TITLE whenever the row already exists (Mason 08-04: renames kept
+        // REVERTING because every turn-save re-derived the title from the
+        // first user message and clobbered the custom one). A title is set
+        // once on first save and only changes via rename_conversation().
+        let prev: Option<(i64, i64, String)> = c.query_row(
+            "SELECT pinned, ord, title FROM conversation WHERE id = ?1",
+            params![conv.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         ).optional().map_err(|e| format!("prev: {e}"))?;
-        let (pinned, ord) = match prev {
-            Some((p, o)) => (
+        let (pinned, ord, title) = match prev {
+            Some((p, o, t)) => (
                 if conv.pinned { 1 } else { p },
                 if conv.order == 0 { o } else { conv.order },
+                if t.is_empty() { conv.title.clone() } else { t },
             ),
-            None => (conv.pinned as i64, conv.order),
+            None => (conv.pinned as i64, conv.order, conv.title.clone()),
         };
         c.execute(
             "INSERT INTO conversation (id,agent_id,title,updated,pinned,ord,msgs,history)
@@ -473,7 +478,7 @@ pub fn save_conversation(db: &Db, mut conv: Conversation) -> Result<(), String> 
              ON CONFLICT(id) DO UPDATE SET
                agent_id=excluded.agent_id, title=excluded.title, updated=excluded.updated,
                pinned=excluded.pinned, ord=excluded.ord, msgs=excluded.msgs, history=excluded.history",
-            params![conv.id, conv.agent_id, conv.title, conv.updated, pinned, ord, msgs, history],
+            params![conv.id, conv.agent_id, title, conv.updated, pinned, ord, msgs, history],
         ).map_err(|e| format!("save conv: {e}"))?;
         Ok(())
     })
@@ -489,6 +494,21 @@ pub fn reorder_conversations(db: &Db, updates: Vec<(String, bool, i64)>) -> Resu
             ).map_err(|e| format!("reorder: {e}"))?;
         }
         tx.commit().map_err(|e| format!("commit: {e}"))?;
+        Ok(())
+    })
+}
+
+/// Rename ONLY — the single authorized way to change a title after creation
+/// (save_conversation preserves the stored title; see the note there). A
+/// targeted UPDATE so a rename can never race a turn-save into losing msgs.
+pub fn rename_conversation(db: &Db, id: &str, title: &str) -> Result<(), String> {
+    let id = id.to_string();
+    let title = title.to_string();
+    db.write(move |c| {
+        c.execute(
+            "UPDATE conversation SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        ).map_err(|e| format!("rename conv: {e}"))?;
         Ok(())
     })
 }

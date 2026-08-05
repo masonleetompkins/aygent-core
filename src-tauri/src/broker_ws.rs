@@ -16,12 +16,6 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::broker::{Broker, Mode};
 use crate::exec::ExecBroker;
 
-/// Info the Rust side hands the daemon (via env at spawn) so it can connect.
-pub struct BrokerWsInfo {
-    pub port: u16,
-    pub token: String,
-}
-
 /// Start the broker WS server on loopback:0 (ephemeral). Returns the bound
 /// port; serves for the app lifetime on the tokio runtime. The exec broker is
 /// passed in so Pro-Mode `exec.*` ops resolve against the same privileged actor.

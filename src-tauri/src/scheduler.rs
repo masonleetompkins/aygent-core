@@ -119,11 +119,6 @@ pub fn compute_next_tz(spec: &ScheduleSpec, after_ms: i64, tz: &str) -> i64 {
     }
 }
 
-/// Back-compat shim: default timezone ("local"). Prefer compute_next_tz.
-pub fn compute_next(spec: &ScheduleSpec, after_ms: i64) -> i64 {
-    compute_next_tz(spec, after_ms, "local")
-}
-
 /// The LOCAL calendar day as an integer YYYYMMDD, used as the daily-counter
 /// reset key. "Local" here means the schedule's tz (so the day rolls at the
 /// user's midnight, not UTC's).
