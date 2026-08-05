@@ -4706,16 +4706,9 @@ pub fn run() {
                     drainer::spawn(_app.handle().clone(), db.clone(), brk, lns, sig);
 
                     // AYGENT REMOTE: if this Mac is paired, bring the Realtime
-                    // session up at boot (silently no-ops when unpaired or the
-                    // browser hasn't published its key yet).
-                    let remote_app = _app.handle().clone();
-                    tauri::async_runtime::spawn(async move {
-                        match crate::remote_runtime::start_if_paired(remote_app).await {
-                            Ok(true) => eprintln!("[aygent][remote] realtime session up"),
-                            Ok(false) => {}
-                            Err(e) => eprintln!("[aygent][remote] autostart: {e}"),
-                        }
-                    });
+                    // session up at boot — with retries, because the browser
+                    // key may not be published yet (first-time pairing).
+                    remote_runtime::spawn_autostart(_app.handle().clone());
                 }
 
                 // M1.8 SCHEDULER: spawn the ticker ("the drainer with a clock in

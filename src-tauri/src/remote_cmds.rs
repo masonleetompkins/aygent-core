@@ -69,8 +69,10 @@ pub async fn remote_pair(app: tauri::AppHandle, code: String) -> Result<(), Stri
         .unwrap_or_else(|_| "https://www.masonlee.build".to_string());
     let device_name = hostname_or_default();
     crate::remote::pair(&site, &code, &device_name).await?;
-    // Best effort: the browser may not have published its key yet.
-    let _ = crate::remote_runtime::start_if_paired(app).await;
+    // The browser publishes its key AFTER this claim succeeds — a one-shot
+    // start would always miss on first pair. The autostart loop retries
+    // until the key appears and the session is up.
+    crate::remote_runtime::spawn_autostart(app);
     Ok(())
 }
 

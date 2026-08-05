@@ -62,6 +62,32 @@ impl RemoteRuntime {
     }
 }
 
+/// Keep trying to bring the session up until it succeeds (or unpaired).
+/// WHY: at first-time pair the browser key does not exist yet — the browser
+/// publishes it AFTER the Mac claims the code. A one-shot start at pair/boot
+/// time therefore always misses; this loop closes that gap (15s cadence).
+pub fn spawn_autostart(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if !crate::remote::is_paired() {
+                break;
+            }
+            if app.state::<RemoteRuntime>().is_running() {
+                break;
+            }
+            match start_if_paired(app.clone()).await {
+                Ok(true) => {
+                    eprintln!("[aygent][remote] realtime session up");
+                    break;
+                }
+                Ok(false) => {} // paired, browser key not published yet — retry
+                Err(e) => eprintln!("[aygent][remote] autostart retry: {e}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        }
+    });
+}
+
 /// Start the runtime if the device is paired AND the browser key exchange has
 /// completed (we need the browser pubkey to build the Sealer). Safe to call
 /// repeatedly — an already-running runtime is shut down and replaced.
@@ -129,6 +155,11 @@ async fn run_loop(
         match evt {
             RtEvent::Connected => {
                 let _ = app.emit("remote-status", &serde_json::json!({ "connected": true }));
+                // Announce ourselves. The browser may have joined first and
+                // already sent its one-shot hello into an empty channel; an
+                // unsolicited hello on every (re)connect means whoever joins
+                // last still completes the handshake.
+                send_hello(&app, &tx, &sealer).await;
             }
             RtEvent::Disconnected { retry_in_secs } => {
                 let _ = app.emit(
@@ -154,6 +185,34 @@ async fn run_loop(
     let _ = app.emit("remote-status", &serde_json::json!({ "connected": false }));
 }
 
+/// Build + send the hello (device name + live agent roster).
+async fn send_hello(
+    app: &tauri::AppHandle,
+    tx: &tokio::sync::mpsc::Sender<RtCommand>,
+    sealer: &Arc<Sealer>,
+) {
+    let db = app.state::<writer::Db>();
+    let agents = repo::list_agents(&db)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| !a.archived)
+        .map(|a| AgentInfo { id: a.id, name: a.name, icon: a.icon, color: a.color })
+        .collect::<Vec<_>>();
+    let device_name = hostname();
+    let _ = send_dev_msg(sealer, tx, CTL, &DevMsg::Hello { device_name, agents }).await;
+}
+
+fn hostname() -> String {
+    std::process::Command::new("scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "My Mac".to_string())
+}
+
 /// Dispatch one decrypted web message.
 async fn handle_msg(
     app: &tauri::AppHandle,
@@ -168,14 +227,7 @@ async fn handle_msg(
             let _ = send_dev_msg(sealer, tx, CTL, &DevMsg::Pong).await;
         }
         WebMsg::Hello | WebMsg::ListAgents => {
-            let agents = repo::list_agents(&db)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|a| !a.archived)
-                .map(|a| AgentInfo { id: a.id, name: a.name, icon: a.icon, color: a.color })
-                .collect::<Vec<_>>();
-            let device_name = crate::remote::load_meta().map(|m| m.device_id).unwrap_or_default();
-            let _ = send_dev_msg(sealer, tx, CTL, &DevMsg::Hello { device_name, agents }).await;
+            send_hello(app, tx, sealer).await;
         }
         WebMsg::ListConvs { agent } => {
             let convs = repo::list_conversations(&db, &agent)
