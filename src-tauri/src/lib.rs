@@ -4597,6 +4597,8 @@ pub fn run() {
             remote_cmds::remote_pair,
             remote_cmds::remote_unpair,
             remote_cmds::remote_connect,
+            remote_cmds::remote_local_status,
+            remote_cmds::remote_set_enabled,
             provider_verify_key,
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,

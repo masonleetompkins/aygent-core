@@ -69,8 +69,8 @@ impl RemoteRuntime {
 pub fn spawn_autostart(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
-            if !crate::remote::is_paired() {
-                break;
+            if !crate::remote::is_paired() || !crate::remote::is_enabled() {
+                break; // unpaired, or user toggled offline — stay silent
             }
             if app.state::<RemoteRuntime>().is_running() {
                 break;

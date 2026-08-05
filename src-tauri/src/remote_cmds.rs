@@ -12,6 +12,8 @@ pub struct RemoteStatus {
     pub paired: bool,
     /// Realtime session currently up (browser may still be offline).
     pub running: bool,
+    /// User's online/offline toggle (AgentRail): false = paired but silent.
+    pub enabled: bool,
     /// Site the pairing points at (for display; empty when unpaired).
     pub site: String,
     /// 6-digit SAS to compare against the browser, once both keys exist.
@@ -55,10 +57,43 @@ pub async fn remote_status(app: tauri::AppHandle) -> Result<RemoteStatus, String
     Ok(RemoteStatus {
         paired,
         running,
+        enabled: crate::remote::is_enabled(),
         site: meta.map(|m| m.site).unwrap_or_default(),
         sas,
         browser_linked,
     })
+}
+
+/// Lightweight LOCAL status — no network. Safe for the AgentRail to poll.
+/// (remote_status above fetches the device row for the SAS; polling that
+/// would hammer the site.)
+#[derive(serde::Serialize)]
+pub struct RemoteLocalStatus {
+    pub paired: bool,
+    pub enabled: bool,
+    pub running: bool,
+}
+
+#[tauri::command]
+pub fn remote_local_status(app: tauri::AppHandle) -> RemoteLocalStatus {
+    RemoteLocalStatus {
+        paired: crate::remote::is_paired(),
+        enabled: crate::remote::is_enabled(),
+        running: app.state::<crate::remote_runtime::RemoteRuntime>().is_running(),
+    }
+}
+
+/// The online/offline toggle (AgentRail). OFF: keep the pairing, tear down
+/// the Realtime session entirely — no socket, no heartbeat. ON: bring it
+/// back up (autostart loop handles the browser-key wait).
+#[tauri::command]
+pub fn remote_set_enabled(app: tauri::AppHandle, on: bool) {
+    crate::remote::set_enabled(on);
+    if on {
+        crate::remote_runtime::spawn_autostart(app);
+    } else {
+        app.state::<crate::remote_runtime::RemoteRuntime>().shutdown();
+    }
 }
 
 /// Pair this Mac with a code from masonlee.build/remote. On success, tries to

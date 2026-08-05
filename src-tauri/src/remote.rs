@@ -25,6 +25,7 @@ const B64: base64::engine::general_purpose::GeneralPurpose =
 const KC_SECRET: &str = "remote:device_secret";
 const KC_JWT: &str = "remote:device_jwt";
 const KC_META: &str = "remote:meta"; // JSON: {user_id, device_id, channel, site}
+const KC_ENABLED: &str = "remote:enabled"; // "0" = user toggled offline; absent/other = online
 
 /// Max plaintext bytes per envelope chunk. Spike measured the Realtime cap at
 /// ~250KB; 48KB pre-seal leaves generous headroom for the seal + JSON + b64.
@@ -81,12 +82,24 @@ pub fn is_paired() -> bool {
     load_meta().is_some() && load_jwt().is_some()
 }
 
+/// User preference: should the Mac hold its Realtime session open?
+/// Default ON — pairing implies wanting to be reachable. OFF = paired but
+/// silent: no socket, no heartbeat, until toggled back.
+pub fn is_enabled() -> bool {
+    crate::keychain::get_key(KC_ENABLED).map(|v| v != "0").unwrap_or(true)
+}
+
+pub fn set_enabled(on: bool) {
+    let _ = crate::keychain::set_key(KC_ENABLED, if on { "1" } else { "0" });
+}
+
 /// Forget everything. Called from Settings ("Unpair") — the browser's next
 /// exchange has nothing to target, and our secret is gone.
 pub fn unpair() {
     let _ = crate::keychain::delete_key(KC_SECRET);
     let _ = crate::keychain::delete_key(KC_JWT);
     let _ = crate::keychain::delete_key(KC_META);
+    let _ = crate::keychain::delete_key(KC_ENABLED);
 }
 
 // ---------------------------------------------------------------------------
