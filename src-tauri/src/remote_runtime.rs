@@ -95,8 +95,12 @@ pub async fn start_if_paired(app: tauri::AppHandle) -> Result<bool, String> {
     let Some(meta) = crate::remote::load_meta() else { return Ok(false) };
     let Some(jwt) = crate::remote::load_jwt() else { return Ok(false) };
 
-    // Fetch the browser pubkey from the device row via the site (the browser
-    // publishes it on first /remote load; until then we can't seal).
+    // v2 ACCOUNT PAIRING: the channel key is OURS (generated at pair time,
+    // in the keychain). No browser-key wait — the session starts the moment
+    // we're paired, and any logged-in browser can join whenever it likes.
+    let sealer = Arc::new(Sealer::new()?);
+
+    // Device-row ping for supabase coords (+ last_seen liveness).
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -110,19 +114,6 @@ pub async fn start_if_paired(app: tauri::AppHandle) -> Result<bool, String> {
         .json()
         .await
         .map_err(|e| format!("device status decode: {e}"))?;
-    let browser_pub = resp
-        .get("device")
-        .and_then(|d| d.get("browser_pubkey"))
-        .and_then(|k| k.as_str())
-        .unwrap_or("")
-        .to_string();
-    if browser_pub.is_empty() {
-        // Paired but no browser yet — not an error; Settings shows "waiting
-        // for first browser connection." The runtime starts on next attempt.
-        return Ok(false);
-    }
-
-    let sealer = Arc::new(Sealer::new(&browser_pub)?);
 
     // Supabase coordinates come from the site metadata (same project the site
     // uses; the anon key is public by definition).
@@ -150,10 +141,9 @@ async fn run_loop(
 ) {
     let mut reasm = Reassembler::default();
     let mut dedupe = TurnDedupe::default();
-    // BROWSER KEY ROTATION (phone links while we're running): the session's
-    // Sealer targets the OLD key, so every inbound envelope fails to open.
-    // 3 consecutive failures = assume rotation → restart the session; the
-    // autostart loop refetches the device row and builds a fresh Sealer.
+    // KEY ROTATION (re-pair from another Mac / stale session): inbound
+    // envelopes stop opening. 3 consecutive failures → restart the session;
+    // autostart rebuilds the Sealer from the keychain (or dies if unpaired).
     let mut open_failures: u32 = 0;
 
     while let Some(evt) = events.recv().await {

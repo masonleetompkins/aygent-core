@@ -499,8 +499,7 @@ export { saveTheme };
 // live status + the SAS to compare against the browser, unpair. The device is
 // the source of truth for capability — this card only manages the session.
 type RemoteStatus = {
-  paired: boolean; running: boolean; site: string;
-  sas: string | null; browser_linked: boolean;
+  paired: boolean; running: boolean; enabled: boolean; site: string;
 };
 
 function RemoteCard() {
@@ -520,7 +519,7 @@ function RemoteCard() {
     setBusy(true); setMsg(null);
     try {
       await invoke("remote_pair", { code: code.trim() });
-      setCode(""); setMsg("✓ paired — open masonlee.build/remote in your browser to finish");
+      setCode(""); setMsg("✓ paired — open masonlee.build/remote in any browser you're logged into");
       await refresh();
     } catch (e) { setMsg("✗ " + String(e)); }
     finally { setBusy(false); }
@@ -564,18 +563,11 @@ function RemoteCard() {
         <>
           <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)", flexWrap: "wrap" }}>
             <Pill tone={status.running ? "ok" : "muted"}>
-              {status.running ? "connected" : "paired · offline"}
+              {status.running ? "connected" : status.enabled ? "paired · connecting" : "paired · offline"}
             </Pill>
-            {status.browser_linked && status.sas && (
-              <span style={{ fontSize: "var(--text-caption)", color: "var(--text-muted)" }}>
-                SAS <b style={{ letterSpacing: 2 }}>{status.sas}</b> — must match your browser
-              </span>
-            )}
-            {!status.browser_linked && (
-              <span style={{ fontSize: "var(--text-caption)", color: "var(--text-muted)" }}>
-                waiting for first browser connection
-              </span>
-            )}
+            <span style={{ fontSize: "var(--text-caption)", color: "var(--text-muted)" }}>
+              your account is paired — any browser you're logged into can chat
+            </span>
           </div>
           <div style={{ display: "flex", gap: "var(--space-2)", marginTop: "var(--space-2)" }}>
             {!status.running && <Button onClick={connect} disabled={busy}>Connect now</Button>}
