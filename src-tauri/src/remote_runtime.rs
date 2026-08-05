@@ -209,7 +209,8 @@ async fn send_hello(
         .map(|a| AgentInfo { id: a.id, name: a.name, icon: a.icon, color: a.color })
         .collect::<Vec<_>>();
     let device_name = hostname();
-    let _ = send_dev_msg(sealer, tx, CTL, &DevMsg::Hello { device_name, agents }).await;
+    let (theme_mode, theme_accent) = crate::remote_cmds::cached_theme(app);
+    let _ = send_dev_msg(sealer, tx, CTL, &DevMsg::Hello { device_name, agents, theme_mode, theme_accent }).await;
 }
 
 fn hostname() -> String {

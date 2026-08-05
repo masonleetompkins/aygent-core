@@ -30,6 +30,27 @@ pub fn remote_status(app: tauri::AppHandle) -> RemoteStatus {
     }
 }
 
+/// THEME SYNC: the UI owns the theme (localStorage); Rust caches a copy so
+/// the remote hello can tell the browser what to look like. Written on every
+/// theme change + app start.
+#[tauri::command]
+pub fn theme_sync(app: tauri::AppHandle, mode: String, accent: String) -> Result<(), String> {
+    let dir = crate::paths::state_dir(&app)?;
+    let json = serde_json::json!({ "mode": mode, "accent": accent });
+    std::fs::write(dir.join("theme.json"), json.to_string()).map_err(|e| format!("theme cache: {e}"))
+}
+
+/// Read the cached theme (mode, accent). Defaults: light, no accent.
+pub fn cached_theme(app: &tauri::AppHandle) -> (String, String) {
+    let Ok(dir) = crate::paths::state_dir(app) else { return ("light".into(), String::new()) };
+    let Ok(text) = std::fs::read_to_string(dir.join("theme.json")) else { return ("light".into(), String::new()) };
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    (
+        v.get("mode").and_then(|m| m.as_str()).unwrap_or("light").to_string(),
+        v.get("accent").and_then(|a| a.as_str()).unwrap_or("").to_string(),
+    )
+}
+
 /// Lightweight LOCAL status — no network. Safe for the AgentRail to poll.
 /// (remote_status above fetches the device row for the SAS; polling that
 /// would hammer the site.)
