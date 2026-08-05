@@ -193,6 +193,32 @@ pub fn enqueue_continue(db: &Db, agent_id: &str, note: &str, delay_secs: u64) ->
     })
 }
 
+/// AYGENT REMOTE (R4): enqueue a remote-originated USER prompt. Origin
+/// sentinel "remote:<turn_uuid>" — run_headless_turn frames it as the USER
+/// speaking (via phone), not a peer/task message. Delivered immediately
+/// (the 'continue:' due-time skip doesn't match this prefix). Fresh root +
+/// budget per turn, same shape as enqueue_continue.
+pub fn enqueue_remote(db: &Db, turn: &str, agent_id: &str, body: &str) -> Result<i64, String> {
+    let (from_s, agent_s, body_s) = (format!("remote:{turn}"), agent_id.to_string(), body.to_string());
+    db.write(move |c| {
+        let tx = c.transaction().map_err(|e| format!("txn: {e}"))?;
+        tx.execute(
+            "INSERT INTO mailbox (from_agent,to_agent,body,root_id,depth,ancestry,status,created_at)
+             VALUES (?1,?2,?3,0,6,'','pending',?4)",
+            params![from_s, agent_s, body_s, now()],
+        ).map_err(|e| format!("enqueue remote: {e}"))?;
+        let mid = tx.last_insert_rowid();
+        tx.execute("UPDATE mailbox SET root_id = ?1 WHERE id = ?1", params![mid])
+            .map_err(|e| format!("set root: {e}"))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO mailbox_budget (root_id, turns, cap, created_at) VALUES (?1, 0, 12, ?2)",
+            params![mid, now()],
+        ).map_err(|e| format!("init budget: {e}"))?;
+        tx.commit().map_err(|e| format!("commit: {e}"))?;
+        Ok(mid)
+    })
+}
+
 /// Pull the next pending message for a recipient (oldest first), marking it
 /// delivered + incrementing the tree budget, all atomic. Returns None if the
 /// recipient has no pending mail. The caller then runs it as a turn on the
