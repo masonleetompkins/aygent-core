@@ -1,28 +1,32 @@
 // AYGENT REMOTE — device-side client (the Mac end of masonlee.build/remote).
 //
-// ARCHITECTURE (see Cleo/context/plan-aygent-remote.md):
+// ARCHITECTURE (v2 — ACCOUNT pairing, see context/plan-aygent-remote.md):
 //   browser  ⇄  Supabase Realtime broadcast channel `remote:{user_id}`  ⇄  this
-// Both ends dial OUT; nobody opens ports. Payloads are E2E-sealed with
-// crypto_box (X25519 + XChaCha20-Poly1305): the relay and Mason's server carry
-// ciphertext only. Public keys are exchanged through the site's device row at
-// pair time; a 6-digit SAS derived from both pubkeys is confirmed on both
-// screens to rule out a key-swapping relay.
+// Both ends dial OUT; nobody opens ports.
 //
-// TRUST: this module runs on the PRIVILEGED Rust side. The device secret key
-// and device JWT live in the macOS keychain. What remote is ALLOWED to do is
-// decided HERE (capability manifest sent at hello) — the server never grants
-// capabilities, it only relays.
+// CRYPTO MODEL (v2, Mason 08-05): ONE symmetric channel key per account.
+// The Mac GENERATES it at pair time and registers it with the site; any
+// browser the user is logged into fetches it over authed HTTPS and can talk
+// immediately — no per-browser keypairs, no SAS, no link step. Trade-off
+// (explicit, Mason's call): encryption gates on ACCOUNT AUTH rather than
+// strict E2E-vs-relay — the site's DB holds the key. Payloads are still
+// XChaCha20-Poly1305 sealed in transit and at rest in Realtime's pipeline;
+// re-pair rotates the key; unpair deletes it everywhere.
+//
+// TRUST: this module runs on the PRIVILEGED Rust side. The channel key and
+// device JWT live in the macOS keychain. What remote is ALLOWED to do is
+// decided HERE — the server never grants capabilities, it only relays.
 
 use base64::Engine;
-use crypto_box::aead::{Aead, AeadCore, OsRng};
-use crypto_box::{ChaChaBox, PublicKey, SecretKey};
+use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
+use chacha20poly1305::XChaCha20Poly1305;
 use serde::{Deserialize, Serialize};
 
 const B64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
 
 // Keychain slots (namespaced like connection credentials).
-const KC_SECRET: &str = "remote:device_secret";
+const KC_SECRET: &str = "remote:device_secret"; // v2: the 32-byte channel key, b64
 const KC_JWT: &str = "remote:device_jwt";
 const KC_META: &str = "remote:meta"; // JSON: {user_id, device_id, channel, site}
 const KC_ENABLED: &str = "remote:enabled"; // "0" = user toggled offline; absent/other = online
@@ -43,30 +47,21 @@ pub struct RemoteMeta {
     pub site: String, // e.g. https://www.masonlee.build
 }
 
-pub struct DeviceKeys {
-    pub secret: SecretKey,
-    pub public_b64: String,
+/// Generate a FRESH 32-byte channel key and store it (re-pair = rotation).
+fn fresh_channel_key() -> Result<[u8; 32], String> {
+    use chacha20poly1305::aead::rand_core::RngCore;
+    let mut key = [0u8; 32];
+    OsRng.fill_bytes(&mut key);
+    crate::keychain::set_key(KC_SECRET, &B64.encode(key))?;
+    Ok(key)
 }
 
-/// Load the device keypair from the keychain, or create + store a fresh one.
-/// Re-pairing intentionally rotates: `pair()` always generates new keys.
-fn fresh_keys() -> Result<DeviceKeys, String> {
-    let secret = SecretKey::generate(&mut OsRng);
-    let public_b64 = B64.encode(secret.public_key().as_bytes());
-    crate::keychain::set_key(KC_SECRET, &B64.encode(secret.to_bytes()))?;
-    Ok(DeviceKeys { secret, public_b64 })
-}
-
-fn load_keys() -> Result<DeviceKeys, String> {
+fn load_channel_key() -> Result<[u8; 32], String> {
     let b64 = crate::keychain::get_key(KC_SECRET)?;
-    let bytes: [u8; 32] = B64
-        .decode(&b64)
-        .map_err(|e| format!("device key decode: {e}"))?
+    B64.decode(&b64)
+        .map_err(|e| format!("channel key decode: {e}"))?
         .try_into()
-        .map_err(|_| "device key wrong length".to_string())?;
-    let secret = SecretKey::from(bytes);
-    let public_b64 = B64.encode(secret.public_key().as_bytes());
-    Ok(DeviceKeys { secret, public_b64 })
+        .map_err(|_| "channel key wrong length".to_string())
 }
 
 pub fn load_meta() -> Option<RemoteMeta> {
@@ -93,8 +88,8 @@ pub fn set_enabled(on: bool) {
     let _ = crate::keychain::set_key(KC_ENABLED, if on { "1" } else { "0" });
 }
 
-/// Forget everything. Called from Settings ("Unpair") — the browser's next
-/// exchange has nothing to target, and our secret is gone.
+/// Forget everything. Called from Settings ("Unpair") — the site row is
+/// deleted separately; our key is gone here.
 pub fn unpair() {
     let _ = crate::keychain::delete_key(KC_SECRET);
     let _ = crate::keychain::delete_key(KC_JWT);
@@ -121,10 +116,11 @@ struct ClaimResponse {
     channel: Option<String>,
 }
 
-/// Claim a pairing code against the site. Generates FRESH keys (re-pair =
-/// rotation), registers the public key, stores jwt + meta in the keychain.
+/// Claim a pairing code against the site. Generates a FRESH channel key
+/// (re-pair = rotation), registers it account-wide, stores jwt + meta.
+/// After this succeeds, ANY logged-in browser can use the remote.
 pub async fn pair(site: &str, code: &str, device_name: &str) -> Result<RemoteMeta, String> {
-    let keys = fresh_keys()?;
+    let key = fresh_channel_key()?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -134,7 +130,7 @@ pub async fn pair(site: &str, code: &str, device_name: &str) -> Result<RemoteMet
         .post(format!("{}/api/remote/claim", site.trim_end_matches('/')))
         .json(&serde_json::json!({
             "code": code.trim().to_uppercase(),
-            "device_pubkey": keys.public_b64,
+            "channel_key": B64.encode(key),
             "device_name": device_name,
         }))
         .send()
@@ -159,26 +155,11 @@ pub async fn pair(site: &str, code: &str, device_name: &str) -> Result<RemoteMet
 }
 
 // ---------------------------------------------------------------------------
-// SAS — 6-digit short authentication string, shown on BOTH screens.
-// Derived from both public keys sorted, so both ends compute the same number
-// and a relay that swapped either key changes it.
-// ---------------------------------------------------------------------------
-
-pub fn sas_code(device_pub_b64: &str, browser_pub_b64: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let (a, b) = if device_pub_b64 <= browser_pub_b64 {
-        (device_pub_b64, browser_pub_b64)
-    } else {
-        (browser_pub_b64, device_pub_b64)
-    };
-    let d = Sha256::digest(format!("aygent-remote-sas:{a}:{b}").as_bytes());
-    let n = u32::from_be_bytes([d[0], d[1], d[2], d[3]]) % 1_000_000;
-    format!("{n:06}")
-}
-
-// ---------------------------------------------------------------------------
 // ENVELOPE — seal/open + chunking. Wire shape (broadcast event "env"):
-//   { v:1, from:"dev"|"web", turn, seq, last, nonce, ct }
+//   { v:2, from:"dev"|"web", turn, seq, last, nonce, ct }
+// XChaCha20-Poly1305 IETF AEAD with the account channel key. The browser
+// side is libsodium's crypto_aead_xchacha20poly1305_ietf_* — the same
+// construction (proven interop: examples/crypto_interop.rs).
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,20 +174,19 @@ pub struct Envelope {
 }
 
 pub struct Sealer {
-    boxer: ChaChaBox,
+    cipher: XChaCha20Poly1305,
 }
 
 impl Sealer {
-    /// Build from our secret + the browser's public key (fetched from the
-    /// device row after the browser publishes it).
-    pub fn new(browser_pub_b64: &str) -> Result<Self, String> {
-        let keys = load_keys()?;
-        let bytes: [u8; 32] = B64
-            .decode(browser_pub_b64)
-            .map_err(|e| format!("browser key decode: {e}"))?
-            .try_into()
-            .map_err(|_| "browser key wrong length".to_string())?;
-        Ok(Self { boxer: ChaChaBox::new(&PublicKey::from(bytes), &keys.secret) })
+    /// Build from the account channel key in the keychain.
+    pub fn new() -> Result<Self, String> {
+        let key = load_channel_key()?;
+        Ok(Self { cipher: XChaCha20Poly1305::new((&key).into()) })
+    }
+
+    /// Test-only: build from an explicit key (no keychain).
+    pub fn from_key(key: [u8; 32]) -> Self {
+        Self { cipher: XChaCha20Poly1305::new((&key).into()) }
     }
 
     /// Seal one plaintext into 1..N chunked envelopes.
@@ -219,13 +199,13 @@ impl Sealer {
         let n = chunks.len();
         let mut out = Vec::with_capacity(n);
         for (i, chunk) in chunks.into_iter().enumerate() {
-            let nonce = ChaChaBox::generate_nonce(&mut OsRng);
+            let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
             let ct = self
-                .boxer
+                .cipher
                 .encrypt(&nonce, chunk)
                 .map_err(|_| "seal failed".to_string())?;
             out.push(Envelope {
-                v: 1,
+                v: 2,
                 from: "dev".into(),
                 turn: turn.to_string(),
                 seq: i as u32,
@@ -241,10 +221,10 @@ impl Sealer {
     pub fn open(&self, env: &Envelope) -> Result<Vec<u8>, String> {
         let nonce_bytes = B64.decode(&env.nonce).map_err(|e| format!("nonce: {e}"))?;
         let ct = B64.decode(&env.ct).map_err(|e| format!("ct: {e}"))?;
-        let nonce = crypto_box::aead::generic_array::GenericArray::from_slice(&nonce_bytes);
-        self.boxer
+        let nonce = chacha20poly1305::aead::generic_array::GenericArray::from_slice(&nonce_bytes);
+        self.cipher
             .decrypt(nonce, ct.as_slice())
-            .map_err(|_| "open failed (wrong key? re-pair)".to_string())
+            .map_err(|_| "open failed (stale channel key? re-pair)".to_string())
     }
 }
 
@@ -264,12 +244,8 @@ impl Reassembler {
             return None;
         }
         let expected = env.seq + 1;
-        if parts.len() as u32 != expected {
-            // Missing chunks: keep waiting (out-of-order delivery) — but if the
-            // last flag arrived and count exceeds expected, something's wrong.
-            if (parts.len() as u32) < expected {
-                return None;
-            }
+        if (parts.len() as u32) < expected {
+            return None; // out-of-order delivery — keep waiting
         }
         let mut parts = self.partial.remove(&env.turn)?;
         parts.sort_by_key(|(s, _)| *s);
@@ -282,73 +258,51 @@ impl Reassembler {
 mod tests {
     use super::*;
 
-    fn pair_of_sealers() -> (Sealer, ChaChaBox, String) {
-        // Simulate both ends without the keychain: device sealer built by hand.
-        let dev = SecretKey::generate(&mut OsRng);
-        let web = SecretKey::generate(&mut OsRng);
-        let dev_sealer = Sealer { boxer: ChaChaBox::new(&web.public_key(), &dev) };
-        let web_boxer = ChaChaBox::new(&dev.public_key(), &web);
-        (dev_sealer, web_boxer, B64.encode(web.public_key().as_bytes()))
+    fn sealer() -> Sealer {
+        Sealer::from_key([7u8; 32])
     }
 
     #[test]
     fn seal_open_roundtrip() {
-        let (dev, web, _) = pair_of_sealers();
-        let envs = dev.seal("t1", b"hello remote").unwrap();
+        let s = sealer();
+        let envs = s.seal("t1", b"hello remote").unwrap();
         assert_eq!(envs.len(), 1);
-        let nonce_bytes = B64.decode(&envs[0].nonce).unwrap();
-        let ct = B64.decode(&envs[0].ct).unwrap();
-        let nonce = crypto_box::aead::generic_array::GenericArray::from_slice(&nonce_bytes);
-        let plain = web.decrypt(nonce, ct.as_slice()).unwrap();
-        assert_eq!(plain, b"hello remote");
+        assert_eq!(s.open(&envs[0]).unwrap(), b"hello remote");
+    }
+
+    #[test]
+    fn different_key_fails_open() {
+        let a = sealer();
+        let b = Sealer::from_key([8u8; 32]);
+        let envs = a.seal("t1", b"secret").unwrap();
+        assert!(b.open(&envs[0]).is_err(), "wrong key must not decrypt");
     }
 
     #[test]
     fn chunking_splits_and_reassembles() {
-        let (dev, _, _) = pair_of_sealers();
+        let s = sealer();
         let big = vec![b'x'; CHUNK_BYTES * 2 + 100]; // 3 chunks
-        let envs = dev.seal("t2", &big).unwrap();
+        let envs = s.seal("t2", &big).unwrap();
         assert_eq!(envs.len(), 3);
         assert!(envs[2].last && !envs[0].last);
 
-        // Reassemble using the DEVICE's own open (self-test of shapes): build a
-        // web-side sealer to open dev-sealed envelopes.
         let mut re = Reassembler::default();
-        // Simulate out-of-order arrival: 1, 0, 2.
-        let order = [1usize, 0, 2];
+        // Out-of-order arrival: 1, 0, 2.
         let mut done = None;
-        for &i in &order {
-            // NOTE: in production the WEB side opens dev envelopes; here we
-            // shortcut by re-opening with a mirrored boxer inside the test
-            // above. For reassembly we only need the plaintext chunks:
-            let plain = big
-                [i * CHUNK_BYTES..((i + 1) * CHUNK_BYTES).min(big.len())]
-                .to_vec();
+        for &i in &[1usize, 0, 2] {
+            let plain = s.open(&envs[i]).unwrap();
             done = re.feed(&envs[i], plain);
         }
         assert_eq!(done.expect("reassembled"), big);
     }
 
     #[test]
-    fn sas_is_stable_and_order_independent() {
-        let a = "AAAApubkeyAAAA";
-        let b = "BBBBpubkeyBBBB";
-        assert_eq!(sas_code(a, b), sas_code(b, a));
-        assert_eq!(sas_code(a, b).len(), 6);
-        assert_ne!(sas_code(a, b), sas_code(a, "CCCC"), "key swap must change the SAS");
-    }
-
-    #[test]
     fn tampered_ciphertext_fails_open() {
-        let (dev, web, _) = pair_of_sealers();
-        let mut envs = dev.seal("t3", b"secret").unwrap();
-        // Flip a byte in the ciphertext.
+        let s = sealer();
+        let mut envs = s.seal("t3", b"secret").unwrap();
         let mut ct = B64.decode(&envs[0].ct).unwrap();
         ct[0] ^= 0xFF;
         envs[0].ct = B64.encode(ct);
-        let nonce_bytes = B64.decode(&envs[0].nonce).unwrap();
-        let ct2 = B64.decode(&envs[0].ct).unwrap();
-        let nonce = crypto_box::aead::generic_array::GenericArray::from_slice(&nonce_bytes);
-        assert!(web.decrypt(nonce, ct2.as_slice()).is_err(), "AEAD must reject tampering");
+        assert!(s.open(&envs[0]).is_err(), "AEAD must reject tampering");
     }
 }

@@ -10,58 +10,45 @@ use tauri::Manager;
 #[derive(serde::Serialize)]
 pub struct RemoteStatus {
     pub paired: bool,
-    /// Realtime session currently up (browser may still be offline).
+    /// Realtime session currently up.
     pub running: bool,
     /// User's online/offline toggle (AgentRail): false = paired but silent.
     pub enabled: bool,
     /// Site the pairing points at (for display; empty when unpaired).
     pub site: String,
-    /// 6-digit SAS to compare against the browser, once both keys exist.
-    pub sas: Option<String>,
-    /// Browser has published its key (SAS is meaningful).
-    pub browser_linked: bool,
 }
 
+/// v2 account pairing: no SAS, no browser-link state — pairing is between
+/// the ACCOUNT and this Mac; any logged-in browser just works.
 #[tauri::command]
-pub async fn remote_status(app: tauri::AppHandle) -> Result<RemoteStatus, String> {
-    let meta = crate::remote::load_meta();
-    let paired = crate::remote::is_paired();
-    let running = app.state::<crate::remote_runtime::RemoteRuntime>().is_running();
-
-    // SAS needs the browser pubkey from the device row; fetch when paired.
-    let (mut sas, mut browser_linked) = (None, false);
-    if let (Some(m), Some(jwt)) = (&meta, crate::remote::load_jwt()) {
-        if let Ok(client) = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-        {
-            if let Ok(resp) = client
-                .get(format!("{}/api/remote/device", m.site))
-                .bearer_auth(&jwt)
-                .send()
-                .await
-            {
-                if let Ok(v) = resp.json::<serde_json::Value>().await {
-                    let dev = v.get("device").cloned().unwrap_or_default();
-                    let dev_pub = dev.get("device_pubkey").and_then(|k| k.as_str()).unwrap_or("");
-                    let web_pub = dev.get("browser_pubkey").and_then(|k| k.as_str()).unwrap_or("");
-                    if !web_pub.is_empty() && !dev_pub.is_empty() {
-                        browser_linked = true;
-                        sas = Some(crate::remote::sas_code(dev_pub, web_pub));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(RemoteStatus {
-        paired,
-        running,
+pub fn remote_status(app: tauri::AppHandle) -> RemoteStatus {
+    RemoteStatus {
+        paired: crate::remote::is_paired(),
+        running: app.state::<crate::remote_runtime::RemoteRuntime>().is_running(),
         enabled: crate::remote::is_enabled(),
-        site: meta.map(|m| m.site).unwrap_or_default(),
-        sas,
-        browser_linked,
-    })
+        site: crate::remote::load_meta().map(|m| m.site).unwrap_or_default(),
+    }
+}
+
+/// THEME SYNC: the UI owns the theme (localStorage); Rust caches a copy so
+/// the remote hello can tell the browser what to look like. Written on every
+/// theme change + app start.
+#[tauri::command]
+pub fn theme_sync(app: tauri::AppHandle, mode: String, accent: String) -> Result<(), String> {
+    let dir = crate::paths::state_dir(&app)?;
+    let json = serde_json::json!({ "mode": mode, "accent": accent });
+    std::fs::write(dir.join("theme.json"), json.to_string()).map_err(|e| format!("theme cache: {e}"))
+}
+
+/// Read the cached theme (mode, accent). Defaults: light, no accent.
+pub fn cached_theme(app: &tauri::AppHandle) -> (String, String) {
+    let Ok(dir) = crate::paths::state_dir(app) else { return ("light".into(), String::new()) };
+    let Ok(text) = std::fs::read_to_string(dir.join("theme.json")) else { return ("light".into(), String::new()) };
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    (
+        v.get("mode").and_then(|m| m.as_str()).unwrap_or("light").to_string(),
+        v.get("accent").and_then(|a| a.as_str()).unwrap_or("").to_string(),
+    )
 }
 
 /// Lightweight LOCAL status — no network. Safe for the AgentRail to poll.

@@ -20,6 +20,12 @@ export function applyTheme(mode: Mode, accentHex: string) {
   const root = document.documentElement;
   root.setAttribute("data-theme", mode);
 
+  // AYGENT REMOTE: mirror the theme to the Rust side so the web client can
+  // match it (sent in the remote hello). Fire-and-forget.
+  import("@tauri-apps/api/core")
+    .then(({ invoke }) => invoke("theme_sync", { mode, accent: accentHex || "" }))
+    .catch(() => {});
+
   const rgb = accentHex ? hexToRgb(accentHex) : null;
   if (rgb) {
     root.style.setProperty("--accent", accentHex);

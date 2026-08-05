@@ -95,8 +95,12 @@ pub async fn start_if_paired(app: tauri::AppHandle) -> Result<bool, String> {
     let Some(meta) = crate::remote::load_meta() else { return Ok(false) };
     let Some(jwt) = crate::remote::load_jwt() else { return Ok(false) };
 
-    // Fetch the browser pubkey from the device row via the site (the browser
-    // publishes it on first /remote load; until then we can't seal).
+    // v2 ACCOUNT PAIRING: the channel key is OURS (generated at pair time,
+    // in the keychain). No browser-key wait — the session starts the moment
+    // we're paired, and any logged-in browser can join whenever it likes.
+    let sealer = Arc::new(Sealer::new()?);
+
+    // Device-row ping for supabase coords (+ last_seen liveness).
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -110,19 +114,6 @@ pub async fn start_if_paired(app: tauri::AppHandle) -> Result<bool, String> {
         .json()
         .await
         .map_err(|e| format!("device status decode: {e}"))?;
-    let browser_pub = resp
-        .get("device")
-        .and_then(|d| d.get("browser_pubkey"))
-        .and_then(|k| k.as_str())
-        .unwrap_or("")
-        .to_string();
-    if browser_pub.is_empty() {
-        // Paired but no browser yet — not an error; Settings shows "waiting
-        // for first browser connection." The runtime starts on next attempt.
-        return Ok(false);
-    }
-
-    let sealer = Arc::new(Sealer::new(&browser_pub)?);
 
     // Supabase coordinates come from the site metadata (same project the site
     // uses; the anon key is public by definition).
@@ -150,6 +141,10 @@ async fn run_loop(
 ) {
     let mut reasm = Reassembler::default();
     let mut dedupe = TurnDedupe::default();
+    // KEY ROTATION (re-pair from another Mac / stale session): inbound
+    // envelopes stop opening. 3 consecutive failures → restart the session;
+    // autostart rebuilds the Sealer from the keychain (or dies if unpaired).
+    let mut open_failures: u32 = 0;
 
     while let Some(evt) = events.recv().await {
         match evt {
@@ -173,8 +168,23 @@ async fn run_loop(
                     continue;
                 }
                 let plain = match sealer.open(&env) {
-                    Ok(p) => p,
-                    Err(_) => continue, // wrong key / tamper — drop silently
+                    Ok(p) => {
+                        open_failures = 0;
+                        p
+                    }
+                    Err(_) => {
+                        open_failures += 1;
+                        if open_failures >= 3 {
+                            eprintln!("[aygent][remote] {open_failures} consecutive decrypt failures — browser key likely rotated; restarting session");
+                            let _ = tx.send(RtCommand::Shutdown).await;
+                            // Clear the runtime slot so autostart's is_running()
+                            // check doesn't see a ghost session.
+                            app.state::<RemoteRuntime>().shutdown();
+                            spawn_autostart(app.clone());
+                            break;
+                        }
+                        continue; // tamper / stray — drop silently
+                    }
                 };
                 let Some(full) = reasm.feed(&env, plain) else { continue };
                 let Some(msg) = parse_web_msg(&full) else { continue };
@@ -199,7 +209,8 @@ async fn send_hello(
         .map(|a| AgentInfo { id: a.id, name: a.name, icon: a.icon, color: a.color })
         .collect::<Vec<_>>();
     let device_name = hostname();
-    let _ = send_dev_msg(sealer, tx, CTL, &DevMsg::Hello { device_name, agents }).await;
+    let (theme_mode, theme_accent) = crate::remote_cmds::cached_theme(app);
+    let _ = send_dev_msg(sealer, tx, CTL, &DevMsg::Hello { device_name, agents, theme_mode, theme_accent }).await;
 }
 
 fn hostname() -> String {

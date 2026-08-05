@@ -46,7 +46,7 @@ pub enum WebMsg {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum DevMsg {
-    Hello { device_name: String, agents: Vec<AgentInfo> },
+    Hello { device_name: String, agents: Vec<AgentInfo>, theme_mode: String, theme_accent: String },
     Convs { agent: String, convs: serde_json::Value },
     ConvHistory { id: String, title: String, msgs: serde_json::Value },
     TurnStart { turn: String },
