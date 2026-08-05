@@ -157,10 +157,14 @@ impl TurnDedupe {
 /// coalescing for text). `ev` is the JSON the engine emits via app.emit.
 pub fn translate_event(turn: &str, ev: &serde_json::Value, co: &mut Coalescer) -> Vec<DevMsg> {
     let mut out = Vec::new();
-    // Engine events are externally-tagged enums: {"TextDelta":{"text":..}} etc.
-    // (turns.ts does this same sniff on the UI side.)
-    if let Some(d) = ev.get("TextDelta") {
-        if let Some(t) = d.get("text").and_then(|t| t.as_str()) {
+    // StreamEvent derives #[serde(tag = "kind")] — INTERNALLY tagged:
+    //   {"kind":"TextDelta","text":"..."}  (fields at top level).
+    // The first version of this fn matched the externally-tagged shape and
+    // silently dropped EVERY event — the web stuck at "thinking…" forever
+    // while the turn ran fine locally (live bug, Mason 08-05). Match the tag.
+    let kind = ev.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+    if kind == "TextDelta" {
+        if let Some(t) = ev.get("text").and_then(|t| t.as_str()) {
             if let Some(m) = co.push(t) {
                 out.push(m);
             }
@@ -171,21 +175,27 @@ pub fn translate_event(turn: &str, ev: &serde_json::Value, co: &mut Coalescer) -
     if let Some(m) = co.flush() {
         out.push(m);
     }
-    if let Some(d) = ev.get("ToolUse") {
-        let name = d.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
-        out.push(DevMsg::ToolStart { turn: turn.into(), name, summary: String::new() });
-    } else if let Some(d) = ev.get("ToolResult") {
-        let name = d.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
-        let ok = d.get("ok").and_then(|o| o.as_bool()).unwrap_or(true);
-        out.push(DevMsg::ToolEnd { turn: turn.into(), name, ok });
-    } else if ev.get("Done").is_some() {
-        out.push(DevMsg::TurnEnd { turn: turn.into() });
-    } else if let Some(d) = ev.get("Error") {
-        let msg = d.get("text").and_then(|t| t.as_str()).unwrap_or("turn failed").to_string();
-        out.push(DevMsg::Error { msg });
+    match kind {
+        "ToolUse" | "ToolUseStart" => {
+            let name = ev.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
+            // ToolUseStart + ToolUse both open the same card web-side; send one.
+            if kind == "ToolUse" {
+                out.push(DevMsg::ToolStart { turn: turn.into(), name, summary: String::new() });
+            }
+        }
+        "ToolResult" => {
+            let name = ev.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
+            let ok = ev.get("ok").and_then(|o| o.as_bool()).unwrap_or(true);
+            out.push(DevMsg::ToolEnd { turn: turn.into(), name, ok });
+        }
+        "Done" => out.push(DevMsg::TurnEnd { turn: turn.into() }),
+        "Error" => {
+            let msg = ev.get("text").and_then(|t| t.as_str()).unwrap_or("turn failed").to_string();
+            out.push(DevMsg::Error { msg });
+        }
+        // Info / ToolUseDelta: not forwarded in v1 (bandwidth / local color).
+        _ => {}
     }
-    // Info / ToolUseStart / ToolUseDelta are intentionally not forwarded in v1:
-    // args can contain file contents (bandwidth) and Info is local color.
     out
 }
 
@@ -260,6 +270,19 @@ mod tests {
         assert!(co.flush().is_none());
     }
 
+    /// The translator must accept what provider::StreamEvent ACTUALLY
+    /// serializes to — not a hand-written approximation of it.
+    #[test]
+    fn translates_real_serialized_stream_events() {
+        let mut co = Coalescer::new("t9");
+        let delta = serde_json::to_value(crate::provider::StreamEvent::TextDelta { text: "hi".into() }).unwrap();
+        let got = translate_event("t9", &delta, &mut co);
+        assert!(matches!(&got[0], DevMsg::Delta { text, .. } if text == "hi"), "got: {got:?}");
+        let done = serde_json::to_value(crate::provider::StreamEvent::Done { stop_reason: "end_turn".into() }).unwrap();
+        let got = translate_event("t9", &done, &mut co);
+        assert!(matches!(&got[0], DevMsg::TurnEnd { .. }), "got: {got:?}");
+    }
+
     #[test]
     fn dedupe_accepts_once_and_evicts_oldest() {
         let mut d = TurnDedupe::default();
@@ -278,19 +301,21 @@ mod tests {
         let mut co = Coalescer::new("t1");
         // Prime the coalescer so subsequent pushes buffer.
         let _ = co.push("first ");
-        let buffered = translate_event("t1", &serde_json::json!({"TextDelta": {"text": "reply"}}), &mut co);
+        // REAL wire shape: StreamEvent is #[serde(tag = "kind")] — internally
+        // tagged. (The externally-tagged shape here was exactly the live bug.)
+        let buffered = translate_event("t1", &serde_json::json!({"kind": "TextDelta", "text": "reply"}), &mut co);
         assert!(buffered.is_empty(), "within gap → buffered");
         // A tool event must flush the buffered text BEFORE the tool msg.
         let msgs = translate_event(
             "t1",
-            &serde_json::json!({"ToolUse": {"id": "x", "name": "read_file", "input": {}}}),
+            &serde_json::json!({"kind": "ToolUse", "id": "x", "name": "read_file", "input": {}}),
             &mut co,
         );
         assert_eq!(msgs.len(), 2);
         assert!(matches!(&msgs[0], DevMsg::Delta { text, .. } if text == "reply"));
         assert!(matches!(&msgs[1], DevMsg::ToolStart { name, .. } if name == "read_file"));
         // Done → TurnEnd.
-        let done = translate_event("t1", &serde_json::json!({"Done": {"stop_reason": "end_turn"}}), &mut co);
+        let done = translate_event("t1", &serde_json::json!({"kind": "Done", "stop_reason": "end_turn"}), &mut co);
         assert!(matches!(&done[0], DevMsg::TurnEnd { .. }));
     }
 }
