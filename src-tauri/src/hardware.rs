@@ -35,7 +35,10 @@ pub struct HardwareInfo {
 pub enum Accelerator {
     /// Apple Silicon w/ Metal + unified memory — the ideal local-inference box.
     AppleSilicon,
-    /// Discrete NVIDIA GPU w/ CUDA (VRAM-bound).
+    /// Discrete NVIDIA GPU w/ CUDA (VRAM-bound). Dormant until the PC detect
+    /// path constructs it (`cuda` cargo feature) — the match arms below keep
+    /// the wiring compiling so that port stays honest.
+    #[allow(dead_code)]
     Cuda,
     /// Intel Mac / no usable GPU offload — CPU inference.
     Cpu,

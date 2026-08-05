@@ -135,15 +135,6 @@ impl DataSource {
         }
     }
 
-    fn label(&self) -> &'static str {
-        match self {
-            DataSource::Static { .. } => "static",
-            DataSource::Binding { .. } => "binding",
-            DataSource::Http { .. } => "http",
-            DataSource::Exec { .. } => "exec",
-            DataSource::AgentTurn { .. } => "agent_turn",
-        }
-    }
 }
 
 impl Default for DataSource {

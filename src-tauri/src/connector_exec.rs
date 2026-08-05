@@ -17,9 +17,6 @@ pub struct Creds {
 }
 
 impl Creds {
-    fn as_value(&self) -> serde_json::Value {
-        serde_json::Value::Object(self.fields.clone())
-    }
 }
 
 /// Execute a connector tool. Returns the tool convention `(text, is_error)` —

@@ -102,18 +102,6 @@ fn index_path(app_data: &Path) -> Result<PathBuf, String> {
     Ok(agents_dir(app_data)?.join("index.json"))
 }
 
-/// Per-agent state root: <app_data>/agents/<agentId>/
-pub fn agent_state_dir(app_data: &Path, agent_id: &str) -> Result<PathBuf, String> {
-    let d = agents_dir(app_data)?.join(sanitize_id(agent_id));
-    fs::create_dir_all(&d).map_err(|e| format!("mkdir agent state: {e}"))?;
-    Ok(d)
-}
-
-/// Ids are app-generated, but never trust one straight into a path.
-fn sanitize_id(id: &str) -> String {
-    id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect()
-}
-
 pub fn load_index(app_data: &Path) -> AgentIndex {
     let p = match index_path(app_data) { Ok(p) => p, Err(_) => return AgentIndex::default() };
     fs::read_to_string(&p)
@@ -160,56 +148,6 @@ pub fn create(
     if first || idx.active_id.is_empty() { idx.active_id = profile.id.clone(); }
     save_index(app_data, &idx)?;
     Ok(profile)
-}
-
-pub fn update(app_data: &Path, mut profile: AgentProfile) -> Result<(), String> {
-    let mut idx = load_index(app_data);
-    profile.updated_at = now();
-    match idx.agents.iter_mut().find(|a| a.id == profile.id) {
-        Some(existing) => { *existing = profile; }
-        None => return Err("agent not found".into()),
-    }
-    save_index(app_data, &idx)
-}
-
-pub fn delete(app_data: &Path, id: &str) -> Result<(), String> {
-    let mut idx = load_index(app_data);
-    let before = idx.agents.len();
-    idx.agents.retain(|a| a.id != id);
-    if idx.agents.len() == before { return Err("agent not found".into()); }
-    // If we deleted the active one, fall back to the first remaining.
-    if idx.active_id == id {
-        idx.active_id = idx.agents.first().map(|a| a.id.clone()).unwrap_or_default();
-    }
-    save_index(app_data, &idx)?;
-    // Drop this agent's per-agent state (settings/conversations/tools). Folder +
-    // Save Points are untouched (they belong to the folder, not the agent).
-    if let Ok(dir) = agent_state_dir(app_data, id) {
-        let _ = fs::remove_dir_all(dir);
-    }
-    Ok(())
-}
-
-pub fn set_active(app_data: &Path, id: &str) -> Result<(), String> {
-    let mut idx = load_index(app_data);
-    if !idx.agents.iter().any(|a| a.id == id) { return Err("agent not found".into()); }
-    idx.active_id = id.to_string();
-    save_index(app_data, &idx)
-}
-
-pub fn get(app_data: &Path, id: &str) -> Option<AgentProfile> {
-    load_index(app_data).agents.into_iter().find(|a| a.id == id)
-}
-
-pub fn get_active(app_data: &Path) -> Option<AgentProfile> {
-    let idx = load_index(app_data);
-    idx.agents.into_iter().find(|a| a.id == idx.active_id)
-}
-
-/// Resolve an agentId to its jailed folder path (for the broker scope). Returns
-/// None if the agent is unknown or has no folder yet.
-pub fn folder_for(app_data: &Path, id: &str) -> Option<String> {
-    get(app_data, id).map(|a| a.folder_path).filter(|p| !p.is_empty())
 }
 
 /// BACK-COMPAT MIGRATION: if there are no agent profiles yet but a legacy

@@ -28,11 +28,6 @@ use std::sync::{Arc, Mutex};
 
 /// Opaque handle handed back to the daemon. NOT a path. The daemon cannot
 /// derive a filesystem path from this — it can only pass it back to read/write.
-#[derive(Clone, Debug)]
-pub struct Handle {
-    pub id: String,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mode {
     Read,
@@ -65,7 +60,6 @@ pub struct Mount {
 /// zero or more READ-ONLY mounts of other folders.
 #[derive(Clone)]
 pub struct AgentScope {
-    pub agent_id: String,
     pub root: PathBuf,        // canonical, data-volume-resolved
     pub bookmark_stale: bool, // Atlas C2: handle explicitly, fail closed if stale
     /// Read-only shared context. Tried ONLY after the primary root misses, and
@@ -108,7 +102,7 @@ impl Broker {
         let mounts = scopes.get(agent_id).map(|s| s.mounts.clone()).unwrap_or_default();
         scopes.insert(
             agent_id.to_string(),
-            AgentScope { agent_id: agent_id.to_string(), root, bookmark_stale, mounts },
+            AgentScope { root, bookmark_stale, mounts },
         );
     }
 

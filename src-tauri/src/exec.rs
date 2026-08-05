@@ -212,7 +212,6 @@ pub struct ExecBroker {
 
 #[derive(Debug)]
 pub enum ExecError {
-    NoScope,
     Spawn(String),
     NotFound,
     Io(String),
@@ -222,7 +221,6 @@ pub enum ExecError {
 impl std::fmt::Display for ExecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExecError::NoScope => write!(f, "no agent scope (pick a folder first)"),
             ExecError::Spawn(e) => write!(f, "spawn failed: {e}"),
             ExecError::NotFound => write!(f, "unknown process handle"),
             ExecError::Io(e) => write!(f, "io: {e}"),
@@ -445,6 +443,7 @@ impl ExecBroker {
     /// try SIGTERM via libc first on unix, then fall back to kill()).
     pub fn kill(&self, handle: &str, signal: &str) -> Result<serde_json::Value, ExecError> {
         let proc = self.get(handle)?;
+        #[cfg_attr(unix, allow(unused_mut))] // non-unix branch needs `child.kill(&mut)`
         let mut child = proc.child.lock().unwrap();
 
         #[cfg(unix)]

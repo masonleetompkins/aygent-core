@@ -121,18 +121,16 @@ pub async fn local_stream_turn<F: FnMut(StreamEvent)>(
     let ctx = if ctx_tokens == 0 { DEFAULT_CTX_TOKENS } else { ctx_tokens }
         .clamp(MIN_CTX_TOKENS, MAX_CTX_TOKENS);
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TokenMsg>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     // Decode on a blocking thread (llama.cpp is synchronous + heavy).
     let handle = tokio::task::spawn_blocking(move || decode(&path, &prompt, ctx, tx));
 
     // Forward tokens live as they arrive.
     let mut full = String::new();
-    while let Some(msg) = rx.recv().await {
-        match msg {
-            TokenMsg::Text(t) => { full.push_str(&t); on_event(StreamEvent::TextDelta { text: t }); }
-            TokenMsg::Err(e) => { on_event(StreamEvent::Error { text: e.clone() }); return Err(e); }
-        }
+    while let Some(t) = rx.recv().await {
+        full.push_str(&t);
+        on_event(StreamEvent::TextDelta { text: t });
     }
     handle.await.map_err(|e| format!("decode task: {e}"))??;
 
@@ -141,10 +139,8 @@ pub async fn local_stream_turn<F: FnMut(StreamEvent)>(
     Ok((content, "end_turn".to_string()))
 }
 
-enum TokenMsg { Text(String), Err(String) }
-
 /// The synchronous decode loop (runs on a blocking thread).
-fn decode(path: &str, prompt: &str, ctx_tokens: u32, tx: tokio::sync::mpsc::UnboundedSender<TokenMsg>) -> Result<(), String> {
+fn decode(path: &str, prompt: &str, ctx_tokens: u32, tx: tokio::sync::mpsc::UnboundedSender<String>) -> Result<(), String> {
     let be = backend()?;
     let model = load_model(path)?;
 
@@ -203,7 +199,7 @@ fn decode(path: &str, prompt: &str, ctx_tokens: u32, tx: tokio::sync::mpsc::Unbo
         let piece = model
             .token_to_str(token, llama_cpp_2::model::Special::Tokenize)
             .unwrap_or_default();
-        if tx.send(TokenMsg::Text(piece)).is_err() { break; } // UI hung up
+        if tx.send(piece).is_err() { break; } // UI hung up
 
         batch.clear();
         batch.add(token, n_cur, &[0], true).map_err(|e| format!("batch add: {e}"))?;

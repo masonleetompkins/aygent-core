@@ -223,12 +223,6 @@ pub enum StreamEvent {
     Error { text: String },
 }
 
-/// Does this provider/model support server-sent streaming? (Phase-1 providers
-/// all do; kept as a hook so a future provider can declare turn-based only.)
-pub fn provider_supports_streaming(provider: &str) -> bool {
-    matches!(provider, "anthropic" | "openai" | "openrouter" | "ollama")
-}
-
 /// Find the byte-offset of the next SSE frame delimiter (a blank line, i.e.
 /// \n\n or \r\n\r\n) in a raw byte buffer. Operating on bytes (not a decoded
 /// String) means we never risk splitting a multi-byte UTF-8 character while
