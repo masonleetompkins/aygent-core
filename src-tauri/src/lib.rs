@@ -1193,6 +1193,13 @@ fn conv_save(db: tauri::State<writer::Db>, folder: String, conv: repo::Conversat
 
 /// Delete a conversation (and forget its execution lane).
 #[tauri::command]
+fn conv_rename(db: tauri::State<writer::Db>, id: String, title: String) -> Result<(), String> {
+    let t = title.trim();
+    if t.is_empty() { return Err("title cannot be empty".into()); }
+    repo::rename_conversation(&db, &id, t)
+}
+
+#[tauri::command]
 fn conv_delete(db: tauri::State<writer::Db>, lanes: tauri::State<lanes::Lanes>, id: String) -> Result<(), String> {
     repo::delete_conversation(&db, &id)?;
     lanes.forget(&id);
@@ -4587,7 +4594,7 @@ pub fn run() {
             savepoint_snapshot, savepoint_timeline, savepoint_rewind,
             savepoint_undo, savepoint_redo,
             savepoint_get_retention, savepoint_set_retention, savepoint_purge,
-            conv_list, conv_load, conv_save, conv_delete, conv_reorder,
+            conv_list, conv_load, conv_save, conv_rename, conv_delete, conv_reorder,
             agents_list, agents_create, agents_update, agents_delete,
             agents_set_active, agents_get_active, agents_sharing_folder,
             agent_mounts_list, agent_mount_add, agent_mount_remove,

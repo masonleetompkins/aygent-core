@@ -423,16 +423,18 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     } catch { /* ignore */ }
   }
 
-  // Rename a chat by id: persist a new title via conv_save (loads the full
-  // conversation first so we don't clobber msgs/history) then refresh. Used by
-  // both the sidebar pencil (prompt) and the inline header field (direct value).
+  // Rename a chat by id via the dedicated conv_rename command (a targeted
+  // UPDATE of title only). The old load+conv_save round-trip was the revert
+  // bug (Mason 08-04): every turn-save re-derived the title from the first
+  // user message and clobbered the rename; the backend now preserves stored
+  // titles on save, so renames MUST go through conv_rename. Used by both the
+  // sidebar pencil and the inline header field.
   async function saveConvTitle(id: string, next: string) {
     if (!folder) return;
     const title = next.trim();
     if (!title) return;
     try {
-      const c = await invoke<any>("conv_load", { folder, id });
-      await invoke("conv_save", { folder, conv: { ...c, title } });
+      await invoke("conv_rename", { id, title });
       await refreshList();
     } catch { /* ignore */ }
   }
