@@ -188,6 +188,9 @@ export function Settings({
 
       {/* AGENT FOLDER card removed — each agent's folder is set in the Agents tab. */}
 
+      {/* AYGENT REMOTE — pair this Mac with masonlee.build/remote. */}
+      <RemoteCard />
+
       {/* DAEMON — quiet sanity-check (moved out of the old persistent top strip).
           Just confirms the local engine is up; not something to stare at. */}
       {daemonStatus && (
@@ -490,3 +493,97 @@ function ProviderRow({ provider, label, placeholder }: { provider: string; label
 
 // re-export so App can persist through the same helper
 export { saveTheme };
+
+// --- AYGENT REMOTE ----------------------------------------------------------
+// Pair this Mac with masonlee.build/remote: enter the site's 8-char code, see
+// live status + the SAS to compare against the browser, unpair. The device is
+// the source of truth for capability — this card only manages the session.
+type RemoteStatus = {
+  paired: boolean; running: boolean; site: string;
+  sas: string | null; browser_linked: boolean;
+};
+
+function RemoteCard() {
+  const [status, setStatus] = useState<RemoteStatus | null>(null);
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  async function refresh() {
+    try { setStatus(await invoke<RemoteStatus>("remote_status")); }
+    catch { /* status is best-effort */ }
+  }
+  useEffect(() => { refresh(); }, []);
+
+  async function pair() {
+    if (!code.trim() || busy) return;
+    setBusy(true); setMsg(null);
+    try {
+      await invoke("remote_pair", { code: code.trim() });
+      setCode(""); setMsg("✓ paired — open masonlee.build/remote in your browser to finish");
+      await refresh();
+    } catch (e) { setMsg("✗ " + String(e)); }
+    finally { setBusy(false); }
+  }
+  async function unpair() {
+    setBusy(true); setMsg(null);
+    try { await invoke("remote_unpair"); setMsg("✓ unpaired — keys wiped"); await refresh(); }
+    catch (e) { setMsg("✗ " + String(e)); }
+    finally { setBusy(false); }
+  }
+  async function connect() {
+    setBusy(true); setMsg(null);
+    try {
+      const up = await invoke<boolean>("remote_connect");
+      setMsg(up ? "✓ session up" : "waiting for the browser — open /remote on the site first");
+      await refresh();
+    } catch (e) { setMsg("✗ " + String(e)); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <Card title="AYGENT Remote">
+      {!status?.paired ? (
+        <>
+          <p style={hint}>
+            Use your agents from any browser. Get a pairing code at{" "}
+            <b>masonlee.build/remote</b>, then enter it here.
+          </p>
+          <div style={{ display: "flex", gap: "var(--space-2)" }}>
+            <Input
+              value={code}
+              onChange={(e) => setCode(e.target.value.toUpperCase())}
+              placeholder="8-character code"
+              maxLength={8}
+              style={{ width: 180, textTransform: "uppercase", letterSpacing: 2 }}
+            />
+            <Button onClick={pair} disabled={busy || code.trim().length !== 8}>Pair</Button>
+          </div>
+        </>
+      ) : (
+        <>
+          <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)", flexWrap: "wrap" }}>
+            <Pill tone={status.running ? "ok" : "muted"}>
+              {status.running ? "connected" : "paired · offline"}
+            </Pill>
+            {status.browser_linked && status.sas && (
+              <span style={{ fontSize: "var(--text-caption)", color: "var(--text-muted)" }}>
+                SAS <b style={{ letterSpacing: 2 }}>{status.sas}</b> — must match your browser
+              </span>
+            )}
+            {!status.browser_linked && (
+              <span style={{ fontSize: "var(--text-caption)", color: "var(--text-muted)" }}>
+                waiting for first browser connection
+              </span>
+            )}
+          </div>
+          <div style={{ display: "flex", gap: "var(--space-2)", marginTop: "var(--space-2)" }}>
+            {!status.running && <Button onClick={connect} disabled={busy}>Connect now</Button>}
+            <Button onClick={unpair} disabled={busy} variant="secondary">Unpair</Button>
+          </div>
+        </>
+      )}
+      {msg && <p style={{ ...hint, marginTop: "var(--space-2)" }}>{msg}</p>}
+    </Card>
+  );
+}

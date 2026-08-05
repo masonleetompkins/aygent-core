@@ -45,6 +45,7 @@ mod migrate_json;
 pub mod remote_rt; // AYGENT REMOTE: Supabase Realtime client (Phoenix framing over wss).
 pub mod remote_bridge; // AYGENT REMOTE: turn bridge — protocol, coalescing, dedupe, event translation.
 pub mod remote_runtime; // AYGENT REMOTE: device runtime — rt events → dispatch → engine → sealed replies.
+pub mod remote_cmds; // AYGENT REMOTE: Settings-card commands (pair/unpair/status/connect).
 pub mod remote;   // AYGENT REMOTE: pairing + E2E envelope + Realtime client (masonlee.build/remote).
 mod repo;
 mod writer;
@@ -4592,6 +4593,10 @@ pub fn run() {
             whisper::transcribe_audio_b64,
             chat_attach_file,
             agent_stop,
+            remote_cmds::remote_status,
+            remote_cmds::remote_pair,
+            remote_cmds::remote_unpair,
+            remote_cmds::remote_connect,
             provider_verify_key,
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
@@ -4699,6 +4704,18 @@ pub fn run() {
                     let brk = _app.state::<Arc<Broker>>().inner().clone();
                     let lns = _app.state::<lanes::Lanes>().inner().clone();
                     drainer::spawn(_app.handle().clone(), db.clone(), brk, lns, sig);
+
+                    // AYGENT REMOTE: if this Mac is paired, bring the Realtime
+                    // session up at boot (silently no-ops when unpaired or the
+                    // browser hasn't published its key yet).
+                    let remote_app = _app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        match crate::remote_runtime::start_if_paired(remote_app).await {
+                            Ok(true) => eprintln!("[aygent][remote] realtime session up"),
+                            Ok(false) => {}
+                            Err(e) => eprintln!("[aygent][remote] autostart: {e}"),
+                        }
+                    });
                 }
 
                 // M1.8 SCHEDULER: spawn the ticker ("the drainer with a clock in
