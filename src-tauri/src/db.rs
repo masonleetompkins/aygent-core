@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 /// Current schema version. Bump when adding a migration step below.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// The DB file name under <app_data>.
 pub const DB_FILE: &str = "aygent.db";
@@ -167,6 +167,81 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("migrate v8: {e}"))?;
         set_version(conn, 8)?;
         v = 8;
+    }
+
+    if v < 9 {
+        // DASHBOARDS (M1). One dashboard per agent (Mason's call: no tabs in v1),
+        // modules as validated JSON specs, plus a revision log so "undo that"
+        // after a bad prompt is trivial — the fastest way to hate a
+        // prompt-driven builder is one emit nuking an hour of work.
+        //
+        // NOTE: no interval/ttl/next_fire_at column ANYWHERE in here, on
+        // purpose. Dashboards are pull-only (see dashboard.rs safety rule);
+        // recurrence lives in scheduler.rs where spend is explicit.
+        conn.execute_batch(SCHEMA_V9)
+            .map_err(|e| format!("migrate v9: {e}"))?;
+        set_version(conn, 9)?;
+        v = 9;
+    }
+
+    if v < 10 {
+        // CONNECTIONS v2 — PER-AGENT ACCOUNTS + READ/WRITE.
+        //
+        // Two real problems this fixes:
+        //   1. Multiple accounts per provider (Cleo = personal GitHub, a work
+        //      agent = the company GitHub). The rows already supported it, but
+        //      nothing NAMED them, so the UI couldn't tell them apart and
+        //      token_for_agent_provider() picked one with an unordered LIMIT 1.
+        //      `nickname` makes the account human-identifiable.
+        //   2. Write access was all-or-nothing. `access_mode` gates write tools
+        //      per (agent, connection): read is the default, write is opt-in.
+        //
+        // The uniqueness INDEX is the important line: at most ONE enabled
+        // connection per (agent, provider) is enforced by the DATABASE, not by
+        // careful callers. A wrong-credential bug doesn't fail loudly, it
+        // SUCCEEDS against the wrong account — so ambiguity must be impossible.
+        conn.execute_batch(SCHEMA_V10)
+            .map_err(|e| format!("migrate v10: {e}"))?;
+        set_version(conn, 10)?;
+        v = 10;
+    }
+
+    if v < 11 {
+        // FULL CAPABILITY BY DEFAULT + PER-TOOL SWITCHES.
+        //
+        // v10 shipped connections read-only with write as an opt-in toggle. In
+        // practice that meant connecting Notion bought you two tools and no
+        // ability to act — "hardly useful" was the accurate description. If a
+        // user hands us a credential, the intent is for the agent to USE that
+        // service; safety belongs in per-tool control, not a crippled default.
+        //
+        // The OFF list (rather than an allow-list) is the important choice: when
+        // a connector gains tools in a later release they arrive ENABLED, instead
+        // of being invisible because an allow-list written months ago didn't
+        // mention them.
+        conn.execute_batch(SCHEMA_V11)
+            .map_err(|e| format!("migrate v11: {e}"))?;
+        set_version(conn, 11)?;
+        v = 11;
+    }
+
+    if v < 12 {
+        // FIX THE v11 MIGRATION. v11 flipped the DEFAULT to 'write' but left
+        // existing rows alone, reasoning that "someone who deliberately chose
+        // read-only keeps it". That reasoning was wrong: nobody chose read-only,
+        // they were read-only because v10's default WAS read. I preserved a
+        // default and called it a choice — so every connection made before the
+        // flip stayed crippled, which is exactly the complaint the change was
+        // supposed to fix (Mason connected Notion, saw all capabilities listed as
+        // on, and the agent still said "I'm read-only").
+        //
+        // Per-tool switches are the single gate now, and this table is empty for
+        // everyone (the feature is one build old), so promoting every row to
+        // 'write' cannot discard a real user choice.
+        conn.execute_batch(SCHEMA_V12)
+            .map_err(|e| format!("migrate v12: {e}"))?;
+        set_version(conn, 12)?;
+        v = 12;
     }
 
     let _ = v;
@@ -487,4 +562,120 @@ CREATE TABLE IF NOT EXISTS agent_mount (
   FOREIGN KEY (agent_id) REFERENCES agent(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_agent_mount_agent ON agent_mount(agent_id);
+"#;
+
+/// SCHEMA v9 (DASHBOARDS) — a configurable, prompt-built dashboard per agent.
+///
+/// `dashboard` is 1:1 with an agent (UNIQUE agent_id). `dashboard_module` holds
+/// one validated ModuleSpec per row: `kind` is denormalized into a column for
+/// cheap filtering while `spec_json` stays the source of truth (scheduler.rs
+/// precedent — typed enum as JSON => new variants need no migration).
+///
+/// `cached_json` + `fetched_at` exist because dashboards are PULL-ONLY: nothing
+/// refreshes on a timer, so a module MUST be able to render its last known
+/// value instantly on load (stale but honest, never a spinner wall) and show
+/// how old it is.
+///
+/// `dashboard_revision` is an append-only log of whole-dashboard snapshots,
+/// written before every mutation, so undo/restore is a read not a diff.
+const SCHEMA_V9: &str = r#"
+CREATE TABLE IF NOT EXISTS dashboard (
+  id          TEXT PRIMARY KEY,
+  agent_id    TEXT NOT NULL UNIQUE,   -- 1:1 with the agent (v1: no tabs)
+  title       TEXT NOT NULL DEFAULT 'Dashboard',
+  created_at  INTEGER NOT NULL DEFAULT 0,
+  updated_at  INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY (agent_id) REFERENCES agent(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS dashboard_module (
+  id            TEXT PRIMARY KEY,
+  dashboard_id  TEXT NOT NULL,
+  kind          TEXT NOT NULL,               -- denormalized from spec_json
+  title         TEXT NOT NULL DEFAULT '',
+  x             INTEGER NOT NULL DEFAULT 0,  -- 12-col grid
+  y             INTEGER NOT NULL DEFAULT 0,
+  w             INTEGER NOT NULL DEFAULT 4,
+  h             INTEGER NOT NULL DEFAULT 4,
+  spec_json     TEXT NOT NULL,               -- the full validated ModuleSpec
+  cached_json   TEXT,                        -- last fetched value (pull-only)
+  fetched_at    INTEGER,                     -- when that value was fetched
+  error         TEXT,                        -- last refresh error, if any
+  created_at    INTEGER NOT NULL DEFAULT 0,
+  updated_at    INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY (dashboard_id) REFERENCES dashboard(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_dash_module_dash ON dashboard_module(dashboard_id);
+
+CREATE TABLE IF NOT EXISTS dashboard_revision (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  dashboard_id  TEXT NOT NULL,
+  modules_json  TEXT NOT NULL,   -- full snapshot of all modules, pre-change
+  summary       TEXT NOT NULL DEFAULT '',
+  created_at    INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY (dashboard_id) REFERENCES dashboard(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_dash_rev_dash ON dashboard_revision(dashboard_id, id DESC);
+"#;
+
+/// SCHEMA v10 (CONNECTIONS v2 — per-agent accounts + read/write gating).
+///
+/// `nickname` names an account ("Personal", "Work / Stan") so two GitHub
+/// connections are distinguishable in the UI and in errors.
+///
+/// `access_mode` is per (agent, connection): 'read' (default) or 'write'.
+/// Write connector tools are never even added to an agent's tool list unless
+/// this says 'write' — the model cannot call what it was not given.
+///
+/// The partial unique index enforces AT MOST ONE ENABLED connection per
+/// (agent, provider). Without it, "which GitHub token did the agent just push
+/// with?" has no deterministic answer.
+const SCHEMA_V10: &str = r#"
+ALTER TABLE connection ADD COLUMN nickname TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_connection ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'read';
+
+-- Backfill: existing rows get their account (or provider) as the nickname so
+-- nothing shows up blank after upgrade.
+UPDATE connection SET nickname = COALESCE(NULLIF(account, ''), provider)
+  WHERE nickname = '';
+
+-- Denormalized provider on the join row so the invariant is expressible as a
+-- plain unique index (SQLite can't index across a join).
+ALTER TABLE agent_connection ADD COLUMN provider TEXT NOT NULL DEFAULT '';
+UPDATE agent_connection SET provider = (
+  SELECT c.provider FROM connection c WHERE c.id = agent_connection.connection_id
+) WHERE provider = '';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_conn_one_enabled_per_provider
+  ON agent_connection(agent_id, provider) WHERE enabled = 1;
+"#;
+
+/// SCHEMA v11 — write-by-default + per-tool disable list.
+///
+/// `access_mode` default flips to 'write': connecting an account grants the full
+/// capability of that account, which is what handing over a credential means.
+/// Existing rows are LEFT ALONE — someone who deliberately chose read-only keeps
+/// it; only new grants get the new default.
+///
+/// `connection_tool_off` holds individually switched-off tools per (agent,
+/// connection). Absence means enabled, so new tools in future releases are on by
+/// default rather than silently missing.
+const SCHEMA_V11: &str = r#"
+CREATE TABLE IF NOT EXISTS connection_tool_off (
+  agent_id      TEXT NOT NULL,
+  connection_id INTEGER NOT NULL,
+  tool_name     TEXT NOT NULL,
+  PRIMARY KEY (agent_id, connection_id, tool_name),
+  FOREIGN KEY (agent_id) REFERENCES agent(id) ON DELETE CASCADE,
+  FOREIGN KEY (connection_id) REFERENCES connection(id) ON DELETE CASCADE
+);
+"#;
+
+/// SCHEMA v12 — promote every existing connection to full capability.
+///
+/// `access_mode` no longer gates tool assembly at all (the per-tool off-list is
+/// the only gate), but it is still read as an enablement sanity check, and stale
+/// 'read' values are confusing to anyone reading the DB. Normalize them.
+const SCHEMA_V12: &str = r#"
+UPDATE agent_connection SET access_mode = 'write' WHERE access_mode = 'read';
 "#;

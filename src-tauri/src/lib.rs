@@ -26,9 +26,13 @@ mod paths;     // CONFIG RELOCATION: root-folder pointer + state-dir seam + onbo
 mod history;
 mod catalog;
 mod connections;
+mod connectors; // CONNECTOR REGISTRY: a provider is data (descriptor), not code.
+mod connector_exec; // One generic HTTP executor for every registry connector.
 mod savepoint;
 mod context_docs;
 mod conversations;
+mod dashboard_data; // DASHBOARDS M3: pull-only data resolution (bindings/http/exec).
+mod dashboard; // DASHBOARDS: prompt-built, spec-driven, pull-only (never auto-runs a model).
 mod db;
 mod drainer;
 mod lanes;
@@ -42,6 +46,7 @@ mod migrate_json;
 mod repo;
 mod writer;
 mod gguf;
+mod google_auth; // GOOGLE service accounts: RS256 JWT -> access token (the one credential we must MINT, not paste).
 mod hardware;
 mod keychain;
 mod local_provider;
@@ -854,6 +859,126 @@ fn connection_set_agent_enabled(db: tauri::State<writer::Db>, agent_id: String, 
 #[tauri::command]
 fn connection_enabled_for_agent(db: tauri::State<writer::Db>, agent_id: String) -> Result<Vec<i64>, String> {
     connections::enabled_ids_for_agent(&db, &agent_id)
+}
+
+/// The connector CATALOG (all descriptors, non-secret by construction). Drives
+/// the Connections screen: cards, setup steps, auth fields, per-tool access.
+#[tauri::command]
+fn connectors_catalog() -> Vec<&'static connectors::Connector> {
+    connectors::catalog().iter().collect()
+}
+
+/// Connect ANY registry connector. `values` maps auth-field key -> value.
+/// Validates against the live API (so a bad credential fails at paste time, not
+/// mid-turn an hour later) and captures which ACCOUNT it belongs to.
+#[tauri::command]
+async fn connector_connect(
+    db: tauri::State<'_, writer::Db>,
+    provider: String,
+    nickname: String,
+    values: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let map = values.as_object().cloned().unwrap_or_default();
+    let (id, account) = connections::connect_connector(&db, &provider, &nickname, &map).await?;
+    Ok(serde_json::json!({ "id": id, "account": account }))
+}
+
+/// Per-agent connection state for the UI: which are enabled and in what mode.
+#[tauri::command]
+fn connection_agent_state(
+    db: tauri::State<writer::Db>,
+    agent_id: String,
+) -> Result<serde_json::Value, String> {
+    let enabled = connections::enabled_ids_for_agent(&db, &agent_id)?;
+    let modes: Vec<serde_json::Value> = connections::enabled_providers_for_agent(&db, &agent_id)
+        .into_iter()
+        .map(|(p, m)| serde_json::json!({ "provider": p, "access_mode": m }))
+        .collect();
+    Ok(serde_json::json!({ "enabled_ids": enabled, "providers": modes }))
+}
+
+/// Switch ONE connector tool on or off for an (agent, connection). This is the
+/// primary control surface: connecting an account grants full capability, and the
+/// user removes individual tools from here.
+#[tauri::command]
+fn connection_set_tool_enabled(
+    db: tauri::State<writer::Db>,
+    agent_id: String,
+    connection_id: i64,
+    tool_name: String,
+    on: bool,
+) -> Result<(), String> {
+    connections::set_tool_enabled(&db, &agent_id, connection_id, &tool_name, on)
+}
+
+/// Every tool a connected provider COULD offer, with its current on/off state —
+/// the switch list. Must include OFF tools, or there is no way to switch one back
+/// on.
+#[tauri::command]
+fn connection_tool_states(
+    db: tauri::State<writer::Db>,
+    agent_id: String,
+) -> Result<serde_json::Value, String> {
+    let off: std::collections::HashSet<(i64, String)> =
+        connections::disabled_tools_by_connection(&db, &agent_id).into_iter().collect();
+    let mut out = Vec::new();
+    for row in connections::list(&db)? {
+        let Some(def) = connectors::by_id(&row.provider) else { continue };
+        let tools: Vec<serde_json::Value> = def.all_tools().map(|t| {
+            serde_json::json!({
+                "name": t.name,
+                "description": t.description,
+                "access": if t.access == connectors::Access::Write { "Write" } else { "Read" },
+                "danger": t.danger,
+                "enabled": !off.contains(&(row.id, t.name.to_string())),
+            })
+        }).collect();
+        out.push(serde_json::json!({
+            "connection_id": row.id,
+            "provider": row.provider,
+            "tools": tools,
+        }));
+    }
+    Ok(serde_json::json!(out))
+}
+
+/// Bulk switch: turn every WRITE tool of a connection off (read-only) or back on.
+/// This replaces the old access_mode toggle — expressed in the same per-tool
+/// storage everything else reads, so it cannot disagree with the switch panel.
+#[tauri::command]
+fn connection_set_read_only(
+    db: tauri::State<writer::Db>,
+    agent_id: String,
+    connection_id: i64,
+    read_only: bool,
+) -> Result<(), String> {
+    let provider: String = {
+        let conn = db.reader()?;
+        conn.query_row(
+            "SELECT provider FROM connection WHERE id = ?1",
+            rusqlite::params![connection_id],
+            |r| r.get(0),
+        ).map_err(|e| format!("unknown connection: {e}"))?
+    };
+    let def = connectors::by_id(&provider)
+        .ok_or_else(|| format!("unknown connector `{provider}`"))?;
+    for t in def.all_tools() {
+        if t.access != connectors::Access::Write { continue; }
+        connections::set_tool_enabled(&db, &agent_id, connection_id, t.name, !read_only)?;
+    }
+    Ok(())
+}
+
+/// Turn WRITE access on/off for one (agent, connection). Read is the default and
+/// write tools are not even added to the agent's tool list until this is on.
+#[tauri::command]
+fn connection_set_write(
+    db: tauri::State<writer::Db>,
+    agent_id: String,
+    connection_id: i64,
+    write: bool,
+) -> Result<(), String> {
+    connections::set_access_mode(&db, &agent_id, connection_id, write)
 }
 
 // ---- M1.8 Scheduler: CRUD (Slice 2) --------------------------------------
@@ -1828,6 +1953,119 @@ async fn local_download(app: tauri::AppHandle, channel: String, url: String, fil
 #[tauri::command]
 fn local_tool_capability(path: String) -> gguf::ToolCapability {
     gguf::detect_tool_capability(&path)
+}
+
+// --- CAPABILITY INVENTORY -------------------------------------------------
+// ONE answer to "what can my agent actually do?", assembled from all origins:
+//
+//   built-in    native Rust (files, pdf, fetch_url, whisper) + always-on core
+//   connection  contributed by an enabled Connection (github_list_prs, …)
+//   mcp         discovered from an MCP server (not yet implemented — the
+//               inventory is built to carry it so the UI doesn't change later)
+//
+// SKILLS ARE NOT HERE. A skill is saved instructions ("how I want work done"),
+// not a machine capability, and it holds no credential. Mixing them was the
+// confusing part of the old Tools tab: `kind='composed'` entries looked like
+// tools but behaved like procedures. They get their own list.
+//
+// This is DERIVED state — it never stores anything. The truth lives in the tools
+// registry, the connection tables, and the connector descriptors.
+
+/// The always-available core tools. These aren't in the tools registry (they're
+/// unconditional in the agent loop), but a user asking "what can my agent do?"
+/// must see them or the answer is a lie.
+const CORE_TOOLS: &[(&str, &str, &str)] = &[
+    ("read_file", "Read files", "Read a UTF-8 text file inside the agent folder."),
+    ("write_file", "Write files", "Create or overwrite a text file inside the agent folder."),
+    ("list_files", "List files", "List directory entries inside the agent folder."),
+    ("rename_file", "Rename / move files", "Rename or move a file inside the agent folder."),
+    ("delete_file", "Delete files", "Delete a file inside the agent folder."),
+];
+
+/// The full capability inventory for one agent, grouped by ORIGIN.
+#[tauri::command]
+fn capabilities_list(
+    app: tauri::AppHandle,
+    db: tauri::State<writer::Db>,
+    agent_id: Option<String>,
+    folder: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let ad = app_data(&app)?;
+    let mut items: Vec<serde_json::Value> = Vec::new();
+
+    // 1. CORE — jailed file tools, always on, cannot be disabled.
+    for (name, label, desc) in CORE_TOOLS {
+        items.push(serde_json::json!({
+            "name": name, "display_name": label, "description": desc,
+            "origin": "built-in", "source": "Core", "enabled": true,
+            "toggleable": false, "access": "Write", "id": format!("core.{name}"),
+        }));
+    }
+
+    // 2. BUILT-IN REGISTRY TOOLS — pdf, whisper, fetch_url. Toggleable per agent.
+    let enabled_map = agent_id.as_ref()
+        .map(|a| tools_registry::load_enabled(&ad, &tools_registry::Scope::new(a, folder.as_deref())))
+        .unwrap_or_default();
+    for t in tools_registry::load_registry(&ad) {
+        // Composed entries are SKILLS now — excluded from the tool inventory.
+        if t.kind == "composed" { continue; }
+        let on = match enabled_map.get(&t.id) { Some(v) => *v, None => t.builtin };
+        items.push(serde_json::json!({
+            "name": t.name, "display_name": t.display_name, "description": t.description,
+            "origin": "built-in", "source": "Built-in", "enabled": on,
+            "toggleable": true, "access": "Write", "id": t.id,
+            "has_config": !tools_registry::config_schema(&t.id).as_array().map(|a| a.is_empty()).unwrap_or(true),
+        }));
+    }
+
+    // 3. CONNECTION TOOLS — contributed by whatever is enabled for THIS agent.
+    // Read the same way the agent loop does, so the inventory can't drift from
+    // what the model is actually given.
+    if let Some(aid) = agent_id.as_deref() {
+        for (provider, _legacy_access) in connections::enabled_providers_for_agent(&db, aid) {
+            let Some(def) = connectors::by_id(&provider) else { continue };
+            let off = connections::disabled_tools(&db, aid, &provider);
+            for t in def.tools_granted(true, &off) {
+                items.push(serde_json::json!({
+                    "name": t.name, "display_name": t.name, "description": t.description,
+                    "origin": "connection", "source": def.label, "enabled": true,
+                    "toggleable": false, "id": format!("conn.{}.{}", def.id, t.name),
+                    "access": if t.access == connectors::Access::Write { "Write" } else { "Read" },
+                }));
+            }
+        }
+    }
+
+    // 4. MCP — placeholder shape, deliberately empty until the client lands.
+
+    Ok(serde_json::json!(items))
+}
+
+/// SKILLS — saved procedures (instructions + an allowed subset of real tools).
+/// Same storage as before (`kind: "composed"` in the tools registry); this is a
+/// clearer name and a separate list, not a migration.
+#[tauri::command]
+fn skills_list(
+    app: tauri::AppHandle,
+    agent_id: Option<String>,
+    folder: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let ad = app_data(&app)?;
+    let enabled = agent_id.as_ref()
+        .map(|a| tools_registry::load_enabled(&ad, &tools_registry::Scope::new(a, folder.as_deref())))
+        .unwrap_or_default();
+    let out: Vec<serde_json::Value> = tools_registry::load_registry(&ad).iter()
+        .filter(|t| t.kind == "composed")
+        .map(|t| {
+            let on = enabled.get(&t.id).copied().unwrap_or(false);
+            serde_json::json!({
+                "id": t.id, "name": t.name, "display_name": t.display_name,
+                "description": t.description, "instructions": t.instructions,
+                "allowed_tools": t.allowed_tools, "enabled": on, "builtin": t.builtin,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!(out))
 }
 
 // --- TOOLS registry (extensible agent capabilities) ------------------------
@@ -2922,14 +3160,43 @@ fn agent_tools_for_full(
 
     // CONNECTION TOOLS (M1.9): if GitHub is connected + enabled for this agent,
     // surface its read tools. Token is attached Rust-side at call time.
+    // DASHBOARD TOOLS (M2): always available when we have an agent identity —
+    // every agent owns exactly one dashboard, so there is nothing to enable.
+    if conn_ctx.is_some() {
+        for schema in dashboard::tool_schemas() { tools.push(schema); }
+        extra_instructions.push_str(dashboard::tool_instructions());
+    }
+
+    // CONNECTION TOOLS, registry-driven. Every connected+enabled provider
+    // contributes its tools from its descriptor — no per-provider code here.
+    // Write tools appear ONLY when the agent's access_mode is 'write', so an
+    // agent in read mode is never even offered a destructive call.
     if let Some((db, agent_id)) = conn_ctx {
-        if connections::provider_enabled_for_agent(db, agent_id, "github") {
-            tools.push(serde_json::json!({
-                "name": "github_list_prs",
-                "description": "List YOUR open GitHub pull requests (authored by you across all repos). Use when the user asks about their PRs / what they're working on. No arguments.",
-                "input_schema": { "type": "object", "properties": {} }
-            }));
-            extra_instructions.push_str("\n\nYou have GitHub connected: use github_list_prs to read the user's open pull requests.");
+        let mut connected: Vec<String> = Vec::new();
+        for (provider, _legacy_access) in connections::enabled_providers_for_agent(db, agent_id) {
+            let Some(def) = connectors::by_id(&provider) else { continue };
+            // SINGLE SOURCE OF TRUTH: the per-tool off-list. `access_mode` used to
+            // ALSO gate this, which meant a legacy row left at 'read' silently
+            // withheld every write tool while the Connections screen showed them
+            // all switched on. Two gates for one question always drift; the
+            // switches are the control surface, so they are the only gate.
+            let off = connections::disabled_tools(db, agent_id, &provider);
+            let mut names: Vec<&str> = Vec::new();
+            for t in def.tools_granted(true, &off) {
+                tools.push(connectors::tool_schema(t));
+                names.push(t.name);
+            }
+            if names.is_empty() { continue; }
+            connected.push(format!("{}: {}", def.label, names.join(", ")));
+        }
+        if !connected.is_empty() {
+            extra_instructions.push_str(&format!(
+                "\n\nCONNECTED ACCOUNTS — you may call these tools to read or act on the \
+                 user's real accounts:\n- {}\nThese hit live services on the user's behalf. \
+                 If a tool reports it needs write access, tell the user to enable it in \
+                 Connections rather than trying another route.",
+                connected.join("\n- ")
+            ));
         }
     }
 
@@ -2979,11 +3246,13 @@ fn agent_tools_for_full(
                 "builtin" => {
                     if let Some(schema) = builtin_tool_schema(&t.name) { tools.push(schema); }
                 }
+                // A SKILL (stored as kind "composed" — the storage name predates
+                // the rename; the UI calls these Skills). It is exposed as a
+                // named tool the model invokes by following its saved
+                // instructions using only the base tools it's allowed. A skill
+                // grants no new capability: it's a way of working, not a
+                // credential or a new reach.
                 "composed" => {
-                    // A composed tool is exposed as a named tool the model can
-                    // "invoke" by following its saved instructions using the base
-                    // tools it's allowed. We surface it as a no-arg-ish tool plus
-                    // an instruction block so the model knows what it does.
                     tools.push(serde_json::json!({
                         "name": t.name,
                         "description": t.description,
@@ -3322,7 +3591,11 @@ async fn agent_stream(
                     "kind": "ToolUse", "id": call_id, "name": c.name,
                     "input": c.input,
                 }));
-                let (result, is_err) = exec_tool_cfg(&broker, &scope_id, &c.name, &c.input, &pdf_cfg);
+                let (result, is_err) = if dashboard::is_dashboard_tool(&c.name) {
+                    dashboard::exec_dashboard_tool(&db, &scope_id, &c.name, &c.input)
+                } else {
+                    exec_tool_cfg(&broker, &scope_id, &c.name, &c.input, &pdf_cfg)
+                };
                 let path_s = c.input.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
                 let _ = app.emit(&channel, &serde_json::json!({
                     "kind": "ToolResult", "id": call_id, "name": c.name, "path": path_s,
@@ -3478,6 +3751,8 @@ async fn agent_stream(
                                 }
                             }
                         }
+                    } else if dashboard::is_dashboard_tool(&name) {
+                        dashboard::exec_dashboard_tool(&db, &scope_id, &name, &input)
                     } else {
                         exec_tool_cfg(&broker, &scope_id, &name, &input, &pdf_cfg)
                     };
@@ -3699,10 +3974,12 @@ async fn agent_stream(
                             Err(e) => (format!("send failed: {e}"), true),
                         };
                         r
-                    } else if name == "github_list_prs" {
-                        // Connection tool: token attached Rust-side. Async GitHub
-                        // call, so run it directly (we're already in async here).
-                        connections::github_list_prs(&db, &scope_id).await
+                    } else if connectors::is_connector_tool(&name) {
+                        // Registry-driven: one path for every connected service.
+                        // The credential is resolved from the keychain and
+                        // attached HERE, on the privileged side — the jailed
+                        // brain never receives a token.
+                        connector_exec::exec(&db, &scope_id, &name, &input).await
                     } else if name == "transcribe_audio" {
                         // Whisper (task #6): resolve the audio THROUGH THE JAIL
                         // (read mode), then the async API call. Key from Keychain.
@@ -3720,6 +3997,8 @@ async fn agent_stream(
                                 }
                             }
                         }
+                    } else if dashboard::is_dashboard_tool(&name) {
+                        dashboard::exec_dashboard_tool(&db, &scope_id, &name, &input)
                     } else {
                     // Run the tool inside catch_unwind so a PANIC (e.g. deep in
                     // genpdf table/render) becomes a VISIBLE tool error the model
@@ -4116,6 +4395,8 @@ pub async fn run_headless_turn(
                                     Ok(mailbox::SendResult::Refused { reason }) => (format!("not sent: {reason}"), true),
                                     Err(e) => (format!("send failed: {e}"), true),
                                 }
+                            } else if dashboard::is_dashboard_tool(&name) {
+                                dashboard::exec_dashboard_tool(db, agent_id, &name, &input)
                             } else {
                                 exec_tool_cfg(broker, agent_id, &name, &input, &pdf_cfg)
                             };
@@ -4303,6 +4584,13 @@ pub fn run() {
             browser::set_browser_hittest, browser::browser_engine_info,
             openai_models, tools_list, tools_upsert, tools_delete, tools_set_enabled,
             tools_config, tools_set_config,
+            capabilities_list, skills_list,
+            dashboard::dashboard_load, dashboard::dashboard_upsert_module,
+            dashboard::dashboard_remove_module, dashboard::dashboard_arrange,
+            dashboard::dashboard_undo,
+            dashboard_data::dashboard_refresh, dashboard_data::dashboard_refresh_module,
+            dashboard_data::dashboard_approve_exec,
+            dashboard_data::dashboard_run_tool,
             savepoint_snapshot, savepoint_timeline, savepoint_rewind,
             savepoint_undo, savepoint_redo,
             savepoint_get_retention, savepoint_set_retention, savepoint_purge,
@@ -4323,6 +4611,9 @@ pub fn run() {
             scheduler_reset_counters,
             github_connect, connections_list, connection_disconnect,
             connection_set_agent_enabled, connection_enabled_for_agent,
+            connectors_catalog, connector_connect, connection_agent_state,
+            connection_set_write, connection_set_tool_enabled, connection_tool_states,
+            connection_set_read_only,
             memory_get_auto_remember, memory_set_auto_remember,
             pro_mode_get, pro_mode_set, shell_procs, shell_kill_proc,
             github_git_auth,

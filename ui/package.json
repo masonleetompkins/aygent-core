@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
-    "preview": "vite preview"
+    "build": "node scripts/check-grid.mjs && tsc && vite build",
+    "preview": "vite preview",
+    "check:grid": "node scripts/check-grid.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
