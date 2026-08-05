@@ -118,6 +118,18 @@ pub enum DataSource {
 }
 
 impl DataSource {
+    /// Short human name for error/assertion messages. (Restored: the fd50bcb
+    /// warning sweep removed it as dead code while a test still used it —
+    /// "unused" must mean unused by tests too.)
+    pub fn label(&self) -> &'static str {
+        match self {
+            DataSource::Static { .. } => "static",
+            DataSource::Binding { .. } => "binding",
+            DataSource::Http { .. } => "http",
+            DataSource::Exec { .. } => "exec",
+            DataSource::AgentTurn { .. } => "agent_turn",
+        }
+    }
     /// Does refreshing this source spend money? The global Refresh button MUST
     /// skip every source where this is true. This single predicate is the
     /// enforcement point for the safety rule — keep the check here, not in the

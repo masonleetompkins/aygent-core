@@ -42,6 +42,11 @@ mod vault_write;
 mod web;
 mod whisper;
 mod migrate_json;
+pub mod remote_rt; // AYGENT REMOTE: Supabase Realtime client (Phoenix framing over wss).
+pub mod remote_bridge; // AYGENT REMOTE: turn bridge — protocol, coalescing, dedupe, event translation.
+pub mod remote_runtime; // AYGENT REMOTE: device runtime — rt events → dispatch → engine → sealed replies.
+pub mod remote_cmds; // AYGENT REMOTE: Settings-card commands (pair/unpair/status/connect).
+pub mod remote;   // AYGENT REMOTE: pairing + E2E envelope + Realtime client (masonlee.build/remote).
 mod repo;
 mod writer;
 mod gguf;
@@ -4219,9 +4224,12 @@ pub async fn run_headless_turn(
     // scheduler:7). Inter-agent turns keep the reply-capable peer framing.
     let is_scheduled = msg.from_agent.starts_with("scheduler:");
     let is_continue = msg.from_agent.starts_with("continue:");
+    // AYGENT REMOTE (R4): a remote-originated turn IS the user speaking (from
+    // their phone through the E2E channel) — framed verbatim, no task wrapper.
+    let is_remote = msg.from_agent.starts_with("remote:");
     // task_continue routing (Mason 08-01, UI task #1): body may carry a
     // "conv:<session id>" first line — the chat the wake-up reports INTO.
-    let (continue_conv, msg_body): (Option<String>, String) = if is_continue {
+    let (continue_conv, msg_body): (Option<String>, String) = if is_continue || is_remote {
         match msg.body.split_once('\n') {
             Some((first, rest)) if first.starts_with("conv:") => {
                 let id = first.trim_start_matches("conv:").trim().to_string();
@@ -4232,7 +4240,9 @@ pub async fn run_headless_turn(
     } else { (None, msg.body.clone()) };
     let msg_body = msg_body.as_str();
 
-    let from_name = if is_continue {
+    let from_name = if is_remote {
+        "Remote".to_string()
+    } else if is_continue {
         "Continuation".to_string()
     } else if is_scheduled {
         "Scheduler".to_string()
@@ -4240,7 +4250,16 @@ pub async fn run_headless_turn(
         repo::get_agent(db, &msg.from_agent)?.map(|a| a.name).unwrap_or_else(|| msg.from_agent.clone())
     };
 
-    let framed = if is_continue {
+    let framed = if is_remote {
+        // The user, remotely. No wrapper beyond a one-line situational note —
+        // tools, memory, soul all apply exactly as if typed at the desk.
+        format!(
+            "(This message arrived via AYGENT Remote — the user is chatting from \
+             their phone/browser. Reply normally; your answer streams back to \
+             their remote screen and is saved in this conversation.)\n\n{}",
+            msg_body
+        )
+    } else if is_continue {
         format!(
             "WAKE-UP: you previously called task_continue and asked to resume work. Your note to self:\n\n{}\n\n\
              Continue the task now: check any processes you started (shell_poll), finish the work, and report \
@@ -4280,7 +4299,8 @@ pub async fn run_headless_turn(
         let conv_id = continue_conv.clone().unwrap_or_else(|| format!("inbox-{agent_id}"));
         let existing = repo::load_conversation(db, &conv_id).ok();
         let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
-        let inbound_text = if is_continue { format!("\u{23F0} resumed: {}", msg_body) }
+        let inbound_text = if is_remote { format!("\u{1F4F1} {}", msg_body) }
+            else if is_continue { format!("\u{23F0} resumed: {}", msg_body) }
             else { format!("\u{1F4E8} from {from_name}: {}", msg_body) };
         ui_msgs.push(serde_json::json!({ "role": "user", "from": from_name, "text": inbound_text }));
         let title = existing.as_ref().map(|c| c.title.clone()).unwrap_or_else(|| "Activity".into());
@@ -4305,6 +4325,13 @@ pub async fn run_headless_turn(
         "agentId": agent_id, "kind": "turn_start", "from": msg.from_agent, "fromName": from_name,
     }));
     let _ = app.emit(&stream_channel, &provider::StreamEvent::Info { text: format!("working on {from_name}’s request…") });
+
+    // STOP support for headless turns (needed by AYGENT Remote's stop{turn}):
+    // register a cancel flag under the stream channel — remote_runtime maps
+    // turn->conv and calls request_stop(conv). Guard drops on any exit path.
+    let cancel_reg = app.state::<cancel::CancelRegistry>();
+    let (_hl_cancel_guard, hl_cancel_flag) =
+        cancel::CancelGuard::new(cancel_reg.inner().clone(), stream_channel.clone());
 
     // Build the recipient's system prompt: soul + peers + context docs (same as
     // the human path, minus streaming).
@@ -4345,7 +4372,7 @@ pub async fn run_headless_turn(
             // human path emits — so an open pane WATCHES the work happen (tokens +
             // tool cards), not just a rail spinner.
             let (content, stop) = provider::anthropic_stream_turn(
-                &key, &model, &system, &messages, &tools, None,
+                &key, &model, &system, &messages, &tools, Some(&hl_cancel_flag),
                 |ev| { let _ = app.emit(&stream_channel, &ev); },
             ).await?;
             messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": content.clone() }));
@@ -4537,6 +4564,9 @@ pub fn run() {
     // state so both agent_stream (registers/checks the flag) and the new
     // agent_stop command (flips it from the UI's Stop click) share ONE map.
     let cancel_registry = cancel::CancelRegistry::new();
+    // AYGENT REMOTE: runtime handle (Settings starts/stops it; boot autostarts
+    // if paired). Managed even when unpaired so state::<RemoteRuntime> is safe.
+    let remote_runtime = remote_runtime::RemoteRuntime::default();
 
     // PRO MODE (2026-07-31): the exec broker — the ONLY code with process-spawn
     // authority. The daemon (Seatbelt deny-exec) requests spawns over the broker
@@ -4558,10 +4588,17 @@ pub fn run() {
         .manage(sched_signal.clone())
         .manage(browser_proc)
         .manage(cancel_registry)
+        .manage(remote_runtime)
         .invoke_handler(tauri::generate_handler![
             whisper::transcribe_audio_b64,
             chat_attach_file,
             agent_stop,
+            remote_cmds::remote_status,
+            remote_cmds::remote_pair,
+            remote_cmds::remote_unpair,
+            remote_cmds::remote_connect,
+            remote_cmds::remote_local_status,
+            remote_cmds::remote_set_enabled,
             provider_verify_key,
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
@@ -4669,6 +4706,11 @@ pub fn run() {
                     let brk = _app.state::<Arc<Broker>>().inner().clone();
                     let lns = _app.state::<lanes::Lanes>().inner().clone();
                     drainer::spawn(_app.handle().clone(), db.clone(), brk, lns, sig);
+
+                    // AYGENT REMOTE: if this Mac is paired, bring the Realtime
+                    // session up at boot — with retries, because the browser
+                    // key may not be published yet (first-time pairing).
+                    remote_runtime::spawn_autostart(_app.handle().clone());
                 }
 
                 // M1.8 SCHEDULER: spawn the ticker ("the drainer with a clock in

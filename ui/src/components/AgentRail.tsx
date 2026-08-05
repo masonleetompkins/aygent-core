@@ -32,6 +32,8 @@ export function AgentRail({
   const [agents, setAgents] = useState<AgentProfile[]>([]);
   const [working, setWorking] = useState<Record<string, boolean>>({});
   const [unread, setUnread] = useState<Record<string, number>>({});
+  // AYGENT Remote: paired/enabled/running for the rail-bottom toggle.
+  const [remote, setRemote] = useState<{ paired: boolean; enabled: boolean; running: boolean } | null>(null);
 
   async function refresh() {
     try {
@@ -55,6 +57,25 @@ export function AgentRail({
     const t = setInterval(refreshUnread, 3000);
     return () => clearInterval(t);
   }, []);
+
+  // Remote status: local-only command (keychain + a bool) — cheap to poll.
+  async function refreshRemote() {
+    try { setRemote(await invoke("remote_local_status")); } catch { /* ignore */ }
+  }
+  useEffect(() => {
+    void refreshRemote();
+    const t = setInterval(refreshRemote, 5000);
+    return () => clearInterval(t);
+  }, []);
+
+  async function toggleRemote() {
+    if (!remote) return;
+    const next = !remote.enabled;
+    // Optimistic: the socket teardown/bring-up follows within a beat.
+    setRemote({ ...remote, enabled: next, running: next ? remote.running : false });
+    try { await invoke("remote_set_enabled", { on: next }); } catch { /* ignore */ }
+    setTimeout(refreshRemote, 1200);
+  }
 
   // Live activity: agents starting/finishing turns. Drives the working ring +
   // clears/raises the unread badge.
@@ -150,6 +171,45 @@ export function AgentRail({
           display: "flex", alignItems: "center", justifyContent: "center",
         }}
       ><Icon name="plus" size={18} /></button>
+
+      {/* AYGENT Remote toggle — only when a device is paired. Online = the
+          Mac holds its relay session (reachable from the web); offline =
+          paired but silent (no socket, no heartbeat). */}
+      {remote?.paired && (
+        <button
+          onClick={toggleRemote}
+          title={remote.enabled
+            ? (remote.running ? "Remote: online — reachable from the web. Click to go offline." : "Remote: connecting…")
+            : "Remote: offline (still paired). Click to go online."}
+          style={{
+            position: "relative",
+            width: 42, height: 42, borderRadius: "var(--radius-pill)",
+            border: "var(--border-width) solid transparent",
+            background: "transparent", cursor: "pointer",
+            color: remote.enabled && remote.running ? "var(--accent)" : "var(--text-muted)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            marginTop: "auto",
+            opacity: remote.enabled ? 1 : 0.55,
+            transition: "color .15s ease, opacity .15s ease",
+          }}
+        >
+          <Icon name="globe" size={19} />
+          {/* offline slash */}
+          {!remote.enabled && (
+            <span style={{
+              position: "absolute", width: 24, height: 2, borderRadius: 1,
+              background: "var(--text-muted)", transform: "rotate(-45deg)",
+            }} />
+          )}
+          {/* online dot */}
+          {remote.enabled && remote.running && (
+            <span style={{
+              position: "absolute", top: 4, right: 4, width: 7, height: 7,
+              borderRadius: "50%", background: "var(--ok, #22c55e)",
+            }} />
+          )}
+        </button>
+      )}
 
       {/* keyframes for the working pulse (scoped-ish via a style tag) */}
       <style>{`@keyframes aygentPulse { 0%,100% { box-shadow: 0 0 0 3px var(--pulse-a, rgba(91,140,255,.3)); } 50% { box-shadow: 0 0 0 6px rgba(91,140,255,.12); } }`}</style>
