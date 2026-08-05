@@ -150,6 +150,11 @@ async fn run_loop(
 ) {
     let mut reasm = Reassembler::default();
     let mut dedupe = TurnDedupe::default();
+    // BROWSER KEY ROTATION (phone links while we're running): the session's
+    // Sealer targets the OLD key, so every inbound envelope fails to open.
+    // 3 consecutive failures = assume rotation → restart the session; the
+    // autostart loop refetches the device row and builds a fresh Sealer.
+    let mut open_failures: u32 = 0;
 
     while let Some(evt) = events.recv().await {
         match evt {
@@ -173,8 +178,23 @@ async fn run_loop(
                     continue;
                 }
                 let plain = match sealer.open(&env) {
-                    Ok(p) => p,
-                    Err(_) => continue, // wrong key / tamper — drop silently
+                    Ok(p) => {
+                        open_failures = 0;
+                        p
+                    }
+                    Err(_) => {
+                        open_failures += 1;
+                        if open_failures >= 3 {
+                            eprintln!("[aygent][remote] {open_failures} consecutive decrypt failures — browser key likely rotated; restarting session");
+                            let _ = tx.send(RtCommand::Shutdown).await;
+                            // Clear the runtime slot so autostart's is_running()
+                            // check doesn't see a ghost session.
+                            app.state::<RemoteRuntime>().shutdown();
+                            spawn_autostart(app.clone());
+                            break;
+                        }
+                        continue; // tamper / stray — drop silently
+                    }
                 };
                 let Some(full) = reasm.feed(&env, plain) else { continue };
                 let Some(msg) = parse_web_msg(&full) else { continue };
