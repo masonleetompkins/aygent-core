@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 /// Current schema version. Bump when adding a migration step below.
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// The DB file name under <app_data>.
 pub const DB_FILE: &str = "aygent.db";
@@ -242,6 +242,27 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("migrate v12: {e}"))?;
         set_version(conn, 12)?;
         v = 12;
+    }
+
+    if v < 13 {
+        // AGENT REORDER (Mason 2026-08-06): a user-controllable display order for
+        // agents (Agents tab drag + the rail). Add sort_order, then SEED it from
+        // the existing created_at order so nothing jumps on first launch after the
+        // upgrade (rowid ascending == created_at ascending here). New agents get a
+        // sort_order at the end (create_agent sets it to max+1).
+        conn.execute_batch(
+            "ALTER TABLE agent ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;"
+        ).map_err(|e| format!("migrate v13 (add sort_order): {e}"))?;
+        // Seed: number existing rows by created_at so current order is preserved.
+        conn.execute_batch(
+            "WITH ordered AS (
+                 SELECT id, ROW_NUMBER() OVER (ORDER BY created_at ASC, rowid ASC) AS rn
+                 FROM agent
+             )
+             UPDATE agent SET sort_order = (SELECT rn FROM ordered WHERE ordered.id = agent.id);"
+        ).map_err(|e| format!("migrate v13 (seed sort_order): {e}"))?;
+        set_version(conn, 13)?;
+        v = 13;
     }
 
     debug_assert_eq!(v, SCHEMA_VERSION, "migrate() must end at SCHEMA_VERSION — add the missing step or bump the constant");

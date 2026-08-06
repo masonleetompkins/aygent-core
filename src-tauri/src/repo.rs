@@ -45,6 +45,8 @@ pub struct AgentProfile {
     pub updated_at: i64,
     #[serde(default)]
     pub archived: bool,
+    #[serde(default)]
+    pub sort_order: i64,
 }
 fn default_context_mode() -> String { "isolated".to_string() }
 
@@ -92,13 +94,14 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
         archived: r.get::<_, i64>("archived")? != 0,
+        sort_order: r.get("sort_order").unwrap_or(0),
     })
 }
 
 pub fn list_agents(db: &Db) -> Result<Vec<AgentProfile>, String> {
     let conn = db.reader()?;
     let mut stmt = conn
-        .prepare("SELECT * FROM agent ORDER BY created_at ASC")
+        .prepare("SELECT * FROM agent ORDER BY sort_order ASC, created_at ASC")
         .map_err(|e| format!("prepare list_agents: {e}"))?;
     let rows = stmt
         .query_map([], row_to_agent)
@@ -174,14 +177,19 @@ pub fn create_agent(
         created_at: now(),
         updated_at: now(),
         archived: false,
+        sort_order: 0, // real value assigned in the txn (max+1)
     };
     let p = profile.clone();
     db.write(move |c| {
         let tx = c.transaction().map_err(|e| format!("txn: {e}"))?;
+        // Append to the end of the display order: sort_order = current max + 1.
+        let next_order: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM agent", [], |r| r.get(0),
+        ).unwrap_or(1);
         tx.execute(
-            "INSERT INTO agent (id,name,icon,color,folder_path,model,provider,context_mode,system_prompt,created_at,updated_at,archived)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0)",
-            params![p.id, p.name, p.icon, p.color, p.folder_path, p.model, p.provider, p.context_mode, p.system_prompt, p.created_at, p.updated_at],
+            "INSERT INTO agent (id,name,icon,color,folder_path,model,provider,context_mode,system_prompt,created_at,updated_at,archived,sort_order)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12)",
+            params![p.id, p.name, p.icon, p.color, p.folder_path, p.model, p.provider, p.context_mode, p.system_prompt, p.created_at, p.updated_at, next_order],
         ).map_err(|e| format!("insert agent: {e}"))?;
         // First agent becomes active; also seed its settings row.
         tx.execute(
@@ -206,6 +214,24 @@ pub fn update_agent(db: &Db, mut profile: AgentProfile) -> Result<(), String> {
             params![profile.id, profile.name, profile.icon, profile.color, profile.folder_path, profile.model, profile.provider, profile.context_mode, profile.system_prompt, profile.updated_at, profile.archived as i64],
         ).map_err(|e| format!("update agent: {e}"))?;
         if n == 0 { return Err("agent not found".into()); }
+        Ok(())
+    })
+}
+
+/// Persist a new agent display order. `ids` is the full ordered list of agent
+/// ids (top-first). sort_order is rewritten to the index so the order is exactly
+/// what the UI showed. Runs in one txn so the rail + Agents tab never see a
+/// half-applied order.
+pub fn reorder_agents(db: &Db, ids: Vec<String>) -> Result<(), String> {
+    db.write(move |c| {
+        let tx = c.transaction().map_err(|e| format!("txn: {e}"))?;
+        for (i, id) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE agent SET sort_order = ?2 WHERE id = ?1",
+                params![id, i as i64],
+            ).map_err(|e| format!("reorder agent {id}: {e}"))?;
+        }
+        tx.commit().map_err(|e| format!("commit reorder: {e}"))?;
         Ok(())
     })
 }

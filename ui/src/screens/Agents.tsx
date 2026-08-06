@@ -51,6 +51,7 @@ export function Agents({
   onPickFolder,
   pendingFolder,
   onRosterChange,
+  onOpenChat,
 }: {
   activeId: string | null;
   onActiveChange: (a: AgentProfile) => void;
@@ -60,10 +61,37 @@ export function Agents({
   // shared refreshKey — this is what makes the AgentRail re-list immediately
   // instead of showing a deleted agent until restart.
   onRosterChange?: () => void;
+  // Open a chat window for this agent (activate it + jump to the Chat screen).
+  onOpenChat?: (a: AgentProfile) => void;
 }) {
   const [agents, setAgents] = useState<AgentProfile[]>([]);
   const [editing, setEditing] = useState<AgentProfile | null>(null);
   const [creating, setCreating] = useState(false);
+  // Drag-to-reorder: which agent id is being dragged, and which slot it's over.
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [overId, setOverId] = useState<string | null>(null);
+
+  // Persist the current agents[] order to the backend, then tell App so the
+  // rail re-lists (and animates) into the same order.
+  async function persistOrder(next: AgentProfile[]) {
+    setAgents(next); // optimistic — the list reorders instantly
+    try {
+      await invoke("agents_reorder", { ids: next.map((a) => a.id) });
+      onRosterChange?.(); // rail re-lists in the new order (FLIP-animated there)
+    } catch { void refresh(); } // on failure, snap back to the stored order
+  }
+
+  // Reorder helper: move dragged id to before/after the target id.
+  function moveAgent(fromId: string, toId: string) {
+    if (fromId === toId) return;
+    const cur = [...agents];
+    const from = cur.findIndex((a) => a.id === fromId);
+    const to = cur.findIndex((a) => a.id === toId);
+    if (from < 0 || to < 0) return;
+    const [moved] = cur.splice(from, 1);
+    cur.splice(to, 0, moved);
+    void persistOrder(cur);
+  }
 
   async function refresh() {
     try {
@@ -123,25 +151,47 @@ export function Agents({
       )}
 
       {agents.map((a) => (
-        <Card key={a.id} style={{ flexDirection: "row", alignItems: "center", gap: 14 }}>
-          <div style={{
-            width: 44, height: 44, flexShrink: 0, color: "var(--accent)",
-            display: "flex", alignItems: "center", justifyContent: "center",
-          }}><Icon name={(a.icon as IconName) || "sparkles"} size={26} /></div>
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <span style={{ fontWeight: 700, fontSize: 16 }}>{a.name}</span>
+        <div
+          key={a.id}
+          draggable
+          onDragStart={(e) => { setDragId(a.id); e.dataTransfer.effectAllowed = "move"; }}
+          onDragEnter={() => { if (dragId && dragId !== a.id) setOverId(a.id); }}
+          onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }}
+          onDrop={(e) => { e.preventDefault(); if (dragId) moveAgent(dragId, a.id); setDragId(null); setOverId(null); }}
+          onDragEnd={() => { setDragId(null); setOverId(null); }}
+          style={{
+            opacity: dragId === a.id ? 0.4 : 1,
+            transform: overId === a.id && dragId !== a.id ? "translateY(2px)" : "none",
+            transition: "opacity .12s ease, transform .12s ease, box-shadow .12s ease",
+            boxShadow: overId === a.id && dragId !== a.id ? "0 -2px 0 0 var(--accent)" : "none",
+            borderRadius: "var(--radius-card)",
+          }}
+        >
+          <Card style={{ flexDirection: "row", alignItems: "center", gap: 14 }}>
+            {/* drag handle — the grip signals the whole card is draggable */}
+            <div
+              title="Drag to reorder"
+              style={{ flexShrink: 0, color: "var(--text-faint)", cursor: "grab", fontSize: 18, lineHeight: 1, userSelect: "none", padding: "0 2px" }}
+            >⋮⋮</div>
+            <div style={{
+              width: 44, height: 44, flexShrink: 0, color: "var(--accent)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+            }}><Icon name={(a.icon as IconName) || "sparkles"} size={26} /></div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontWeight: 700, fontSize: 16 }}>{a.name}</span>
+              </div>
+              <div style={{ fontSize: 12, color: "var(--text-faint)", fontFamily: "ui-monospace, monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {a.folder_path || "no folder"} · {a.model || "auto"} · {a.provider || "anthropic"} · {a.context_mode}
+              </div>
             </div>
-            <div style={{ fontSize: 12, color: "var(--text-faint)", fontFamily: "ui-monospace, monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {a.folder_path || "no folder"} · {a.model || "auto"} · {a.provider || "anthropic"} · {a.context_mode}
+            <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+              <Button onClick={() => (onOpenChat ? onOpenChat(a) : activate(a))}>Open</Button>
+              <Button variant="secondary" onClick={() => setEditing(a)}>Edit</Button>
+              {agents.length > 1 && <Button variant="secondary" onClick={() => remove(a)}>Delete</Button>}
             </div>
-          </div>
-          <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-            <Button variant="secondary" onClick={() => { activate(a); }}>Open</Button>
-            <Button variant="secondary" onClick={() => setEditing(a)}>Edit</Button>
-            {agents.length > 1 && <Button variant="secondary" onClick={() => remove(a)}>Delete</Button>}
-          </div>
-        </Card>
+          </Card>
+        </div>
       ))}
     </div>
   );

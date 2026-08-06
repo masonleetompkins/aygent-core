@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef, useLayoutEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { AgentProfile } from "./AgentSwitcher";
@@ -105,6 +105,34 @@ export function AgentRail({
     onView(a); // NOTE: does NOT change which agents run — only what you view.
   }
 
+  // ---- FLIP reorder animation ----------------------------------------------
+  // Each agent button registers its DOM node; before every paint we compare its
+  // new top to its last top and, if it moved, jump it back to the old spot with
+  // a transform (no transition) then release to 0 with a transition on the next
+  // frame — so it SLIDES from where it was to where it now is. Fast + smooth.
+  const btnRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
+  const lastTops = useRef<Map<string, number>>(new Map());
+  useLayoutEffect(() => {
+    const tops = new Map<string, number>();
+    btnRefs.current.forEach((el, id) => { tops.set(id, el.getBoundingClientRect().top); });
+    tops.forEach((newTop, id) => {
+      const prev = lastTops.current.get(id);
+      const el = btnRefs.current.get(id);
+      if (prev == null || !el) return;
+      const dy = prev - newTop;
+      if (Math.abs(dy) < 1) return;
+      // Invert: place it back where it was, no transition.
+      el.style.transition = "none";
+      el.style.transform = `translateY(${dy}px)`;
+      // Play: next frame, transition to home.
+      requestAnimationFrame(() => {
+        el.style.transition = "transform 220ms cubic-bezier(.2,.8,.2,1)";
+        el.style.transform = "";
+      });
+    });
+    lastTops.current = tops;
+  }, [agents]);
+
   return (
     <div
       style={{
@@ -123,6 +151,7 @@ export function AgentRail({
         return (
           <button
             key={a.id}
+            ref={(el) => { if (el) btnRefs.current.set(a.id, el); else btnRefs.current.delete(a.id); }}
             onClick={() => pick(a)}
             title={`${a.name}${a.model ? ` · ${a.model}` : ""}${busy ? " · working…" : ""}`}
             style={{

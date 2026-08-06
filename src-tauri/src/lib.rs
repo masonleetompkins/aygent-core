@@ -1448,6 +1448,13 @@ fn agents_update(db: tauri::State<writer::Db>, broker: tauri::State<'_, Arc<Brok
     Ok(())
 }
 
+/// AGENT REORDER (Mason 2026-08-06): persist a new display order for the agents
+/// (Agents tab drag / the rail). `ids` is the full ordered list, top-first.
+#[tauri::command]
+fn agents_reorder(db: tauri::State<writer::Db>, ids: Vec<String>) -> Result<(), String> {
+    repo::reorder_agents(&db, ids)
+}
+
 /// DYNAMIC APP ICON: install a PNG (base64 from the UI's canvas render) as the
 /// running app's Dock icon. Called whenever the theme (light/dark + accent)
 /// changes, so the icon always matches the app's look.
@@ -4633,7 +4640,7 @@ pub fn run() {
             savepoint_undo, savepoint_redo,
             savepoint_get_retention, savepoint_set_retention, savepoint_purge,
             conv_list, conv_load, conv_save, conv_rename, conv_delete, conv_reorder,
-            agents_list, agents_create, agents_update, agents_delete,
+            agents_list, agents_create, agents_update, agents_reorder, agents_delete,
             agents_set_active, agents_get_active, agents_sharing_folder,
             agent_mounts_list, agent_mount_add, agent_mount_remove,
             set_app_icon,

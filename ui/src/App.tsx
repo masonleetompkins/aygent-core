@@ -246,6 +246,13 @@ export function App() {
               onPickFolder={pickFolder}
               pendingFolder={folder}
               onRosterChange={() => setRosterRefresh((n) => n + 1)}
+              onOpenChat={(a) => {
+                // Open a chat for this agent: make it active, then jump to Chat.
+                invoke<AgentProfile | null>("agents_set_active", { id: a.id })
+                  .then((u) => { onActiveChange(u ?? a); })
+                  .catch(() => onActiveChange(a))
+                  .finally(() => setScreen("chat"));
+              }}
             />
           )}
           {screen === "settings" && (
