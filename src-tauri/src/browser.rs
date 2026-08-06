@@ -3708,9 +3708,51 @@ async fn wait_for_cdp_load(state: &tauri::State<'_, BrowserProc>) {
 /// Read the ACTIVE tab's (title, visible text) via CDP Runtime.evaluate (works
 /// on external pages; no __TAURI__ needed).
 async fn active_tab_page_text(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>) -> Result<(String, String), String> {
-    let r = active_tab_read(app, state,
-        "[document.title||'', (document.body?document.body.innerText:'').slice(0,8000)]").await?;
-    let arr: Vec<String> = serde_json::from_str(&r).unwrap_or_default();
+    // POLISH #4b (Mason v1.0.1): innerText alone showed the agent PROSE ONLY —
+    // no buttons, no inputs, no links. It couldn't find Google's search button
+    // because the button isn't in innerText. Append an INTERACTIVE ELEMENTS
+    // digest: every visible button/link/input with its accessible label, so
+    // browser_click_text has real targets to aim at.
+    let expr = r#"(() => {
+        const title = document.title || '';
+        const text = (document.body ? document.body.innerText : '').slice(0, 6000);
+        const seen = new Set();
+        const items = [];
+        const els = document.querySelectorAll(
+            'a[href], button, input, textarea, select, [role="button"], [role="link"], [role="searchbox"], [role="textbox"], [onclick]'
+        );
+        for (const el of els) {
+            if (items.length >= 60) break;
+            const r = el.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2) continue;
+            const style = getComputedStyle(el);
+            if (style.visibility === 'hidden' || style.display === 'none') continue;
+            const tag = el.tagName.toLowerCase();
+            const label = (
+                el.getAttribute('aria-label') ||
+                (tag === 'input' && (el.value || el.placeholder)) ||
+                (el.innerText || '').trim().slice(0, 60) ||
+                el.getAttribute('title') || el.getAttribute('name') || ''
+            ).toString().trim().slice(0, 60);
+            if (!label && tag !== 'input' && tag !== 'textarea') continue;
+            const kind = tag === 'a' ? 'link'
+                : (tag === 'input' ? (el.type || 'input')
+                : (tag === 'textarea' || tag === 'select' ? tag
+                : 'button'));
+            const key = kind + '|' + label;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            items.push('[' + kind + '] ' + (label || '(unlabeled)'));
+        }
+        const digest = items.length
+            ? '\n\n--- INTERACTIVE ELEMENTS (click with browser_click_text using the label) ---\n' + items.join('\n')
+            : '';
+        return JSON.stringify([title, text + digest]);
+    })()"#;
+    let r = active_tab_read(app, state, expr).await?;
+    // active_tab_read returns the JSON.stringify'd value (possibly double-encoded).
+    let decoded: String = serde_json::from_str(&r).unwrap_or(r);
+    let arr: Vec<String> = serde_json::from_str(&decoded).unwrap_or_default();
     if arr.len() == 2 { Ok((arr[0].clone(), arr[1].clone())) } else { Err("unexpected page text shape".into()) }
 }
 
