@@ -34,6 +34,10 @@ pub struct McpConfig {
     /// system Node isn't required).
     #[serde(default)]
     pub needs_node: bool,
+    /// Uses the AYGENT-provisioned uv (Python toolchain) — true for Python MCP
+    /// servers (e.g. Blender) so no system Python/uv is required.
+    #[serde(default)]
+    pub needs_uv: bool,
     /// Human note about what enabling installs / requires (shown in the UI).
     #[serde(default)]
     pub setup_note: String,
@@ -80,10 +84,34 @@ pub fn catalog() -> Vec<McpConfig> {
             env: vec![("PREMIERE_TEMP_DIR".into(), "/tmp/premiere-mcp-bridge".into())],
             enabled: false,
             needs_node: true,
+            needs_uv: false,
             setup_note: "Installs the `adobe-premiere-pro-mcp` package + its CEP bridge into Premiere. \
                          After enabling, restart Premiere, open Window > Extensions > MCP Bridge (CEP), \
                          and click Start Bridge. AYGENT will verify the connection.".into(),
             verify_tool: Some("verify_premiere_connection".into()),
+            builtin: true,
+        },
+        McpConfig {
+            key: "blender".into(),
+            label: "Blender".into(),
+            // The official Blender MCP is a Python server launched via uv:
+            // `uv run blender-mcp` (from manifest.json's mcp_config). needs_uv
+            // provisions AYGENT's own uv + a managed Python — no system Python.
+            command: "uv".into(),
+            args: vec!["run".into(), "blender-mcp".into()],
+            env: vec![],
+            enabled: false,
+            needs_node: false,
+            needs_uv: true,
+            setup_note: "Requires Blender 5.1+. Enabling installs the `blender-mcp` server into \
+                         AYGENT's own space (portable uv + a managed Python — nothing touches your \
+                         system). You must ALSO install the Blender add-on inside Blender: follow \
+                         https://lab.blender.org/mcp-server/#addon (drag the Blender Lab repo + the \
+                         add-on into Blender), then keep Blender open and click Verify. \
+                         ⚠ SECURITY: the Blender MCP executes LLM-generated Python inside Blender \
+                         with NO guardrails — it can modify or delete your data. Use a machine (or \
+                         VM) without sensitive files.".into(),
+            verify_tool: Some("get_objects_summary".into()),
             builtin: true,
         },
     ]
@@ -136,7 +164,7 @@ pub fn add_custom(app: &AppHandle, label: &str, command: &str, args: Vec<String>
     let cfg = McpConfig {
         key: key.clone(), label: label.trim().to_string(),
         command: command.trim().to_string(), args, env,
-        enabled: false, needs_node,
+        enabled: false, needs_node, needs_uv: false,
         setup_note: "User-added MCP server.".into(),
         verify_tool: None, builtin: false,
     };
@@ -170,6 +198,22 @@ use crate::mcp_client;
 /// node we resolve it under runtime/node/bin.
 fn launch_spec(app: &AppHandle, cfg: &McpConfig) -> Result<(String, Vec<String>, Vec<(String, String)>), String> {
     let mut env = cfg.env.clone();
+    if cfg.needs_uv {
+        // Python MCP servers (e.g. Blender) launch through OUR provisioned uv,
+        // with uv's cache/data/managed-Python pinned inside our runtime tree so
+        // nothing touches the user's home or system Python.
+        let path = crate::provision::provisioned_uv_path(app);
+        env.push(("PATH".into(), path));
+        for kv in crate::provision::uv_env(app) { env.push(kv); }
+        // Use the ABSOLUTE uv path as the program so we never depend on PATH
+        // resolution inside the jailed spawn.
+        if let Some(uv) = crate::provision::uv_bin(app) {
+            return Ok((uv.to_string_lossy().to_string(), cfg.args.clone(), env));
+        }
+        // uv not provisioned yet — fall through to the bare command (will error
+        // clearly if uv isn't on PATH), but this path is normally unreachable
+        // because mcp_enable provisions uv before start.
+    }
     if cfg.needs_node {
         // Ensure the provisioned node's bin is on PATH so a globally-installed
         // (into our node prefix) MCP CLI resolves.

@@ -15,6 +15,9 @@ use tauri::{AppHandle, Emitter, Manager};
 // Pinned Node LTS (Krypton). Portable tarball, no installer, no admin. We resolve
 // the arch at runtime so Apple Silicon + Intel both work.
 const NODE_VERSION: &str = "v24.19.0";
+// Pinned uv (Python package/runtime manager) — a single static binary that can
+// bootstrap its own Python, so Python MCP servers need zero system Python.
+const UV_VERSION: &str = "0.12.2";
 // Static macOS FFmpeg + FFprobe, ARCH-NATIVE. martin-riedl.de publishes separate
 // arm64 and amd64 macOS static builds, each as a per-binary zip — so Apple Silicon
 // gets a real arm64 binary (NOT x86_64-through-Rosetta, which flaked the render's
@@ -282,4 +285,107 @@ pub fn hyperframes_invocation(app: &AppHandle) -> Option<(String, String)> {
     let bin = hf.join("node_modules").join(".bin").join("hyperframes");
     if !bin.is_file() { return None; }
     Some((provisioned_path(app), bin.to_string_lossy().to_string()))
+}
+
+// ── uv (Python toolchain for Python-based MCP servers) ───────────────────────
+// uv is a single self-contained static binary that can also bootstrap its OWN
+// Python — so provisioning it keeps AYGENT's "install nothing" promise for
+// Python MCP servers (e.g. the official Blender MCP: `uv run blender-mcp`).
+// Everything lands under <app_data>/runtime/uv/: the binaries in bin/, and uv's
+// cache + data + managed Pythons pinned into subdirs via UV_* env so nothing
+// touches the user's ~/.local, ~/.cache, or system Python.
+
+fn uv_dir(app: &AppHandle) -> Result<PathBuf, String> { Ok(runtime_dir(app)?.join("uv")) }
+
+/// Abs path to the provisioned `uv` binary (…/uv/bin/uv). None if absent.
+pub fn uv_bin(app: &AppHandle) -> Option<PathBuf> {
+    let p = uv_dir(app).ok()?.join("bin").join("uv");
+    p.is_file().then_some(p)
+}
+
+/// The UV_* env that pins uv's cache, data, tools, and managed-Python installs
+/// INSIDE our runtime tree (never the user's home/system). Callers merge this
+/// into the child env when running uv so a Python MCP server + its interpreter
+/// all live under <app_data>/runtime/uv and vanish cleanly on uninstall.
+pub fn uv_env(app: &AppHandle) -> Vec<(String, String)> {
+    let Ok(base) = uv_dir(app) else { return vec![]; };
+    let s = |p: PathBuf| p.to_string_lossy().to_string();
+    vec![
+        ("UV_CACHE_DIR".into(), s(base.join("cache"))),
+        ("UV_DATA_DIR".into(), s(base.join("data"))),
+        ("UV_TOOL_DIR".into(), s(base.join("tools"))),
+        ("UV_TOOL_BIN_DIR".into(), s(base.join("bin"))),
+        ("UV_PYTHON_INSTALL_DIR".into(), s(base.join("python"))),
+        // Let uv fetch a managed CPython if the machine has none — this is what
+        // makes it truly install-nothing (the Blender server needs Python >=3.10).
+        ("UV_PYTHON_PREFERENCE".into(), "managed".into()),
+    ]
+}
+
+/// Ensure a PORTABLE `uv` lives under runtime/uv/bin. Downloads the pinned
+/// darwin tarball for this arch + extracts it. Idempotent (fast if uv_bin
+/// already exists). Mirrors ensure_node: pinned, known-good, never probes the
+/// system uv/python.
+pub async fn ensure_uv(app: &AppHandle, channel: &str) -> Result<PathBuf, String> {
+    if let Some(p) = uv_bin(app) { return Ok(p); }
+    // uv's darwin arch tokens: aarch64 | x86_64 (NOT arm64/x64 like Node).
+    let a = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
+    let stem = format!("uv-{a}-apple-darwin");
+    let url = format!("https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/{stem}.tar.gz");
+    let rt = runtime_dir(app)?;
+    let tarball = rt.join(format!("{stem}.tar.gz"));
+    download_to(app, channel, "uv", &format!("uv {UV_VERSION} ({a})"), &url, &tarball).await?;
+
+    emit(app, channel, "uv", "Unpacking uv…", None);
+    // The tarball extracts to a dir `uv-<arch>-apple-darwin/` containing the
+    // `uv` and `uvx` binaries. Extract into rt, then place bin/ under runtime/uv.
+    let out = std::process::Command::new("tar")
+        .arg("-xzf").arg(&tarball).arg("-C").arg(&rt)
+        .output().map_err(|e| format!("tar uv: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("unpack uv failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    let extracted = rt.join(&stem);
+    let uv_home = uv_dir(app)?;
+    let bin_dir = uv_home.join("bin");
+    std::fs::create_dir_all(&bin_dir).map_err(|e| format!("mkdir uv/bin: {e}"))?;
+    for name in ["uv", "uvx"] {
+        let from = extracted.join(name);
+        if from.is_file() {
+            let to = bin_dir.join(name);
+            std::fs::rename(&from, &to).map_err(|e| format!("place {name}: {e}"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(md) = std::fs::metadata(&to) {
+                    let mut perm = md.permissions();
+                    perm.set_mode(0o755);
+                    let _ = std::fs::set_permissions(&to, perm);
+                }
+            }
+            // Strip quarantine so it launches without a Gatekeeper prompt.
+            let _ = std::process::Command::new("xattr").arg("-dr").arg("com.apple.quarantine").arg(&to).output();
+        }
+    }
+    let _ = std::fs::remove_dir_all(&extracted);
+    let _ = std::fs::remove_file(&tarball);
+    uv_bin(app).ok_or_else(|| "uv binary missing after unpack".into())
+}
+
+/// A PATH string with the provisioned uv bin dir FIRST, then /usr/bin:/bin.
+/// Used when launching a uv-based MCP server so OUR uv resolves.
+pub fn provisioned_uv_path(app: &AppHandle) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Ok(ud) = uv_dir(app) { parts.push(ud.join("bin").to_string_lossy().to_string()); }
+    parts.push("/usr/bin".into());
+    parts.push("/bin".into());
+    parts.join(":")
+}
+
+/// Remove the provisioned uv toolchain (binaries + cache + managed Pythons).
+/// Called when the last uv-based MCP server is disabled with uninstall=true.
+pub fn uv_uninstall(app: &AppHandle) -> Result<(), String> {
+    let d = uv_dir(app)?;
+    if d.is_dir() { std::fs::remove_dir_all(&d).map_err(|e| format!("remove uv: {e}"))?; }
+    Ok(())
 }

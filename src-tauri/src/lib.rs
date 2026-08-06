@@ -3523,7 +3523,7 @@ fn mcp_list(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     let out: Vec<serde_json::Value> = mcp::list(&app).into_iter().map(|c| {
         serde_json::json!({
             "key": c.key, "label": c.label, "command": c.command, "args": c.args,
-            "enabled": c.enabled, "builtin": c.builtin, "needs_node": c.needs_node,
+            "enabled": c.enabled, "builtin": c.builtin, "needs_node": c.needs_node, "needs_uv": c.needs_uv,
             "setup_note": c.setup_note, "verify_tool": c.verify_tool,
             "running": mcp_client::is_running(&c.key),
             "tool_count": mcp_client::get(&c.key).map(|s| s.tools().len()).unwrap_or(0),
@@ -3553,6 +3553,10 @@ async fn mcp_enable(app: tauri::AppHandle, channel: String, key: String) -> Resu
     if cfg.needs_node {
         let _ = app.emit(&channel, &serde_json::json!({ "phase": "node", "note": "Preparing the toolchain (Node)…" }));
         crate::provision::ensure_node(&app, &channel).await?;
+    }
+    if cfg.needs_uv {
+        let _ = app.emit(&channel, &serde_json::json!({ "phase": "uv", "note": "Preparing the toolchain (uv + Python)…" }));
+        crate::provision::ensure_uv(&app, &channel).await?;
     }
     let plan = mcp::install_plan(&cfg);
     if !plan.is_empty() {
@@ -3584,6 +3588,13 @@ async fn mcp_disable(app: tauri::AppHandle, channel: Option<String>, key: String
             let ch = channel.unwrap_or_default();
             let r = mcp::run_plan(&app, &ch, &plan).await?;
             report["uninstalled"] = serde_json::json!(r);
+        }
+        // Python (uv) servers: reclaim the provisioned uv toolchain + managed
+        // Python + package cache. (Shared across uv servers — fine today since
+        // Blender is the only one; revisit if we add a second uv server.)
+        if cfg.needs_uv {
+            let _ = crate::provision::uv_uninstall(&app);
+            report["uv_removed"] = serde_json::json!(true);
         }
     }
     Ok(report)

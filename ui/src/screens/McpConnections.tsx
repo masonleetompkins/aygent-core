@@ -1,5 +1,5 @@
 // AYGENT — MCP servers section of the Connections screen (2026-08-06).
-// Built-in catalog (Premiere) + add-your-own from the web. Enabling a server
+// Built-in catalog (Premiere, Blender) + add-your-own from the web. Enabling a server
 // runs its managed install (narrated live), starts it, and — for servers with a
 // verify tool (Premiere) — shows the manual in-app step + a Verify button.
 // Disable stops it; "remove" (custom only) or "uninstall" clears what it added.
@@ -10,7 +10,7 @@ import { Card, Button, Input, Pill } from "../components/ui";
 
 type McpServer = {
   key: string; label: string; command: string; args: string[];
-  enabled: boolean; builtin: boolean; needs_node: boolean;
+  enabled: boolean; builtin: boolean; needs_node: boolean; needs_uv: boolean;
   setup_note: string; verify_tool: string | null;
   running: boolean; tool_count: number;
 };
@@ -118,12 +118,14 @@ export function McpConnections() {
                 </span>
               )}
             </div>
-            {s.setup_note && <p style={{ ...hint, fontSize: 12.5, marginTop: 10 }}>{s.setup_note}</p>}
-            {/* Premiere-style manual step + verify result. */}
+            {s.setup_note && <p style={{ ...hint, fontSize: 12.5, marginTop: 10, whiteSpace: "pre-line" }}>{s.setup_note}</p>}
+            {/* Manual in-app step + verify result. The specific instructions live in
+                the server's setup_note above (Premiere's Start Bridge, Blender's
+                add-on install, etc.) so this block is server-agnostic. */}
             {s.enabled && s.verify_tool && (
               <div style={{ marginTop: 10, border: "var(--border-width) solid var(--line)", borderRadius: 8, padding: 10, fontSize: 13 }}>
-                <b>Final step (in Premiere):</b> restart Premiere Pro, open <code>Window &gt; Extensions &gt; MCP Bridge (CEP)</code>,
-                and click <b>Start Bridge</b>. Then click <b>Verify</b> above.
+                <b>Final step:</b> complete the in-app setup described above, make sure the app
+                is running, then click <b>Verify</b>.
                 {v && (
                   <div style={{ marginTop: 8, color: v.ok ? "var(--ok, #16a34a)" : "var(--danger, #dc2626)" }}>
                     {v.ok ? "✓ " : "✕ "}{v.text}
@@ -162,7 +164,7 @@ function AddMcp({ onClose, onAdded }: { onClose: () => void; onAdded: () => void
 
   return (
     <Card title="Add an MCP server">
-      <p style={hint}>Point AYGENT at any MCP server. If it’s an npm package, AYGENT runs it with its own Node.</p>
+      <p style={hint}>Point AYGENT at any MCP server. Node/npm servers run on AYGENT’s bundled Node; built-in catalog servers (e.g. Blender) can also use a bundled Python via uv.</p>
       <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 8 }}>
         <label style={{ fontSize: 13 }}>Name<Input value={label} onChange={(e: any) => setLabel(e.target.value)} placeholder="My MCP" /></label>
         <label style={{ fontSize: 13 }}>Command<Input value={command} onChange={(e: any) => setCommand(e.target.value)} placeholder="e.g. some-mcp-server" /></label>
