@@ -996,16 +996,8 @@ async fn mirror_visible_to_cdp(app: &tauri::AppHandle, state: &tauri::State<'_, 
         .and_then(|r| r["result"]["value"].as_str().map(|s| s.to_string()))
         .unwrap_or_default();
     crate::history::record(app, &url, &title);
-    // Navigate the visible embedded webview (best-effort; the human sees it).
-    let id = ACTIVE_TAB_ID.load(std::sync::atomic::Ordering::SeqCst);
-    if id < 0 { return; }
-    use tauri::Manager;
-    if let Some(wv) = app.get_webview(&tab_label(Some(id))) {
-        if let Ok(parsed) = url.parse::<tauri::Url>() {
-            eprintln!("[aygent][browser][MIRROR] visible tab={id} -> {url}");
-            let _ = wv.navigate(parsed);
-        }
-    }
+    // WKWebView removed (Mason, browser rebuild): the CDP page IS the visible
+    // page now — the screencast mirror shows it. Nothing else to sync.
 }
 
 /// Read the active tab's (title, url) â€” from the VISIBLE embedded webview via a
@@ -1078,7 +1070,10 @@ async fn ensure_session(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
     session_call(
         state,
         "Page.startScreencast",
-        serde_json::json!({ "format": "jpeg", "quality": 60, "maxWidth": 1280, "maxHeight": 800, "everyNthFrame": 1 }),
+        // QUALITY (browser rebuild): q60 @ 1280x800 CSS px was the "foggy
+        // glass" — a Retina viewport downscaled then re-upscaled. q85 with 2x
+        // headroom keeps text crisp; frames still track the real viewport.
+        serde_json::json!({ "format": "jpeg", "quality": 85, "maxWidth": 2560, "maxHeight": 1600, "everyNthFrame": 1 }),
     )
     .await?;
     Ok(())
@@ -1278,40 +1273,9 @@ pub async fn browser_start_view(
 // background). This webview is the interactive human+handoff surface.
 // ===========================================================================
 
-const WEBVIEW_LABEL: &str = "aygent-browser";
 
-/// Per-tab webview label. Multi-tab = one native child webview per tab, each
-/// with a unique label `aygent-browser-<tabId>`, so every tab holds its OWN
-/// live page + WebKit history. `tab_id: None` maps to the legacy single label
-/// (back-compat + the agent path that operates on "the active tab").
-fn tab_label(tab_id: Option<i64>) -> String {
-    match tab_id {
-        Some(id) => format!("{WEBVIEW_LABEL}-{id}"),
-        None => WEBVIEW_LABEL.to_string(),
-    }
-}
 
-/// ISSUE 1 — tell the FE to update THIS tab's displayed label to where the
-/// page actually is. Fired on every MAIN-FRAME commit (on_page_load Started).
-/// The FE (Browser.tsx) listens for `browser:tab-navigated` and updates that
-/// tab's { addr, title } so the tab strip reflects the live page (link clicks,
-/// redirects, agent nav) instead of the stale typed address. `title` may be
-/// empty at commit; `emit_tab_title` backfills it a beat later.
-fn emit_tab_navigated(app: &tauri::AppHandle, tab_id: Option<i64>, url: &str, title: &str) {
-    use tauri::Emitter;
-    let _ = app.emit("browser:tab-navigated", &serde_json::json!({
-        "tabId": tab_id, "url": url, "title": title,
-    }));
-}
 
-/// ISSUE 1 (title backfill) — the page title resolved after commit. Emit a
-/// title-only update the FE applies to the tab whose last commit we tracked.
-fn emit_tab_title(app: &tauri::AppHandle, tab_id: Option<i64>, title: &str) {
-    use tauri::Emitter;
-    let _ = app.emit("browser:tab-navigated", &serde_json::json!({
-        "tabId": tab_id, "url": serde_json::Value::Null, "title": title,
-    }));
-}
 
 /// Make a URL/Content-Disposition-ish name filesystem-safe. Strips path
 /// separators and control chars; caps length; falls back to a timestamped name.
@@ -1447,6 +1411,7 @@ fn ext_for_mime(ct: &str) -> Option<&'static str> {
 /// user process that can write the agent folder freely) MOVES the finished file
 /// into `<agentFolder>/downloads/`. The write and the final destination are
 /// decoupled — WebKit's sandbox never touches the agent folder.
+#[allow(dead_code)] // TODO(browser-rebuild): rewire to CDP Browser.downloadWillBegin
 fn download_event(app: &tauri::AppHandle, event: tauri::webview::DownloadEvent<'_>) -> bool {
     use tauri::webview::DownloadEvent;
     use tauri::Manager;
@@ -1619,6 +1584,7 @@ fn download_event(app: &tauri::AppHandle, event: tauri::webview::DownloadEvent<'
 /// missing at Finished, scan the download dir for the NEWEST file whose stem
 /// starts with our expected stem — that's almost certainly the one WebKit just
 /// wrote. Returns the matched path if found.
+#[allow(dead_code)] // TODO(browser-rebuild): CDP download path
 fn newest_matching_download(predicted: &Path) -> Option<PathBuf> {
     let dir = predicted.parent()?;
     let stem = predicted.file_stem()?.to_string_lossy().to_string();
@@ -1670,586 +1636,16 @@ fn dedup_name(dir: &Path, name: &str) -> String {
     }
 }
 
-/// Create the embedded browser webview if absent, positioned + sized to the
-/// Browser pane rect (CSS px from the UI). Navigates to `url`. Idempotent:
-/// re-shows + repositions an existing one.
-#[tauri::command]
-pub async fn webview_open(
-    app: tauri::AppHandle,
-    url: String,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    // Content-area size the frontend measured against. Kept in the invoke
-    // signature for compatibility but no longer used: the pane rect is already
-    // in the SAME content-coordinate space add_child uses, so we pass it through
-    // exactly. (Every titlebar/DPR/inset correction we tried broke it a new way
-    // â€” there was no offset to correct.)
-    client_width: Option<f64>,
-    client_height: Option<f64>,
-    // Corner radius (CSS px) to round the WKWebView's own CALayer, so the OS
-    // clips the page to a rounded rect matching the UI frame.
-    radius: Option<f64>,
-    // Which tab this webview belongs to. Each tab = its own native webview.
-    tab_id: Option<i64>,
-) -> Result<(), String> {
-    use tauri::{Manager, WebviewUrl};
-    let target = normalize_url(&url);
-    eprintln!("[aygent][browser] webview_open ENTER url={url:?} -> target={target:?} tab_id={tab_id:?} rect=({x},{y} {width}x{height})");
-    let parsed: tauri::Url = target.parse().map_err(|e| { eprintln!("[aygent][browser] webview_open BAD URL: {e}"); format!("bad url: {e}") })?;
-    let label = tab_label(tab_id);
-    eprintln!("[aygent][browser] webview_open label={label} existing={}", app.get_webview(&label).is_some());
 
-    let _ = (client_width, client_height);
-    let pos = tauri::LogicalPosition::new(x, y);
-    let size = tauri::LogicalSize::new(width.max(1.0), height.max(1.0));
 
-    // ============================================================
-    // ENGINE-CEF PATH (Phase 1). When the CEF engine is live, the VISIBLE
-    // surface is a native Chromium browser embedded via the punchout wrapper
-    // (cef_geometry) — NOT a wry child webview. Create/ensure the wrapper NSView
-    // parented behind the transparent React pane, then create/navigate the CEF
-    // browser into it. Everything below (add_child, DL bridge JS, on_page_load)
-    // is the WKWebView fallback, compiled when engine-cef is OFF.
-    // ============================================================
-    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
-    if crate::cef_engine::is_ready() {
-        let tid = tab_id.unwrap_or(-1);
-        // Resolve the parent window (same robust lookup as the wry path).
-        let parent_window: tauri::Window = app
-            .get_window("main")
-            .or_else(|| app.windows().into_values().next())
-            .or_else(|| app.get_webview_window("main").map(|wv| wv.as_ref().window()))
-            .or_else(|| app.webviews().into_values().next().map(|wv| wv.window()))
-            .ok_or_else(|| "no main window".to_string())?;
-        // Make the React webview transparent so the wrapper shows through the
-        // pane div (idempotent).
-        if let Some(wv) = app.webviews().into_values().next() {
-            crate::cef_geometry::set_main_webview_transparent(&wv);
-        }
-        let content_h = client_height.filter(|v| *v > 0.0).unwrap_or(height + y);
-        note_active_tab_url(tid, &target);
-        // ALL AppKit wrapper work MUST run on the MAIN THREAD (webview_open runs
-        // on a Tauri worker thread -> MainThreadMarker::new() was None -> wrapper
-        // never created -> parent_view=0x0 -> CEF spawned its own window). Hop
-        // onto the main thread, create/position the wrapper there, get its
-        // NSView pointer, then create the CEF browser parented into it.
-        let target_c = target.clone();
-        let pw = parent_window.clone();
-        let _ = app.run_on_main_thread(move || {
-            let ptr = crate::cef_geometry::ensure_wrapper(&pw, tid, (x, y, width, height));
-            let parent_ptr = ptr.unwrap_or(std::ptr::null_mut());
-            // Transparency also needs main thread; do it here alongside.
-            crate::cef_geometry::set_wrapper_hidden(tid, false);
-            crate::cef_geometry::front_wrapper(tid);
-            crate::cef_geometry::place_wrapper(tid, x, y, width, height, Some(content_h));
-            crate::cef_engine::create_or_navigate(tid, target_c.clone(), parent_ptr, width as i32, height as i32);
-            eprintln!("[aygent][cef] webview_open (CEF, main-thread) tab={tid} parent={parent_ptr:?} url={target_c}");
-        });
-        return Ok(());
-    }
 
-    // Existing EMBEDDED child webview for THIS tab? reposition + navigate.
-    // add_child creates a `Webview` (embedded child), retrieved via
-    // get_webview() (not get_webview_window(), None for embedded children).
-    if let Some(wv) = app.get_webview(&label) {
-        #[cfg(target_os = "macos")]
-        {
-            place_child_exact(&wv, x, y, width, height, client_height, radius);
-            set_child_hidden(&wv, false);
-            bring_child_to_front(&wv);
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = wv.set_position(pos);
-            let _ = wv.set_size(size);
-        }
-        wv.navigate(parsed).map_err(|e| format!("navigate: {e}"))?;
-        return Ok(());
-    }
 
-    // EMBED a child webview INSIDE the main window. add_child lives on the raw
-    // WINDOW (not WebviewWindow/AppHandle). Getting the parent WINDOW:
-    // get_webview_window("main") returns None once child webviews exist (the
-    // registry entry "main" is the parent WEBVIEW, and after children the
-    // lookup can miss) â€” which is exactly why tab 2 failed with "no main
-    // window" while tab 1 succeeded. Get the parent Window robustly: prefer
-    // the windows() map (keyed by window label), falling back to any existing
-    // child webview's own .window() (all children share the same parent
-    // window), then finally the webview lookup.
-    let parent_window: tauri::Window = app
-        .get_window("main")
-        .or_else(|| app.windows().into_values().next())
-        .or_else(|| app.get_webview_window("main").map(|wv| wv.as_ref().window()))
-        .or_else(|| app.webviews().into_values().next().map(|wv| wv.window()))
-        .ok_or_else(|| { eprintln!("[aygent][browser] NO PARENT WINDOW found via any path"); "no main window".to_string() })?;
-    eprintln!("[aygent][browser] parent window resolved label={}", parent_window.label());
 
-    // ============================================================
-    // MAIN-FRAME-ONLY NAVIGATION CAPTURE — THE ROOT FIX v2 (Atlas).
-    //
-    // v1 used WebviewBuilder::on_navigation as the history source. PROBLEM: wry
-    // invokes on_navigation for EVERY navigation of the webview — including
-    // SUBFRAMES/IFRAMES (hCaptcha widgets, ad/embed frames) and download URLs.
-    // That polluted history with entries like newassets.hcaptcha.com/... that
-    // Mason never navigated to, and (worse) a DOWNLOAD url handed to WKWebView
-    // as a "navigation" fired on_navigation -> history::record in a tight churn
-    // (the terminal flood). on_navigation cannot distinguish main-frame from
-    // sub-frame, so it is the WRONG signal for both the tab label and history.
-    //
-    // THE CORRECT SIGNAL: WebviewBuilder::on_page_load. wry fires on_page_load
-    // ONLY for the MAIN FRAME's committed document loads (Started at commit,
-    // Finished at load-complete) — never for subframes/iframes, never for a
-    // sub-resource, and never for a download (a download is not a committed
-    // page load). This cleanly gives us "the actual pages Mason visits, in
-    // order" — the exact main-frame-only semantics Issue 2 asks for.
-    //
-    // On PageLoadEvent::Started (commit) we:
-    //   * record the page in persistent history (main-frame only), and
-    //   * emit `browser:tab-navigated` { tabId, url, title:"" } so Browser.tsx
-    //     updates THIS tab's label to where the page actually went (Issue 1).
-    // Title is unknown at commit; on_document_title_changed backfills it below
-    // (emits `browser:tab-navigated` again with the real title, and history's
-    // title-upgrade path upgrades the stored entry in place).
-    //
-    // on_navigation is kept ONLY as a pure allow-all observer (returns true);
-    // it NO LONGER records history or touches the tab — so subframe/captcha/
-    // download navigations can't pollute anything.
-    // ============================================================
-    let this_tab = tab_id; // captured for the event payloads (which tab this is)
-    let load_app = app.clone();
-    let title_app = app.clone();
-    let dl_app = app.clone();
-    // PAGE-INJECTED DOWNLOAD BRIDGE: wry's on_download does NOT fire for a
-    // right-click "Save Image" (confirmed — no [DL] begin ever printed). So we
-    // catch it in the page: on contextmenu over an <img> (or a click on a
-    // download link), we capture the resource URL + suggested name and post it
-    // to Rust via the Tauri IPC event `browser:save-request`. Rust then fetches
-    // + writes to the agent folder (browser_download_url) — no WKWebView
-    // download, no sandbox. We ALSO override the default "Save Image" so it
-    // routes here instead of WebKit's broken WKDownload path.
-    const DL_BRIDGE_JS: &str = r#"(function(){
-  if (window.__aygentDlBridge) return; window.__aygentDlBridge = true;
-  function emit(url, name){
-    try {
-      if (window.__TAURI__ && window.__TAURI__.event) {
-        window.__TAURI__.event.emit('browser:save-request', { url: url, name: name || '' });
-      }
-    } catch(e){}
-  }
-  // Right-click on an image => intercept, send its src to Rust.
-  document.addEventListener('contextmenu', function(ev){
-    var el = ev.target;
-    if (el && el.tagName === 'IMG' && el.src && /^https?:/.test(el.src)) {
-      // Don't fully preventDefault (keep the native menu usable), but stash the
-      // last image so an explicit Save action can use it. We also offer an
-      // immediate save on Alt+right-click for power users.
-      window.__aygentLastImg = el.src;
-      if (ev.altKey) { ev.preventDefault(); emit(el.src, ''); }
-    }
-  }, true);
-  // Clicks on <a download> or direct file links => route through Rust.
-  document.addEventListener('click', function(ev){
-    var a = ev.target && ev.target.closest ? ev.target.closest('a') : null;
-    if (!a) return;
-    var href = a.href || '';
-    var isDl = a.hasAttribute('download');
-    if (isDl && /^https?:/.test(href)) { ev.preventDefault(); emit(href, a.getAttribute('download')||''); }
-  }, true);
-})();"#;
-    let builder = tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed))
-        .initialization_script(DL_BRIDGE_JS)
-        .on_navigation(|url| {
-            // DIAGNOSTIC (Atlas): log every URL that reaches wry's
-            // navigation_policy. If a right-click "Save Image" / binary URL
-            // appears here, the download went through nav policy (and we
-            // allowed it). If [DL] begin fires but the download URL never
-            // appears in a [NAV] line, the download came via WebKit's
-            // context-menu WKDownload path (didBecomeDownload) — proving the
-            // on_navigation observer is NOT intercepting/swallowing downloads.
-            eprintln!("[aygent][browser][NAV] policy url={url}");
-            true // allow-all observer; NEVER records (see on_page_load)
-        })
-        .on_page_load(move |_wv, payload| {
-            use tauri::webview::PageLoadEvent;
-            // Only act at COMMIT (Started); Finished would double-fire per page.
-            if !matches!(payload.event(), PageLoadEvent::Started) { return; }
-            let url = payload.url().as_str().to_string();
-            // Guard: main-frame commits still include about:blank / devtools —
-            // history::record already skips non-http(s), but skip the emit too.
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
-                return;
-            }
-            eprintln!("[aygent][browser][HIST] main-frame commit tab={this_tab:?} url={url}");
-            // PERSISTENT HISTORY — main-frame only, at commit.
-            crate::history::record(&load_app, &url, "");
-            // ISSUE 1: update the tab strip label to where the page really is.
-            emit_tab_navigated(&load_app, this_tab, &url, "");
-        })
-        .on_document_title_changed(move |_wv, title| {
-            // Title resolved after the main-frame commit. Backfill it: read the
-            // committed url so the event/history carry a matching url+title.
-            let t = title.trim().to_string();
-            if t.is_empty() { return; }
-            // We don't get the url in this callback; the FE keeps the last
-            // committed url per tab and just applies the title. Emit title-only.
-            eprintln!("[aygent][browser][HIST] title-changed tab={this_tab:?} title={t:?}");
-            emit_tab_title(&title_app, this_tab, &t);
-        })
-        .on_download(move |_wv, event| download_event(&dl_app, event));
-    let wv = parent_window
-        .add_child(builder, pos, size)
-        .map_err(|e| { eprintln!("[aygent][browser] add_child FAILED: {e}"); format!("embed webview: {e}") })?;
-    eprintln!("[aygent][browser] webview_open add_child OK label={label}");
-    // Immediately pin the freshly-created child to the exact measured rect via
-    // AppKit â€” add_child's own placement is what we stopped trusting.
-    #[cfg(target_os = "macos")]
-    place_child_exact(&wv, x, y, width, height, client_height, radius);
-    #[cfg(not(target_os = "macos"))]
-    let _ = wv;
-    Ok(())
-}
 
-/// GROUND-TRUTH PLACEMENT (macOS): set the child webview's NSView frame
-/// DIRECTLY against the window contentView's live bounds. We do NOT trust
-/// wry's child-positioning math â€” every attempt to pre-correct for it
-/// (titlebar inset, DPR, frame inset) broke a new way because we were
-/// guessing its reference frame. Here there is nothing to guess: AppKit
-/// tells us the content area, we convert top-left CSS coords to AppKit
-/// bottom-left coords ourselves, and we place the view. All values live,
-/// nothing hardcoded.
-#[cfg(target_os = "macos")]
-fn place_child_exact(wv: &tauri::Webview, x: f64, y: f64, w: f64, h: f64, content_h: Option<f64>, radius: Option<f64>) {
-    let w = w.max(1.0);
-    let h = h.max(1.0);
-    let radius = radius.unwrap_or(0.0).max(0.0);
-    let _ = wv.with_webview(move |pw| unsafe {
-        use objc2::rc::Retained;
-        use objc2::Message;
-        use objc2_app_kit::{NSAutoresizingMaskOptions, NSView};
-        use objc2_foundation::{NSPoint, NSRect, NSSize};
 
-        let raw: *mut NSView = pw.inner().cast();
-        if raw.is_null() {
-            return;
-        }
-        let view: &NSView = &*raw;
-        let Some(window) = view.window() else { return };
-        let Some(content) = window.contentView() else { return };
 
-        // wry may wrap the WKWebView in a container view; the frame that
-        // matters is the ancestor sitting DIRECTLY inside contentView.
-        let mut target: Retained<NSView> = view.retain();
-        loop {
-            let Some(sup) = target.superview() else { break };
-            if Retained::as_ptr(&sup) == Retained::as_ptr(&content) {
-                break;
-            }
-            target = sup;
-        }
 
-        // The frame we set lives in the coordinate space of target.superview
-        // (the direct parent), NOT contentView per se. Flip against the PARENT's
-        // flip state + the PARENT's height. If the parent is flipped, top-left
-        // y is used directly; otherwise convert to bottom-left.
-        let parent = target.superview();
-        let (parent_flipped, parent_h) = match &parent {
-            Some(p) => (p.isFlipped(), p.bounds().size.height),
-            None => (content.isFlipped(), content.bounds().size.height),
-        };
-        // KEY FIX: the parent NSView spans the FULL WINDOW (incl. titlebar),
-        // but the frontend's y is measured from the CONTENT area top (below the
-        // titlebar). Flip against the CONTENT height (client_height from JS),
-        // not the parent's full height â€” otherwise the webview rides up over the
-        // tabs by exactly the titlebar height. NSVIEW log proved parent_h=720
-        // while content=688. Fall back to parent_h if JS didn't send it.
-        let flip_h = content_h.filter(|v| *v > 0.0).unwrap_or(parent_h);
-        let oy = if parent_flipped { y } else { flip_h - y - h };
 
-        let wrapped = Retained::as_ptr(&target) != (raw as *const NSView);
-        eprintln!(
-            "[aygent][browser][NSVIEW] in=({x:.0},{y:.0} {w:.0}x{h:.0}) \
-             content_flipped={} parent_flipped={parent_flipped} parent_h={parent_h:.0} \
-             flip_h={flip_h:.0} wrapped={wrapped} => frame=({x:.0},{oy:.0} {w:.0}x{h:.0})",
-            content.isFlipped(),
-        );
-
-        // MINIMAL INTERVENTION: place ONLY the outer container (the view sitting
-        // directly under contentView). Do NOT touch the inner WKWebView frame
-        // and do NOT clear autoresizing â€” doing both is what broke rendering
-        // (blank page). The WKWebView tracks its container via its own
-        // autoresizing mask; we only correct WHERE the container sits. wry still
-        // sized it via set_size before this call; we override position + size on
-        // the container only.
-        target.setFrame(NSRect::new(NSPoint::new(x, oy), NSSize::new(w, h)));
-        let _ = NSAutoresizingMaskOptions::empty();
-
-        // PREMIUM ROUNDED CORNERS â€” the proper native way: round the WKWebView's
-        // OWN backing CALayer so the OS clips the web content itself to a
-        // rounded rect. No DOM inset, sizes match the pane EXACTLY; the DOM
-        // frame overlay then overlaps only the corner pixels for the accent
-        // border. We round the actual web-content view (`raw`) AND the outer
-        // container so nothing square peeks past the arc. wantsLayer=true
-        // guarantees a layer is backing the view (WKWebView is layer-backed,
-        // but set it defensively on any wrapper too).
-        if radius > 0.0 {
-            for v in [view as &NSView, &*target] {
-                v.setWantsLayer(true);
-                if let Some(layer) = v.layer() {
-                    layer.setCornerRadius(radius);
-                    layer.setMasksToBounds(true);
-                }
-            }
-        }
-    });
-}
-
-/// Reposition/resize the embedded webview to track the pane (called on layout
-/// changes / scroll). No-op if it doesn't exist.
-#[tauri::command]
-pub fn webview_set_bounds(
-    app: tauri::AppHandle,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    // Content-area size the frontend rect was measured against, used to compute
-    // the native titlebar inset at runtime. `parent_height` kept as an alias for
-    // client_height so the older invoke shape still works.
-    client_width: Option<f64>,
-    client_height: Option<f64>,
-    parent_height: Option<f64>,
-    // Corner radius (CSS px) to round the WKWebView's CALayer, matching the UI
-    // frame. Same single-sourced value the open call sends.
-    radius: Option<f64>,
-    // Which tab's webview to reposition.
-    tab_id: Option<i64>,
-) -> Result<(), String> {
-    use tauri::Manager;
-    // ENGINE-CEF: place the punchout wrapper (not a wry child) for this tab.
-    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
-    if crate::cef_engine::is_ready() {
-        let content_h = client_height.or(parent_height);
-        crate::cef_geometry::place_wrapper(tab_id.unwrap_or(-1), x, y, width, height, content_h);
-        let _ = (client_width, radius);
-        return Ok(());
-    }
-    if let Some(wv) = app.get_webview(&tab_label(tab_id)) {
-        let _ = client_width;
-        let content_h = client_height.or(parent_height);
-        #[cfg(target_os = "macos")]
-        place_child_exact(&wv, x, y, width, height, content_h, radius);
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = content_h;
-            let _ = wv.set_position(tauri::LogicalPosition::new(x, y));
-            let _ = wv.set_size(tauri::LogicalSize::new(width.max(1.0), height.max(1.0)));
-        }
-    }
-    Ok(())
-}
-
-/// Hide the embedded webview when the user leaves the Browser tab so it doesn't
-/// float over other screens. Embedded child webviews have no hide() â€” shrink to
-/// zero + move off-screen (reliable across versions).
-/// Set NSView `hidden` on a tab's webview (macOS). Atlas P0: hiding by
-/// setHidden removes the view from hit-testing (no leaked clicks) + drops it
-/// from compositing (no GPU/flash), and is lossless on re-show (no reload).
-/// The old size-0/offscreen hack leaked input + paint. Non-macOS falls back to
-/// the geometry hack.
-#[cfg(target_os = "macos")]
-fn set_child_hidden(wv: &tauri::Webview, hidden: bool) {
-    let _ = wv.with_webview(move |pw| unsafe {
-        use objc2_app_kit::NSView;
-        let raw: *mut NSView = pw.inner().cast();
-        if raw.is_null() { return; }
-        (&*raw).setHidden(hidden);
-    });
-}
-
-#[cfg(target_os = "macos")]
-fn bring_child_to_front(wv: &tauri::Webview) {
-    let _ = wv.with_webview(move |pw| unsafe {
-        use objc2::msg_send;
-        use objc2::runtime::AnyObject;
-        use objc2_app_kit::{NSView, NSWindowOrderingMode};
-        let raw: *mut NSView = pw.inner().cast();
-        if raw.is_null() { return; }
-        let view: &NSView = &*raw;
-        if let Some(superview) = view.superview() {
-            let _: () = msg_send![
-                &*superview,
-                addSubview: view,
-                positioned: NSWindowOrderingMode::Above,
-                relativeTo: std::ptr::null::<AnyObject>()
-            ];
-        }
-    });
-}
-
-#[tauri::command]
-pub fn webview_hide(app: tauri::AppHandle, tab_id: Option<i64>) -> Result<(), String> {
-    use tauri::Manager;
-    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
-    if crate::cef_engine::is_ready() {
-        crate::cef_geometry::set_wrapper_hidden(tab_id.unwrap_or(-1), true);
-        return Ok(());
-    }
-    if let Some(wv) = app.get_webview(&tab_label(tab_id)) {
-        #[cfg(target_os = "macos")]
-        set_child_hidden(&wv, true);
-        #[cfg(not(target_os = "macos"))]
-        {
-            use tauri::{LogicalPosition, LogicalSize};
-            let _ = wv.set_size(LogicalSize::new(0.0, 0.0));
-            let _ = wv.set_position(LogicalPosition::new(-10000.0, -10000.0));
-        }
-    }
-    Ok(())
-}
-
-/// Hide EVERY tab's webview except `keep` (the active tab), and bring `keep` to
-/// the front. Called on tab switch. keep=None hides all (leaving the Browser
-/// screen). Iterates the window's webviews by our label prefix.
-#[tauri::command]
-pub fn webview_hide_others(app: tauri::AppHandle, keep: Option<i64>) -> Result<(), String> {
-    use tauri::Manager;
-    // ENGINE-CEF: hide every tab's wrapper except `keep`, and front `keep`.
-    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
-    if crate::cef_engine::is_ready() {
-        crate::cef_geometry::hide_others_and_front(keep);
-        return Ok(());
-    }
-    let keep_label = keep.map(|id| tab_label(Some(id)));
-    for (label, wv) in app.webviews() {
-        if !label.starts_with(WEBVIEW_LABEL) { continue; }
-        let is_keep = Some(&label) == keep_label.as_ref();
-        #[cfg(target_os = "macos")]
-        {
-            set_child_hidden(&wv, !is_keep);
-            if is_keep { bring_child_to_front(&wv); }
-        }
-        #[cfg(not(target_os = "macos"))]
-        if !is_keep {
-            use tauri::{LogicalPosition, LogicalSize};
-            let _ = wv.set_size(LogicalSize::new(0.0, 0.0));
-            let _ = wv.set_position(LogicalPosition::new(-10000.0, -10000.0));
-        }
-    }
-    Ok(())
-}
-
-/// Navigate a tab's embedded webview to a URL (address bar).
-#[tauri::command]
-pub fn webview_navigate(app: tauri::AppHandle, url: String, tab_id: Option<i64>) -> Result<(), String> {
-    use tauri::Manager;
-    let target = normalize_url(&url);
-    // ENGINE-CEF: drive the CEF browser's main frame.
-    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
-    if crate::cef_engine::is_ready() {
-        let tid = tab_id.unwrap_or(-1);
-        crate::history::record(&app, &target, "");
-        note_active_tab_url(tid, &target);
-        crate::cef_engine::navigate(tid, target.clone());
-        return Ok(());
-    }
-    let parsed = target.parse().map_err(|e| format!("bad url: {e}"))?;
-    let wv = app.get_webview(&tab_label(tab_id)).ok_or("browser not open")?;
-    // PERSISTENT HISTORY: record the explicit target immediately (title empty;
-    // the webview_page_info poll backfills the real title once the page loads).
-    crate::history::record(&app, &target, "");
-    wv.navigate(parsed).map_err(|e| format!("navigate: {e}"))
-}
-
-/// Read a tab's current page title + URL from its embedded webview. Used by the
-/// UI to label the tab with the REAL page title ("Google") instead of the typed
-/// address / "New Tab". Round-trips through a Tauri IPC event keyed by a nonce:
-/// inject JS that emits [title, href] back, wait (bounded) for it. If the
-/// webview isn't loaded yet the caller just retries.
-#[tauri::command]
-pub async fn webview_page_info(app: tauri::AppHandle, tab_id: Option<i64>) -> Result<serde_json::Value, String> {
-    use tauri::{Manager, Listener};
-    let wv = app.get_webview(&tab_label(tab_id)).ok_or("browser not open")?;
-    let nonce = format!("wvpi_{}", SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
-    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-    let tx = std::sync::Mutex::new(Some(tx));
-    let handler = app.once(nonce.clone(), move |ev| {
-        if let Ok(mut g) = tx.lock() {
-            if let Some(sender) = g.take() { let _ = sender.send(ev.payload().to_string()); }
-        }
-    });
-    let script = format!(
-        "(() => {{ try {{ const r = JSON.stringify([document.title||'', location.href||'']); \
-         if (window.__TAURI__ && window.__TAURI__.event) window.__TAURI__.event.emit({nonce:?}, r); }} catch(e) {{}} }})()",
-        nonce = nonce
-    );
-    wv.eval(&script).map_err(|e| { app.unlisten(handler); format!("eval: {e}") })?;
-    let raw = match tokio::time::timeout(std::time::Duration::from_secs(3), rx).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(_)) => return Err("page info channel closed".into()),
-        Err(_) => { app.unlisten(handler); return Err("page info timed out".into()); }
-    };
-    // The payload is a JSON string containing a JSON-stringified array; unwrap both.
-    let inner: String = serde_json::from_str(&raw).unwrap_or(raw);
-    let arr: Vec<String> = serde_json::from_str(&inner).unwrap_or_default();
-    let title = arr.get(0).cloned().unwrap_or_default();
-    let url = arr.get(1).cloned().unwrap_or_default();
-    // PERSISTENT HISTORY: this command is polled after every human go() and
-    // every back/forward/reload, returning the REAL committed title+url of the
-    // visible tab. Record it here so human navigations (incl. in-page link
-    // clicks + redirects that never touched go()) are captured with their real
-    // title. record() de-dupes consecutive identical urls and upgrades titles.
-    crate::history::record(&app, &url, &title);
-    Ok(serde_json::json!({ "title": title, "url": url }))
-}
-
-/// Close/destroy a tab's embedded webview entirely.
-#[tauri::command]
-pub fn webview_close(app: tauri::AppHandle, tab_id: Option<i64>) -> Result<(), String> {
-    use tauri::Manager;
-    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
-    if crate::cef_engine::is_ready() {
-        let tid = tab_id.unwrap_or(-1);
-        crate::cef_engine::close_tab(tid);
-        crate::cef_geometry::remove_wrapper(tid);
-        return Ok(());
-    }
-    if let Some(wv) = app.get_webview(&tab_label(tab_id)) {
-        let _ = wv.close();
-    }
-    Ok(())
-}
-
-/// Browser HISTORY within a tab's webview (Phase C prep): back / forward /
-/// reload via injected JS on the live WebKit view. Simple + engine-native.
-#[tauri::command]
-pub fn webview_history(app: tauri::AppHandle, action: String, tab_id: Option<i64>) -> Result<(), String> {
-    use tauri::Manager;
-    // ENGINE-CEF: back/forward/reload on the CEF browser (native).
-    #[cfg(all(target_os = "macos", feature = "engine-cef"))]
-    if crate::cef_engine::is_ready() {
-        let tid = tab_id.unwrap_or(-1);
-        match action.as_str() {
-            "back" => crate::cef_engine::go_back(tid),
-            "forward" => crate::cef_engine::go_forward(tid),
-            "reload" => crate::cef_engine::reload(tid),
-            other => return Err(format!("unknown history action: {other}")),
-        }
-        eprintln!("[aygent][cef] webview_history action={action} tab={tid}");
-        return Ok(());
-    }
-    let wv = app.get_webview(&tab_label(tab_id)).ok_or("browser not open")?;
-    let js = match action.as_str() {
-        "back" => "history.back()",
-        "forward" => "history.forward()",
-        "reload" => "location.reload()",
-        other => return Err(format!("unknown history action: {other}")),
-    };
-    // ITEM 3 [NAV] logging: back/forward/refresh on the visible tab's webview.
-    eprintln!("[aygent][browser][NAV] webview_history action={action} tab={:?} (engine-native WebKit history)", tab_id);
-    wv.eval(js).map_err(|e| format!("history {action}: {e}"))
-}
 
 /// ITEM 3 (Downloads). List the files in the ACTIVE agent's downloads directory
 /// (`<agentFolder>/downloads` — see `agent_downloads_dir`) so the Browser view
@@ -2321,92 +1717,7 @@ pub fn browser_history_clear(app: tauri::AppHandle) -> Result<(), String> {
 // the current page text + the webview tools, and iterates until done.
 // ---------------------------------------------------------------------------
 
-/// Run one JS expression in the human's webview and return the JSON-stringified
-/// result. Uses a Tauri IPC round-trip: the injected script posts its result
-/// back on a one-shot channel keyed by a nonce.
-pub async fn webview_eval(app: &tauri::AppHandle, expr: &str) -> Result<String, String> {
-    use tauri::{Manager, Listener};
-    let wv = app.get_webview(WEBVIEW_LABEL).ok_or("browser not open")?;
-    let nonce = format!("wvr_{}", SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
-    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-    let tx = std::sync::Mutex::new(Some(tx));
 
-    // Listen once for the result event the injected script emits.
-    let handler = app.once(nonce.clone(), move |ev| {
-        if let Ok(mut g) = tx.lock() {
-            if let Some(sender) = g.take() {
-                let _ = sender.send(ev.payload().to_string());
-            }
-        }
-    });
-
-    // Inject: eval the expression, emit the (stringified) result back to Rust.
-    // Wrapped so an exception becomes a readable string instead of silent fail.
-    let script = format!(
-        "(async () => {{ let r; try {{ r = JSON.stringify(await (async()=>({expr}))()); }} catch(e) {{ r = 'ERR: '+ (e && e.message || e); }} \
-         if (window.__TAURI__ && window.__TAURI__.event) {{ window.__TAURI__.event.emit({nonce:?}, r); }} }})()",
-        expr = expr, nonce = nonce
-    );
-    wv.eval(&script).map_err(|e| { app.unlisten(handler); format!("eval: {e}") })?;
-
-    match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
-        Ok(Ok(v)) => Ok(v),
-        Ok(Err(_)) => Err("webview eval channel closed".into()),
-        Err(_) => { app.unlisten(handler); Err("webview eval timed out".into()) }
-    }
-}
-
-/// THE HAND-OFF COMMAND. The human typed a task in the prompt bar; drive the
-/// agent to do it in the live webview. Slice-thin agent loop with webview tools.
-#[tauri::command]
-pub async fn webview_agent_act(app: tauri::AppHandle, task: String) -> Result<String, String> {
-    // Read the current page so the agent knows what it's looking at.
-    let page = webview_eval(
-        &app,
-        "({title: document.title, url: location.href, text: (document.body?document.body.innerText:'').slice(0,4000)})",
-    )
-    .await
-    .unwrap_or_else(|_| "{}".into());
-
-    // For Slice-1 of the hand-off we do a DIRECT interpretation: the agent's
-    // action verbs map to webview JS. A full model-in-the-loop version routes
-    // through agent_stream; this focused version keeps the hand-off SNAPPY +
-    // self-contained (the model call is a follow-up wire-up). We interpret a few
-    // natural commands directly so the loop is real + demoable today.
-    let t = task.to_lowercase();
-    if let Some(rest) = t.strip_prefix("click ") {
-        let target = rest.trim().trim_matches('"');
-        let expr = format!(
-            "(() => {{ const t={target:?}; const els=[...document.querySelectorAll('a,button,input[type=submit],[role=button],label')]; \
-             const el=els.find(e=>(e.innerText||e.value||'').toLowerCase().includes(t)); \
-             if(!el) return 'no element matching '+t; el.click(); return 'clicked: '+(el.innerText||el.value||t).slice(0,60); }})()",
-            target = target
-        );
-        return webview_eval(&app, &expr).await.map(|r| r.trim_matches('"').to_string());
-    }
-    if t.starts_with("scroll") {
-        let _ = webview_eval(&app, "(()=>{window.scrollBy(0, window.innerHeight*0.8); return 'scrolled';})()").await;
-        return Ok("scrolled down".into());
-    }
-    if t.starts_with("summar") || t.starts_with("read") || t.starts_with("what") {
-        // Return the page text for the model layer to summarize. (Until the
-        // model call is wired, hand back the visible text so the human sees it.)
-        return Ok(format!("Current page: {page}"));
-    }
-    if let Some(rest) = t.strip_prefix("type ") {
-        let text = rest.trim().trim_matches('"');
-        let expr = format!(
-            "(() => {{ const el=document.activeElement; if(!el||!('value' in el)) return 'no focused input'; \
-             el.value={text:?}; el.dispatchEvent(new Event('input',{{bubbles:true}})); return 'typed'; }})()",
-            text = text
-        );
-        return webview_eval(&app, &expr).await.map(|r| r.trim_matches('"').to_string());
-    }
-
-    Ok(format!(
-        "I can do: click <text>, type <text>, scroll, summarize. (Full free-form agent reasoning is the next wire-up.) You asked: {task}"
-    ))
-}
 
 // ---------------------------------------------------------------------------
 // SLICE 5 â€” SHARED CONTROL (the wheel).
@@ -3754,6 +3065,38 @@ async fn active_tab_page_text(app: &tauri::AppHandle, state: &tauri::State<'_, B
     let decoded: String = serde_json::from_str(&r).unwrap_or(r);
     let arr: Vec<String> = serde_json::from_str(&decoded).unwrap_or_default();
     if arr.len() == 2 { Ok((arr[0].clone(), arr[1].clone())) } else { Err("unexpected page text shape".into()) }
+}
+
+/// Back/forward/reload on the CDP page (replaces the WKWebView-era
+/// webview_history). Back/forward walk Page.getNavigationHistory; reload is
+/// Page.reload. No-ops quietly at history edges.
+#[tauri::command]
+pub async fn browser_history_nav(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, BrowserProc>,
+    action: String,
+) -> Result<(), String> {
+    ensure_session(&app, &state).await?;
+    match action.as_str() {
+        "reload" => {
+            session_call(&state, "Page.reload", serde_json::json!({})).await?;
+        }
+        "back" | "forward" => {
+            let h = session_call(&state, "Page.getNavigationHistory", serde_json::json!({})).await?;
+            let cur = h["currentIndex"].as_i64().unwrap_or(0);
+            let entries = h["entries"].as_array().cloned().unwrap_or_default();
+            let target = if action == "back" { cur - 1 } else { cur + 1 };
+            if target < 0 || target as usize >= entries.len() {
+                return Ok(()); // edge of history — quiet no-op
+            }
+            let id = entries[target as usize]["id"].as_i64().unwrap_or(0);
+            session_call(&state, "Page.navigateToHistoryEntry", serde_json::json!({ "entryId": id })).await?;
+        }
+        _ => return Err(format!("unknown nav action: {action}")),
+    }
+    // Keep history/active-url in sync with wherever we landed.
+    mirror_visible_to_cdp(&app, &state).await;
+    Ok(())
 }
 
 /// Read (title, url) via CDP.
