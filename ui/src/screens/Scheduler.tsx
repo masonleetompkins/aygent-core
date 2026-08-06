@@ -75,6 +75,13 @@ export function Scheduler({ agentId }: { agentId: string | null }) {
   const [adding, setAdding] = useState(false);
   const [openRuns, setOpenRuns] = useState<number | null>(null);
   const [runs, setRuns] = useState<Run[]>([]);
+  // Run-now status banner (separate from `err` so a SUCCESS is never shown in
+  // the red error style). phase: running (yellow) -> done (green) / failed (red).
+  // Dismissible via the × — it does not auto-hide once done, so the result stays
+  // until you read it.
+  const [runStatus, setRunStatus] = useState<
+    { phase: "running" | "done" | "failed"; name: string; text: string } | null
+  >(null);
 
   async function refresh() {
     try {
@@ -98,13 +105,54 @@ export function Scheduler({ agentId }: { agentId: string | null }) {
   }
   async function runNow(s: Schedule) {
     setErr(null);
+    setRunStatus({ phase: "running", name: s.name, text: "Running now…" });
     try {
       const enq = await invoke<boolean>("scheduler_run_now", { id: s.id });
-      setErr(enq
-        ? `Fired “${s.name}” now — check the agent’s Activity + History in a few seconds.`
-        : `“${s.name}” didn’t fire — it hit today’s fire limit (or is a system job). Click “Reset limits” to test again.`);
-      setTimeout(refresh, 1500);
-    } catch (e) { setErr(String(e)); }
+      if (!enq) {
+        setRunStatus({
+          phase: "failed", name: s.name,
+          text: "Didn’t fire — it hit today’s fire limit (or is a system job). Click “Reset limits” to try again.",
+        });
+        void refresh();
+        return;
+      }
+      // Poll the schedule row for THIS run's completion. run_now records
+      // last_status + last_result (the distilled summary) when the turn ends.
+      // We watch last_fired_at flip forward, then read the result off the row.
+      const before = s.last_fired_at ?? 0;
+      const started = Date.now();
+      const poll = async () => {
+        try {
+          const fresh = await invoke<Schedule[]>("scheduler_list", { agentId });
+          setList(fresh);
+          const row = fresh.find((x) => x.id === s.id);
+          const fired = row?.last_fired_at ?? 0;
+          const status = row?.last_status ?? null;
+          if (row && fired > before && (status === "ok" || status === "error" || status === "skipped")) {
+            const result = (row.last_result || "").trim();
+            if (status === "ok" || status === "skipped") {
+              setRunStatus({
+                phase: "done", name: s.name,
+                text: result ? `Done — ${result}` : "Done.",
+              });
+            } else {
+              setRunStatus({
+                phase: "failed", name: s.name,
+                text: result ? `Failed — ${result}` : "The run reported an error. See History for details.",
+              });
+            }
+            return; // stop polling
+          }
+        } catch { /* keep trying */ }
+        if (Date.now() - started < 30000) setTimeout(poll, 1200);
+        else setRunStatus((cur) => cur && cur.phase === "running"
+          ? { phase: "done", name: s.name, text: "Fired — still running. Check History for the result." }
+          : cur);
+      };
+      setTimeout(poll, 1000);
+    } catch (e) {
+      setRunStatus({ phase: "failed", name: s.name, text: String(e) });
+    }
   }
   async function resetLimits(s: Schedule) {
     setErr(null);
@@ -137,6 +185,37 @@ export function Scheduler({ agentId }: { agentId: string | null }) {
       {paused && <Pill tone="danger">All schedules paused — nothing will fire until you resume.</Pill>}
       {!agentId && <Pill tone="muted">Pick an agent in the rail to add a schedule.</Pill>}
       {err && <Pill tone="danger">{err}</Pill>}
+      {runStatus && (() => {
+        const c = runStatus.phase === "running"
+          ? { fg: "var(--warn, #b7791f)", bg: "var(--warn-bg, rgba(234,179,8,.12))", icon: "◐" }
+          : runStatus.phase === "done"
+          ? { fg: "var(--ok, #16a34a)", bg: "var(--ok-bg, rgba(34,197,94,.12))", icon: "✓" }
+          : { fg: "var(--danger, #dc2626)", bg: "var(--danger-bg, rgba(220,38,38,.10))", icon: "✕" };
+        return (
+          <div style={{
+            display: "flex", alignItems: "center", gap: 10,
+            border: `var(--border-width) solid ${c.fg}`, color: c.fg, background: c.bg,
+            borderRadius: "var(--radius-pill)", padding: "8px 12px", fontSize: 14,
+          }}>
+            <span style={{
+              fontSize: 15, lineHeight: 1,
+              animation: runStatus.phase === "running" ? "aygentSpin 1s linear infinite" : "none",
+              display: "inline-block",
+            }}>{c.icon}</span>
+            <span style={{ flex: 1 }}>
+              <b>{runStatus.name}</b>{runStatus.phase === "running" ? " — running…" : `: ${runStatus.text}`}
+            </span>
+            {runStatus.phase !== "running" && (
+              <button
+                onClick={() => setRunStatus(null)}
+                title="Dismiss"
+                style={{ border: "none", background: "transparent", color: c.fg, cursor: "pointer", fontSize: 16, lineHeight: 1, padding: 2 }}
+              >×</button>
+            )}
+          </div>
+        );
+      })()}
+      <style>{`@keyframes aygentSpin { to { transform: rotate(360deg); } }`}</style>
 
       {adding && agentId && (
         <AddSchedule agentId={agentId} onClose={() => setAdding(false)} onSaved={() => { setAdding(false); refresh(); }} />
