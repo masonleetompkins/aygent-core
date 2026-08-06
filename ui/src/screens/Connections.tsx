@@ -18,7 +18,6 @@
 // validates, stores in the OS keychain, and returns only non-secret metadata.
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { McpConnections } from "./McpConnections";
 import { Card, Button, Input, Pill } from "../components/ui";
 
 type AuthField = {
@@ -298,11 +297,6 @@ export function Connections({ agentId }: { agentId: string | null }) {
           })}
         </div>
       ))}
-
-      {/* MCP servers — the platform integration layer (built-in + add-your-own). */}
-      <div style={{ marginTop: "var(--space-4)", paddingTop: "var(--space-4)", borderTop: "var(--border-width) solid var(--line)" }}>
-        <McpConnections />
-      </div>
 
       {connectingTo && (
         <ConnectSheet

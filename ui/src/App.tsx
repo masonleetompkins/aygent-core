@@ -9,7 +9,8 @@ import { Chat } from "./screens/Chat";
 import { Dashboard } from "./screens/Dashboard";
 import { Browser } from "./screens/Browser";
 import { SavePoints } from "./screens/SavePoints";
-import { Tools } from "./screens/Tools";
+import { Tools, Skills } from "./screens/Tools";
+import { McpConnections } from "./screens/McpConnections";
 import { applyAppIcon } from "./lib/appIcon";
 import { Scheduler } from "./screens/Scheduler";
 import { Connections } from "./screens/Connections";
@@ -262,6 +263,8 @@ export function App() {
           {screen === "scheduler" && <Scheduler agentId={activeAgent?.id ?? null} />}
           {screen === "connections" && <Connections agentId={activeAgent?.id ?? null} />}
           {screen === "tools" && <Tools folder={folder} agentId={activeAgent?.id ?? null} />}
+          {screen === "skills" && <Skills folder={folder} agentId={activeAgent?.id ?? null} />}
+          {screen === "mcp" && <McpConnections />}
           {screen === "browser" && <Browser />}
         </div>
       </div>

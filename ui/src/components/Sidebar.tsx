@@ -4,7 +4,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { Icon, type IconName } from "./Icon";
 
 export type ScreenId =
-  | "dashboard" | "chat" | "browser" | "agents" | "tools" | "settings" | "scheduler" | "connections" | "savepoints";
+  | "dashboard" | "chat" | "browser" | "agents" | "tools" | "skills" | "mcp" | "settings" | "scheduler" | "connections" | "savepoints";
 
 export type NavGroup = "agent" | "global";
 export interface NavItem { id: ScreenId; label: string; icon: IconName; enabled: boolean; group: NavGroup; }
@@ -20,11 +20,13 @@ export const NAV: NavItem[] = [
   { id: "dashboard", label: "Dashboard", icon: "chart", enabled: true, group: "agent" },
   { id: "chat", label: "Chat", icon: "chat", enabled: true, group: "agent" },
   { id: "browser", label: "Browser", icon: "globe", enabled: true, group: "agent" },
-  { id: "tools", label: "Tools & Skills", icon: "tools", enabled: true, group: "agent" },
+  { id: "tools", label: "Tools", icon: "tools", enabled: true, group: "agent" },
+  { id: "skills", label: "Skills", icon: "sparkles", enabled: true, group: "agent" },
   { id: "scheduler", label: "Scheduler", icon: "scheduler", enabled: true, group: "agent" },
   { id: "savepoints", label: "Save Points", icon: "savepoints", enabled: true, group: "agent" },
   { id: "agents", label: "Agents", icon: "agents", enabled: true, group: "global" },
   { id: "connections", label: "Connections", icon: "connections", enabled: true, group: "global" },
+  { id: "mcp", label: "MCP", icon: "terminal", enabled: true, group: "global" },
   { id: "settings", label: "Settings", icon: "settings", enabled: true, group: "global" },
 ];
 

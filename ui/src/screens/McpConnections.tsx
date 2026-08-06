@@ -82,7 +82,7 @@ export function McpConnections() {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-4)" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <h3 style={{ fontSize: 18, fontWeight: 800, margin: 0 }}>MCP servers</h3>
+        <h2 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>MCP</h2>
         <Button variant="secondary" onClick={() => setAdding(true)}>+ Add from the web</Button>
       </div>
       <p style={{ ...hint, marginTop: -8 }}>

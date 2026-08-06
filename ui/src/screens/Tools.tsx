@@ -30,16 +30,19 @@ type Skill = {
 };
 
 export function Tools({ folder, agentId }: { folder: string | null; agentId: string | null }) {
-  const [tab, setTab] = useState<"tools" | "skills">("tools");
+  // TOOLS tab: the capability inventory + AYGENT-branded tools (the browser).
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18, maxWidth: 760 }}>
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        <TabButton active={tab === "tools"} onClick={() => setTab("tools")}>Tools</TabButton>
-        <TabButton active={tab === "skills"} onClick={() => setTab("skills")}>Skills</TabButton>
-      </div>
-      {tab === "tools"
-        ? <ToolInventory folder={folder} agentId={agentId} />
-        : <SkillList folder={folder} agentId={agentId} />}
+      <ToolInventory folder={folder} agentId={agentId} />
+    </div>
+  );
+}
+
+export function Skills({ folder, agentId }: { folder: string | null; agentId: string | null }) {
+  // SKILLS tab: user-authored ways of working + AYGENT-branded skills (HyperFrames).
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 18, maxWidth: 760 }}>
+      <SkillList folder={folder} agentId={agentId} />
     </div>
   );
 }
@@ -183,9 +186,8 @@ function ToolInventory({ folder, agentId }: { folder: string | null; agentId: st
         })()}
       </div>
 
-      {/* AYGENT-branded tools: in-app browser + HyperFrames video/graphics. */}
+      {/* AYGENT-branded tools: the in-app browser (HyperFrames lives in Skills). */}
       <AygentBrowser />
-      <AygentHyperFrames />
 
       {configuring && (
         <ToolConfig tool={configuring} folder={folder} agentId={agentId}
@@ -330,6 +332,9 @@ function SkillList({ folder, agentId }: { folder: string | null; agentId: string
           onSaved={async () => { setEditing(null); await refresh(); }}
         />
       )}
+
+      {/* AYGENT-branded skill: HyperFrames video/motion-graphics (one-click enable). */}
+      <AygentHyperFrames />
     </>
   );
 }
