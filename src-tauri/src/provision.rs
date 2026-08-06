@@ -15,9 +15,19 @@ use tauri::{AppHandle, Emitter, Manager};
 // Pinned Node LTS (Krypton). Portable tarball, no installer, no admin. We resolve
 // the arch at runtime so Apple Silicon + Intel both work.
 const NODE_VERSION: &str = "v24.19.0";
-// Static macOS FFmpeg (evermeet.cx publishes signed static universal builds).
-// A single self-contained binary — exactly what we want (no shared libs).
-const FFMPEG_URL: &str = "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip";
+// Static macOS FFmpeg + FFprobe, ARCH-NATIVE. martin-riedl.de publishes separate
+// arm64 and amd64 macOS static builds, each as a per-binary zip — so Apple Silicon
+// gets a real arm64 binary (NOT x86_64-through-Rosetta, which flaked the render's
+// -version probe), and we can fetch ffprobe too (HyperFrames needs BOTH). Fixed
+// after Mason's live test surfaced "FFmpeg cannot start" + a missing ffprobe.
+fn ffmpeg_base_url() -> &'static str {
+    // martin-riedl arch tokens: arm64 | amd64.
+    if cfg!(target_arch = "aarch64") {
+        "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release"
+    } else {
+        "https://ffmpeg.martin-riedl.de/redirect/latest/macos/amd64/release"
+    }
+}
 // HyperFrames npm package (the CLI + engine). Installed into runtime/hyperframes.
 const HYPERFRAMES_PKG: &str = "hyperframes";
 
@@ -52,6 +62,12 @@ pub fn npm_cli(app: &AppHandle) -> Option<PathBuf> {
 /// Abs path to the provisioned `ffmpeg` binary. None if absent.
 pub fn ffmpeg_bin(app: &AppHandle) -> Option<PathBuf> {
     let p = ffmpeg_dir(app).ok()?.join("ffmpeg");
+    p.is_file().then_some(p)
+}
+/// Abs path to the provisioned `ffprobe` binary. None if absent. HyperFrames
+/// probes media with ffprobe, so both must be present for a render to work.
+pub fn ffprobe_bin(app: &AppHandle) -> Option<PathBuf> {
+    let p = ffmpeg_dir(app).ok()?.join("ffprobe");
     p.is_file().then_some(p)
 }
 
@@ -124,35 +140,45 @@ pub async fn ensure_node(app: &AppHandle, channel: &str) -> Result<PathBuf, Stri
     node_bin(app).ok_or_else(|| "node binary missing after unpack".into())
 }
 
-/// Ensure a static FFmpeg lives under runtime/ffmpeg. evermeet.cx ships a signed
-/// static build as a zip containing a single `ffmpeg` binary. Idempotent.
+/// Ensure BOTH `ffmpeg` and `ffprobe` (arch-native static builds) live under
+/// runtime/ffmpeg. HyperFrames shells out to both; shipping only ffmpeg (or an
+/// x86_64 binary that Rosetta chokes on) is the render failure Mason hit live.
+/// Idempotent per-binary. Returns the ffmpeg path.
 pub async fn ensure_ffmpeg(app: &AppHandle, channel: &str) -> Result<PathBuf, String> {
-    if let Some(p) = ffmpeg_bin(app) { return Ok(p); }
+    // Fast path: both already present.
+    if let (Some(mp), Some(_)) = (ffmpeg_bin(app), ffprobe_bin(app)) { return Ok(mp); }
     let dir = ffmpeg_dir(app)?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir ffmpeg: {e}"))?;
-    let zip = dir.join("ffmpeg.zip");
-    download_to(app, channel, "ffmpeg", "FFmpeg (static)", FFMPEG_URL, &zip).await?;
-    emit(app, channel, "ffmpeg", "Unpacking FFmpeg…", None);
-    // macOS ships `unzip`. The archive contains a bare `ffmpeg` binary.
-    let out = std::process::Command::new("unzip")
-        .arg("-o").arg(&zip).arg("-d").arg(&dir)
-        .output().map_err(|e| format!("unzip ffmpeg: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("unpack ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr)));
+    let base = ffmpeg_base_url();
+    let a = arch();
+
+    // Each binary ships as its own zip containing a bare executable.
+    for name in ["ffmpeg", "ffprobe"] {
+        let bin = dir.join(name);
+        if bin.is_file() { continue; } // idempotent per-binary
+        let url = format!("{base}/{name}.zip");
+        download_to(app, channel, "ffmpeg", &format!("{name} (macOS {a})"), &url, &dir.join(format!("{name}.zip"))).await?;
+        emit(app, channel, "ffmpeg", &format!("Unpacking {name}…"), None);
+        let zip = dir.join(format!("{name}.zip"));
+        let out = std::process::Command::new("unzip")
+            .arg("-o").arg(&zip).arg("-d").arg(&dir)
+            .output().map_err(|e| format!("unzip {name}: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("unpack {name} failed: {}", String::from_utf8_lossy(&out.stderr)));
+        }
+        if !bin.is_file() { return Err(format!("{name} binary missing after unpack")); }
+        // chmod +x + strip quarantine so it launches without a Gatekeeper prompt.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&bin).map_err(|e| format!("stat {name}: {e}"))?.permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&bin, perm).map_err(|e| format!("chmod {name}: {e}"))?;
+        }
+        let _ = std::process::Command::new("xattr").arg("-dr").arg("com.apple.quarantine").arg(&bin).output();
+        let _ = std::fs::remove_file(&zip);
     }
-    let bin = dir.join("ffmpeg");
-    if !bin.is_file() { return Err("ffmpeg binary missing after unpack".into()); }
-    // chmod +x + strip quarantine so it launches without Gatekeeper prompts.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perm = std::fs::metadata(&bin).map_err(|e| format!("stat ffmpeg: {e}"))?.permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(&bin, perm).map_err(|e| format!("chmod ffmpeg: {e}"))?;
-    }
-    let _ = std::process::Command::new("xattr").arg("-dr").arg("com.apple.quarantine").arg(&bin).output();
-    let _ = std::fs::remove_file(&zip);
-    Ok(bin)
+    ffmpeg_bin(app).ok_or_else(|| "ffmpeg missing after provisioning".into())
 }
 
 /// A PATH string with our provisioned node + ffmpeg dirs FIRST, so any npm/npx
@@ -193,6 +219,7 @@ async fn run_npm(app: &AppHandle, channel: &str, cwd: &Path, args: &[&str]) -> R
 pub fn hyperframes_installed(app: &AppHandle) -> bool {
     node_bin(app).is_some()
         && ffmpeg_bin(app).is_some()
+        && ffprobe_bin(app).is_some()
         && hyperframes_dir(app).map(|d| d.join("node_modules").join("hyperframes").is_dir()).unwrap_or(false)
 }
 
