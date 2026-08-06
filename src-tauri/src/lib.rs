@@ -3477,12 +3477,31 @@ fn hyperframes_status(app: tauri::AppHandle) -> Result<serde_json::Value, String
 }
 
 /// One-click ENABLE: provision node+ffmpeg+hyperframes (narrated on `channel`),
-/// then register the Skill. Everything lands in AYGENT's app-data; nothing
-/// touches the system.
+/// register the Skill, AND turn it ON for the acting agent. Without that last
+/// step the skill exists in the registry but its per-agent toggle defaults OFF
+/// (composed skills default off), so the agent never receives it — the "enabled
+/// but not found" bug (Mason 08-06). Everything lands in AYGENT's app-data.
 #[tauri::command]
-async fn hyperframes_provision(app: tauri::AppHandle, channel: String) -> Result<serde_json::Value, String> {
+async fn hyperframes_provision(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, writer::Db>,
+    channel: String,
+    agent_id: Option<String>,
+    folder: Option<String>,
+) -> Result<serde_json::Value, String> {
     let report = provision::hyperframes_install(&app, &channel).await?;
     upsert_hyperframes_skill(&app)?;
+    // Enable the skill for the acting agent so the model actually gets it. Resolve
+    // the agent: explicit id → owner of `folder` → active agent.
+    let aid: String = agent_id.filter(|s| !s.trim().is_empty())
+        .or_else(|| folder.as_deref().and_then(|f| agent_for_folder(&db, f).ok()))
+        .or_else(|| repo::active_id(&db).ok())
+        .unwrap_or_default();
+    if !aid.is_empty() {
+        let ad = app_data(&app)?;
+        let scope = tools_registry::Scope::new(&aid, folder.as_deref());
+        tools_registry::set_enabled(&ad, &scope, HYPERFRAMES_SKILL_ID, true)?;
+    }
     Ok(report)
 }
 

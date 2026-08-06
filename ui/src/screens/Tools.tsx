@@ -334,7 +334,7 @@ function SkillList({ folder, agentId }: { folder: string | null; agentId: string
       )}
 
       {/* AYGENT-branded skill: HyperFrames video/motion-graphics (one-click enable). */}
-      <AygentHyperFrames />
+      <AygentHyperFrames agentId={agentId} folder={folder} />
     </>
   );
 }

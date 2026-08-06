@@ -10,7 +10,7 @@ import { Card, Button, Pill } from "./ui";
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 
-export function AygentHyperFrames() {
+export function AygentHyperFrames({ agentId, folder }: { agentId: string | null; folder: string | null }) {
   type Status = { installed: boolean; runtime_dir: string | null };
   const [status, setStatus] = useState<Status | null>(null);
   const [phase, setPhase] = useState<string | null>(null);
@@ -20,11 +20,16 @@ export function AygentHyperFrames() {
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [removing, setRemoving] = useState(false);
   const unlistenRef = useRef<null | (() => void)>(null);
+  const [proMode, setProMode] = useState(false);
 
   async function refresh() {
     try { setStatus(await invoke<Status>("hyperframes_status")); } catch (e) { setErr(String(e)); }
   }
-  useEffect(() => { refresh(); return () => { unlistenRef.current?.(); }; }, []);
+  useEffect(() => {
+    refresh();
+    invoke<boolean>("pro_mode_get", { folder }).then(setProMode).catch(() => setProMode(false));
+    return () => { unlistenRef.current?.(); };
+  }, [folder]);
 
   async function enable() {
     setErr(null); setPhase("start"); setPct(0); setNote("Starting…");
@@ -37,7 +42,7 @@ export function AygentHyperFrames() {
     });
     unlistenRef.current = un;
     try {
-      await invoke("hyperframes_provision", { channel });
+      await invoke("hyperframes_provision", { channel, agentId, folder });
       await refresh();
       setPhase("done"); setNote("HyperFrames is ready."); setPct(1);
       // Let the Skills list refresh so the new skill shows up immediately.
@@ -92,6 +97,17 @@ export function AygentHyperFrames() {
             <p style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>
               Installed in <code style={{ fontFamily: "ui-monospace, monospace" }}>{status.runtime_dir}</code>. Removing frees the space.
             </p>
+          )}
+          {!proMode && (
+            <div style={{
+              fontSize: 12.5, color: "var(--warn, #b7791f)",
+              border: "var(--border-width) solid var(--warn, #b7791f)",
+              background: "var(--warn-bg, rgba(234,179,8,.10))",
+              borderRadius: "var(--radius-pill)", padding: "8px 12px",
+            }}>
+              ⚠️ HyperFrames renders run shell commands, so this agent needs <b>Pro Mode</b> ON (enable it
+              on the agent in the <b>Agents</b> tab). Without it, the agent has the skill but can’t run the render.
+            </div>
           )}
         </div>
       ) : busy ? (
