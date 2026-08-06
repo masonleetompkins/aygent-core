@@ -88,6 +88,27 @@ fn desktop_user_agent() -> String {
 
 /// The relative CDN path segment for a CfT chrome build:
 ///   {version}/{platform}/chrome-{platform}.zip
+/// Kill any Chromium bound to OUR profile dir (orphans from a previous app
+/// session hold the Singleton lock and make every relaunch hand off + exit),
+/// then remove stale Singleton* files so the fresh launch can take the lock.
+fn kill_orphan_chromium(profile: &std::path::Path) {
+    let pat = format!("--user-data-dir={}", profile.display());
+    if let Ok(out) = std::process::Command::new("pgrep").args(["-f", &pat]).output() {
+        let pids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace().map(|s| s.to_string()).collect();
+        if !pids.is_empty() {
+            eprintln!("[aygent][browser] killing {} orphan chromium proc(s) on profile {}", pids.len(), profile.display());
+            for pid in &pids {
+                let _ = std::process::Command::new("kill").args(["-9", pid]).output();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
+    }
+    for f in ["SingletonLock", "SingletonCookie", "SingletonSocket"] {
+        let _ = std::fs::remove_file(profile.join(f));
+    }
+}
+
 fn cft_zip_relpath(version: &str, platform: &str) -> String {
     format!("{version}/{platform}/chrome-{platform}.zip")
 }
@@ -764,6 +785,12 @@ async fn ensure_running(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
     let profile = browser_dir(app)?.join("profiles").join(&agent);
     let downloads = profile.join("downloads");
     std::fs::create_dir_all(&downloads).map_err(|e| format!("mkdir profile/downloads: {e}"))?;
+    // ORPHAN CHROMIUM (Mason's 'Loading flips back' bug): a Chromium from a
+    // previous app session holds the profile's Singleton lock; a relaunch
+    // hands off to it and exits BEFORE printing 'DevTools listening' ->
+    // instant launch failure every time. Kill orphans on OUR profile and
+    // clear stale Singleton* files, then launch fresh.
+    kill_orphan_chromium(&profile);
 
     // FINGERPRINT HARDENING (#2). Chrome-for-Testing + --headless leaks several
     // "I am automation" tells that Google's bot detector reads:
