@@ -3306,3 +3306,41 @@ pub fn browser_shutdown(state: tauri::State<'_, BrowserProc>) -> Result<(), Stri
     }
     Ok(())
 }
+
+/// UNINSTALL the in-app browser: shut down any running instance, then DELETE the
+/// downloaded Chromium (the whole <app_data>/browser/ tree — ~150-180MB). After
+/// this `is_installed` reports false, so the Browser screen reverts to the
+/// "Download & enable" gate and agents lose the browser tools. This is the
+/// user-facing OFF SWITCH from Tools & Skills (Mason 2026-08-06): the feature is
+/// half-baked, so let people turn it off + reclaim the disk it took.
+///
+/// Best-effort + honest: we remove the browser dir and report what happened. A
+/// running browser is stopped first so no open handles block the delete.
+#[tauri::command]
+pub fn browser_uninstall(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, BrowserProc>,
+) -> Result<serde_json::Value, String> {
+    // 1. Stop any running instance (frees the child + the Chromium files).
+    {
+        if let Ok(mut guard) = state.inner.lock() {
+            if let Some(mut rb) = guard.take() {
+                drop(rb.session.take());
+                let _ = rb.child.kill();
+                let _ = rb.child.wait();
+            }
+        }
+    }
+    // 2. Delete the whole browser dir (Chromium runtime + any partial downloads).
+    let dir = browser_dir(&app)?;
+    let existed = dir.is_dir();
+    if existed {
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| format!("could not remove browser files ({}): {e}", dir.display()))?;
+    }
+    eprintln!("[aygent][browser] uninstalled — removed {} (existed={existed})", dir.display());
+    Ok(serde_json::json!({
+        "removed": existed,
+        "path": dir.to_string_lossy(),
+    }))
+}
