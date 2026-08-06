@@ -13,7 +13,7 @@
 // and split it back on dispatch. Underscores in <key> are avoided (keys are
 // slugs). The double-underscore delimiter keeps the original tool name intact.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tauri::AppHandle;
 
 pub const TOOL_PREFIX: &str = "mcp__";
@@ -335,7 +335,3 @@ pub async fn run_plan(app: &AppHandle, channel: &str, plan: &[(String, String, V
     Ok(report)
 }
 
-/// Slug helper exposed for the UI dedupe.
-pub fn make_key(label: &str) -> String { slugify(label) }
-
-fn _touch(_p: &Path) {}

@@ -27,6 +27,7 @@ const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 /// shared across the agent loop + the reader thread (Child/ChildStdin aren't
 /// Clone, so we never reconstruct — we mutate in place).
 pub struct McpServer {
+    #[allow(dead_code)] // identity metadata; read by future MCP mgmt UI
     pub key: String,
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
