@@ -59,7 +59,8 @@ mod openai_provider;
 mod pdf_tool;
 mod provider;
 mod provision;
-mod mcp_client; // MCP client: spawn stdio JSON-RPC servers, discover + route their tools. // Level A: bundle portable node+ffmpeg+hyperframes into app-data (no system installs).
+mod mcp_client;
+mod mcp; // MCP manager: registry + catalog + agent-loop bridge + install/uninstall. // MCP client: spawn stdio JSON-RPC servers, discover + route their tools. // Level A: bundle portable node+ffmpeg+hyperframes into app-data (no system installs).
 mod supervisor;
 mod tools_registry;
 
@@ -3219,6 +3220,16 @@ fn agent_tools_for_full(
         }
     }
 
+    // MCP TOOLS: every enabled+running MCP server contributes its tools,
+    // namespaced mcp__<server>__<tool>. Start enabled servers first so their
+    // tool lists are known. App-wide (not folder-scoped).
+    {
+        mcp::ensure_enabled_running(app);
+        let (mcp_schemas, mcp_instr) = mcp::agent_tool_schemas(app);
+        for s in mcp_schemas { tools.push(s); }
+        extra_instructions.push_str(&mcp_instr);
+    }
+
     // BROWSER TOOLS (Slice 4): if the in-app browser is installed AND this agent
     // has at least one allowed browsing domain, expose the browser_* tools.
     // Fails closed — no allowed domains => no agent browsing.
@@ -3482,6 +3493,99 @@ fn hyperframes_remove(app: tauri::AppHandle, keep_toolchain: Option<bool>) -> Re
     let ad = app_data(&app)?;
     let _ = tools_registry::delete_tool(&ad, HYPERFRAMES_SKILL_ID);
     provision::hyperframes_uninstall(&app, keep_toolchain.unwrap_or(false))
+}
+
+// ── MCP servers (Connections) ────────────────────────────────────────────────
+
+/// List all MCP servers (built-in catalog merged with stored state + custom),
+/// annotated with whether each is currently running.
+#[tauri::command]
+fn mcp_list(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let out: Vec<serde_json::Value> = mcp::list(&app).into_iter().map(|c| {
+        serde_json::json!({
+            "key": c.key, "label": c.label, "command": c.command, "args": c.args,
+            "enabled": c.enabled, "builtin": c.builtin, "needs_node": c.needs_node,
+            "setup_note": c.setup_note, "verify_tool": c.verify_tool,
+            "running": mcp_client::is_running(&c.key),
+            "tool_count": mcp_client::get(&c.key).map(|s| s.tools().len()).unwrap_or(0),
+        })
+    }).collect();
+    Ok(serde_json::json!(out))
+}
+
+/// The steps enabling a server will run (so the UI can narrate before doing it).
+#[tauri::command]
+fn mcp_install_plan(app: tauri::AppHandle, key: String) -> Result<serde_json::Value, String> {
+    let cfg = mcp::get_config(&app, &key).ok_or_else(|| format!("unknown MCP server `{key}`"))?;
+    let steps: Vec<serde_json::Value> = mcp::install_plan(&cfg).into_iter()
+        .map(|(label, program, args)| serde_json::json!({ "label": label, "cmd": format!("{program} {}", args.join(" ")) }))
+        .collect();
+    Ok(serde_json::json!({ "key": key, "label": cfg.label, "setup_note": cfg.setup_note, "steps": steps, "needs_node": cfg.needs_node }))
+}
+
+/// ENABLE an MCP server: ensure Node (if needed), run its install plan (narrated
+/// on `channel`), mark it enabled + persist, then start it (handshake). Returns
+/// the running tool count + the verify tool (if any) so the UI can prompt the
+/// user for the manual in-app step (e.g. Premiere's Start Bridge).
+#[tauri::command]
+async fn mcp_enable(app: tauri::AppHandle, channel: String, key: String) -> Result<serde_json::Value, String> {
+    use tauri::Emitter;
+    let mut cfg = mcp::get_config(&app, &key).ok_or_else(|| format!("unknown MCP server `{key}`"))?;
+    if cfg.needs_node {
+        let _ = app.emit(&channel, &serde_json::json!({ "phase": "node", "note": "Preparing the toolchain (Node)…" }));
+        crate::provision::ensure_node(&app, &channel).await?;
+    }
+    let plan = mcp::install_plan(&cfg);
+    if !plan.is_empty() {
+        mcp::run_plan(&app, &channel, &plan).await?;
+    }
+    cfg.enabled = true;
+    mcp::upsert(&app, cfg.clone())?;
+    let _ = app.emit(&channel, &serde_json::json!({ "phase": "starting", "note": "Starting the server…" }));
+    let server = mcp::start_server(&app, &key)?;
+    let _ = app.emit(&channel, &serde_json::json!({ "phase": "done", "note": "Connected." }));
+    Ok(serde_json::json!({
+        "enabled": true, "running": true, "tool_count": server.tools().len(),
+        "verify_tool": cfg.verify_tool, "setup_note": cfg.setup_note,
+    }))
+}
+
+/// DISABLE an MCP server: stop it, mark disabled. `uninstall=true` also runs the
+/// uninstall plan (npm remove etc.) so nothing is left on the machine.
+#[tauri::command]
+async fn mcp_disable(app: tauri::AppHandle, channel: Option<String>, key: String, uninstall: Option<bool>) -> Result<serde_json::Value, String> {
+    mcp_client::stop(&key);
+    let mut cfg = mcp::get_config(&app, &key).ok_or_else(|| format!("unknown MCP server `{key}`"))?;
+    cfg.enabled = false;
+    mcp::upsert(&app, cfg.clone())?;
+    let mut report = serde_json::json!({ "disabled": true });
+    if uninstall.unwrap_or(false) {
+        let plan = mcp::uninstall_plan(&cfg);
+        if !plan.is_empty() {
+            let ch = channel.unwrap_or_default();
+            let r = mcp::run_plan(&app, &ch, &plan).await?;
+            report["uninstalled"] = serde_json::json!(r);
+        }
+    }
+    Ok(report)
+}
+
+/// Verify a running server via its declared read-only verify tool.
+#[tauri::command]
+fn mcp_verify(app: tauri::AppHandle, key: String) -> Result<String, String> {
+    mcp::verify(&app, &key)
+}
+
+/// Add a user MCP server from the web (command + args + env pairs).
+#[tauri::command]
+fn mcp_add_custom(app: tauri::AppHandle, label: String, command: String, args: Vec<String>, env: Vec<(String, String)>, needs_node: Option<bool>) -> Result<String, String> {
+    mcp::add_custom(&app, &label, &command, args, env, needs_node.unwrap_or(true))
+}
+
+/// Remove a user-added MCP server (built-ins can only be disabled).
+#[tauri::command]
+fn mcp_remove_custom(app: tauri::AppHandle, key: String) -> Result<(), String> {
+    mcp::remove_custom(&app, &key)
 }
 
 const AGENT_SYSTEM: &str = "You are AYGENT, a helpful, concise, friendly assistant running privately \
@@ -3841,6 +3945,8 @@ async fn agent_stream(
                                 }
                             }
                         }
+                    } else if mcp::is_mcp_tool(&name) {
+                        mcp::exec(&name, &input)
                     } else if dashboard::is_dashboard_tool(&name) {
                         dashboard::exec_dashboard_tool(&db, &scope_id, &name, &input)
                     } else {
@@ -4090,6 +4196,8 @@ async fn agent_stream(
                                 }
                             }
                         }
+                    } else if mcp::is_mcp_tool(&name) {
+                        mcp::exec(&name, &input)
                     } else if dashboard::is_dashboard_tool(&name) {
                         dashboard::exec_dashboard_tool(&db, &scope_id, &name, &input)
                     } else {
@@ -4510,6 +4618,8 @@ pub async fn run_headless_turn(
                                     Ok(mailbox::SendResult::Refused { reason }) => (format!("not sent: {reason}"), true),
                                     Err(e) => (format!("send failed: {e}"), true),
                                 }
+                            } else if mcp::is_mcp_tool(&name) {
+                                mcp::exec(&name, &input)
                             } else if dashboard::is_dashboard_tool(&name) {
                                 dashboard::exec_dashboard_tool(db, agent_id, &name, &input)
                             } else {
@@ -4708,6 +4818,7 @@ pub fn run() {
             openai_models, tools_list, tools_upsert, tools_delete, tools_set_enabled,
             tools_config, tools_set_config,
             hyperframes_status, hyperframes_provision, hyperframes_remove,
+            mcp_list, mcp_install_plan, mcp_enable, mcp_disable, mcp_verify, mcp_add_custom, mcp_remove_custom,
             capabilities_list, skills_list,
             dashboard::dashboard_load, dashboard::dashboard_upsert_module,
             dashboard::dashboard_remove_module, dashboard::dashboard_arrange,
@@ -4898,6 +5009,7 @@ pub fn run() {
             // never wired (found in the 08 warning sweep). No-op if CEF never
             // initialized (CEF_READY guard).
             tauri::RunEvent::Exit => {
+                mcp_client::stop_all();
                 #[cfg(all(target_os = "macos", feature = "engine-cef"))]
                 cef_engine::shutdown_engine();
             }
