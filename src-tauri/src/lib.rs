@@ -58,6 +58,7 @@ mod local_tools;
 mod openai_provider;
 mod pdf_tool;
 mod provider;
+mod provision; // Level A: bundle portable node+ffmpeg+hyperframes into app-data (no system installs).
 mod supervisor;
 mod tools_registry;
 
@@ -3406,6 +3407,82 @@ fn pdf_config_for(app: &tauri::AppHandle, agent_id: Option<&str>, folder: Option
     }
 }
 
+// ── HYPERFRAMES (in-app video/graphics skill; Level A provisioning) ──────────
+// One-click enable: AYGENT downloads a PORTABLE node + static ffmpeg + the
+// hyperframes npm package into its OWN app-data space (nothing touches the
+// system), then registers a Skill teaching the agent the render loop. The UI
+// narrates every step. Remove reclaims the disk. See provision.rs.
+
+/// The Skill id + the instructions the agent follows. Kept here so install can
+/// (re)write it against the CURRENT provisioned paths.
+const HYPERFRAMES_SKILL_ID: &str = "skill.hyperframes";
+
+fn upsert_hyperframes_skill(app: &tauri::AppHandle) -> Result<(), String> {
+    let ad = app_data(app)?;
+    let (path_env, hf_bin) = provision::hyperframes_invocation(app)
+        .ok_or("HyperFrames CLI not found after install")?;
+    let instructions = format!(
+        "You can create videos, animations, and motion graphics with HyperFrames — an          HTML-to-MP4 renderer. It is ALREADY installed inside AYGENT (portable Node + FFmpeg +          the hyperframes CLI); you do NOT install anything.
+
+         HOW TO INVOKE (Pro Mode shell): always prefix the provisioned toolchain PATH so the          right node/ffmpeg are used, then call the hyperframes binary directly. Run commands with          shell_run like:
+           program: \"bash\"
+           args: [\"-lc\", \"export PATH='{path_env}':$PATH && '{hf_bin}' <hyperframes args>\"]
+
+         PRODUCTION LOOP:
+         1. Plan the video: scenes, timing, assets. Confirm the brief with the user first.
+         2. Scaffold a project in the agent folder: `'{hf_bin}' init <name>` (creates an index.html             composition + project files under the agent folder).
+         3. Author the composition by editing index.html with write_file: a #stage div with             data-composition-id/data-width/data-height, `class=\"clip\"` elements with             data-start/data-duration/data-track-index for video/text/audio, and seekable             animation (GSAP timeline assigned to window.__timelines.<id>, or CSS/WAAPI).
+         4. Lint + preview: `'{hf_bin}' lint` then (optional) `'{hf_bin}' preview`.
+         5. Render to MP4: `'{hf_bin}' render` — the output lands in the project dir.
+
+         RULES: keep compositions deterministic (seekable animation, not wall-clock). Put all          media + output inside the agent folder. Report the final MP4 path when done. If a render          fails, read the hyperframes error (it names the offending clip/attribute) and fix the HTML.
+
+         Provisioned toolchain PATH: {path_env}
+         HyperFrames CLI: {hf_bin}"
+    );
+    let tool = tools_registry::ToolDef {
+        id: HYPERFRAMES_SKILL_ID.to_string(),
+        name: "hyperframes".to_string(),
+        display_name: "HyperFrames — video & motion graphics".to_string(),
+        description: "Create videos, animations, and motion graphics from HTML (installed in-app; renders to MP4).".to_string(),
+        kind: "composed".to_string(),
+        builtin: false,
+        instructions,
+        allowed_tools: vec![
+            "read_file".into(), "write_file".into(), "list_files".into(),
+            "shell_run".into(), "shell_spawn".into(), "shell_poll".into(),
+        ],
+    };
+    tools_registry::upsert_tool(&ad, tool)
+}
+
+/// Status of the HyperFrames feature: is it fully provisioned + where it lives.
+#[tauri::command]
+fn hyperframes_status(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let installed = provision::hyperframes_installed(&app);
+    let rt = provision::runtime_dir(&app).ok().map(|p| p.to_string_lossy().to_string());
+    Ok(serde_json::json!({ "installed": installed, "runtime_dir": rt }))
+}
+
+/// One-click ENABLE: provision node+ffmpeg+hyperframes (narrated on `channel`),
+/// then register the Skill. Everything lands in AYGENT's app-data; nothing
+/// touches the system.
+#[tauri::command]
+async fn hyperframes_provision(app: tauri::AppHandle, channel: String) -> Result<serde_json::Value, String> {
+    let report = provision::hyperframes_install(&app, &channel).await?;
+    upsert_hyperframes_skill(&app)?;
+    Ok(report)
+}
+
+/// DISABLE: remove the HyperFrames Skill + its files. `keep_toolchain=true`
+/// leaves the shared node/ffmpeg (for other features); false reclaims all disk.
+#[tauri::command]
+fn hyperframes_remove(app: tauri::AppHandle, keep_toolchain: Option<bool>) -> Result<serde_json::Value, String> {
+    let ad = app_data(&app)?;
+    let _ = tools_registry::delete_tool(&ad, HYPERFRAMES_SKILL_ID);
+    provision::hyperframes_uninstall(&app, keep_toolchain.unwrap_or(false))
+}
+
 const AGENT_SYSTEM: &str = "You are AYGENT, a helpful, concise, friendly assistant running privately \
     on the user's own machine. You have TOOLS available but they are OPTIONAL — use a tool ONLY when \
     the user's request actually requires it. If the user is just chatting, sharing information, or \
@@ -4629,6 +4706,7 @@ pub fn run() {
             browser::set_browser_hittest, browser::browser_engine_info,
             openai_models, tools_list, tools_upsert, tools_delete, tools_set_enabled,
             tools_config, tools_set_config,
+            hyperframes_status, hyperframes_provision, hyperframes_remove,
             capabilities_list, skills_list,
             dashboard::dashboard_load, dashboard::dashboard_upsert_module,
             dashboard::dashboard_remove_module, dashboard::dashboard_arrange,

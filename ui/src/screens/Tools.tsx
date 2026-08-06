@@ -12,6 +12,7 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Input, Pill } from "../components/ui";
 import { AygentBrowser } from "../components/AygentBrowser";
+import { AygentHyperFrames } from "../components/AygentHyperFrames";
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 const faint = { ...hint, fontSize: 12, color: "var(--text-faint)" } as const;
@@ -182,8 +183,9 @@ function ToolInventory({ folder, agentId }: { folder: string | null; agentId: st
         })()}
       </div>
 
-      {/* AYGENT-branded tools: the in-app browser install/enable flow. */}
+      {/* AYGENT-branded tools: in-app browser + HyperFrames video/graphics. */}
       <AygentBrowser />
+      <AygentHyperFrames />
 
       {configuring && (
         <ToolConfig tool={configuring} folder={folder} agentId={agentId}
