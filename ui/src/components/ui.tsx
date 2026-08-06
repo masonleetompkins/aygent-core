@@ -20,8 +20,8 @@ export function Card({ title, children, style }: { title?: string; children: Rea
 }
 
 export function Button({
-  children, onClick, disabled, variant = "primary",
-}: { children: ReactNode; onClick?: () => void; disabled?: boolean; variant?: "primary" | "secondary" }) {
+  children, onClick, disabled, variant = "primary", style,
+}: { children: ReactNode; onClick?: () => void; disabled?: boolean; variant?: "primary" | "secondary"; style?: CSSProperties }) {
   const base: CSSProperties = {
     borderRadius: "var(--radius-control)",
     padding: "9px 16px",
@@ -40,7 +40,7 @@ export function Button({
     <button
       onClick={onClick}
       disabled={disabled}
-      style={{ ...base, ...variantStyle }}
+      style={{ ...base, ...variantStyle, ...style }}
       onMouseEnter={(e) => { if (!disabled) e.currentTarget.style.boxShadow = "var(--elevation-hover)"; }}
       onMouseLeave={(e) => { e.currentTarget.style.boxShadow = "var(--elevation)"; }}
     >

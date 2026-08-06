@@ -289,22 +289,11 @@ function SkillList({ folder, agentId }: { folder: string | null; agentId: string
             it may use. No credentials, and it can't do anything the agent couldn't already do.
           </p>
         </div>
-        <Button onClick={newSkill}>+ New Skill</Button>
+        <Button onClick={newSkill} style={{ whiteSpace: "nowrap", flexShrink: 0 }}>+ New Skill</Button>
       </div>
 
       {!folder && <Pill tone="muted">Pick an Agent Folder in Settings to use skills.</Pill>}
       {msg && <Pill tone={msg.startsWith("✗") ? "danger" : "muted"}>{msg}</Pill>}
-
-      {skills.length === 0 && (
-        <Card title="No skills yet">
-          <p style={hint}>
-            Skills are for the things you explain more than once. "Draft my weekly update the way I
-            like it." "Summarize every new note into the index." Write it once, turn it on, stop
-            repeating yourself.
-          </p>
-          <div><Button onClick={newSkill}>Create your first skill</Button></div>
-        </Card>
-      )}
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
         {skills.map((s) => (
