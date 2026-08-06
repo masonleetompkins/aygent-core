@@ -3099,6 +3099,16 @@ pub async fn browser_history_nav(
     Ok(())
 }
 
+/// Address-bar poll: current CDP page url + title (the ONE page).
+#[tauri::command]
+pub async fn browser_page_info(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, BrowserProc>,
+) -> Result<serde_json::Value, String> {
+    let (title, url) = active_tab_page_info_cdp(&app, &state).await?;
+    Ok(serde_json::json!({ "url": url, "title": title }))
+}
+
 /// Read (title, url) via CDP.
 async fn active_tab_page_info_cdp(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>) -> Result<(String, String), String> {
     let r = active_tab_read(app, state, "[document.title||'', location.href||'']").await?;

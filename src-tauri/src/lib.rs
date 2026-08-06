@@ -4615,7 +4615,7 @@ pub fn run() {
             browser_policy_get, browser_policy_set,
             browser::browser_control_status, browser::browser_take_wheel, browser::browser_release_wheel,
             set_active_agent_marker,
-            browser::browser_history_nav, browser::browser_downloads_list,
+            browser::browser_history_nav, browser::browser_page_info, browser::browser_downloads_list,
             browser::browser_history_list, browser::browser_history_clear,
             browser::browser_download_url,
                         browser::set_active_browser_tab, browser::browser_permission_answer,
