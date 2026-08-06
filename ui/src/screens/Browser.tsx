@@ -313,7 +313,7 @@ export function Browser() {
           {frame ? (
             <img
               ref={frameRef}
-              src={`data:image/jpeg;base64,${frame}`}
+              src={frame} /* payload is ALREADY a full data: URL (Rust prefixes it) */
               onClick={onFrameClick}
               onWheel={onFrameWheel}
               alt=""
