@@ -1307,6 +1307,36 @@ pub async fn browser_start_view(
     Ok(())
 }
 
+/// FIT-TO-PANE (Mason 2026-08-06): match the Chromium viewport's ASPECT RATIO to
+/// the UI pane. The screencast captures the browser's own viewport; if the pane
+/// is taller/shorter than that viewport, objectFit:contain letterboxes — the
+/// "fills width but not height" bug (a big empty band above the page). By
+/// overriding device metrics to the pane's CSS pixel size, the captured frame's
+/// aspect ratio equals the pane's, so contain fills the whole rounded box edge
+/// to edge with no bars. The UI calls this on mount + on every pane resize
+/// (ResizeObserver, debounced). deviceScaleFactor=2 keeps text crisp on Retina.
+/// Best-effort: no live session yet => Ok(()) (the mount effect retries).
+/// width/height are CSS px (integers); clamped to sane bounds so a transient
+/// 0-size layout pass can't collapse the page.
+#[tauri::command]
+pub async fn browser_set_viewport(
+    state: tauri::State<'_, BrowserProc>,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let w = (width.round() as i64).clamp(320, 4096);
+    let h = (height.round() as i64).clamp(240, 4096);
+    // mobile:false, fixed 2x DPR for crisp text. width/height in CSS px.
+    let params = serde_json::json!({
+        "width": w, "height": h,
+        "deviceScaleFactor": 2, "mobile": false,
+    });
+    // Best-effort: if no session is live yet, just report Ok so the caller's
+    // retry-on-mount handles it — never surface a hard error for a resize.
+    let _ = session_call(&state, "Emulation.setDeviceMetricsOverride", params).await;
+    Ok(())
+}
+
 // ===========================================================================
 // REAL EMBEDDED WEBVIEW (the human's actual browser).
 //

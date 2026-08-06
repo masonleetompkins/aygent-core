@@ -51,6 +51,7 @@ export function Browser() {
   const [agentBusy, setAgentBusy] = useState(false);
 
   const frameRef = useRef<HTMLImageElement>(null);
+  const paneRef = useRef<HTMLDivElement>(null);
   const runsScrollRef = useRef<HTMLDivElement>(null);
 
   // ---- install gate --------------------------------------------------------
@@ -88,6 +89,34 @@ export function Browser() {
     })();
     return () => { if (un) un(); };
   }, [installed]);
+
+  // ---- FIT-TO-PANE: keep the Chromium viewport aspect ratio == this pane's ----
+  // The screencast captures the browser's own viewport; if the pane is a
+  // different shape, objectFit:contain letterboxes (the "fills width, not
+  // height" empty band). A ResizeObserver pushes the pane's CSS px size to
+  // browser_set_viewport (debounced) so the captured frame matches the box and
+  // the mirror fills it edge to edge — corners still rounded, meeting the line.
+  // We keep objectFit:contain (not cover) so click coord mapping stays exact;
+  // once the viewport matches, contain has zero letterbox anyway. `driver` is in
+  // the deps because toggling You/Agent opens the side pane and reshapes the box.
+  useEffect(() => {
+    if (installed !== true) return;
+    const el = paneRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let t: ReturnType<typeof setTimeout> | undefined;
+    const push = () => {
+      const r = el.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8) return;
+      invoke("browser_set_viewport", { width: r.width, height: r.height }).catch(() => {});
+    };
+    const ro = new ResizeObserver(() => {
+      if (t) clearTimeout(t);
+      t = setTimeout(push, 120); // debounce drag-resize / animated layout
+    });
+    ro.observe(el);
+    push(); // initial sync on mount
+    return () => { if (t) clearTimeout(t); ro.disconnect(); };
+  }, [installed, driver]);
 
   // Poll url/title so the address bar tracks agent navigations too.
   useEffect(() => {
@@ -302,6 +331,7 @@ export function Browser() {
       {/* page area: frame mirror + optional agent pane */}
       <div style={{ display: "flex", flex: 1, minHeight: 0, gap: 10, position: "relative" }}>
         <div
+          ref={paneRef}
           tabIndex={0}
           onKeyDown={onFrameKey}
           style={{

@@ -4610,7 +4610,7 @@ pub fn run() {
             get_selection, set_selection, detect_hardware, local_catalog, local_downloaded,
             local_download, local_delete, local_tool_capability, restore_agent_folder,
             browser::browser_status, browser::browser_install, browser::browser_launch_probe,
-            browser::browser_navigate, browser::browser_shutdown, browser::browser_start_view,
+            browser::browser_navigate, browser::browser_shutdown, browser::browser_start_view, browser::browser_set_viewport,
             browser::browser_click, browser::browser_scroll, browser::browser_type, browser::browser_key,
             browser_policy_get, browser_policy_set,
             browser::browser_control_status, browser::browser_take_wheel, browser::browser_release_wheel,
