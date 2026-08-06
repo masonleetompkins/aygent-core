@@ -889,6 +889,10 @@ static ACTIVE_TAB_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI6
 /// point at about:blank, so the UI's own knowledge of where the tab is is the
 /// authoritative "current page" for permission purposes.
 static ACTIVE_TAB_URL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// Last screencast frame (data: URL). Re-emitted on view (re)start because
+/// screencastFrame only fires on PAINTS — a static page sends nothing, so a
+/// remounting UI would stay blank without this.
+static LAST_FRAME: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 /// Frontend reports which tab is active + its URL (called on switch/open/nav).
 /// Lets the agent tools target the visible tab AND lets the host pre-check know
@@ -1161,6 +1165,8 @@ async fn pump(
                         let data = v["params"]["data"].as_str().unwrap_or("").to_string();
                         let session = v["params"]["sessionId"].as_i64().unwrap_or(0);
                         let meta = v["params"]["metadata"].clone();
+                        let framed = format!("data:image/jpeg;base64,{data}");
+                        if let Ok(mut g) = LAST_FRAME.lock() { *g = framed; }
                         // Emit the frame to the UI (base64 JPEG + device metrics).
                         let _ = app.emit("browser:frame", &serde_json::json!({
                             "data": format!("data:image/jpeg;base64,{data}"),
@@ -1279,7 +1285,26 @@ pub async fn browser_start_view(
     app: tauri::AppHandle,
     state: tauri::State<'_, BrowserProc>,
 ) -> Result<(), String> {
-    ensure_session(&app, &state).await
+    use tauri::Emitter;
+    ensure_session(&app, &state).await?;
+    // INSTANT PAINT on (re)mount: screencastFrame only fires when the page
+    // paints, so a static loaded page would leave a remounted mirror blank.
+    // Re-emit the cached frame immediately, then refresh it with a live
+    // screenshot (covers "page changed while the Browser screen was closed").
+    let cached = LAST_FRAME.lock().ok().map(|g| g.clone()).unwrap_or_default();
+    if !cached.is_empty() {
+        let _ = app.emit("browser:frame", &serde_json::json!({ "data": cached }));
+    }
+    if let Ok(shot) = session_call(&state, "Page.captureScreenshot",
+        serde_json::json!({ "format": "jpeg", "quality": 85 })).await
+    {
+        if let Some(data) = shot["data"].as_str() {
+            let framed = format!("data:image/jpeg;base64,{data}");
+            if let Ok(mut g) = LAST_FRAME.lock() { *g = framed.clone(); }
+            let _ = app.emit("browser:frame", &serde_json::json!({ "data": framed }));
+        }
+    }
+    Ok(())
 }
 
 // ===========================================================================
