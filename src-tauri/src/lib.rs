@@ -58,7 +58,8 @@ mod local_tools;
 mod openai_provider;
 mod pdf_tool;
 mod provider;
-mod provision; // Level A: bundle portable node+ffmpeg+hyperframes into app-data (no system installs).
+mod provision;
+mod mcp_client; // MCP client: spawn stdio JSON-RPC servers, discover + route their tools. // Level A: bundle portable node+ffmpeg+hyperframes into app-data (no system installs).
 mod supervisor;
 mod tools_registry;
 
