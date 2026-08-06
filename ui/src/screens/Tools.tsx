@@ -252,7 +252,12 @@ function SkillList({ folder, agentId }: { folder: string | null; agentId: string
   const [msg, setMsg] = useState<string | null>(null);
 
   async function refresh() {
-    try { setSkills(await invoke<Skill[]>("skills_list", { agentId, folder })); }
+    try {
+      const all = await invoke<Skill[]>("skills_list", { agentId, folder });
+      // The HyperFrames skill is MANAGED by its own card below (install/enable/
+      // remove) — hide it from the generic user-skill list so it isn't shown twice.
+      setSkills(all.filter((k) => k.id !== "skill.hyperframes"));
+    }
     catch (e) { setMsg("✗ " + String(e)); }
   }
   useEffect(() => { refresh(); /* eslint-disable-next-line */ }, [folder, agentId]);

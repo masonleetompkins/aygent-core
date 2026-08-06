@@ -1,35 +1,45 @@
-// AYGENT HyperFrames — one-click enable for the in-app video/graphics skill.
-// AYGENT provisions a PORTABLE Node + static FFmpeg + the hyperframes package
-// into its OWN space (nothing touches the system), then registers a Skill the
-// agent uses to render HTML->MP4. The card narrates every step + lists what's
-// installed and where; Disable removes it and reclaims the disk. (Mason 08-06.)
+// AYGENT HyperFrames — the SINGLE card that owns the in-app video/graphics skill:
+// install (provision a portable Node + FFmpeg + hyperframes into AYGENT's own
+// space, nothing touches the system), turn it ON/OFF for this agent, and remove.
+// It is deliberately NOT shown in the generic Skills list (filtered out there) so
+// there's exactly one place to manage it. (Mason 08-06 — merged the duplicate.)
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Card, Button, Pill } from "./ui";
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
+const SKILL_ID = "skill.hyperframes";
 
 export function AygentHyperFrames({ agentId, folder }: { agentId: string | null; folder: string | null }) {
   type Status = { installed: boolean; runtime_dir: string | null };
+  type Skill = { id: string; enabled: boolean };
   const [status, setStatus] = useState<Status | null>(null);
+  const [skillOn, setSkillOn] = useState<boolean>(false);
   const [phase, setPhase] = useState<string | null>(null);
   const [note, setNote] = useState<string>("");
   const [pct, setPct] = useState<number | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [removing, setRemoving] = useState(false);
-  const unlistenRef = useRef<null | (() => void)>(null);
+  const [toggling, setToggling] = useState(false);
   const [proMode, setProMode] = useState(false);
+  const unlistenRef = useRef<null | (() => void)>(null);
 
   async function refresh() {
     try { setStatus(await invoke<Status>("hyperframes_status")); } catch (e) { setErr(String(e)); }
+    // Per-agent ON/OFF state for the skill (the card owns this toggle now).
+    try {
+      const skills = await invoke<Skill[]>("skills_list", { agentId, folder });
+      setSkillOn(!!skills.find((k) => k.id === SKILL_ID)?.enabled);
+    } catch { /* leave as-is */ }
   }
   useEffect(() => {
     refresh();
     invoke<boolean>("pro_mode_get", { folder }).then(setProMode).catch(() => setProMode(false));
     return () => { unlistenRef.current?.(); };
-  }, [folder]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [folder, agentId]);
 
   async function enable() {
     setErr(null); setPhase("start"); setPct(0); setNote("Starting…");
@@ -45,7 +55,6 @@ export function AygentHyperFrames({ agentId, folder }: { agentId: string | null;
       await invoke("hyperframes_provision", { channel, agentId, folder });
       await refresh();
       setPhase("done"); setNote("HyperFrames is ready."); setPct(1);
-      // Let the Skills list refresh so the new skill shows up immediately.
       window.dispatchEvent(new Event("aygent-skills-changed"));
     } catch (e) {
       setErr(String(e)); setPhase(null);
@@ -54,11 +63,22 @@ export function AygentHyperFrames({ agentId, folder }: { agentId: string | null;
     }
   }
 
+  async function toggleSkill() {
+    if (!agentId) { setErr("Select an agent first — skills enable per agent."); return; }
+    setToggling(true); setErr(null);
+    try {
+      await invoke("tools_set_enabled", { agentId, folder, id: SKILL_ID, on: !skillOn });
+      setSkillOn((v) => !v);
+      window.dispatchEvent(new Event("aygent-skills-changed"));
+    } catch (e) { setErr(String(e)); }
+    finally { setToggling(false); }
+  }
+
   async function disable() {
     setErr(null); setRemoving(true);
     try {
       await invoke("hyperframes_remove", { keepToolchain: false });
-      setConfirmRemove(false); setPhase(null); setPct(null); setNote("");
+      setConfirmRemove(false); setPhase(null); setPct(null); setNote(""); setSkillOn(false);
       await refresh();
       window.dispatchEvent(new Event("aygent-skills-changed"));
     } catch (e) { setErr(String(e)); }
@@ -76,39 +96,51 @@ export function AygentHyperFrames({ agentId, folder }: { agentId: string | null;
       </p>
 
       {status?.installed && !busy ? (
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {/* Row 1: the single meaningful control — is this skill ON for the agent. */}
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-            <Pill tone="ok">enabled ✓</Pill>
-            <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>
-              Your agents now have the <b>hyperframes</b> skill (see the Skills tab).
+            <Button variant={skillOn ? "primary" : "secondary"} onClick={() => void toggleSkill()} disabled={toggling}>
+              {toggling ? "…" : skillOn ? "On" : "Off"}
+            </Button>
+            <span style={{ fontSize: 13, color: "var(--text-muted)" }}>
+              {skillOn
+                ? "This agent can create videos & motion graphics."
+                : "Installed but off for this agent — turn On to give it the skill."}
             </span>
             <span style={{ flex: 1 }} />
+            <Pill tone="ok">installed ✓</Pill>
+          </div>
+
+          {/* Row 2: Pro Mode dependency — only shown when it would actually block. */}
+          {skillOn && !proMode && (
+            <div style={{
+              fontSize: 12.5, color: "var(--warn, #b7791f)",
+              border: "var(--border-width) solid var(--warn, #b7791f)",
+              background: "var(--warn-bg, rgba(234,179,8,.10))",
+              borderRadius: 8, padding: "8px 12px",
+            }}>
+              ⚠️ Renders run shell commands, so this agent also needs <b>Pro Mode</b> ON — turn it on for
+              this agent in the <b>Agents</b> tab. Until then it has the skill but can’t run the render.
+            </div>
+          )}
+
+          {/* Row 3: install location + remove (secondary, tucked at the bottom). */}
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", borderTop: "var(--border-width) solid var(--line)", paddingTop: 10 }}>
+            {status.runtime_dir && (
+              <span style={{ ...hint, fontSize: 11.5, color: "var(--text-faint)", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                Installed in <code style={{ fontFamily: "ui-monospace, monospace" }}>{status.runtime_dir}</code>
+              </span>
+            )}
             {!confirmRemove ? (
               <Button variant="secondary" onClick={() => setConfirmRemove(true)} disabled={removing}>Disable &amp; remove</Button>
             ) : (
               <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span style={{ fontSize: 12.5, color: "var(--text-muted)" }}>Remove HyperFrames + its toolchain?</span>
+                <span style={{ fontSize: 12.5, color: "var(--text-muted)" }}>Remove it + free the space?</span>
                 <Button variant="secondary" onClick={() => void disable()} disabled={removing}>{removing ? "Removing…" : "Yes, remove"}</Button>
                 <Button variant="secondary" onClick={() => setConfirmRemove(false)} disabled={removing}>Cancel</Button>
               </span>
             )}
           </div>
-          {status.runtime_dir && (
-            <p style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>
-              Installed in <code style={{ fontFamily: "ui-monospace, monospace" }}>{status.runtime_dir}</code>. Removing frees the space.
-            </p>
-          )}
-          {!proMode && (
-            <div style={{
-              fontSize: 12.5, color: "var(--warn, #b7791f)",
-              border: "var(--border-width) solid var(--warn, #b7791f)",
-              background: "var(--warn-bg, rgba(234,179,8,.10))",
-              borderRadius: "var(--radius-pill)", padding: "8px 12px",
-            }}>
-              ⚠️ HyperFrames renders run shell commands, so this agent needs <b>Pro Mode</b> ON (enable it
-              on the agent in the <b>Agents</b> tab). Without it, the agent has the skill but can’t run the render.
-            </div>
-          )}
         </div>
       ) : busy ? (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
