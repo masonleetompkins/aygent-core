@@ -28,7 +28,7 @@ mod catalog;
 mod connections;
 mod connectors; // CONNECTOR REGISTRY: a provider is data (descriptor), not code.
 mod connector_exec; // One generic HTTP executor for every registry connector.
-mod savepoint;
+pub mod savepoint; // pub for examples/savepoint_diag
 mod context_docs;
 mod dashboard_data; // DASHBOARDS M3: pull-only data resolution (bindings/http/exec).
 mod dashboard; // DASHBOARDS: prompt-built, spec-driven, pull-only (never auto-runs a model).
@@ -3839,7 +3839,10 @@ async fn agent_stream(
         if let Ok(root) = broker.root_for(&scope_id) {
             match savepoint::snapshot(&root, &prompt) {
                 Ok(Some(sha)) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("SAVE POINT {sha}") }); }
-                _ => {}
+                Ok(None) => {}
+                // NEVER swallow snapshot failures (v1.0.1 polish #3: nested-repo
+                // errors killed save points silently for days).
+                Err(e) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("\u{26A0} save point failed: {e}") }); }
             }
         }
         run_auto_capture(&app, &db, &broker, &scope_id, &prompt, &channel).await;

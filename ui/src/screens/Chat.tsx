@@ -834,6 +834,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       {/* HISTORY SIDEBAR — right-hand side, so the active chat stays centered */}
       {!blocked && (
         <HistorySidebar
+          multi={multi}
           convs={convs} activeId={convId} busy={running} dragId={dragId} overId={overId}
           listElRef={listElRef}
           renamingId={renamingId}
@@ -847,9 +848,11 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 }
 
 function HistorySidebar({
+  multi,
   convs, activeId, busy, dragId, overId, listElRef, renamingId, onCommitRename,
   onNew, onOpen, onDelete, onRename, onPin, onPointerDragStart,
 }: {
+  multi: boolean;
   convs: ConvMeta[]; activeId: string | null; busy: boolean;
   dragId: string | null; overId: string | null;
   listElRef: React.RefObject<HTMLDivElement>;
@@ -863,15 +866,17 @@ function HistorySidebar({
   return (
     <div style={{
       width: 230, flexShrink: 0, display: "flex", flexDirection: "column", gap: 8,
-      // Bleed past App.tsx's 28px top/bottom content padding so the divider
-      // reaches the literal top and bottom of the window. height:100% alone
-      // does NOT do this with negative margins -- a negative margin SHIFTS a
-      // box, it doesn't stretch it, so height:100% + marginTop:-28 moved the
-      // top up 28px but left the bottom 28px short (the exact bug Mason
-      // caught). Grow the height by the full bled amount (28 top + 28 bottom)
-      // so the box actually stretches past both edges instead of relocating.
-      height: "calc(100% + 56px)",
-      marginTop: -28, marginBottom: -28, paddingTop: 28, paddingBottom: 28,
+      // SINGLE pane: bleed past App.tsx's 28px top/bottom padding so the
+      // divider reaches the window edges (grow height by the bled amount — a
+      // negative margin SHIFTS, it doesn't stretch). MULTI pane: the pane is a
+      // rounded card; bleeding overflows the card bounds (Mason, v1.0.1 polish
+      // #2), so stay at 100% of the container.
+      ...(multi
+        ? { height: "100%" }
+        : {
+            height: "calc(100% + 56px)",
+            marginTop: -28, marginBottom: -28, paddingTop: 28, paddingBottom: 28,
+          }),
       borderLeft: "var(--border-width) solid var(--line)", paddingLeft: 14,
     }}>
       <Button onClick={onNew} disabled={busy}>+ New chat</Button>
