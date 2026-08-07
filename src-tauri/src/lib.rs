@@ -2903,12 +2903,38 @@ fn exec_tool_cfg(
             if let Ok(real) = broker.resolve(agent_id, path, broker::Mode::Write) {
                 if let Some(parent) = real.parent() { let _ = std::fs::create_dir_all(parent); }
             }
-            match broker.resolve_and_open(agent_id, path, broker::Mode::Write) {
+            // ATOMIC WRITE (Mason 08-06): write to a fresh temp sibling (always
+            // nlink == 1 → the hardlink guard can't false-refuse), fsync, then
+            // rename OVER the target. A partial write can no longer truncate the
+            // real file ("long replies vanish"), and rewriting a legit
+            // hardlinked/cloned file no longer hits "refused by jail". Both temp
+            // and final paths resolve THROUGH THE BROKER, so the jail still
+            // governs every byte. Mirrors the broker_ws write handler.
+            let tmp_rel = format!("{path}.aygent-tmp-{}",
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos()).unwrap_or(0));
+            match broker.resolve_and_open(agent_id, &tmp_rel, broker::Mode::Write) {
                 Ok(mut f) => {
                     use std::io::Write as _;
-                    match f.write_all(cnt.as_bytes()) {
-                        Ok(_) => (format!("wrote {} bytes to {path}", cnt.len()), false),
-                        Err(e) => (format!("io error: {e}"), true),
+                    match f.write_all(cnt.as_bytes()).and_then(|_| f.flush()) {
+                        Ok(_) => {
+                            let _ = f.sync_all();
+                            drop(f);
+                            let t = broker.resolve(agent_id, &tmp_rel, broker::Mode::Write);
+                            let d = broker.resolve(agent_id, path, broker::Mode::Write);
+                            match (t, d) {
+                                (Ok(t), Ok(d)) => match std::fs::rename(&t, &d) {
+                                    Ok(_) => (format!("wrote {} bytes to {path}", cnt.len()), false),
+                                    Err(e) => { let _ = std::fs::remove_file(&t); (format!("io error: {e}"), true) }
+                                },
+                                (Ok(t), Err(e)) => { let _ = std::fs::remove_file(&t); (format!("refused by jail: {e:?}"), true) }
+                                (Err(e), _) => (format!("refused by jail: {e:?}"), true),
+                            }
+                        }
+                        Err(e) => {
+                            if let Ok(t) = broker.resolve(agent_id, &tmp_rel, broker::Mode::Write) { let _ = std::fs::remove_file(&t); }
+                            (format!("io error: {e}"), true)
+                        }
                     }
                 }
                 Err(e) => (format!("refused by jail: {e:?}"), true),
