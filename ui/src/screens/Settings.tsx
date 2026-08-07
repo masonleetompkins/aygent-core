@@ -99,8 +99,12 @@ export function Settings({
         {/* (daemon sanity-check card is at the bottom) */}
         <div style={{ display: "flex", gap: "var(--space-2)", alignItems: "center" }}>
           <span style={{ fontSize: "var(--text-body)", fontWeight: 600, width: 90 }}>Mode</span>
-          <Button variant={mode === "light" ? "primary" : "secondary"} onClick={() => onTheme("light", accent)}>◐ Light</Button>
-          <Button variant={mode === "dark" ? "primary" : "secondary"} onClick={() => onTheme("dark", accent)}>◑ Dark</Button>
+          <div style={{ display: "flex", gap: "var(--space-2)", flexWrap: "wrap" }}>
+            <Button variant={mode === "light" ? "primary" : "secondary"} onClick={() => onTheme("light", accent)}>◐ Light</Button>
+            <Button variant={mode === "dark" ? "primary" : "secondary"} onClick={() => onTheme("dark", accent)}>◑ Dark</Button>
+            <Button variant={mode === "neutral" ? "primary" : "secondary"} onClick={() => onTheme("neutral", accent)}>◒ Neutral</Button>
+            <Button variant={mode === "matrix" ? "primary" : "secondary"} onClick={() => onTheme("matrix", accent)}>▚ Matrix</Button>
+          </div>
         </div>
         <div style={{ display: "flex", gap: "var(--space-3)", alignItems: "center", marginTop: "var(--space-1)" }}>
           <span style={{ fontSize: "var(--text-body)", fontWeight: 600, width: 90 }}>Accent</span>
@@ -110,7 +114,7 @@ export function Settings({
                 style={{
                   width: 26, height: 26, borderRadius: 999, cursor: "pointer",
                   border: `2px solid ${accent === c ? "var(--text)" : "var(--line)"}`,
-                  background: c || (mode === "light" ? "#0a0a0a" : "#ffffff"),
+                  background: c || (mode === "matrix" ? "#00ff41" : mode === "dark" ? "#ffffff" : mode === "neutral" ? "#22201c" : "#0a0a0a"),
                   boxShadow: accent === c ? "var(--elevation)" : "none",
                 }} />
             ))}

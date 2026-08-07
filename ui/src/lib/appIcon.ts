@@ -10,14 +10,18 @@
 // itself for the Dock, so we draw a full-bleed rounded square at that size.
 
 import { invoke } from "@tauri-apps/api/core";
+import type { Mode } from "./theme";
 
 const SIZE = 1024;
 
 /** Resolve the accent to a concrete hex. "" means the theme's default, which
  *  is the inverse of the background (black on light, white on dark). */
-function resolveAccent(accent: string, mode: "light" | "dark"): string {
+function resolveAccent(accent: string, mode: Mode): string {
   if (accent) return accent;
-  return mode === "dark" ? "#ffffff" : "#111111";
+  if (mode === "matrix") return "#00ff41"; // phosphor green is the identity
+  if (mode === "dark") return "#ffffff";
+  if (mode === "neutral") return "#22201c"; // soft near-black on warm paper
+  return "#111111";
 }
 
 /**
@@ -25,7 +29,7 @@ function resolveAccent(accent: string, mode: "light" | "dark"): string {
  * Exported separately from `applyAppIcon` so it can be previewed/tested
  * without touching the Dock.
  */
-export function renderIconPng(mode: "light" | "dark", accent: string): string | null {
+export function renderIconPng(mode: Mode, accent: string): string | null {
   const canvas = document.createElement("canvas");
   canvas.width = SIZE;
   canvas.height = SIZE;
@@ -33,7 +37,7 @@ export function renderIconPng(mode: "light" | "dark", accent: string): string | 
   if (!ctx) return null;
 
   const ink = resolveAccent(accent, mode);
-  const bg = mode === "dark" ? "#0b0b0c" : "#fafafa";
+  const bg = mode === "matrix" ? "#000000" : mode === "dark" ? "#0b0b0c" : mode === "neutral" ? "#f4f1ea" : "#fafafa";
 
   // Ground: a rounded square, full-bleed. macOS applies its own mask, but a
   // radius here keeps it looking right if the mask ever changes.
@@ -72,7 +76,7 @@ function hexToRgba(hex: string, alpha: number): string {
 }
 
 /** Render for the current theme and install it as the Dock icon. */
-export async function applyAppIcon(mode: "light" | "dark", accent: string): Promise<void> {
+export async function applyAppIcon(mode: Mode, accent: string): Promise<void> {
   try {
     const b64 = renderIconPng(mode, accent);
     if (!b64) return;

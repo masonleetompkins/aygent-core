@@ -89,6 +89,60 @@
   --elevation-hover: 0 0 16px rgba(var(--accent-rgb), 0.5), 0 0 44px rgba(var(--accent-rgb), 0.3);
 }
 
+/* ---- NEUTRAL MODE: warm off-white bg + soft near-black text (easy on the
+   eyes; a "paper" feel rather than clinical white). Same soft-shadow lighting
+   as Light, just warmer tokens. ---- */
+:root[data-theme="neutral"] {
+  --bg: #f4f1ea;        /* warm off-white "paper" */
+  --surface: #faf8f2;   /* cards lift slightly off the paper */
+  --text: #22201c;      /* soft near-black, not harsh #000 */
+  --text-muted: #6b665d;
+  --text-faint: #a49e92;
+  --line: #22201c;
+  --accent: #22201c;
+  --accent-rgb: 34, 32, 28;
+
+  --elevation: 0 2px 8px rgba(60, 50, 30, 0.07), 0 8px 24px rgba(60, 50, 30, 0.1);
+  --elevation-hover: 0 4px 12px rgba(60, 50, 30, 0.11), 0 12px 32px rgba(60, 50, 30, 0.15);
+
+  --ok: #2f8f52;
+  --danger: #c14b3f;
+  --warn: #b0761c;
+}
+:root[data-theme="neutral"][data-accent="on"] {
+  --line: var(--accent);
+  --elevation: 0 2px 10px rgba(var(--accent-rgb), 0.2), 0 10px 30px rgba(var(--accent-rgb), 0.16);
+  --elevation-hover: 0 4px 14px rgba(var(--accent-rgb), 0.28), 0 14px 38px rgba(var(--accent-rgb), 0.22);
+}
+
+/* ---- MATRIX MODE: phosphor-green text on black, futuristic-terminal look.
+   Per Mason: text is in the ACCENT (green) — NO text glow. Card lighting keeps
+   the dark-mode glow feel (in green), but glyphs themselves stay crisp. ---- */
+:root[data-theme="matrix"] {
+  --bg: #000000;
+  --surface: #050a05;   /* barely-lifted near-black with a green cast */
+  --text: #00ff41;      /* phosphor green — the accent IS the text color */
+  --text-muted: #12b23a;
+  --text-faint: #0a7a26;
+  --line: #00ff41;
+  --accent: #00ff41;
+  --accent-rgb: 0, 255, 65;
+
+  --elevation: 0 0 0 1px rgba(0, 255, 65, 0.06), 0 0 16px rgba(0, 255, 65, 0.22), 0 0 40px rgba(0, 255, 65, 0.12);
+  --elevation-hover: 0 0 0 1px rgba(0, 255, 65, 0.1), 0 0 22px rgba(0, 255, 65, 0.34), 0 0 52px rgba(0, 255, 65, 0.18);
+
+  --ok: #00ff41;
+  --danger: #ff5c5c;
+  --warn: #d7ff3a;
+}
+/* Matrix is inherently accent-colored; a custom accent still retints the
+   outline + card lighting, but the text stays green (the mode's identity). */
+:root[data-theme="matrix"][data-accent="on"] {
+  --line: var(--accent);
+  --elevation: 0 0 12px rgba(var(--accent-rgb), 0.35), 0 0 34px rgba(var(--accent-rgb), 0.2);
+  --elevation-hover: 0 0 16px rgba(var(--accent-rgb), 0.5), 0 0 44px rgba(var(--accent-rgb), 0.3);
+}
+
 * { box-sizing: border-box; }
 
 body {
