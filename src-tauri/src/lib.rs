@@ -4696,12 +4696,34 @@ pub async fn run_headless_turn(
     } else if provider_kind == "openai" || provider_kind == "openrouter" {
         let key = keychain::get_key(&provider_kind).map_err(|_| format!("recipient has no {provider_kind} key"))?;
         if agent.model.trim().is_empty() { return Err("recipient has no model set".into()); }
-        // Non-streaming completion (streaming tool-loop parity is a fast-follow).
-        // Emit a visible "working" line so the pane isn't blank while it runs.
+        // STREAMING (Mason 08-06): stream token-by-token so AYGENT Remote shows
+        // partial text as it arrives (was a single delta on completion — the
+        // whole reply popped in at once over the tunnel). Emits real TextDelta
+        // events on the stream channel, exactly like the Anthropic headless path.
         let _ = app.emit(&stream_channel, &provider::StreamEvent::Info { text: "thinking…".into() });
-        reply_text = openai_provider::complete(&provider_kind, &key, &agent.model, &framed).await.unwrap_or_default();
-        // Emit the completed text as one delta so the pane shows it live.
-        let _ = app.emit(&stream_channel, &provider::StreamEvent::TextDelta { text: reply_text.clone() });
+        let msgs = serde_json::json!([{ "role": "user", "content": framed }]);
+        let no_tools = serde_json::json!([]);
+        match openai_provider::openai_stream_turn(
+            &provider_kind, &key, &agent.model, &system, &msgs, &no_tools, Some(&hl_cancel_flag),
+            |ev| {
+                // Accumulate the assistant text AND forward the live event so the
+                // remote/inbox pane streams it.
+                if let provider::StreamEvent::TextDelta { text } = &ev { reply_text.push_str(text); }
+                let _ = app.emit(&stream_channel, &ev);
+            },
+        ).await {
+            Ok((assistant, _stop)) => {
+                // If the stream produced no TextDelta (some models only fill the
+                // final message content), fall back to the assembled content.
+                if reply_text.trim().is_empty() {
+                    if let Some(c) = assistant.get("content").and_then(|c| c.as_str()) {
+                        reply_text = c.to_string();
+                        let _ = app.emit(&stream_channel, &provider::StreamEvent::TextDelta { text: reply_text.clone() });
+                    }
+                }
+            }
+            Err(e) => { reply_text = format!("(couldn't complete the reply: {e})"); }
+        }
     } else {
         reply_text = format!("({} runs a local model — headless inter-agent turns use a cloud provider for now.)", agent.name);
     }
