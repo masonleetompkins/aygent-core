@@ -2061,6 +2061,98 @@ fn capabilities_list(
     Ok(serde_json::json!(items))
 }
 
+// --- SPARKS (interactive AI-built mini-apps) -------------------------------
+// A Spark is a SELF-CONTAINED mini-app the agent authors as a single
+// `Sparks/<slug>/index.html` inside the agent folder (jailed). It runs in a
+// SANDBOXED iframe (sandbox="allow-scripts", NO same-origin) in the Sparks tab
+// — so it can run its own JS + any data the agent EMBEDDED at build time, but
+// can NOT reach the file system, the network to this machine, or the agent.
+// The agent gives it data; the Spark never calls back. These commands are the
+// read/list/delete surface for the Sparks library; the agent BUILDS a Spark
+// with ordinary jailed write_file (taught by the built-in "sparks" skill).
+
+/// One Spark's metadata (from its spark.json, with sane fallbacks).
+fn spark_slug_ok(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 80
+        && slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// List every Spark in the agent folder: scans Sparks/<slug>/ for an index.html
+/// (+ optional spark.json for title/description/created). Jailed via the broker.
+#[tauri::command]
+fn sparks_list(broker: tauri::State<Arc<Broker>>, agent_id: String) -> Result<serde_json::Value, String> {
+    let dir = match broker.resolve(&agent_id, "Sparks", broker::Mode::Read) {
+        Ok(p) => p,
+        Err(_) => return Ok(serde_json::json!([])), // no Sparks/ yet → empty library
+    };
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir() { continue; }
+            let slug = e.file_name().to_string_lossy().to_string();
+            if !spark_slug_ok(&slug) { continue; }
+            if !p.join("index.html").is_file() { continue; }
+            // Optional manifest.
+            let (mut title, mut description, mut created) = (slug.clone(), String::new(), 0i64);
+            if let Ok(txt) = std::fs::read_to_string(p.join("spark.json")) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                    if let Some(t) = v.get("title").and_then(|x| x.as_str()) { title = t.to_string(); }
+                    if let Some(d) = v.get("description").and_then(|x| x.as_str()) { description = d.to_string(); }
+                    if let Some(c) = v.get("created").and_then(|x| x.as_i64()) { created = c; }
+                }
+            }
+            let modified = std::fs::metadata(p.join("index.html")).ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64).unwrap_or(0);
+            out.push(serde_json::json!({
+                "slug": slug, "title": title, "description": description,
+                "created": created, "modified": modified,
+            }));
+        }
+    }
+    // Newest activity first.
+    out.sort_by(|a, b| b.get("modified").and_then(|x| x.as_i64()).unwrap_or(0)
+        .cmp(&a.get("modified").and_then(|x| x.as_i64()).unwrap_or(0)));
+    Ok(serde_json::json!(out))
+}
+
+/// Read one Spark's index.html (jailed). Returned as a STRING the UI injects as
+/// an iframe srcdoc under sandbox="allow-scripts" (no same-origin) — the Spark
+/// runs isolated; it can never read this file path or reach the agent.
+#[tauri::command]
+fn sparks_read(broker: tauri::State<Arc<Broker>>, agent_id: String, slug: String) -> Result<serde_json::Value, String> {
+    if !spark_slug_ok(&slug) { return Err("invalid spark name".into()); }
+    let rel = format!("Sparks/{slug}/index.html");
+    let html = match broker.resolve_and_open(&agent_id, &rel, broker::Mode::Read) {
+        Ok(mut f) => { use std::io::Read; let mut s = String::new(); f.read_to_string(&mut s).map_err(|e| format!("read: {e}"))?; s }
+        Err(e) => return Err(format!("refused by jail: {e:?}")),
+    };
+    Ok(serde_json::json!({ "slug": slug, "html": html }))
+}
+
+/// Delete a Spark (its whole Sparks/<slug>/ folder). Jailed: resolves a sentinel
+/// inside the folder through the broker (Write) to prove it's in-scope, then
+/// removes the directory.
+#[tauri::command]
+fn sparks_delete(broker: tauri::State<Arc<Broker>>, agent_id: String, slug: String) -> Result<(), String> {
+    if !spark_slug_ok(&slug) { return Err("invalid spark name".into()); }
+    let sentinel = format!("Sparks/{slug}/index.html");
+    let abs = broker.resolve(&agent_id, &sentinel, broker::Mode::Write)
+        .map_err(|e| format!("refused by jail: {e:?}"))?;
+    let spark_dir = abs.parent().ok_or("could not resolve spark dir")?.to_path_buf();
+    // Paranoia: the resolved dir must actually be .../Sparks/<slug>.
+    if spark_dir.file_name().and_then(|n| n.to_str()) != Some(slug.as_str()) {
+        return Err("spark path mismatch".into());
+    }
+    if spark_dir.is_dir() {
+        std::fs::remove_dir_all(&spark_dir).map_err(|e| format!("delete: {e}"))?;
+    }
+    Ok(())
+}
+
 /// SKILLS — saved procedures (instructions + an allowed subset of real tools).
 /// Same storage as before (`kind: "composed"` in the tools registry); this is a
 /// clearer name and a separate list, not a migration.
@@ -3211,6 +3303,11 @@ fn agent_tools_for_full(
     if conn_ctx.is_some() {
         for schema in dashboard::tool_schemas() { tools.push(schema); }
         extra_instructions.push_str(dashboard::tool_instructions());
+        // SPARKS — the embedded skill (data, not a tool): teach every agent how
+        // to build an interactive mini-app on request. No new capability; it's a
+        // way of using the existing jailed write_file. The Sparks tab renders
+        // what the agent writes, in a sandboxed iframe.
+        extra_instructions.push_str(SPARKS_INSTRUCTIONS);
     }
 
     // CONNECTION TOOLS, registry-driven. Every connected+enabled provider
@@ -3643,6 +3740,28 @@ fn mcp_add_custom(app: tauri::AppHandle, label: String, command: String, args: V
 fn mcp_remove_custom(app: tauri::AppHandle, key: String) -> Result<(), String> {
     mcp::remove_custom(&app, &key)
 }
+
+const SPARKS_INSTRUCTIONS: &str = "\n\n\
+SPARKS — interactive mini-apps you can build for the user. A \"Spark\" is a single \
+self-contained HTML file that renders live in the app's Sparks tab (a sandboxed panel \
+beside the chat). Build one when the user asks for something interactive, visual, or \
+reusable — a calculator, a chart of their data, a dashboard, a little tool, a game, a \
+formatted report they can poke at.\n\
+HOW TO BUILD ONE:\n\
+1. Pick a short slug (lowercase, letters/digits/hyphens), e.g. \"budget-planner\".\n\
+2. Write the app to `Sparks/<slug>/index.html` with write_file. It MUST be ONE \
+self-contained file: inline all CSS in <style> and all JS in <script>. You MAY load \
+libraries from a CDN (e.g. React, Chart.js, D3 via <script src=\"https://...\">).\n\
+3. DATA GOES IN AT BUILD TIME. The Spark runs sandboxed — it CANNOT call you, read \
+files, or reach this machine. If it needs the user's real data (their finances, a \
+file's contents, an API result, a computed table), gather it FIRST with your own tools, \
+then EMBED it directly in the HTML as a JavaScript literal, e.g. `const DATA = {...};`. \
+The Spark reads only from that embedded DATA — never from the network back to you.\n\
+4. Also write `Sparks/<slug>/spark.json` = {\"title\":\"Human Title\",\"description\":\"one line\",\"created\":<unix seconds>} so it shows nicely in the library.\n\
+5. Tell the user it's ready in the Sparks tab. To CHANGE a Spark, just rewrite its \
+index.html (same slug) — the panel reloads it.\n\
+Keep Sparks fully client-side and self-contained. Never put secrets or API keys in a \
+Spark — assume the user can view its source.";
 
 const AGENT_SYSTEM: &str = "You are AYGENT, a helpful, concise, friendly assistant running privately \
     on the user's own machine. You have TOOLS available but they are OPTIONAL — use a tool ONLY when \
@@ -4898,6 +5017,7 @@ pub fn run() {
             hyperframes_status, hyperframes_provision, hyperframes_remove,
             mcp_list, mcp_install_plan, mcp_enable, mcp_disable, mcp_verify, mcp_add_custom, mcp_remove_custom,
             capabilities_list, skills_list,
+            sparks_list, sparks_read, sparks_delete,
             dashboard::dashboard_load, dashboard::dashboard_upsert_module,
             dashboard::dashboard_remove_module, dashboard::dashboard_arrange,
             dashboard::dashboard_undo,
