@@ -7,7 +7,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Pill } from "../components/ui";
-import { wrapSparkHtml } from "../lib/sparkChrome";
+import { useSparkBlobUrl } from "../lib/sparkChrome";
 
 type SparkMeta = {
   slug: string; title: string; description: string; created: number; modified: number;
@@ -22,6 +22,8 @@ export function Sparks({ agentId, onNavigate }: { agentId: string | null; onNavi
   const [html, setHtml] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  // blob: URL so the app CSP doesn't strip the spark's inline CSS (see sparkChrome).
+  const blobUrl = useSparkBlobUrl(html || "");
 
   const refresh = useCallback(async () => {
     if (!agentId) { setSparks([]); return; }
@@ -133,13 +135,15 @@ export function Sparks({ agentId, onNavigate }: { agentId: string | null; onNavi
             </div>
             <div style={{ flex: 1, minHeight: 0, background: "#ffffff" }}>
               {loading && <div style={{ ...hint, padding: 16 }}>Loading…</div>}
-              {!loading && html != null && (
+              {!loading && html != null && blobUrl && (
                 // SANDBOXED: allow-scripts only (NO allow-same-origin) — the Spark
-                // runs its own JS + embedded data, but is fully isolated from the
-                // app, the file system, and the agent. It can't call anything back.
+                // runs its own JS + embedded data, isolated from the app/files/agent.
+                // Loaded from a blob: URL (own origin) so the app CSP doesn't strip
+                // its inline styles — srcDoc inherited the parent CSP and rendered
+                // unstyled (Mason 08-08).
                 <iframe
                   title={selected || "spark"}
-                  srcDoc={wrapSparkHtml(html)}
+                  src={blobUrl}
                   sandbox="allow-scripts allow-popups allow-forms"
                   style={{ width: "100%", height: "100%", border: "none", background: "#fff" }}
                 />

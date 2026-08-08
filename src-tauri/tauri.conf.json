@@ -20,7 +20,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: blob:; connect-src 'self' ws://127.0.0.1:* ws://localhost:*"
+      "csp": "default-src 'self'; img-src 'self' data: blob:; frame-src blob:; connect-src 'self' ws://127.0.0.1:* ws://localhost:*"
     }
   },
   "bundle": {

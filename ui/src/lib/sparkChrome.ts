@@ -110,3 +110,26 @@ export function wrapSparkHtml(html: string): string {
     `<meta name="viewport" content="width=device-width,initial-scale=1">` +
     `<style>${SPARK_BASE_CSS}</style></head><body>${body}</body></html>`;
 }
+
+// The app runs under a strict CSP (default-src 'self'; no style-src 'unsafe-inline').
+// A `srcDoc` iframe inherits the PARENT's origin/CSP, so the spark's inline <style>
+// gets BLOCKED inside AYGENT (it renders serif/unstyled) even though the exact same
+// html renders perfectly in Safari (no CSP). Fix: load the wrapped document from a
+// `blob:` URL instead of srcDoc. A blob URL is a SEPARATE origin, so the app's CSP
+// does not apply to it and the spark may use its own inline styles freely. Sandbox
+// stays allow-scripts (no same-origin) so the spark still can't reach the app/files.
+// This React hook returns a stable blob URL for the given html and revokes it on
+// change/unmount (no leaks). Import React lazily to keep this module UI-agnostic.
+import { useEffect, useState } from "react";
+
+export function useSparkBlobUrl(html: string): string | null {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    const doc = wrapSparkHtml(html || "");
+    const blob = new Blob([doc], { type: "text/html" });
+    const u = URL.createObjectURL(blob);
+    setUrl(u);
+    return () => { URL.revokeObjectURL(u); };
+  }, [html]);
+  return url;
+}

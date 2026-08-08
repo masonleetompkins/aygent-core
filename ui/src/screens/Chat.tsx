@@ -7,7 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Button } from "../components/ui";
 import { Icon, type IconName } from "../components/Icon";
 import { Markdown } from "../components/Markdown";
-import { wrapSparkHtml } from "../lib/sparkChrome";
+import { useSparkBlobUrl } from "../lib/sparkChrome";
 import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion, stopTurn } from "../lib/turns";
 import type { TurnItem } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
@@ -1207,6 +1207,9 @@ function SparkCard({ spark, agentId }: { spark: { slug: string; title: string; h
   const [saved, setSaved] = useState(false);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // Load via a blob: URL so the app's CSP doesn't strip the spark's inline CSS
+  // (srcDoc inherits the parent CSP; a blob URL is its own origin). See sparkChrome.
+  const blobUrl = useSparkBlobUrl(spark.html);
 
   async function save() {
     if (!agentId) { setErr("no agent"); return; }
@@ -1244,12 +1247,14 @@ function SparkCard({ spark, agentId }: { spark: { slug: string; title: string; h
       </div>
       {err && <div style={{ padding: "4px 10px", fontSize: 12, color: "var(--danger)" }}>✗ {err}</div>}
       {expanded && (
+        blobUrl ? (
         <iframe
           title={spark.slug}
-          srcDoc={wrapSparkHtml(spark.html)}
+          src={blobUrl}
           sandbox="allow-scripts allow-popups allow-forms"
           style={{ width: "100%", height: 420, border: "none", background: "#fff", display: "block" }}
         />
+        ) : null
       )}
     </div>
   );
