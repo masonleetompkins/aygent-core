@@ -7,6 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Button } from "../components/ui";
 import { Icon, type IconName } from "../components/Icon";
 import { Markdown } from "../components/Markdown";
+import { wrapSparkHtml } from "../lib/sparkChrome";
 import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion, stopTurn } from "../lib/turns";
 import type { TurnItem } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
@@ -1245,7 +1246,7 @@ function SparkCard({ spark, agentId }: { spark: { slug: string; title: string; h
       {expanded && (
         <iframe
           title={spark.slug}
-          srcDoc={spark.html}
+          srcDoc={wrapSparkHtml(spark.html)}
           sandbox="allow-scripts allow-popups allow-forms"
           style={{ width: "100%", height: 420, border: "none", background: "#fff", display: "block" }}
         />

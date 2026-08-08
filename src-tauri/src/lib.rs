@@ -3294,7 +3294,7 @@ fn task_continue_tool() -> serde_json::Value {
 fn spark_preview_tool() -> serde_json::Value {
     serde_json::json!({
         "name": "spark_preview",
-        "description": "Render an interactive mini-app (a Spark) LIVE inline in the chat. Pass the FULL self-contained HTML. Call again with the same slug to iterate; the preview hot-swaps. The user saves it to their library when happy — you do not save it. Follow the SPARKS design rules (styled, not bare HTML; embed any data as a JS literal).",
+        "description": "Render an interactive mini-app (a Spark) LIVE inline in the chat. Pass ONLY the inner body markup using AYGENT's Spark classes (card/label/seg/row/stat/stepper/input-money/grid) plus a single <script> for logic — do NOT include <style>, fonts, or <html>/<head>/<body>; the design system is injected for you. Call again with the same slug to iterate (it hot-swaps). The user saves it to their library — you do not.",
         "input_schema": { "type": "object", "properties": {
             "slug": { "type": "string", "description": "short id, lowercase letters/digits/hyphens (stable across iterations)" },
             "title": { "type": "string", "description": "human title shown on the card + in the library" },
@@ -3808,49 +3808,38 @@ fn mcp_remove_custom(app: tauri::AppHandle, key: String) -> Result<(), String> {
 }
 
 const SPARKS_INSTRUCTIONS: &str = "\n\n\
-SPARKS \u{2014} interactive mini-apps you build RIGHT IN THE CHAT. A \"Spark\" is one \
-self-contained HTML page (a calculator, a chart of the user's data, a tool, a game, a \
-formatted report). Build one when the user asks for something interactive or visual.\n\
-HOW IT WORKS \u{2014} use the `spark_preview` tool (do NOT write files):\n\
-1. Call spark_preview with { slug (lowercase-hyphen), title, html }. The html renders \
-LIVE inline in this chat, in a sandbox. The user sees it immediately and can ask for \
-changes.\n\
-2. To ITERATE, call spark_preview again with the SAME slug and updated html \u{2014} the inline \
-preview hot-swaps. Keep refining with the user until they're happy.\n\
-3. The user clicks \"Save to Library\" on the preview when ready (you don't save it \u{2014} \
-they do). Saved Sparks live in the Sparks tab.\n\
-DATA GOES IN AT BUILD TIME. The Spark is sandboxed \u{2014} it CANNOT call you, read files, or \
-reach this machine. If it needs the user's real data, gather it FIRST with your tools, \
-then EMBED it in the html as a JS literal, e.g. `const DATA = {...};`. Never put secrets \
-in a Spark.\n\
-DESIGN \u{2014} THIS IS NOT OPTIONAL. Unless the user asks for a specific look, every Spark \
-MUST use AYGENT's clean aesthetic (NOT bare unstyled HTML). Start from this template and \
-build inside it:\n\
-<!doctype html><html><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><style>\
-:root{--bg:#fff;--surface:#fff;--text:#0a0a0a;--muted:#5c5c5c;--line:#e6e6e6;\
---accent:#0a0a0a;--radius:14px;--radius-sm:8px;--pad:16px}\
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);\
-font:15px/1.5 -apple-system,system-ui,'SF Pro Text',sans-serif;padding:20px}\
-h1{font-size:20px;font-weight:800;margin:0 0 4px}.sub{color:var(--muted);font-size:13px;margin:0 0 16px}\
-.card{background:var(--surface);border:1.5px solid var(--line);border-radius:var(--radius);\
-padding:var(--pad);box-shadow:0 2px 8px rgba(0,0,0,.06),0 8px 24px rgba(0,0,0,.08);margin-bottom:12px}\
-.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}\
-.stat{font-size:28px;font-weight:800}.label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}\
-button{font:inherit;font-weight:600;padding:9px 16px;border-radius:var(--radius-sm);\
-border:1.5px solid var(--line);background:var(--accent);color:#fff;cursor:pointer}\
-button.secondary{background:var(--surface);color:var(--text)}\
-input,select{font:inherit;padding:9px 12px;border:1.5px solid var(--line);border-radius:var(--radius-sm);background:var(--bg);color:var(--text);width:100%}\
-label{display:block;font-size:13px;font-weight:600;margin:10px 0 4px}\
-table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}\
-th{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}\
-</style></head><body>\n\
-<h1>Title</h1><p class=\"sub\">one-line description</p>\n\
-<!-- build UI inside .card blocks; use .grid/.stat/.label for metrics, real inputs+buttons for tools -->\n\
-<script>const DATA={};/* your logic */</script></body></html>\n\
-Use real, styled controls (buttons, sliders, inputs), .card containers, and clear \
-hierarchy. For charts, load Chart.js from a CDN. Make it look designed, responsive, and \
-genuinely functional \u{2014} something the user would be pleased to see, not a bare form.";
+SPARKS \u{2014} interactive mini-apps you build RIGHT IN THE CHAT with the `spark_preview` \
+tool. A Spark is a small self-contained web app (a calculator, a chart, a tool, a game).\n\
+\n\
+CRITICAL \u{2014} STYLING IS HANDLED FOR YOU. Do NOT write a <style> block, do NOT set \
+fonts, colors, or CSS, and do NOT write <!doctype>/<html>/<head>/<body>. AYGENT injects a \
+complete, polished design system (system font, spacing, dark-mode, styled controls) around \
+your markup automatically. If you ship your own <style> or full document, we assume you \
+want a custom look and step aside \u{2014} so ONLY do that when the user explicitly asks for \
+a specific design. In every normal case, write ONLY the inner body markup using the \
+provided classes below, and it will look great.\n\
+\n\
+The `html` you pass to spark_preview = just the body content. Use these building blocks:\n\
+- Wrap sections in <div class=\"card\">\u{2026}</div>.\n\
+- Title: <h1>Name</h1><p class=\"sub\">one line</p>.\n\
+- A labeled field: <label class=\"label\">Bill amount</label> then the control.\n\
+- Money input: <div class=\"input-money\"><span>$</span><input id=\"bill\" type=\"number\" placeholder=\"0.00\"></div>.\n\
+- A set of choice buttons (e.g. tip %): <div class=\"seg\"><button>10%</button><button class=\"active\">15%</button><button>20%</button></div> (toggle the `active` class in JS).\n\
+- A +/- stepper: <div class=\"stepper\"><button>\u{2212}</button><span class=\"val\" id=\"n\">1</span><button>+</button></div>.\n\
+- Result rows: <div class=\"row\"><span class=\"k\">Total</span><span class=\"v\" id=\"total\">$0.00</span></div>.\n\
+- A big headline number: <div class=\"stat\" id=\"x\">$0.00</div>.\n\
+- Metrics side by side: <div class=\"grid\">\u{2026}</div>. Tables: plain <table>.\n\
+Put ALL logic in a single <script> at the end. Wire inputs with addEventListener and update \
+the result elements by id. Keep it fully client-side.\n\
+\n\
+DATA AT BUILD TIME: the Spark is sandboxed \u{2014} it CANNOT call you or read files. If it \
+needs the user's real data, gather it FIRST with your tools, then embed it in the <script> \
+as a JS literal (const DATA = {\u{2026}}). Never put secrets in a Spark.\n\
+\n\
+FLOW: call spark_preview({slug, title, html}) \u{2014} it renders live inline in chat. To \
+change it, call spark_preview again with the SAME slug (it hot-swaps). The user clicks \
+Save to Library when happy; you do not save it. For charts, you MAY add \
+<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script> before your script.";
 
 const AGENT_SYSTEM: &str = "You are AYGENT, a helpful, concise, friendly assistant running privately \
     on the user's own machine. You have TOOLS available but they are OPTIONAL — use a tool ONLY when \

@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Pill } from "../components/ui";
+import { wrapSparkHtml } from "../lib/sparkChrome";
 
 type SparkMeta = {
   slug: string; title: string; description: string; created: number; modified: number;
@@ -138,7 +139,7 @@ export function Sparks({ agentId, onNavigate }: { agentId: string | null; onNavi
                 // app, the file system, and the agent. It can't call anything back.
                 <iframe
                   title={selected || "spark"}
-                  srcDoc={html}
+                  srcDoc={wrapSparkHtml(html)}
                   sandbox="allow-scripts allow-popups allow-forms"
                   style={{ width: "100%", height: "100%", border: "none", background: "#fff" }}
                 />
