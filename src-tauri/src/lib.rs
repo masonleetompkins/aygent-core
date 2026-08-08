@@ -597,6 +597,75 @@ fn reveal_in_finder(
 
 use tauri::Manager;
 
+/// CACHE-BUST (Mason 08-08): WKWebView caches the frontend bundle on disk under
+/// the OS cache dir; on macOS it can serve STALE JS across app updates, so a new
+/// build appears to change nothing (this is what defeated the Sparks fixes). We
+/// stamp the app version into <cache>/frontend-version.txt and, whenever the
+/// running app's version differs from the stamp, delete the WebKit cache subtree
+/// ONCE and rewrite the stamp. Result: every new build loads fresh frontend code
+/// with zero manual steps. Best-effort + safe: only AYGENT's own WebKit cache is
+/// removed (never user files); any error is logged and ignored (a stale cache is
+/// a cosmetic nuisance, never a reason to fail boot).
+/// Read the content-hashed frontend bundle id from the embedded index.html so we
+/// can detect when the UI actually changed between builds (Vite hashes the asset
+/// filenames). Returns something like "index-Zcg7olRg.js"; None if unreadable.
+fn frontend_build_id(app: &tauri::AppHandle) -> Option<String> {
+    use tauri::Manager;
+    let res = app.path().resource_dir().ok()?;
+    // Tauri bundles frontendDist under the resource dir; index.html references
+    // the hashed asset. Try common layouts.
+    for candidate in ["index.html", "dist/index.html", "../ui/dist/index.html"] {
+        let p = res.join(candidate);
+        if let Ok(html) = std::fs::read_to_string(&p) {
+            // Grab the first hashed asset name (index-XXXX.js or .css).
+            if let Some(start) = html.find("index-") {
+                let tail = &html[start..];
+                let end = tail.find(|c: char| c == '"' || c == '\'' || c == '?').unwrap_or(tail.len());
+                let id = &tail[..end];
+                if id.len() > 6 { return Some(id.to_string()); }
+            }
+        }
+    }
+    None
+}
+
+fn bust_webview_cache_on_version_change(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    // Build id = the version + the content-hashed frontend bundle name (which
+    // Vite regenerates on every real UI change). Read it from the embedded
+    // index.html via the resource dir; fall back to just the version.
+    let version = app.package_info().version.to_string();
+    let build_id = frontend_build_id(app).unwrap_or_else(|| version.clone());
+    let Ok(cache_dir) = app.path().app_cache_dir() else {
+        eprintln!("[aygent][cache] no app cache dir — skipping cache-bust");
+        return;
+    };
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let stamp = cache_dir.join("frontend-version.txt");
+    let prev = std::fs::read_to_string(&stamp).unwrap_or_default();
+    if prev.trim() == build_id {
+        return; // frontend unchanged since last launch — nothing to do
+    }
+    eprintln!("[aygent][cache] frontend changed ({} -> {}), clearing WebKit cache", if prev.trim().is_empty() { "none" } else { prev.trim() }, build_id);
+    // WKWebView's on-disk cache lives in a `WebKit` subdir of the app cache dir.
+    let webkit = cache_dir.join("WebKit");
+    if webkit.is_dir() {
+        match std::fs::remove_dir_all(&webkit) {
+            Ok(_) => eprintln!("[aygent][cache] cleared {}", webkit.display()),
+            Err(e) => eprintln!("[aygent][cache] could not clear WebKit cache: {e}"),
+        }
+    }
+    // Also clear a generic Cache.db / Code Cache if present (belt + suspenders).
+    for name in ["Cache.db", "Cache.db-shm", "Cache.db-wal", "Code Cache", "GPUCache"] {
+        let p = cache_dir.join(name);
+        if p.is_dir() { let _ = std::fs::remove_dir_all(&p); }
+        else if p.is_file() { let _ = std::fs::remove_file(&p); }
+    }
+    if let Err(e) = std::fs::write(&stamp, &build_id) {
+        eprintln!("[aygent][cache] could not write version stamp: {e}");
+    }
+}
+
 /// Resolve the STATE DIR (created if missing) — where SQLite + JSON stores live.
 /// CONFIG RELOCATION (2026-07-31): this now routes through paths::state_dir,
 /// which returns <root>/.aygent when a root folder is configured (via the
@@ -5149,6 +5218,11 @@ pub fn run() {
             onboarding_make_agent_home, onboarding_finish, import_memory
         ])
         .setup(move |_app| {
+            // CACHE-BUST FIRST (Mason 08-08): if this is a new build, clear the
+            // stale WKWebView frontend cache before the window loads, so the new
+            // UI code actually runs. Must happen before any content load.
+            bust_webview_cache_on_version_change(&_app.handle());
+
             // ENGINE-CEF (Phase 1): CEF was ALREADY initialized at the top of
             // run() (init_early), BEFORE tauri::Builder — CefInitialize must run
             // before NSApp's run loop starts, so it CANNOT go here (setup fires
