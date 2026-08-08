@@ -11,7 +11,7 @@ import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, get
 import type { TurnItem } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
 
-type ToolLine = { name: string; path: string; ok?: boolean; detail?: string; summary?: string; body?: string; running?: boolean };
+type ToolLine = { name: string; path: string; ok?: boolean; detail?: string; summary?: string; body?: string; running?: boolean; spark?: { slug: string; title: string; html: string } };
 type Msg =
   // `at` = epoch ms. For a USER message it's when they hit send; for an
   // ASSISTANT message it's when the turn COMPLETED (set at finalize, not at
@@ -707,22 +707,22 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           {msgs.length === 0 && !running && !blocked && (
             <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
           )}
-          {msgs.map((m, i) => <Bubble key={i} m={m} />)}
+          {msgs.map((m, i) => <Bubble key={i} m={m} agentId={agentId} />)}
           {/* LIVE inter-agent inbound message: when a peer dispatches a message
               to the agent you're viewing, show it as a user bubble immediately
               (before the reply streams) so you WATCH the conversation arrive. */}
           {running && getInbound(agentId) && (
-            <Bubble m={{ role: "user", text: `from ${getInbound(agentId)!.fromName}: ${getInbound(agentId)!.text}` }} />
+            <Bubble agentId={agentId} m={{ role: "user", text: `from ${getInbound(agentId)!.fromName}: ${getInbound(agentId)!.text}` }} />
           )}
           {/* LIVE turn for the agent being viewed: render a trailing streaming
               bubble fed by the store, so switching to a running agent shows its
               tokens + tool cards arriving mid-flight (Atlas #2), for BOTH human
               turns and headless inter-agent turns (same store slot). */}
           {running && !(msgs.length > 0 && msgs[msgs.length - 1].role === "assistant" && (msgs[msgs.length - 1] as { streaming?: boolean }).streaming) && (
-            <Bubble m={{
+            <Bubble agentId={agentId} m={{
               role: "assistant",
               text: turn.liveText,
-              tools: turn.liveTools.map((t) => ({ name: t.name, path: t.path ?? "", ok: t.ok, detail: t.detail, summary: t.summary, body: t.body, running: t.running })),
+              tools: turn.liveTools.map((t) => ({ name: t.name, path: t.path ?? "", ok: t.ok, detail: t.detail, summary: t.summary, body: t.body, running: t.running, spark: t.spark })),
               timeline: turn.timeline,
               streaming: true,
             }} />
@@ -1035,7 +1035,7 @@ function Stamp({ at }: { at?: number }) {
   );
 }
 
-function Bubble({ m }: { m: Msg }) {
+function Bubble({ m, agentId }: { m: Msg; agentId?: string | null }) {
   const isUser = m.role === "user";
   const memory = isUser && m.role === "user" ? m.memory : undefined;
   // The stamp lives OUTSIDE the bubble column, in the margin: to the LEFT of
@@ -1043,13 +1043,13 @@ function Bubble({ m }: { m: Msg }) {
   return (
     <div style={{ display: "flex", alignItems: "flex-start", justifyContent: isUser ? "flex-end" : "flex-start", gap: 2, width: "100%" }}>
       {!isUser && <Stamp at={m.at} />}
-      <BubbleBody m={m} isUser={isUser} memory={memory} />
+      <BubbleBody m={m} isUser={isUser} memory={memory} agentId={agentId} />
       {isUser && <Stamp at={m.at} />}
     </div>
   );
 }
 
-function BubbleBody({ m, isUser, memory }: { m: Msg; isUser: boolean; memory?: string }) {
+function BubbleBody({ m, isUser, memory, agentId }: { m: Msg; isUser: boolean; memory?: string; agentId?: string | null }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start", minWidth: 0, flex: 1 }}>
       <div style={{
@@ -1076,7 +1076,7 @@ function BubbleBody({ m, isUser, memory }: { m: Msg; isUser: boolean; memory?: s
               const prevWasTool = i > 0 && m.timeline![i - 1].kind === "tool";
               return (
                 <div key={i} style={{ marginTop: prevWasTool ? 4 : 10 }}>
-                  <ToolCard t={item.tool as ToolLine} />
+                  <ToolCard t={item.tool as ToolLine} agentId={agentId} />
                 </div>
               );
             }
@@ -1090,7 +1090,7 @@ function BubbleBody({ m, isUser, memory }: { m: Msg; isUser: boolean; memory?: s
           })
         ) : (
           <>
-            {!isUser && m.role === "assistant" && m.tools.map((t, i) => <ToolCard key={i} t={t} />)}
+            {!isUser && m.role === "assistant" && m.tools.map((t, i) => <ToolCard key={i} t={t} agentId={agentId} />)}
             {m.text && (isUser
               ? <span style={{ whiteSpace: "pre-wrap", lineHeight: 1.55, fontSize: 15 }}>{m.text}</span>
               : <Markdown text={m.text} />)}
@@ -1105,7 +1105,10 @@ function BubbleBody({ m, isUser, memory }: { m: Msg; isUser: boolean; memory?: s
   );
 }
 
-function ToolCard({ t }: { t: ToolLine }) {
+function ToolCard({ t, agentId }: { t: ToolLine; agentId?: string | null }) {
+  // SPARKS: a spark_preview call renders as a live inline mini-app, not a
+  // collapsed code card.
+  if (t.spark && t.spark.html) return <SparkCard spark={t.spark} agentId={agentId} />;
   const [userOpen, setUserOpen] = useState<boolean | null>(null); // null = no manual toggle yet
   const pending = t.ok === undefined;
   // Live behavior (Mason 08-03): the RUNNING card auto-expands so you watch the
@@ -1188,6 +1191,64 @@ function ToolCard({ t }: { t: ToolLine }) {
             <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 12, opacity: 0.85 }}>{t.detail}</pre>
           )}
         </div>
+      )}
+    </div>
+  );
+}
+
+// SPARKS: an interactive mini-app previewed LIVE inline in the chat. Renders the
+// agent's html in a SANDBOXED iframe (allow-scripts, NO same-origin) — it runs
+// its own JS + embedded data but can't reach the app, files, or the agent. The
+// user iterates by asking for changes (the agent re-emits spark_preview, same
+// slug, and this card hot-swaps), then clicks Save to write it to the library.
+function SparkCard({ spark, agentId }: { spark: { slug: string; title: string; html: string }; agentId?: string | null }) {
+  const [expanded, setExpanded] = useState(true);
+  const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function save() {
+    if (!agentId) { setErr("no agent"); return; }
+    setSaving(true); setErr(null);
+    try {
+      await invoke("spark_save", { agentId, slug: spark.slug, title: spark.title, html: spark.html, description: "" });
+      setSaved(true);
+      window.dispatchEvent(new Event("aygent-tools-changed"));
+    } catch (e) { setErr(String(e)); }
+    finally { setSaving(false); }
+  }
+
+  return (
+    <div style={{
+      border: "var(--border-width) solid var(--accent, var(--line))",
+      borderRadius: "var(--radius-control)", overflow: "hidden",
+      background: "var(--bg)", boxShadow: "var(--elevation)", margin: "2px 0",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px", borderBottom: expanded ? "var(--border-width) solid var(--line)" : "none" }}>
+        <span style={{ fontSize: 13 }}>⚡</span>
+        <span style={{ fontWeight: 700, fontSize: 13, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{spark.title || spark.slug}</span>
+        <button onClick={() => setExpanded((e) => !e)} title={expanded ? "Collapse" : "Expand"}
+          style={{ font: "inherit", fontSize: 12, background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer" }}>
+          {expanded ? "Hide" : "Show"}
+        </button>
+        <button onClick={() => void save()} disabled={saving || saved}
+          style={{
+            font: "inherit", fontSize: 12, fontWeight: 600, cursor: saved ? "default" : "pointer",
+            padding: "4px 10px", borderRadius: 6, border: "var(--border-width) solid var(--line)",
+            background: saved ? "var(--surface)" : "var(--accent)", color: saved ? "var(--text-muted)" : "var(--bg)",
+            opacity: saving ? 0.6 : 1,
+          }}>
+          {saved ? "✓ Saved" : saving ? "Saving…" : "Save to Library"}
+        </button>
+      </div>
+      {err && <div style={{ padding: "4px 10px", fontSize: 12, color: "var(--danger)" }}>✗ {err}</div>}
+      {expanded && (
+        <iframe
+          title={spark.slug}
+          srcDoc={spark.html}
+          sandbox="allow-scripts allow-popups allow-forms"
+          style={{ width: "100%", height: 420, border: "none", background: "#fff", display: "block" }}
+        />
       )}
     </div>
   );

@@ -2153,6 +2153,42 @@ fn sparks_delete(broker: tauri::State<Arc<Broker>>, agent_id: String, slug: Stri
     Ok(())
 }
 
+/// SAVE a Spark from the chat preview into the library: writes
+/// Sparks/<slug>/index.html + spark.json (jailed via the broker). Called by the
+/// inline preview card's "Save to Library" button.
+#[tauri::command]
+fn spark_save(
+    broker: tauri::State<Arc<Broker>>,
+    agent_id: String,
+    slug: String,
+    title: String,
+    html: String,
+    description: Option<String>,
+) -> Result<(), String> {
+    if !spark_slug_ok(&slug) { return Err("invalid spark name".into()); }
+    if html.trim().is_empty() { return Err("nothing to save".into()); }
+    // index.html
+    let html_rel = format!("Sparks/{slug}/index.html");
+    let html_abs = broker.resolve(&agent_id, &html_rel, broker::Mode::Write)
+        .map_err(|e| format!("refused by jail: {e:?}"))?;
+    if let Some(parent) = html_abs.parent() { std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?; }
+    std::fs::write(&html_abs, html.as_bytes()).map_err(|e| format!("write html: {e}"))?;
+    // spark.json manifest
+    let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64).unwrap_or(0);
+    let manifest = serde_json::json!({
+        "title": if title.trim().is_empty() { slug.clone() } else { title },
+        "description": description.unwrap_or_default(),
+        "created": created,
+    });
+    let man_rel = format!("Sparks/{slug}/spark.json");
+    let man_abs = broker.resolve(&agent_id, &man_rel, broker::Mode::Write)
+        .map_err(|e| format!("refused by jail: {e:?}"))?;
+    std::fs::write(&man_abs, serde_json::to_string_pretty(&manifest).unwrap_or_default())
+        .map_err(|e| format!("write manifest: {e}"))?;
+    Ok(())
+}
+
 /// SKILLS — saved procedures (instructions + an allowed subset of real tools).
 /// Same storage as before (`kind: "composed"` in the tools registry); this is a
 /// clearer name and a separate list, not a migration.
@@ -3132,6 +3168,19 @@ fn exec_tool_cfg(
         // 90% one-shot (git/cargo/npm); shell_spawn/poll/kill drive long-lived
         // processes like `cargo tauri dev`. The daemon can't spawn — only the
         // exec broker does.
+        // SPARKS: a preview is a NO-OP on the backend (no file written) — it just
+        // validates and acks. The UI renders the html (from this call's input)
+        // inline in chat; the user saves it later via the spark_save command.
+        "spark_preview" => {
+            let slug = input.get("slug").and_then(|x| x.as_str()).unwrap_or("");
+            let title = input.get("title").and_then(|x| x.as_str()).unwrap_or("");
+            let html = input.get("html").and_then(|x| x.as_str()).unwrap_or("");
+            if slug.trim().is_empty() || html.trim().is_empty() {
+                ("spark_preview needs a slug and full html".to_string(), true)
+            } else {
+                (format!("Spark \"{}\" ({}) is previewing live in the chat. Ask the user for changes, or they can Save it to the library.", if title.is_empty() { slug } else { title }, slug), false)
+            }
+        }
         "shell_run" | "shell_spawn" | "shell_poll" | "shell_write" | "shell_kill" => {
             exec_shell_tool(agent_id, name, input)
         }
@@ -3238,6 +3287,22 @@ fn task_continue_tool() -> serde_json::Value {
     })
 }
 
+/// SPARKS: the preview tool. The agent calls it with the full self-contained
+/// html; the UI renders it inline in chat (sandboxed iframe) and offers a Save
+/// button. Iterating = call again with the same slug. The tool itself just
+/// validates + acks; the render + save happen client-side (spark_save command).
+fn spark_preview_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "spark_preview",
+        "description": "Render an interactive mini-app (a Spark) LIVE inline in the chat. Pass the FULL self-contained HTML. Call again with the same slug to iterate; the preview hot-swaps. The user saves it to their library when happy — you do not save it. Follow the SPARKS design rules (styled, not bare HTML; embed any data as a JS literal).",
+        "input_schema": { "type": "object", "properties": {
+            "slug": { "type": "string", "description": "short id, lowercase letters/digits/hyphens (stable across iterations)" },
+            "title": { "type": "string", "description": "human title shown on the card + in the library" },
+            "html": { "type": "string", "description": "the ENTIRE self-contained HTML document (inline CSS + JS; CDN libs allowed; data embedded as a JS literal)" }
+        }, "required": ["slug", "title", "html"] }
+    })
+}
+
 /// The JSON schema for a built-in tool by its agent-facing name.
 fn builtin_tool_schema(name: &str) -> Option<serde_json::Value> {
     match name {
@@ -3303,6 +3368,7 @@ fn agent_tools_for_full(
     if conn_ctx.is_some() {
         for schema in dashboard::tool_schemas() { tools.push(schema); }
         extra_instructions.push_str(dashboard::tool_instructions());
+        tools.push(spark_preview_tool());
         // SPARKS — the embedded skill (data, not a tool): teach every agent how
         // to build an interactive mini-app on request. No new capability; it's a
         // way of using the existing jailed write_file. The Sparks tab renders
@@ -3742,26 +3808,49 @@ fn mcp_remove_custom(app: tauri::AppHandle, key: String) -> Result<(), String> {
 }
 
 const SPARKS_INSTRUCTIONS: &str = "\n\n\
-SPARKS — interactive mini-apps you can build for the user. A \"Spark\" is a single \
-self-contained HTML file that renders live in the app's Sparks tab (a sandboxed panel \
-beside the chat). Build one when the user asks for something interactive, visual, or \
-reusable — a calculator, a chart of their data, a dashboard, a little tool, a game, a \
-formatted report they can poke at.\n\
-HOW TO BUILD ONE:\n\
-1. Pick a short slug (lowercase, letters/digits/hyphens), e.g. \"budget-planner\".\n\
-2. Write the app to `Sparks/<slug>/index.html` with write_file. It MUST be ONE \
-self-contained file: inline all CSS in <style> and all JS in <script>. You MAY load \
-libraries from a CDN (e.g. React, Chart.js, D3 via <script src=\"https://...\">).\n\
-3. DATA GOES IN AT BUILD TIME. The Spark runs sandboxed — it CANNOT call you, read \
-files, or reach this machine. If it needs the user's real data (their finances, a \
-file's contents, an API result, a computed table), gather it FIRST with your own tools, \
-then EMBED it directly in the HTML as a JavaScript literal, e.g. `const DATA = {...};`. \
-The Spark reads only from that embedded DATA — never from the network back to you.\n\
-4. Also write `Sparks/<slug>/spark.json` = {\"title\":\"Human Title\",\"description\":\"one line\",\"created\":<unix seconds>} so it shows nicely in the library.\n\
-5. Tell the user it's ready in the Sparks tab. To CHANGE a Spark, just rewrite its \
-index.html (same slug) — the panel reloads it.\n\
-Keep Sparks fully client-side and self-contained. Never put secrets or API keys in a \
-Spark — assume the user can view its source.";
+SPARKS \u{2014} interactive mini-apps you build RIGHT IN THE CHAT. A \"Spark\" is one \
+self-contained HTML page (a calculator, a chart of the user's data, a tool, a game, a \
+formatted report). Build one when the user asks for something interactive or visual.\n\
+HOW IT WORKS \u{2014} use the `spark_preview` tool (do NOT write files):\n\
+1. Call spark_preview with { slug (lowercase-hyphen), title, html }. The html renders \
+LIVE inline in this chat, in a sandbox. The user sees it immediately and can ask for \
+changes.\n\
+2. To ITERATE, call spark_preview again with the SAME slug and updated html \u{2014} the inline \
+preview hot-swaps. Keep refining with the user until they're happy.\n\
+3. The user clicks \"Save to Library\" on the preview when ready (you don't save it \u{2014} \
+they do). Saved Sparks live in the Sparks tab.\n\
+DATA GOES IN AT BUILD TIME. The Spark is sandboxed \u{2014} it CANNOT call you, read files, or \
+reach this machine. If it needs the user's real data, gather it FIRST with your tools, \
+then EMBED it in the html as a JS literal, e.g. `const DATA = {...};`. Never put secrets \
+in a Spark.\n\
+DESIGN \u{2014} THIS IS NOT OPTIONAL. Unless the user asks for a specific look, every Spark \
+MUST use AYGENT's clean aesthetic (NOT bare unstyled HTML). Start from this template and \
+build inside it:\n\
+<!doctype html><html><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><style>\
+:root{--bg:#fff;--surface:#fff;--text:#0a0a0a;--muted:#5c5c5c;--line:#e6e6e6;\
+--accent:#0a0a0a;--radius:14px;--radius-sm:8px;--pad:16px}\
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);\
+font:15px/1.5 -apple-system,system-ui,'SF Pro Text',sans-serif;padding:20px}\
+h1{font-size:20px;font-weight:800;margin:0 0 4px}.sub{color:var(--muted);font-size:13px;margin:0 0 16px}\
+.card{background:var(--surface);border:1.5px solid var(--line);border-radius:var(--radius);\
+padding:var(--pad);box-shadow:0 2px 8px rgba(0,0,0,.06),0 8px 24px rgba(0,0,0,.08);margin-bottom:12px}\
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}\
+.stat{font-size:28px;font-weight:800}.label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}\
+button{font:inherit;font-weight:600;padding:9px 16px;border-radius:var(--radius-sm);\
+border:1.5px solid var(--line);background:var(--accent);color:#fff;cursor:pointer}\
+button.secondary{background:var(--surface);color:var(--text)}\
+input,select{font:inherit;padding:9px 12px;border:1.5px solid var(--line);border-radius:var(--radius-sm);background:var(--bg);color:var(--text);width:100%}\
+label{display:block;font-size:13px;font-weight:600;margin:10px 0 4px}\
+table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}\
+th{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}\
+</style></head><body>\n\
+<h1>Title</h1><p class=\"sub\">one-line description</p>\n\
+<!-- build UI inside .card blocks; use .grid/.stat/.label for metrics, real inputs+buttons for tools -->\n\
+<script>const DATA={};/* your logic */</script></body></html>\n\
+Use real, styled controls (buttons, sliders, inputs), .card containers, and clear \
+hierarchy. For charts, load Chart.js from a CDN. Make it look designed, responsive, and \
+genuinely functional \u{2014} something the user would be pleased to see, not a bare form.";
 
 const AGENT_SYSTEM: &str = "You are AYGENT, a helpful, concise, friendly assistant running privately \
     on the user's own machine. You have TOOLS available but they are OPTIONAL — use a tool ONLY when \
@@ -5018,6 +5107,7 @@ pub fn run() {
             mcp_list, mcp_install_plan, mcp_enable, mcp_disable, mcp_verify, mcp_add_custom, mcp_remove_custom,
             capabilities_list, skills_list,
             sparks_list, sparks_read, sparks_delete,
+            spark_save,
             dashboard::dashboard_load, dashboard::dashboard_upsert_module,
             dashboard::dashboard_remove_module, dashboard::dashboard_arrange,
             dashboard::dashboard_undo,

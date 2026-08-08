@@ -32,6 +32,7 @@ export type ToolCard = {
   body?: string;        // expandable content: written file text, full command, fetched URL…
   id?: string;          // tool_use id — routes streaming deltas to this card
   rawArgs?: string;     // accumulating partial-JSON args while streaming
+  spark?: { slug: string; title: string; html: string }; // SPARKS: inline mini-app preview payload (rendered as a sandboxed iframe in Chat)
 };
 
 // LIVE tool-arg streaming (Mason 08-03): the args of an in-flight tool call
@@ -80,8 +81,14 @@ function capBody(s: string | undefined): string | undefined {
 
 // Build the one-line summary + expandable body for a tool call from its input.
 // This is what turns "shell run" into "$ cargo build --release" (Mason 08-03).
-export function describeToolUse(name: string, input: any): { summary: string; body?: string } {
+export function describeToolUse(name: string, input: any): { summary: string; body?: string; spark?: { slug: string; title: string; html: string } } {
   const inp = input ?? {};
+  if (name === "spark_preview") {
+    const slug = typeof inp.slug === "string" ? inp.slug : "spark";
+    const title = typeof inp.title === "string" && inp.title ? inp.title : slug;
+    const html = typeof inp.html === "string" ? inp.html : "";
+    return { summary: `\u26A1 ${title}`, spark: { slug, title, html } };
+  }
   switch (name) {
     case "shell_run": case "shell_spawn": {
       const cmd = [inp.program, ...(Array.isArray(inp.args) ? inp.args : [])].filter(Boolean).join(" ");
@@ -246,12 +253,12 @@ function upsertToolUse(cur: AgentSlot, m: any): void {
   const tools = cur.turn.liveTools;
   for (let i = tools.length - 1; i >= 0; i--) {
     if (tools[i].id === m.id && tools[i].running) {
-      cur.turn = { ...patchTool(cur.turn, i, { path: m.input?.path, summary: d.summary, body: d.body, rawArgs: undefined }), status: "running" };
+      cur.turn = { ...patchTool(cur.turn, i, { path: m.input?.path, summary: d.summary, body: d.body, spark: d.spark, rawArgs: undefined }), status: "running" };
       emit();
       return;
     }
   }
-  cur.turn = { ...appendTool(cur.turn, { id: m.id, name: m.name, path: m.input?.path, running: true, summary: d.summary, body: d.body }), status: "running" };
+  cur.turn = { ...appendTool(cur.turn, { id: m.id, name: m.name, path: m.input?.path, running: true, summary: d.summary, body: d.body, spark: d.spark }), status: "running" };
   emit();
 }
 
