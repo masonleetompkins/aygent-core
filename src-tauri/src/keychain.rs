@@ -1,50 +1,131 @@
-// AYGENT — Keychain (M0.3, Atlas C1).
+// AYGENT — Keychain (M0.3, Atlas C1) — VAULT EDITION (v1.0.1, Mason polish #1).
+//
 // API keys live in the macOS Keychain and NEVER cross into JS/WebView. The UI
-// only ever sees "key set ✓". The daemon fetches secrets from the Rust broker
-// at request time — but even the daemon never gets the raw key in Phase 0: the
-// Rust side makes the provider call and streams tokens back. Keys stay Rust-side.
+// only ever sees "key set ✓". Keys stay Rust-side.
+//
+// WHY A VAULT: macOS pins each keychain item to the creating binary's cdhash;
+// ad-hoc builds get a fresh cdhash every compile, so EVERY item re-prompts
+// after EVERY build ("Always Allow" updates the app ACL, not the partition
+// list). With ~10 separate items (providers + remote + connections) that was
+// 4–5 password prompts per launch and prompts mid-shell-run. One item = ONE
+// prompt per build; an in-memory cache makes it one prompt per PROCESS.
+// (The per-build prompt itself dies when we sign with a stable Developer ID.)
+//
+// Shape: a single generic-password item (SERVICE/"vault") holding a JSON map
+// { name: secret }. Legacy per-name items are migrated lazily: a get() that
+// misses the vault falls back to the old item, absorbs it into the vault, and
+// deletes the legacy entry — so each old secret prompts at most ONCE more.
 
 use keyring::Entry;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 const SERVICE: &str = "build.masonlee.aygent";
+const VAULT_USER: &str = "vault";
 
-/// Store a provider API key under `provider` (e.g. "anthropic"). Overwrites.
-pub fn set_key(provider: &str, key: &str) -> Result<(), String> {
-    let entry = Entry::new(SERVICE, provider).map_err(|e| e.to_string())?;
-    entry.set_password(key).map_err(|e| e.to_string())
+/// In-memory vault cache. None = not yet loaded from the keychain.
+static CACHE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+fn vault_entry() -> Result<Entry, String> {
+    Entry::new(SERVICE, VAULT_USER).map_err(|e| format!("keychain entry: {e}"))
 }
 
-/// Fetch a stored key (Rust-side only — used to make provider calls).
-/// Surfaces the RAW keyring error (NoEntry vs access/decrypt denied) so callers
-/// can distinguish "genuinely absent" from "present but this app identity can't
-/// read it" (a macOS Keychain ACL / code-signing-identity mismatch — common in
-/// unsigned `cargo tauri dev` builds).
-/// NOTE (2026-07-27): the intermittent "Attribute user is invalid: cannot be
-/// empty" + login-password prompt on `cargo tauri dev` is a macOS Keychain
-/// PARTITION-LIST issue, NOT our code. macOS pins each item to the creating
-/// binary's cdhash; every `cargo build` produces a fresh ad-hoc cdhash, so the
-/// partition check fails and the OS prompts. "Always Allow" only updates the
-/// application ACL, not the partition list, so it re-prompts next rebuild.
-/// Self-signing + set-generic-password-partition-list are dead ends (macOS
-/// rewrites the partition list on each authorization). The real fix is a real
-/// Apple Developer ID cert with a Team ID (needed for notarization anyway).
-/// Until then: click "Always Allow"/enter password once per rebuild. A retry
-/// loop here does NOT help (a partition-denied read just fails repeatedly).
+/// Load the vault into the cache (one keychain read per process). A missing
+/// vault item is an empty map, NOT an error. Access-denied errors surface so
+/// callers can distinguish "absent" from "locked out" (partition list).
+fn load_cache(guard: &mut Option<HashMap<String, String>>) -> Result<(), String> {
+    if guard.is_some() {
+        return Ok(());
+    }
+    let map = match vault_entry()?.get_password() {
+        Ok(json) => serde_json::from_str::<HashMap<String, String>>(&json)
+            .map_err(|e| format!("vault parse: {e}"))?,
+        Err(keyring::Error::NoEntry) => HashMap::new(),
+        Err(e) => return Err(format!("keychain get [{SERVICE}/{VAULT_USER}]: {e}")),
+    };
+    *guard = Some(map);
+    Ok(())
+}
+
+fn persist(map: &HashMap<String, String>) -> Result<(), String> {
+    let json = serde_json::to_string(map).map_err(|e| format!("vault encode: {e}"))?;
+    vault_entry()?
+        .set_password(&json)
+        .map_err(|e| format!("keychain set [{SERVICE}/{VAULT_USER}]: {e}"))
+}
+
+/// Store a secret under `provider` (e.g. "anthropic", "remote:meta"). Overwrites.
+pub fn set_key(provider: &str, key: &str) -> Result<(), String> {
+    let mut guard = CACHE.lock().map_err(|_| "vault lock poisoned".to_string())?;
+    load_cache(&mut guard)?;
+    let map = guard.as_mut().unwrap();
+    map.insert(provider.to_string(), key.to_string());
+    persist(map)
+}
+
+/// Fetch a stored secret (Rust-side only). Vault first; on miss, migrate any
+/// legacy per-name item into the vault (prompts once, then never again).
 pub fn get_key(provider: &str) -> Result<String, String> {
-    let entry = Entry::new(SERVICE, provider).map_err(|e| format!("keychain entry: {e}"))?;
-    entry.get_password().map_err(|e| format!("keychain get [{SERVICE}/{provider}]: {e}"))
+    let mut guard = CACHE.lock().map_err(|_| "vault lock poisoned".to_string())?;
+    load_cache(&mut guard)?;
+    let map = guard.as_mut().unwrap();
+    if let Some(v) = map.get(provider) {
+        return Ok(v.clone());
+    }
+    // Legacy migration: old builds stored one keychain item per name.
+    let legacy = Entry::new(SERVICE, provider).map_err(|e| format!("keychain entry: {e}"))?;
+    match legacy.get_password() {
+        Ok(secret) => {
+            map.insert(provider.to_string(), secret.clone());
+            let _ = persist(map); // best effort; the read still succeeds
+            let _ = legacy.delete_credential(); // absorbed — retire the old item
+            Ok(secret)
+        }
+        Err(e) => Err(format!("keychain get [{SERVICE}/{provider}]: {e}")),
+    }
 }
 
 /// Whether a key exists (safe for the UI — returns bool, never the secret).
 pub fn has_key(provider: &str) -> bool {
-    match Entry::new(SERVICE, provider) {
-        Ok(e) => e.get_password().is_ok(),
-        Err(_) => false,
-    }
+    get_key(provider).is_ok()
 }
 
-/// Delete a stored key.
+/// Delete a stored secret (vault + any lingering legacy item).
 pub fn delete_key(provider: &str) -> Result<(), String> {
-    let entry = Entry::new(SERVICE, provider).map_err(|e| e.to_string())?;
-    entry.delete_credential().map_err(|e| e.to_string())
+    let mut guard = CACHE.lock().map_err(|_| "vault lock poisoned".to_string())?;
+    load_cache(&mut guard)?;
+    let map = guard.as_mut().unwrap();
+    map.remove(provider);
+    persist(map)?;
+    if let Ok(legacy) = Entry::new(SERVICE, provider) {
+        let _ = legacy.delete_credential();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    // NOTE: these hit the real login keychain when run locally; they use a
+    // dedicated test name and clean up after themselves.
+    use super::*;
+
+    #[test]
+    fn vault_roundtrip_and_delete() {
+        let name = "test:vault-roundtrip";
+        set_key(name, "s3cret").expect("set");
+        assert_eq!(get_key(name).expect("get"), "s3cret");
+        assert!(has_key(name));
+        delete_key(name).expect("delete");
+        assert!(!has_key(name));
+    }
+
+    #[test]
+    fn cache_survives_multiple_reads() {
+        let name = "test:vault-cache";
+        set_key(name, "v1").unwrap();
+        for _ in 0..5 {
+            assert_eq!(get_key(name).unwrap(), "v1");
+        }
+        delete_key(name).unwrap();
+    }
 }

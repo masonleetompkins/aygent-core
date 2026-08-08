@@ -3,7 +3,7 @@
 // with the Settings screen; for now it reads/writes localStorage so the choice
 // survives reloads during dev.
 
-export type Mode = "light" | "dark";
+export type Mode = "light" | "dark" | "neutral" | "matrix";
 
 const LS_MODE = "aygent.theme.mode";
 const LS_ACCENT = "aygent.theme.accent"; // hex, or "" for default (black/white)
@@ -40,7 +40,8 @@ export function applyTheme(mode: Mode, accentHex: string) {
 }
 
 export function loadTheme(): { mode: Mode; accent: string } {
-  const mode = (localStorage.getItem(LS_MODE) as Mode) || "light";
+  const raw = localStorage.getItem(LS_MODE) as Mode | null;
+  const mode: Mode = (raw === "dark" || raw === "neutral" || raw === "matrix") ? raw : "light";
   const accent = localStorage.getItem(LS_ACCENT) || "";
   return { mode, accent };
 }

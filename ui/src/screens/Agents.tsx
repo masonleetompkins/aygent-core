@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Input, Pill } from "../components/ui";
 import type { AgentProfile } from "../components/AgentSwitcher";
@@ -51,6 +51,7 @@ export function Agents({
   onPickFolder,
   pendingFolder,
   onRosterChange,
+  onOpenChat,
 }: {
   activeId: string | null;
   onActiveChange: (a: AgentProfile) => void;
@@ -60,10 +61,104 @@ export function Agents({
   // shared refreshKey — this is what makes the AgentRail re-list immediately
   // instead of showing a deleted agent until restart.
   onRosterChange?: () => void;
+  // Open a chat window for this agent (activate it + jump to the Chat screen).
+  onOpenChat?: (a: AgentProfile) => void;
 }) {
   const [agents, setAgents] = useState<AgentProfile[]>([]);
   const [editing, setEditing] = useState<AgentProfile | null>(null);
   const [creating, setCreating] = useState(false);
+  // Pointer-drag reorder: the row being dragged (id) — while set, the list
+  // live-reorders as the pointer moves so the OTHER rows slide open to reveal
+  // the drop slot; release commits the order. HTML5 DnD gave no live gap and
+  // dropped onto inner children unreliably, so we drive it by pointer events.
+  const [dragId, setDragId] = useState<string | null>(null);
+  // DOM node per row, so pointermove can find which slot the pointer is over.
+  const rowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  // Latest order during a drag lives in a ref (pointermove mutates it without
+  // waiting for React state), then we setAgents to render + persist.
+  const orderRef = useRef<AgentProfile[]>([]);
+  useEffect(() => { orderRef.current = agents; }, [agents]);
+
+  // FLIP: when the list order changes, make each row SLIDE from its old spot to
+  // its new one instead of jumping (the rows that move aside to open the drop
+  // slot). We capture each row's top before paint, then invert+play. The row
+  // currently being dragged is skipped (it tracks the pointer / lifts).
+  const lastRowTops = useRef<Map<string, number>>(new Map());
+  useLayoutEffect(() => {
+    const tops = new Map<string, number>();
+    rowRefs.current.forEach((el, id) => { tops.set(id, el.getBoundingClientRect().top); });
+    tops.forEach((newTop, id) => {
+      if (id === dragId) return; // dragged row lifts, not FLIP-slid
+      const prev = lastRowTops.current.get(id);
+      const el = rowRefs.current.get(id);
+      if (prev == null || !el) return;
+      const dy = prev - newTop;
+      if (Math.abs(dy) < 1) return;
+      el.style.transition = "none";
+      el.style.transform = `translateY(${dy}px)`;
+      requestAnimationFrame(() => {
+        el.style.transition = "transform 180ms cubic-bezier(.2,.8,.2,1)";
+        el.style.transform = "";
+      });
+    });
+    lastRowTops.current = tops;
+  }, [agents, dragId]);
+
+  // Persist the current order to the backend + tell App so the rail re-lists
+  // (and FLIP-animates) into the same order.
+  async function persistOrder(next: AgentProfile[]) {
+    try {
+      await invoke("agents_reorder", { ids: next.map((a) => a.id) });
+      onRosterChange?.();
+    } catch { void refresh(); } // on failure snap back to the stored order
+  }
+
+  // Begin a drag on `id` (from the grip handle). We capture the pointer so all
+  // subsequent move/up events land here even if the cursor leaves the row.
+  function startDrag(id: string, e: React.PointerEvent) {
+    e.preventDefault();
+    setDragId(id);
+    (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+  }
+
+  // While dragging: find which row the pointer's Y is over and, if it's a
+  // different slot than the dragged row currently occupies, splice the dragged
+  // row into that slot NOW — so the other rows animate open around it.
+  function onDragMove(e: React.PointerEvent) {
+    if (!dragId) return;
+    const y = e.clientY;
+    const cur = orderRef.current;
+    const fromIdx = cur.findIndex((a) => a.id === dragId);
+    if (fromIdx < 0) return;
+    // Which row index is the pointer over? Compare against each row's midpoint.
+    let target = fromIdx;
+    for (let i = 0; i < cur.length; i++) {
+      const el = rowRefs.current.get(cur[i].id);
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      const mid = r.top + r.height / 2;
+      if (y < mid) { target = i; break; }
+      target = i + 1; // past the last midpoint => goes after this row
+    }
+    // Clamp + convert "insertion index" to a final position accounting for the
+    // removal of the dragged item.
+    let to = target;
+    if (to > fromIdx) to -= 1;
+    to = Math.max(0, Math.min(cur.length - 1, to));
+    if (to === fromIdx) return;
+    const next = [...cur];
+    const [moved] = next.splice(fromIdx, 1);
+    next.splice(to, 0, moved);
+    orderRef.current = next;
+    setAgents(next); // live reorder — rows slide to open the slot
+  }
+
+  // Release: commit the order that ended up in the ref.
+  function endDrag() {
+    if (!dragId) return;
+    setDragId(null);
+    void persistOrder(orderRef.current);
+  }
 
   async function refresh() {
     try {
@@ -123,25 +218,53 @@ export function Agents({
       )}
 
       {agents.map((a) => (
-        <Card key={a.id} style={{ flexDirection: "row", alignItems: "center", gap: 14 }}>
-          <div style={{
-            width: 44, height: 44, flexShrink: 0, color: "var(--accent)",
-            display: "flex", alignItems: "center", justifyContent: "center",
-          }}><Icon name={(a.icon as IconName) || "sparkles"} size={26} /></div>
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <span style={{ fontWeight: 700, fontSize: 16 }}>{a.name}</span>
+        <div
+          key={a.id}
+          ref={(el) => { if (el) rowRefs.current.set(a.id, el); else rowRefs.current.delete(a.id); }}
+          onPointerMove={onDragMove}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+          style={{
+            // The dragged row lifts (raised, slightly scaled, above siblings);
+            // the others get a smooth slide as the array reorders around them.
+            opacity: dragId === a.id ? 0.9 : 1,
+            // Only the dragged row gets an inline transform (lift). Non-dragged
+            // rows leave transform to the FLIP effect above (don't set it here,
+            // or it overrides the slide).
+            ...(dragId === a.id ? { transform: "scale(1.02)" } : {}),
+            boxShadow: dragId === a.id ? "var(--elevation)" : "none",
+            zIndex: dragId === a.id ? 2 : 1,
+            position: "relative",
+            borderRadius: "var(--radius-card)",
+            touchAction: "none",
+          }}
+        >
+          <Card style={{ flexDirection: "row", alignItems: "center", gap: 14 }}>
+            {/* drag handle — press + drag it to reorder (pointer-driven) */}
+            <div
+              title="Drag to reorder"
+              onPointerDown={(e) => startDrag(a.id, e)}
+              style={{ flexShrink: 0, color: "var(--text-faint)", cursor: dragId === a.id ? "grabbing" : "grab", fontSize: 18, lineHeight: 1, userSelect: "none", padding: "0 4px", touchAction: "none" }}
+            >⋮⋮</div>
+            <div style={{
+              width: 44, height: 44, flexShrink: 0, color: "var(--accent)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+            }}><Icon name={(a.icon as IconName) || "sparkles"} size={26} /></div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontWeight: 700, fontSize: 16 }}>{a.name}</span>
+              </div>
+              <div style={{ fontSize: 12, color: "var(--text-faint)", fontFamily: "ui-monospace, monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {a.folder_path || "no folder"} · {a.model || "auto"} · {a.provider || "anthropic"} · {a.context_mode}
+              </div>
             </div>
-            <div style={{ fontSize: 12, color: "var(--text-faint)", fontFamily: "ui-monospace, monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {a.folder_path || "no folder"} · {a.model || "auto"} · {a.provider || "anthropic"} · {a.context_mode}
+            <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+              <Button onClick={() => (onOpenChat ? onOpenChat(a) : activate(a))}>Open</Button>
+              <Button variant="secondary" onClick={() => setEditing(a)}>Edit</Button>
+              {agents.length > 1 && <Button variant="secondary" onClick={() => remove(a)}>Delete</Button>}
             </div>
-          </div>
-          <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-            <Button variant="secondary" onClick={() => { activate(a); }}>Open</Button>
-            <Button variant="secondary" onClick={() => setEditing(a)}>Edit</Button>
-            {agents.length > 1 && <Button variant="secondary" onClick={() => remove(a)}>Delete</Button>}
-          </div>
-        </Card>
+          </Card>
+        </div>
       ))}
     </div>
   );

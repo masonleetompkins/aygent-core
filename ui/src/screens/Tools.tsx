@@ -12,6 +12,7 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Input, Pill } from "../components/ui";
 import { AygentBrowser } from "../components/AygentBrowser";
+import { AygentHyperFrames } from "../components/AygentHyperFrames";
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 const faint = { ...hint, fontSize: 12, color: "var(--text-faint)" } as const;
@@ -29,16 +30,19 @@ type Skill = {
 };
 
 export function Tools({ folder, agentId }: { folder: string | null; agentId: string | null }) {
-  const [tab, setTab] = useState<"tools" | "skills">("tools");
+  // TOOLS tab: the capability inventory + AYGENT-branded tools (the browser).
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18, maxWidth: 760 }}>
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        <TabButton active={tab === "tools"} onClick={() => setTab("tools")}>Tools</TabButton>
-        <TabButton active={tab === "skills"} onClick={() => setTab("skills")}>Skills</TabButton>
-      </div>
-      {tab === "tools"
-        ? <ToolInventory folder={folder} agentId={agentId} />
-        : <SkillList folder={folder} agentId={agentId} />}
+      <ToolInventory folder={folder} agentId={agentId} />
+    </div>
+  );
+}
+
+export function Skills({ folder, agentId }: { folder: string | null; agentId: string | null }) {
+  // SKILLS tab: user-authored ways of working + AYGENT-branded skills (HyperFrames).
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 18, maxWidth: 760 }}>
+      <SkillList folder={folder} agentId={agentId} />
     </div>
   );
 }
@@ -64,6 +68,11 @@ function ToolInventory({ folder, agentId }: { folder: string | null; agentId: st
   const [caps, setCaps] = useState<Capability[]>([]);
   const [configuring, setConfiguring] = useState<Capability | null>(null);
   const [filter, setFilter] = useState<"all" | "built-in" | "connection" | "mcp">("all");
+  // POLISH #6 (Mason v1.0.1): connection tools are grouped per provider and
+  // COLLAPSED by default — they have no switches here (control lives in
+  // Connections), so a flat list was a wall of noise burying the rows a user
+  // can actually act on.
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
   const [msg, setMsg] = useState<string | null>(null);
 
   async function refresh() {
@@ -119,32 +128,65 @@ function ToolInventory({ folder, agentId }: { folder: string | null; agentId: st
       )}
 
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-        {shown.map((c) => (
-          <div key={c.id} style={{
-            display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", flexWrap: "wrap",
-            border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)",
-            opacity: c.enabled ? 1 : 0.55,
-          }}>
-            <code style={{ fontSize: 13, fontWeight: 700 }}>{c.name}</code>
-            <OriginBadge origin={c.origin} source={c.source} />
-            {c.access === "Write" && c.origin === "connection" && <Pill tone="danger">write</Pill>}
-            <span style={{ flex: 1 }} />
-            {c.has_config && (
-              <Button variant="secondary" onClick={() => setConfiguring(c)}>Configure</Button>
-            )}
-            {c.toggleable ? (
-              <Button variant={c.enabled ? "primary" : "secondary"} onClick={() => toggle(c)}>
-                {c.enabled ? "On" : "Off"}
-              </Button>
-            ) : (
-              <span style={faint}>{c.origin === "connection" ? "via connection" : "always on"}</span>
-            )}
-            <p style={{ ...faint, flexBasis: "100%", margin: 0 }}>{c.description}</p>
-          </div>
+        {/* Non-connection tools: flat, actionable rows first. */}
+        {shown.filter((c) => c.origin !== "connection").map((c) => (
+          <ToolRow key={c.id} c={c} onConfigure={() => setConfiguring(c)} onToggle={() => toggle(c)} />
         ))}
+
+        {/* Connection tools: one collapsible section per provider. */}
+        {filter !== "built-in" && filter !== "mcp" && (() => {
+          const groups = new Map<string, Capability[]>();
+          for (const c of shown.filter((x) => x.origin === "connection")) {
+            const key = c.source || "connection";
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key)!.push(c);
+          }
+          return [...groups.entries()].map(([source, tools]) => {
+            const open = !!openGroups[source];
+            return (
+              <div key={source} style={{
+                border: "var(--border-width) solid var(--line)",
+                borderRadius: "var(--radius-control)", overflow: "hidden",
+              }}>
+                <button
+                  onClick={() => setOpenGroups((g) => ({ ...g, [source]: !open }))}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 10, width: "100%",
+                    padding: "10px 12px", border: "none", background: "transparent",
+                    color: "var(--text)", cursor: "pointer", textAlign: "left",
+                  }}
+                >
+                  <span style={{ fontSize: 12, color: "var(--text-muted)", width: 12 }}>
+                    {open ? "▾" : "▸"}
+                  </span>
+                  <span style={{ fontSize: 13, fontWeight: 800, textTransform: "capitalize" }}>{source}</span>
+                  <Pill tone="muted">{tools.length} tools</Pill>
+                  <span style={{ flex: 1 }} />
+                  <span style={faint}>on/off per tool lives in Connections</span>
+                </button>
+                {open && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4, padding: "0 12px 10px" }}>
+                    {tools.map((c) => (
+                      <div key={c.id} style={{
+                        display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap",
+                        padding: "6px 0", borderTop: "var(--border-width) solid color-mix(in srgb, var(--line) 30%, transparent)",
+                        opacity: c.enabled ? 1 : 0.55,
+                      }}>
+                        <code style={{ fontSize: 12.5, fontWeight: 700 }}>{c.name}</code>
+                        {c.access === "Write" && <Pill tone="danger">write</Pill>}
+                        {!c.enabled && <Pill tone="muted">off</Pill>}
+                        <span style={{ ...faint, fontSize: 12 }}>{c.description}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          });
+        })()}
       </div>
 
-      {/* AYGENT-branded tools: the in-app browser install/enable flow. */}
+      {/* AYGENT-branded tools: the in-app browser (HyperFrames lives in Skills). */}
       <AygentBrowser />
 
       {configuring && (
@@ -152,6 +194,31 @@ function ToolInventory({ folder, agentId }: { folder: string | null; agentId: st
                     onClose={() => setConfiguring(null)} />
       )}
     </>
+  );
+}
+
+function ToolRow({ c, onConfigure, onToggle }: { c: Capability; onConfigure: () => void; onToggle: () => void }) {
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", flexWrap: "wrap",
+      border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)",
+      opacity: c.enabled ? 1 : 0.55,
+    }}>
+      <code style={{ fontSize: 13, fontWeight: 700 }}>{c.name}</code>
+      <OriginBadge origin={c.origin} source={c.source} />
+      <span style={{ flex: 1 }} />
+      {c.has_config && (
+        <Button variant="secondary" onClick={onConfigure}>Configure</Button>
+      )}
+      {c.toggleable ? (
+        <Button variant={c.enabled ? "primary" : "secondary"} onClick={onToggle}>
+          {c.enabled ? "On" : "Off"}
+        </Button>
+      ) : (
+        <span style={faint}>always on</span>
+      )}
+      <p style={{ ...faint, flexBasis: "100%", margin: 0 }}>{c.description}</p>
+    </div>
   );
 }
 
@@ -185,7 +252,12 @@ function SkillList({ folder, agentId }: { folder: string | null; agentId: string
   const [msg, setMsg] = useState<string | null>(null);
 
   async function refresh() {
-    try { setSkills(await invoke<Skill[]>("skills_list", { agentId, folder })); }
+    try {
+      const all = await invoke<Skill[]>("skills_list", { agentId, folder });
+      // The HyperFrames skill is MANAGED by its own card below (install/enable/
+      // remove) — hide it from the generic user-skill list so it isn't shown twice.
+      setSkills(all.filter((k) => k.id !== "skill.hyperframes"));
+    }
     catch (e) { setMsg("✗ " + String(e)); }
   }
   useEffect(() => { refresh(); /* eslint-disable-next-line */ }, [folder, agentId]);
@@ -217,22 +289,11 @@ function SkillList({ folder, agentId }: { folder: string | null; agentId: string
             it may use. No credentials, and it can't do anything the agent couldn't already do.
           </p>
         </div>
-        <Button onClick={newSkill}>+ New Skill</Button>
+        <Button onClick={newSkill} style={{ whiteSpace: "nowrap", flexShrink: 0 }}>+ New Skill</Button>
       </div>
 
       {!folder && <Pill tone="muted">Pick an Agent Folder in Settings to use skills.</Pill>}
       {msg && <Pill tone={msg.startsWith("✗") ? "danger" : "muted"}>{msg}</Pill>}
-
-      {skills.length === 0 && (
-        <Card title="No skills yet">
-          <p style={hint}>
-            Skills are for the things you explain more than once. "Draft my weekly update the way I
-            like it." "Summarize every new note into the index." Write it once, turn it on, stop
-            repeating yourself.
-          </p>
-          <div><Button onClick={newSkill}>Create your first skill</Button></div>
-        </Card>
-      )}
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
         {skills.map((s) => (
@@ -265,6 +326,9 @@ function SkillList({ folder, agentId }: { folder: string | null; agentId: string
           onSaved={async () => { setEditing(null); await refresh(); }}
         />
       )}
+
+      {/* AYGENT-branded skill: HyperFrames video/motion-graphics (one-click enable). */}
+      <AygentHyperFrames agentId={agentId} folder={folder} />
     </>
   );
 }

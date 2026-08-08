@@ -16,6 +16,8 @@ export function AygentBrowser() {
   const [pct, setPct] = useState<number | null>(null);      // 0..1 during download
   const [probe, setProbe] = useState<string | null>(null);  // reported chromium version
   const [err, setErr] = useState<string | null>(null);
+  const [removing, setRemoving] = useState(false);
+  const [confirmRemove, setConfirmRemove] = useState(false);
   const unlistenRef = useRef<null | (() => void)>(null);
 
   async function refresh() {
@@ -52,6 +54,21 @@ export function AygentBrowser() {
     }
   }
 
+  async function disable() {
+    setErr(null); setRemoving(true);
+    try {
+      await invoke("browser_uninstall");
+      setProbe(null); setPhase(null); setPct(null); setConfirmRemove(false);
+      await refresh();
+      // Tell the app shell to drop the sidebar Browser entry (mirror of enable).
+      window.dispatchEvent(new Event("aygent-browser-changed"));
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setRemoving(false);
+    }
+  }
+
   const busy = phase !== null && phase !== "done";
   const phaseLabel: Record<string, string> = {
     resolve: "Finding the latest build…",
@@ -69,12 +86,33 @@ export function AygentBrowser() {
         Nothing to install: click Enable and AYGENT downloads Chromium into its own space, just like a local model.
       </p>
       {status?.installed ? (
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <Pill tone="ok">installed ✓</Pill>
-          <span style={{ ...hint, fontFamily: "ui-monospace, monospace", fontSize: 12 }}>
-            Chromium {status.version} · {status.platform}
-          </span>
-          {probe && <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>launch OK — {probe}</span>}
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <Pill tone="ok">installed ✓</Pill>
+            <span style={{ ...hint, fontFamily: "ui-monospace, monospace", fontSize: 12 }}>
+              Chromium {status.version} · {status.platform}
+            </span>
+            {probe && <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>launch OK — {probe}</span>}
+            <span style={{ flex: 1 }} />
+            {!confirmRemove ? (
+              <Button variant="secondary" onClick={() => setConfirmRemove(true)} disabled={removing}>
+                Disable &amp; remove
+              </Button>
+            ) : (
+              <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontSize: 12.5, color: "var(--text-muted)" }}>Delete the downloaded Chromium?</span>
+                <Button variant="secondary" onClick={() => void disable()} disabled={removing}>
+                  {removing ? "Removing…" : "Yes, remove"}
+                </Button>
+                <Button variant="secondary" onClick={() => setConfirmRemove(false)} disabled={removing}>
+                  Cancel
+                </Button>
+              </span>
+            )}
+          </div>
+          <p style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>
+            Removing frees ~150MB and turns the browser off. You can re-enable it anytime.
+          </p>
         </div>
       ) : busy ? (
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>

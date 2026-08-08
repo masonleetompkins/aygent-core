@@ -230,6 +230,10 @@ fn handle_op(broker: &Arc<Broker>, v: &serde_json::Value) -> serde_json::Value {
         },
         "write" => {
             let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            // DIAG (Mason 08-06 "refused by jail on large writes / long replies
+            // vanish"): log every write's path + byte length so a refusal or a
+            // silent truncation is diagnosable from the terminal, not guessed.
+            eprintln!("[aygent][broker][write] agent={agent} path={path:?} bytes={}", content.len());
             // Ensure parent dirs exist (resolve validates the parent is in-scope
             // via the resolution logic before we create anything).
             if let Ok(real) = broker.resolve(agent, path, Mode::Write) {
@@ -237,17 +241,52 @@ fn handle_op(broker: &Arc<Broker>, v: &serde_json::Value) -> serde_json::Value {
                     let _ = std::fs::create_dir_all(parent);
                 }
             }
-            match broker.resolve_and_open(agent, path, Mode::Write) {
-                // ATOMIC (M0.2c): O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW — refuses to
-                // follow a symlink at the final component, in the open itself.
-                Ok(mut f) => {
-                    use std::io::Write as _;
-                    match f.write_all(content.as_bytes()) {
-                        Ok(_) => serde_json::json!({ "ok": true }),
-                        Err(e) => serde_json::json!({ "ok": false, "error": format!("io: {e}") }),
-                    }
-                }
-                Err(e) => refuse!(e),
+            // ATOMIC WRITE (Mason 08-06 — "long replies vanish / refused by jail
+            // on large writes"). Two failure modes killed the old direct
+            // O_TRUNC-then-write_all approach:
+            //   (1) a partial write_all (broken pipe / disk pressure on a big
+            //       buffer) left the file TRUNCATED — the reply "vanished".
+            //   (2) rewriting an existing file with nlink > 1 (APFS clone, an
+            //       editor safe-save, git object churn from Save Points) tripped
+            //       the hardlink guard → "refused by jail".
+            // Fix: write to a FRESH sibling temp path (always nlink == 1, so the
+            // guard never fires), fsync it, then rename OVER the target. rename
+            // is atomic and never truncates an aliased inode, so a failed write
+            // can't destroy prior content and a legit hardlinked file isn't
+            // falsely refused. Temp AND final paths resolve THROUGH THE BROKER,
+            // so the jail governs every byte.
+            let tmp_rel = format!("{path}.aygent-tmp-{}",
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos()).unwrap_or(0));
+            let write_result: Result<(), serde_json::Value> = (|| {
+                let mut f = broker.resolve_and_open(agent, &tmp_rel, Mode::Write).map_err(|e| {
+                    eprintln!("[aygent][broker][write] REFUSED tmp for {path:?}: {e:?}");
+                    refuse!(e)
+                })?;
+                use std::io::Write as _;
+                f.write_all(content.as_bytes()).and_then(|_| f.flush()).map_err(|e| {
+                    eprintln!("[aygent][broker][write] io error on {path:?}: {e}");
+                    if let Ok(t) = broker.resolve(agent, &tmp_rel, Mode::Write) { let _ = std::fs::remove_file(&t); }
+                    serde_json::json!({ "ok": false, "error": format!("io: {e}") })
+                })?;
+                let _ = f.sync_all();
+                drop(f);
+                let t = broker.resolve(agent, &tmp_rel, Mode::Write).map_err(|e| refuse!(e))?;
+                let d = broker.resolve(agent, path, Mode::Write).map_err(|e| {
+                    eprintln!("[aygent][broker][write] REFUSED dst {path:?}: {e:?}");
+                    let _ = std::fs::remove_file(&t);
+                    refuse!(e)
+                })?;
+                std::fs::rename(&t, &d).map_err(|e| {
+                    eprintln!("[aygent][broker][write] rename {path:?} failed: {e}");
+                    let _ = std::fs::remove_file(&t);
+                    serde_json::json!({ "ok": false, "error": format!("io: {e}") })
+                })?;
+                Ok(())
+            })();
+            match write_result {
+                Ok(()) => serde_json::json!({ "ok": true, "bytes": content.len() }),
+                Err(err_json) => err_json,
             }
         }
         "list" => match broker.resolve(agent, path, Mode::Read) {

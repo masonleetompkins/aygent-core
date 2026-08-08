@@ -26,6 +26,34 @@ fn base_url(provider: &str) -> &'static str {
     }
 }
 
+/// Does THIS model need OpenAI's `reasoning_effort: "none"` to allow function
+/// tools on /v1/chat/completions? ONLY true for OpenAI proper's reasoning
+/// family (o-series, gpt-5.x). It must NOT be sent to OpenRouter-hosted models
+/// (e.g. Grok, DeepSeek, Llama): their upstreams reject an unknown/invalid
+/// `reasoning_effort` value and OpenRouter forwards the 400 — the exact
+/// "Grok 4.5 errored the instant it had tools" bug. Keyed on the model id, not
+/// a blanket "tools present" flag, so a non-reasoning OpenAI model (gpt-4o) is
+/// also left untouched. Data-driven: adding a model = extend this list.
+/// Does the built message list contain any image part? Used to keep vision
+/// alive on reasoning models: `reasoning_effort:"none"` satisfies the function-
+/// tool requirement but can suppress the multimodal pipeline, so when an image
+/// is present we step up to "low" (still tool-compatible, vision intact).
+fn messages_have_image(msgs: &[serde_json::Value]) -> bool {
+    msgs.iter().any(|m| {
+        m.get("content").and_then(|c| c.as_array()).map(|blocks| {
+            blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("image_url"))
+        }).unwrap_or(false)
+    })
+}
+
+fn needs_reasoning_none(provider: &str, model: &str) -> bool {
+    if provider != "openai" { return false; }
+    let m = model.to_ascii_lowercase();
+    // o1/o3/o4 reasoning series, and the gpt-5 reasoning family.
+    m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
+        || m.starts_with("gpt-5") || m.contains("-o1") || m.contains("-o3")
+}
+
 /// OpenRouter likes these headers for attribution/ranking (optional but polite).
 fn apply_extra_headers(req: reqwest::RequestBuilder, provider: &str) -> reqwest::RequestBuilder {
     if provider == "openrouter" {
@@ -175,8 +203,19 @@ fn build_openai_messages(system: &str, messages: &serde_json::Value) -> Vec<serd
 
             if role == "assistant" {
                 // Assistant may carry tool_calls (already OpenAI-shaped from us) or text.
+                // BUG FIX (08-06): OpenAI REQUIRES an assistant message that has
+                // tool_calls to carry `content` as a STRING (or null) — never an
+                // array. If `content` arrived as an array (e.g. an assistant turn
+                // we round-tripped from a multimodal history), passing it verbatim
+                // 400s. Flatten it to text here so the tool-call turn is always
+                // well-shaped, regardless of what model produced the prior turn.
                 if let Some(tc) = m.get("tool_calls") {
-                    out.push(json!({ "role": "assistant", "content": m.get("content").cloned().unwrap_or(json!("")), "tool_calls": tc }));
+                    let c = m.get("content").cloned().unwrap_or(json!(""));
+                    let content_str = match &c {
+                        serde_json::Value::String(_) | serde_json::Value::Null => c,
+                        _ => json!(flatten_text(&c)),
+                    };
+                    out.push(json!({ "role": "assistant", "content": content_str, "tool_calls": tc }));
                 } else {
                     out.push(json!({ "role": "assistant", "content": flatten_text(&content) }));
                 }
@@ -238,15 +277,20 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
         "tools": tools_json,
         "stream": true,
     });
-    // BUG FIX (Mason 08-02): OpenAI's reasoning-family models (o-series, gpt-5.x
-    // "reasoning" variants) reject function tools on /v1/chat/completions unless
-    // reasoning_effort is explicitly "none" — 400 "Function tools with
-    // reasoning_effort are not supported ... use /v1/responses or set
-    // reasoning_effort to 'none'". We need tool-use for the agent loop, so set
-    // it whenever tools are present. Only OpenAI proper defines this param;
-    // OpenRouter passes it through fine but doesn't require it — harmless either way.
-    if !tools_json.as_array().map(|a| a.is_empty()).unwrap_or(true) {
-        body["reasoning_effort"] = json!("none");
+    // BUG FIX (Mason 08-02, refined 08-06): OpenAI's reasoning-family models
+    // (o-series, gpt-5.x) reject function tools on /v1/chat/completions unless
+    // reasoning_effort is "none". BUT this param is OpenAI-proper-only — sending
+    // it to OpenRouter-hosted models (Grok, DeepSeek, Llama) makes THEIR upstream
+    // 400 (the "Grok 4.5 errored the moment it had tools" report). So we gate it
+    // on the actual model via needs_reasoning_none(), not a blanket "tools present"
+    // flag — and only when tools are actually in play.
+    let has_tools = !tools_json.as_array().map(|a| a.is_empty()).unwrap_or(true);
+    if has_tools && needs_reasoning_none(provider, model) {
+        // "none" is the strict min for function tools; but if this turn carries
+        // an image, "none" can blind the model to it — step up to "low" so vision
+        // survives while tools still work (fixes GPT-5.6 Sol "reply but no screenshot").
+        let built = build_openai_messages(system, messages);
+        body["reasoning_effort"] = if messages_have_image(&built) { json!("low") } else { json!("none") };
     }
 
     // No-redirect client (see list_models): keeps the bearer token attached so

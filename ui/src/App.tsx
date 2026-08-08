@@ -9,7 +9,9 @@ import { Chat } from "./screens/Chat";
 import { Dashboard } from "./screens/Dashboard";
 import { Browser } from "./screens/Browser";
 import { SavePoints } from "./screens/SavePoints";
-import { Tools } from "./screens/Tools";
+import { Tools, Skills } from "./screens/Tools";
+import { Sparks } from "./screens/Sparks";
+import { McpConnections } from "./screens/McpConnections";
 import { applyAppIcon } from "./lib/appIcon";
 import { Scheduler } from "./screens/Scheduler";
 import { Connections } from "./screens/Connections";
@@ -246,6 +248,13 @@ export function App() {
               onPickFolder={pickFolder}
               pendingFolder={folder}
               onRosterChange={() => setRosterRefresh((n) => n + 1)}
+              onOpenChat={(a) => {
+                // Open a chat for this agent: make it active, then jump to Chat.
+                invoke<AgentProfile | null>("agents_set_active", { id: a.id })
+                  .then((u) => { onActiveChange(u ?? a); })
+                  .catch(() => onActiveChange(a))
+                  .finally(() => setScreen("chat"));
+              }}
             />
           )}
           {screen === "settings" && (
@@ -255,6 +264,9 @@ export function App() {
           {screen === "scheduler" && <Scheduler agentId={activeAgent?.id ?? null} />}
           {screen === "connections" && <Connections agentId={activeAgent?.id ?? null} />}
           {screen === "tools" && <Tools folder={folder} agentId={activeAgent?.id ?? null} />}
+          {screen === "skills" && <Skills folder={folder} agentId={activeAgent?.id ?? null} />}
+          {screen === "sparks" && <Sparks agentId={activeAgent?.id ?? null} onNavigate={(sc) => setScreen(sc as ScreenId)} />}
+          {screen === "mcp" && <McpConnections />}
           {screen === "browser" && <Browser />}
         </div>
       </div>

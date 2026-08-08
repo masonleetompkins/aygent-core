@@ -28,7 +28,7 @@ mod catalog;
 mod connections;
 mod connectors; // CONNECTOR REGISTRY: a provider is data (descriptor), not code.
 mod connector_exec; // One generic HTTP executor for every registry connector.
-mod savepoint;
+pub mod savepoint; // pub for examples/savepoint_diag
 mod context_docs;
 mod dashboard_data; // DASHBOARDS M3: pull-only data resolution (bindings/http/exec).
 mod dashboard; // DASHBOARDS: prompt-built, spec-driven, pull-only (never auto-runs a model).
@@ -58,6 +58,9 @@ mod local_tools;
 mod openai_provider;
 mod pdf_tool;
 mod provider;
+mod provision;
+mod mcp_client;
+mod mcp; // MCP manager: registry + catalog + agent-loop bridge + install/uninstall. // MCP client: spawn stdio JSON-RPC servers, discover + route their tools. // Level A: bundle portable node+ffmpeg+hyperframes into app-data (no system installs).
 mod supervisor;
 mod tools_registry;
 
@@ -593,6 +596,75 @@ fn reveal_in_finder(
 // pollutes the vault or gets swept into SAVE POINTs. Keyed per agent folder.
 
 use tauri::Manager;
+
+/// CACHE-BUST (Mason 08-08): WKWebView caches the frontend bundle on disk under
+/// the OS cache dir; on macOS it can serve STALE JS across app updates, so a new
+/// build appears to change nothing (this is what defeated the Sparks fixes). We
+/// stamp the app version into <cache>/frontend-version.txt and, whenever the
+/// running app's version differs from the stamp, delete the WebKit cache subtree
+/// ONCE and rewrite the stamp. Result: every new build loads fresh frontend code
+/// with zero manual steps. Best-effort + safe: only AYGENT's own WebKit cache is
+/// removed (never user files); any error is logged and ignored (a stale cache is
+/// a cosmetic nuisance, never a reason to fail boot).
+/// Read the content-hashed frontend bundle id from the embedded index.html so we
+/// can detect when the UI actually changed between builds (Vite hashes the asset
+/// filenames). Returns something like "index-Zcg7olRg.js"; None if unreadable.
+fn frontend_build_id(app: &tauri::AppHandle) -> Option<String> {
+    use tauri::Manager;
+    let res = app.path().resource_dir().ok()?;
+    // Tauri bundles frontendDist under the resource dir; index.html references
+    // the hashed asset. Try common layouts.
+    for candidate in ["index.html", "dist/index.html", "../ui/dist/index.html"] {
+        let p = res.join(candidate);
+        if let Ok(html) = std::fs::read_to_string(&p) {
+            // Grab the first hashed asset name (index-XXXX.js or .css).
+            if let Some(start) = html.find("index-") {
+                let tail = &html[start..];
+                let end = tail.find(|c: char| c == '"' || c == '\'' || c == '?').unwrap_or(tail.len());
+                let id = &tail[..end];
+                if id.len() > 6 { return Some(id.to_string()); }
+            }
+        }
+    }
+    None
+}
+
+fn bust_webview_cache_on_version_change(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    // Build id = the version + the content-hashed frontend bundle name (which
+    // Vite regenerates on every real UI change). Read it from the embedded
+    // index.html via the resource dir; fall back to just the version.
+    let version = app.package_info().version.to_string();
+    let build_id = frontend_build_id(app).unwrap_or_else(|| version.clone());
+    let Ok(cache_dir) = app.path().app_cache_dir() else {
+        eprintln!("[aygent][cache] no app cache dir — skipping cache-bust");
+        return;
+    };
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let stamp = cache_dir.join("frontend-version.txt");
+    let prev = std::fs::read_to_string(&stamp).unwrap_or_default();
+    if prev.trim() == build_id {
+        return; // frontend unchanged since last launch — nothing to do
+    }
+    eprintln!("[aygent][cache] frontend changed ({} -> {}), clearing WebKit cache", if prev.trim().is_empty() { "none" } else { prev.trim() }, build_id);
+    // WKWebView's on-disk cache lives in a `WebKit` subdir of the app cache dir.
+    let webkit = cache_dir.join("WebKit");
+    if webkit.is_dir() {
+        match std::fs::remove_dir_all(&webkit) {
+            Ok(_) => eprintln!("[aygent][cache] cleared {}", webkit.display()),
+            Err(e) => eprintln!("[aygent][cache] could not clear WebKit cache: {e}"),
+        }
+    }
+    // Also clear a generic Cache.db / Code Cache if present (belt + suspenders).
+    for name in ["Cache.db", "Cache.db-shm", "Cache.db-wal", "Code Cache", "GPUCache"] {
+        let p = cache_dir.join(name);
+        if p.is_dir() { let _ = std::fs::remove_dir_all(&p); }
+        else if p.is_file() { let _ = std::fs::remove_file(&p); }
+    }
+    if let Err(e) = std::fs::write(&stamp, &build_id) {
+        eprintln!("[aygent][cache] could not write version stamp: {e}");
+    }
+}
 
 /// Resolve the STATE DIR (created if missing) — where SQLite + JSON stores live.
 /// CONFIG RELOCATION (2026-07-31): this now routes through paths::state_dir,
@@ -1448,6 +1520,13 @@ fn agents_update(db: tauri::State<writer::Db>, broker: tauri::State<'_, Arc<Brok
     Ok(())
 }
 
+/// AGENT REORDER (Mason 2026-08-06): persist a new display order for the agents
+/// (Agents tab drag / the rail). `ids` is the full ordered list, top-first.
+#[tauri::command]
+fn agents_reorder(db: tauri::State<writer::Db>, ids: Vec<String>) -> Result<(), String> {
+    repo::reorder_agents(&db, ids)
+}
+
 /// DYNAMIC APP ICON: install a PNG (base64 from the UI's canvas render) as the
 /// running app's Dock icon. Called whenever the theme (light/dark + accent)
 /// changes, so the icon always matches the app's look.
@@ -2049,6 +2128,134 @@ fn capabilities_list(
     // 4. MCP — placeholder shape, deliberately empty until the client lands.
 
     Ok(serde_json::json!(items))
+}
+
+// --- SPARKS (interactive AI-built mini-apps) -------------------------------
+// A Spark is a SELF-CONTAINED mini-app the agent authors as a single
+// `Sparks/<slug>/index.html` inside the agent folder (jailed). It runs in a
+// SANDBOXED iframe (sandbox="allow-scripts", NO same-origin) in the Sparks tab
+// — so it can run its own JS + any data the agent EMBEDDED at build time, but
+// can NOT reach the file system, the network to this machine, or the agent.
+// The agent gives it data; the Spark never calls back. These commands are the
+// read/list/delete surface for the Sparks library; the agent BUILDS a Spark
+// with ordinary jailed write_file (taught by the built-in "sparks" skill).
+
+/// One Spark's metadata (from its spark.json, with sane fallbacks).
+fn spark_slug_ok(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 80
+        && slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// List every Spark in the agent folder: scans Sparks/<slug>/ for an index.html
+/// (+ optional spark.json for title/description/created). Jailed via the broker.
+#[tauri::command]
+fn sparks_list(broker: tauri::State<Arc<Broker>>, agent_id: String) -> Result<serde_json::Value, String> {
+    let dir = match broker.resolve(&agent_id, "Sparks", broker::Mode::Read) {
+        Ok(p) => p,
+        Err(_) => return Ok(serde_json::json!([])), // no Sparks/ yet → empty library
+    };
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir() { continue; }
+            let slug = e.file_name().to_string_lossy().to_string();
+            if !spark_slug_ok(&slug) { continue; }
+            if !p.join("index.html").is_file() { continue; }
+            // Optional manifest.
+            let (mut title, mut description, mut created) = (slug.clone(), String::new(), 0i64);
+            if let Ok(txt) = std::fs::read_to_string(p.join("spark.json")) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                    if let Some(t) = v.get("title").and_then(|x| x.as_str()) { title = t.to_string(); }
+                    if let Some(d) = v.get("description").and_then(|x| x.as_str()) { description = d.to_string(); }
+                    if let Some(c) = v.get("created").and_then(|x| x.as_i64()) { created = c; }
+                }
+            }
+            let modified = std::fs::metadata(p.join("index.html")).ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64).unwrap_or(0);
+            out.push(serde_json::json!({
+                "slug": slug, "title": title, "description": description,
+                "created": created, "modified": modified,
+            }));
+        }
+    }
+    // Newest activity first.
+    out.sort_by(|a, b| b.get("modified").and_then(|x| x.as_i64()).unwrap_or(0)
+        .cmp(&a.get("modified").and_then(|x| x.as_i64()).unwrap_or(0)));
+    Ok(serde_json::json!(out))
+}
+
+/// Read one Spark's index.html (jailed). Returned as a STRING the UI injects as
+/// an iframe srcdoc under sandbox="allow-scripts" (no same-origin) — the Spark
+/// runs isolated; it can never read this file path or reach the agent.
+#[tauri::command]
+fn sparks_read(broker: tauri::State<Arc<Broker>>, agent_id: String, slug: String) -> Result<serde_json::Value, String> {
+    if !spark_slug_ok(&slug) { return Err("invalid spark name".into()); }
+    let rel = format!("Sparks/{slug}/index.html");
+    let html = match broker.resolve_and_open(&agent_id, &rel, broker::Mode::Read) {
+        Ok(mut f) => { use std::io::Read; let mut s = String::new(); f.read_to_string(&mut s).map_err(|e| format!("read: {e}"))?; s }
+        Err(e) => return Err(format!("refused by jail: {e:?}")),
+    };
+    Ok(serde_json::json!({ "slug": slug, "html": html }))
+}
+
+/// Delete a Spark (its whole Sparks/<slug>/ folder). Jailed: resolves a sentinel
+/// inside the folder through the broker (Write) to prove it's in-scope, then
+/// removes the directory.
+#[tauri::command]
+fn sparks_delete(broker: tauri::State<Arc<Broker>>, agent_id: String, slug: String) -> Result<(), String> {
+    if !spark_slug_ok(&slug) { return Err("invalid spark name".into()); }
+    let sentinel = format!("Sparks/{slug}/index.html");
+    let abs = broker.resolve(&agent_id, &sentinel, broker::Mode::Write)
+        .map_err(|e| format!("refused by jail: {e:?}"))?;
+    let spark_dir = abs.parent().ok_or("could not resolve spark dir")?.to_path_buf();
+    // Paranoia: the resolved dir must actually be .../Sparks/<slug>.
+    if spark_dir.file_name().and_then(|n| n.to_str()) != Some(slug.as_str()) {
+        return Err("spark path mismatch".into());
+    }
+    if spark_dir.is_dir() {
+        std::fs::remove_dir_all(&spark_dir).map_err(|e| format!("delete: {e}"))?;
+    }
+    Ok(())
+}
+
+/// SAVE a Spark from the chat preview into the library: writes
+/// Sparks/<slug>/index.html + spark.json (jailed via the broker). Called by the
+/// inline preview card's "Save to Library" button.
+#[tauri::command]
+fn spark_save(
+    broker: tauri::State<Arc<Broker>>,
+    agent_id: String,
+    slug: String,
+    title: String,
+    html: String,
+    description: Option<String>,
+) -> Result<(), String> {
+    if !spark_slug_ok(&slug) { return Err("invalid spark name".into()); }
+    if html.trim().is_empty() { return Err("nothing to save".into()); }
+    // index.html
+    let html_rel = format!("Sparks/{slug}/index.html");
+    let html_abs = broker.resolve(&agent_id, &html_rel, broker::Mode::Write)
+        .map_err(|e| format!("refused by jail: {e:?}"))?;
+    if let Some(parent) = html_abs.parent() { std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?; }
+    std::fs::write(&html_abs, html.as_bytes()).map_err(|e| format!("write html: {e}"))?;
+    // spark.json manifest
+    let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64).unwrap_or(0);
+    let manifest = serde_json::json!({
+        "title": if title.trim().is_empty() { slug.clone() } else { title },
+        "description": description.unwrap_or_default(),
+        "created": created,
+    });
+    let man_rel = format!("Sparks/{slug}/spark.json");
+    let man_abs = broker.resolve(&agent_id, &man_rel, broker::Mode::Write)
+        .map_err(|e| format!("refused by jail: {e:?}"))?;
+    std::fs::write(&man_abs, serde_json::to_string_pretty(&manifest).unwrap_or_default())
+        .map_err(|e| format!("write manifest: {e}"))?;
+    Ok(())
 }
 
 /// SKILLS — saved procedures (instructions + an allowed subset of real tools).
@@ -2893,12 +3100,38 @@ fn exec_tool_cfg(
             if let Ok(real) = broker.resolve(agent_id, path, broker::Mode::Write) {
                 if let Some(parent) = real.parent() { let _ = std::fs::create_dir_all(parent); }
             }
-            match broker.resolve_and_open(agent_id, path, broker::Mode::Write) {
+            // ATOMIC WRITE (Mason 08-06): write to a fresh temp sibling (always
+            // nlink == 1 → the hardlink guard can't false-refuse), fsync, then
+            // rename OVER the target. A partial write can no longer truncate the
+            // real file ("long replies vanish"), and rewriting a legit
+            // hardlinked/cloned file no longer hits "refused by jail". Both temp
+            // and final paths resolve THROUGH THE BROKER, so the jail still
+            // governs every byte. Mirrors the broker_ws write handler.
+            let tmp_rel = format!("{path}.aygent-tmp-{}",
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos()).unwrap_or(0));
+            match broker.resolve_and_open(agent_id, &tmp_rel, broker::Mode::Write) {
                 Ok(mut f) => {
                     use std::io::Write as _;
-                    match f.write_all(cnt.as_bytes()) {
-                        Ok(_) => (format!("wrote {} bytes to {path}", cnt.len()), false),
-                        Err(e) => (format!("io error: {e}"), true),
+                    match f.write_all(cnt.as_bytes()).and_then(|_| f.flush()) {
+                        Ok(_) => {
+                            let _ = f.sync_all();
+                            drop(f);
+                            let t = broker.resolve(agent_id, &tmp_rel, broker::Mode::Write);
+                            let d = broker.resolve(agent_id, path, broker::Mode::Write);
+                            match (t, d) {
+                                (Ok(t), Ok(d)) => match std::fs::rename(&t, &d) {
+                                    Ok(_) => (format!("wrote {} bytes to {path}", cnt.len()), false),
+                                    Err(e) => { let _ = std::fs::remove_file(&t); (format!("io error: {e}"), true) }
+                                },
+                                (Ok(t), Err(e)) => { let _ = std::fs::remove_file(&t); (format!("refused by jail: {e:?}"), true) }
+                                (Err(e), _) => (format!("refused by jail: {e:?}"), true),
+                            }
+                        }
+                        Err(e) => {
+                            if let Ok(t) = broker.resolve(agent_id, &tmp_rel, broker::Mode::Write) { let _ = std::fs::remove_file(&t); }
+                            (format!("io error: {e}"), true)
+                        }
                     }
                 }
                 Err(e) => (format!("refused by jail: {e:?}"), true),
@@ -3004,6 +3237,19 @@ fn exec_tool_cfg(
         // 90% one-shot (git/cargo/npm); shell_spawn/poll/kill drive long-lived
         // processes like `cargo tauri dev`. The daemon can't spawn — only the
         // exec broker does.
+        // SPARKS: a preview is a NO-OP on the backend (no file written) — it just
+        // validates and acks. The UI renders the html (from this call's input)
+        // inline in chat; the user saves it later via the spark_save command.
+        "spark_preview" => {
+            let slug = input.get("slug").and_then(|x| x.as_str()).unwrap_or("");
+            let title = input.get("title").and_then(|x| x.as_str()).unwrap_or("");
+            let html = input.get("html").and_then(|x| x.as_str()).unwrap_or("");
+            if slug.trim().is_empty() || html.trim().is_empty() {
+                ("spark_preview needs a slug and full html".to_string(), true)
+            } else {
+                (format!("Spark \"{}\" ({}) is previewing live in the chat. Ask the user for changes, or they can Save it to the library.", if title.is_empty() { slug } else { title }, slug), false)
+            }
+        }
         "shell_run" | "shell_spawn" | "shell_poll" | "shell_write" | "shell_kill" => {
             exec_shell_tool(agent_id, name, input)
         }
@@ -3110,6 +3356,22 @@ fn task_continue_tool() -> serde_json::Value {
     })
 }
 
+/// SPARKS: the preview tool. The agent calls it with the full self-contained
+/// html; the UI renders it inline in chat (sandboxed iframe) and offers a Save
+/// button. Iterating = call again with the same slug. The tool itself just
+/// validates + acks; the render + save happen client-side (spark_save command).
+fn spark_preview_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "spark_preview",
+        "description": "Render an interactive mini-app (a Spark) LIVE inline in the chat. Pass ONLY the inner body markup using AYGENT's Spark classes (card/label/seg/row/stat/stepper/input-money/grid) plus a single <script> for logic — do NOT include <style>, fonts, or <html>/<head>/<body>; the design system is injected for you. Call again with the same slug to iterate (it hot-swaps). The user saves it to their library — you do not.",
+        "input_schema": { "type": "object", "properties": {
+            "slug": { "type": "string", "description": "short id, lowercase letters/digits/hyphens (stable across iterations)" },
+            "title": { "type": "string", "description": "human title shown on the card + in the library" },
+            "html": { "type": "string", "description": "the ENTIRE self-contained HTML document (inline CSS + JS; CDN libs allowed; data embedded as a JS literal)" }
+        }, "required": ["slug", "title", "html"] }
+    })
+}
+
 /// The JSON schema for a built-in tool by its agent-facing name.
 fn builtin_tool_schema(name: &str) -> Option<serde_json::Value> {
     match name {
@@ -3175,6 +3437,12 @@ fn agent_tools_for_full(
     if conn_ctx.is_some() {
         for schema in dashboard::tool_schemas() { tools.push(schema); }
         extra_instructions.push_str(dashboard::tool_instructions());
+        tools.push(spark_preview_tool());
+        // SPARKS — the embedded skill (data, not a tool): teach every agent how
+        // to build an interactive mini-app on request. No new capability; it's a
+        // way of using the existing jailed write_file. The Sparks tab renders
+        // what the agent writes, in a sandboxed iframe.
+        extra_instructions.push_str(SPARKS_INSTRUCTIONS);
     }
 
     // CONNECTION TOOLS, registry-driven. Every connected+enabled provider
@@ -3208,6 +3476,16 @@ fn agent_tools_for_full(
                 connected.join("\n- ")
             ));
         }
+    }
+
+    // MCP TOOLS: every enabled+running MCP server contributes its tools,
+    // namespaced mcp__<server>__<tool>. Start enabled servers first so their
+    // tool lists are known. App-wide (not folder-scoped).
+    {
+        mcp::ensure_enabled_running(app);
+        let (mcp_schemas, mcp_instr) = mcp::agent_tool_schemas(app);
+        for s in mcp_schemas { tools.push(s); }
+        extra_instructions.push_str(&mcp_instr);
     }
 
     // BROWSER TOOLS (Slice 4): if the in-app browser is installed AND this agent
@@ -3398,6 +3676,255 @@ fn pdf_config_for(app: &tauri::AppHandle, agent_id: Option<&str>, folder: Option
         serde_json::json!({})
     }
 }
+
+// ── HYPERFRAMES (in-app video/graphics skill; Level A provisioning) ──────────
+// One-click enable: AYGENT downloads a PORTABLE node + static ffmpeg + the
+// hyperframes npm package into its OWN app-data space (nothing touches the
+// system), then registers a Skill teaching the agent the render loop. The UI
+// narrates every step. Remove reclaims the disk. See provision.rs.
+
+/// The Skill id + the instructions the agent follows. Kept here so install can
+/// (re)write it against the CURRENT provisioned paths.
+const HYPERFRAMES_SKILL_ID: &str = "skill.hyperframes";
+
+fn upsert_hyperframes_skill(app: &tauri::AppHandle) -> Result<(), String> {
+    let ad = app_data(app)?;
+    let (path_env, hf_bin) = provision::hyperframes_invocation(app)
+        .ok_or("HyperFrames CLI not found after install")?;
+    let instructions = format!(
+        "You can create videos, animations, and motion graphics with HyperFrames — an          HTML-to-MP4 renderer. It is ALREADY installed inside AYGENT (portable Node + FFmpeg +          the hyperframes CLI); you do NOT install anything.
+
+         HOW TO INVOKE (Pro Mode shell): always prefix the provisioned toolchain PATH so the          right node/ffmpeg are used, then call the hyperframes binary directly. Run commands with          shell_run like:
+           program: \"bash\"
+           args: [\"-lc\", \"export PATH='{path_env}':$PATH && '{hf_bin}' <hyperframes args>\"]
+
+         PRODUCTION LOOP:
+         1. Plan the video: scenes, timing, assets. Confirm the brief with the user first.
+         2. Scaffold a project in the agent folder: `'{hf_bin}' init <name>` (creates an index.html             composition + project files under the agent folder).
+         3. Author the composition by editing index.html with write_file: a #stage div with             data-composition-id/data-width/data-height, `class=\"clip\"` elements with             data-start/data-duration/data-track-index for video/text/audio, and seekable             animation (GSAP timeline assigned to window.__timelines.<id>, or CSS/WAAPI).
+         4. Lint + preview: `'{hf_bin}' lint` then (optional) `'{hf_bin}' preview`.
+         5. Render to MP4: `'{hf_bin}' render` — the output lands in the project dir.
+
+         RULES: keep compositions deterministic (seekable animation, not wall-clock). Put all          media + output inside the agent folder. Report the final MP4 path when done. If a render          fails, read the hyperframes error (it names the offending clip/attribute) and fix the HTML.
+
+         Provisioned toolchain PATH: {path_env}
+         HyperFrames CLI: {hf_bin}"
+    );
+    let tool = tools_registry::ToolDef {
+        id: HYPERFRAMES_SKILL_ID.to_string(),
+        name: "hyperframes".to_string(),
+        display_name: "HyperFrames — video & motion graphics".to_string(),
+        description: "Create videos, animations, and motion graphics from HTML (installed in-app; renders to MP4).".to_string(),
+        kind: "composed".to_string(),
+        builtin: false,
+        instructions,
+        allowed_tools: vec![
+            "read_file".into(), "write_file".into(), "list_files".into(),
+            "shell_run".into(), "shell_spawn".into(), "shell_poll".into(),
+        ],
+    };
+    tools_registry::upsert_tool(&ad, tool)
+}
+
+/// Status of the HyperFrames feature: is it fully provisioned + where it lives.
+#[tauri::command]
+fn hyperframes_status(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let installed = provision::hyperframes_installed(&app);
+    let rt = provision::runtime_dir(&app).ok().map(|p| p.to_string_lossy().to_string());
+    Ok(serde_json::json!({ "installed": installed, "runtime_dir": rt }))
+}
+
+/// One-click ENABLE: provision node+ffmpeg+hyperframes (narrated on `channel`),
+/// register the Skill, AND turn it ON for the acting agent. Without that last
+/// step the skill exists in the registry but its per-agent toggle defaults OFF
+/// (composed skills default off), so the agent never receives it — the "enabled
+/// but not found" bug (Mason 08-06). Everything lands in AYGENT's app-data.
+#[tauri::command]
+async fn hyperframes_provision(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, writer::Db>,
+    channel: String,
+    agent_id: Option<String>,
+    folder: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let report = provision::hyperframes_install(&app, &channel).await?;
+    upsert_hyperframes_skill(&app)?;
+    // Enable the skill for the acting agent so the model actually gets it. Resolve
+    // the agent: explicit id → owner of `folder` → active agent.
+    let aid: String = agent_id.filter(|s| !s.trim().is_empty())
+        .or_else(|| folder.as_deref().and_then(|f| agent_for_folder(&db, f).ok()))
+        .or_else(|| repo::active_id(&db).ok())
+        .unwrap_or_default();
+    if !aid.is_empty() {
+        let ad = app_data(&app)?;
+        let scope = tools_registry::Scope::new(&aid, folder.as_deref());
+        tools_registry::set_enabled(&ad, &scope, HYPERFRAMES_SKILL_ID, true)?;
+    }
+    Ok(report)
+}
+
+/// DISABLE: remove the HyperFrames Skill + its files. `keep_toolchain=true`
+/// leaves the shared node/ffmpeg (for other features); false reclaims all disk.
+#[tauri::command]
+fn hyperframes_remove(app: tauri::AppHandle, keep_toolchain: Option<bool>) -> Result<serde_json::Value, String> {
+    let ad = app_data(&app)?;
+    let _ = tools_registry::delete_tool(&ad, HYPERFRAMES_SKILL_ID);
+    provision::hyperframes_uninstall(&app, keep_toolchain.unwrap_or(false))
+}
+
+// ── MCP servers (Connections) ────────────────────────────────────────────────
+
+/// List all MCP servers (built-in catalog merged with stored state + custom),
+/// annotated with whether each is currently running.
+#[tauri::command]
+fn mcp_list(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let out: Vec<serde_json::Value> = mcp::list(&app).into_iter().map(|c| {
+        serde_json::json!({
+            "key": c.key, "label": c.label, "command": c.command, "args": c.args,
+            "enabled": c.enabled, "builtin": c.builtin, "needs_node": c.needs_node, "needs_uv": c.needs_uv,
+            "setup_note": c.setup_note, "verify_tool": c.verify_tool,
+            "running": mcp_client::is_running(&c.key),
+            "tool_count": mcp_client::get(&c.key).map(|s| s.tools().len()).unwrap_or(0),
+        })
+    }).collect();
+    Ok(serde_json::json!(out))
+}
+
+/// The steps enabling a server will run (so the UI can narrate before doing it).
+#[tauri::command]
+fn mcp_install_plan(app: tauri::AppHandle, key: String) -> Result<serde_json::Value, String> {
+    let cfg = mcp::get_config(&app, &key).ok_or_else(|| format!("unknown MCP server `{key}`"))?;
+    let steps: Vec<serde_json::Value> = mcp::install_plan(&cfg).into_iter()
+        .map(|(label, program, args)| serde_json::json!({ "label": label, "cmd": format!("{program} {}", args.join(" ")) }))
+        .collect();
+    Ok(serde_json::json!({ "key": key, "label": cfg.label, "setup_note": cfg.setup_note, "steps": steps, "needs_node": cfg.needs_node }))
+}
+
+/// ENABLE an MCP server: ensure Node (if needed), run its install plan (narrated
+/// on `channel`), mark it enabled + persist, then start it (handshake). Returns
+/// the running tool count + the verify tool (if any) so the UI can prompt the
+/// user for the manual in-app step (e.g. Premiere's Start Bridge).
+#[tauri::command]
+async fn mcp_enable(app: tauri::AppHandle, channel: String, key: String) -> Result<serde_json::Value, String> {
+    use tauri::Emitter;
+    let mut cfg = mcp::get_config(&app, &key).ok_or_else(|| format!("unknown MCP server `{key}`"))?;
+    if cfg.needs_node {
+        let _ = app.emit(&channel, &serde_json::json!({ "phase": "node", "note": "Preparing the toolchain (Node)…" }));
+        crate::provision::ensure_node(&app, &channel).await?;
+    }
+    if cfg.needs_uv {
+        let _ = app.emit(&channel, &serde_json::json!({ "phase": "uv", "note": "Preparing the toolchain (uv + Python)…" }));
+        crate::provision::ensure_uv(&app, &channel).await?;
+    }
+    let plan = mcp::install_plan(&cfg);
+    if !plan.is_empty() {
+        mcp::run_plan(&app, &channel, &plan).await?;
+    }
+    cfg.enabled = true;
+    mcp::upsert(&app, cfg.clone())?;
+    let _ = app.emit(&channel, &serde_json::json!({ "phase": "starting", "note": "Starting the server…" }));
+    let server = mcp::start_server(&app, &key)?;
+    let _ = app.emit(&channel, &serde_json::json!({ "phase": "done", "note": "Connected." }));
+    Ok(serde_json::json!({
+        "enabled": true, "running": true, "tool_count": server.tools().len(),
+        "verify_tool": cfg.verify_tool, "setup_note": cfg.setup_note,
+    }))
+}
+
+/// DISABLE an MCP server: stop it, mark disabled. `uninstall=true` also runs the
+/// uninstall plan (npm remove etc.) so nothing is left on the machine.
+#[tauri::command]
+async fn mcp_disable(app: tauri::AppHandle, channel: Option<String>, key: String, uninstall: Option<bool>) -> Result<serde_json::Value, String> {
+    mcp_client::stop(&key);
+    let mut cfg = mcp::get_config(&app, &key).ok_or_else(|| format!("unknown MCP server `{key}`"))?;
+    cfg.enabled = false;
+    mcp::upsert(&app, cfg.clone())?;
+    let mut report = serde_json::json!({ "disabled": true });
+    if uninstall.unwrap_or(false) {
+        let plan = mcp::uninstall_plan(&cfg);
+        if !plan.is_empty() {
+            let ch = channel.unwrap_or_default();
+            let r = mcp::run_plan(&app, &ch, &plan).await?;
+            report["uninstalled"] = serde_json::json!(r);
+        }
+        // Python (uv) servers: reclaim the provisioned uv toolchain + managed
+        // Python + package cache. (Shared across uv servers — fine today since
+        // Blender is the only one; revisit if we add a second uv server.)
+        if cfg.needs_uv {
+            let _ = crate::provision::uv_uninstall(&app);
+            report["uv_removed"] = serde_json::json!(true);
+        }
+    }
+    Ok(report)
+}
+
+/// Verify a running server via its declared read-only verify tool.
+#[tauri::command]
+fn mcp_verify(app: tauri::AppHandle, key: String) -> Result<String, String> {
+    mcp::verify(&app, &key)
+}
+
+/// Add a user MCP server from the web (command + args + env pairs).
+#[tauri::command]
+fn mcp_add_custom(app: tauri::AppHandle, label: String, command: String, args: Vec<String>, env: Vec<(String, String)>, needs_node: Option<bool>) -> Result<String, String> {
+    mcp::add_custom(&app, &label, &command, args, env, needs_node.unwrap_or(true))
+}
+
+/// Remove a user-added MCP server (built-ins can only be disabled).
+#[tauri::command]
+fn mcp_remove_custom(app: tauri::AppHandle, key: String) -> Result<(), String> {
+    mcp::remove_custom(&app, &key)
+}
+
+const SPARKS_INSTRUCTIONS: &str = "\n\n\
+SPARKS \u{2014} interactive mini-apps you build RIGHT IN THE CHAT with the `spark_preview` \
+tool. A Spark is a small self-contained web app (calculator, chart, tool, game).\n\
+\n\
+BEFORE YOU BUILD, PLAN THE UI (do this every time, silently):\n\
+1. What is the ONE main thing the user does here? Make that the biggest, most obvious \
+control.\n\
+2. What is the ONE main result they want? Show it LARGE and live-updating (a .stat).\n\
+3. Choose the simplest control for each input (see the recipe below). Group everything \
+into ONE .card. Order it top-to-bottom the way a person actually uses it: inputs first, \
+result last and prominent.\n\
+Aim for something that looks like a polished little iOS-style utility \u{2014} generous \
+spacing, one clear primary result, no wall of tiny text.\n\
+\n\
+STYLING IS HANDLED FOR YOU \u{2014} do NOT write <style>, fonts, colors, or <html>/<head>/<body>. \
+Write ONLY the inner body markup with these classes; AYGENT injects the full design system \
+(system font, dark mode, styled controls). Any <style> you write is STRIPPED, so styling \
+it yourself is wasted effort.\n\
+\n\
+LAYOUT RECIPE (compose from these \u{2014} they are pre-styled):\n\
+- Shell: <h1>Name</h1><p class=\"sub\">one line</p> then ONE <div class=\"card\">\u{2026}</div>.\n\
+- A field: <label>Bill amount</label> then its control.\n\
+- Money input: <div class=\"input-money\"><span>$</span><input id=\"bill\" type=\"number\" inputmode=\"decimal\" placeholder=\"0.00\"></div>.\n\
+- A pick-one set (tip %, options): <div class=\"seg\"><button>10%</button><button class=\"active\">15%</button><button>20%</button></div> \u{2014} exactly ONE has class active; in JS, on click move the active class and recompute.\n\
+- A count (+/\u{2212}): <div class=\"stepper\"><button>\u{2212}</button><span class=\"val\" id=\"n\">1</span><button>+</button></div>.\n\
+- A big live result: <div class=\"stat\" id=\"total\">$0.00</div> \u{2014} use this for the primary output.\n\
+- Secondary results: <div class=\"row\"><span class=\"k\">Per person</span><span class=\"v\" id=\"pp\">$0.00</span></div> (label left, value right \u{2014} NEVER put label and value adjacent in plain text).\n\
+- Side-by-side metrics: <div class=\"grid\">\u{2026}</div>. Tables: plain <table>.\n\
+Put ALL logic in one <script> at the end: read inputs, wire addEventListener, update result \
+elements by id, and compute on every change so the result is always live.\n\
+\n\
+EXAMPLE \u{2014} a tip calculator's body (follow this shape, adapt the fields):\n\
+<h1>Tip Calculator</h1><p class=\"sub\">Split the bill, no mental math.</p>\
+<div class=\"card\">\
+<label>Bill amount</label><div class=\"input-money\"><span>$</span><input id=\"bill\" type=\"number\" inputmode=\"decimal\" placeholder=\"0.00\"></div>\
+<label>Tip</label><div class=\"seg\"><button>10%</button><button class=\"active\">15%</button><button>20%</button></div>\
+<label>Split between</label><div class=\"stepper\"><button id=\"dec\">\u{2212}</button><span class=\"val\" id=\"n\">1</span><button id=\"inc\">+</button></div>\
+<div class=\"stat\" id=\"total\" style=\"margin-top:14px\">$0.00</div>\
+<div class=\"row\"><span class=\"k\">Tip</span><span class=\"v\" id=\"tip\">$0.00</span></div>\
+<div class=\"row\"><span class=\"k\">Per person</span><span class=\"v\" id=\"pp\">$0.00</span></div>\
+</div><script>/* wire it up: recompute on input + seg/stepper clicks */</script>\n\
+\n\
+DATA AT BUILD TIME: the Spark is sandboxed \u{2014} it CANNOT call you or read files. If it needs \
+the user's real data, gather it FIRST with your tools, then embed it in the <script> as a \
+JS literal (const DATA = {\u{2026}}). Never put secrets in a Spark.\n\
+\n\
+FLOW: call spark_preview({slug, title, html}) \u{2014} it renders live inline in chat. Iterate by \
+calling again with the SAME slug (it hot-swaps). The user clicks Save to Library when happy. \
+For charts, add <script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script> before your script.";
 
 const AGENT_SYSTEM: &str = "You are AYGENT, a helpful, concise, friendly assistant running privately \
     on the user's own machine. You have TOOLS available but they are OPTIONAL — use a tool ONLY when \
@@ -3756,6 +4283,8 @@ async fn agent_stream(
                                 }
                             }
                         }
+                    } else if mcp::is_mcp_tool(&name) {
+                        mcp::exec(&name, &input)
                     } else if dashboard::is_dashboard_tool(&name) {
                         dashboard::exec_dashboard_tool(&db, &scope_id, &name, &input)
                     } else {
@@ -3839,7 +4368,10 @@ async fn agent_stream(
         if let Ok(root) = broker.root_for(&scope_id) {
             match savepoint::snapshot(&root, &prompt) {
                 Ok(Some(sha)) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("SAVE POINT {sha}") }); }
-                _ => {}
+                Ok(None) => {}
+                // NEVER swallow snapshot failures (v1.0.1 polish #3: nested-repo
+                // errors killed save points silently for days).
+                Err(e) => { let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("\u{26A0} save point failed: {e}") }); }
             }
         }
         run_auto_capture(&app, &db, &broker, &scope_id, &prompt, &channel).await;
@@ -4002,6 +4534,8 @@ async fn agent_stream(
                                 }
                             }
                         }
+                    } else if mcp::is_mcp_tool(&name) {
+                        mcp::exec(&name, &input)
                     } else if dashboard::is_dashboard_tool(&name) {
                         dashboard::exec_dashboard_tool(&db, &scope_id, &name, &input)
                     } else {
@@ -4422,6 +4956,8 @@ pub async fn run_headless_turn(
                                     Ok(mailbox::SendResult::Refused { reason }) => (format!("not sent: {reason}"), true),
                                     Err(e) => (format!("send failed: {e}"), true),
                                 }
+                            } else if mcp::is_mcp_tool(&name) {
+                                mcp::exec(&name, &input)
                             } else if dashboard::is_dashboard_tool(&name) {
                                 dashboard::exec_dashboard_tool(db, agent_id, &name, &input)
                             } else {
@@ -4442,12 +4978,34 @@ pub async fn run_headless_turn(
     } else if provider_kind == "openai" || provider_kind == "openrouter" {
         let key = keychain::get_key(&provider_kind).map_err(|_| format!("recipient has no {provider_kind} key"))?;
         if agent.model.trim().is_empty() { return Err("recipient has no model set".into()); }
-        // Non-streaming completion (streaming tool-loop parity is a fast-follow).
-        // Emit a visible "working" line so the pane isn't blank while it runs.
+        // STREAMING (Mason 08-06): stream token-by-token so AYGENT Remote shows
+        // partial text as it arrives (was a single delta on completion — the
+        // whole reply popped in at once over the tunnel). Emits real TextDelta
+        // events on the stream channel, exactly like the Anthropic headless path.
         let _ = app.emit(&stream_channel, &provider::StreamEvent::Info { text: "thinking…".into() });
-        reply_text = openai_provider::complete(&provider_kind, &key, &agent.model, &framed).await.unwrap_or_default();
-        // Emit the completed text as one delta so the pane shows it live.
-        let _ = app.emit(&stream_channel, &provider::StreamEvent::TextDelta { text: reply_text.clone() });
+        let msgs = serde_json::json!([{ "role": "user", "content": framed }]);
+        let no_tools = serde_json::json!([]);
+        match openai_provider::openai_stream_turn(
+            &provider_kind, &key, &agent.model, &system, &msgs, &no_tools, Some(&hl_cancel_flag),
+            |ev| {
+                // Accumulate the assistant text AND forward the live event so the
+                // remote/inbox pane streams it.
+                if let provider::StreamEvent::TextDelta { text } = &ev { reply_text.push_str(text); }
+                let _ = app.emit(&stream_channel, &ev);
+            },
+        ).await {
+            Ok((assistant, _stop)) => {
+                // If the stream produced no TextDelta (some models only fill the
+                // final message content), fall back to the assembled content.
+                if reply_text.trim().is_empty() {
+                    if let Some(c) = assistant.get("content").and_then(|c| c.as_str()) {
+                        reply_text = c.to_string();
+                        let _ = app.emit(&stream_channel, &provider::StreamEvent::TextDelta { text: reply_text.clone() });
+                    }
+                }
+            }
+            Err(e) => { reply_text = format!("(couldn't complete the reply: {e})"); }
+        }
     } else {
         reply_text = format!("({} runs a local model — headless inter-agent turns use a cloud provider for now.)", agent.name);
     }
@@ -4607,22 +5165,23 @@ pub fn run() {
             get_selection, set_selection, detect_hardware, local_catalog, local_downloaded,
             local_download, local_delete, local_tool_capability, restore_agent_folder,
             browser::browser_status, browser::browser_install, browser::browser_launch_probe,
-            browser::browser_navigate, browser::browser_shutdown, browser::browser_start_view,
+            browser::browser_navigate, browser::browser_shutdown, browser::browser_uninstall, browser::browser_start_view, browser::browser_set_viewport,
             browser::browser_click, browser::browser_scroll, browser::browser_type, browser::browser_key,
             browser_policy_get, browser_policy_set,
             browser::browser_control_status, browser::browser_take_wheel, browser::browser_release_wheel,
             set_active_agent_marker,
-            browser::webview_open, browser::webview_set_bounds, browser::webview_hide,
-            browser::webview_hide_others, browser::webview_history, browser::browser_downloads_list,
+            browser::browser_history_nav, browser::browser_page_info, browser::browser_downloads_list,
             browser::browser_history_list, browser::browser_history_clear,
             browser::browser_download_url,
-            browser::webview_navigate, browser::webview_close, browser::webview_agent_act,
-            browser::webview_page_info,
-            browser::set_active_browser_tab, browser::browser_permission_answer,
+                        browser::set_active_browser_tab, browser::browser_permission_answer,
             browser::set_browser_hittest, browser::browser_engine_info,
             openai_models, tools_list, tools_upsert, tools_delete, tools_set_enabled,
             tools_config, tools_set_config,
+            hyperframes_status, hyperframes_provision, hyperframes_remove,
+            mcp_list, mcp_install_plan, mcp_enable, mcp_disable, mcp_verify, mcp_add_custom, mcp_remove_custom,
             capabilities_list, skills_list,
+            sparks_list, sparks_read, sparks_delete,
+            spark_save,
             dashboard::dashboard_load, dashboard::dashboard_upsert_module,
             dashboard::dashboard_remove_module, dashboard::dashboard_arrange,
             dashboard::dashboard_undo,
@@ -4633,7 +5192,7 @@ pub fn run() {
             savepoint_undo, savepoint_redo,
             savepoint_get_retention, savepoint_set_retention, savepoint_purge,
             conv_list, conv_load, conv_save, conv_rename, conv_delete, conv_reorder,
-            agents_list, agents_create, agents_update, agents_delete,
+            agents_list, agents_create, agents_update, agents_reorder, agents_delete,
             agents_set_active, agents_get_active, agents_sharing_folder,
             agent_mounts_list, agent_mount_add, agent_mount_remove,
             set_app_icon,
@@ -4659,6 +5218,11 @@ pub fn run() {
             onboarding_make_agent_home, onboarding_finish, import_memory
         ])
         .setup(move |_app| {
+            // CACHE-BUST FIRST (Mason 08-08): if this is a new build, clear the
+            // stale WKWebView frontend cache before the window loads, so the new
+            // UI code actually runs. Must happen before any content load.
+            bust_webview_cache_on_version_change(&_app.handle());
+
             // ENGINE-CEF (Phase 1): CEF was ALREADY initialized at the top of
             // run() (init_early), BEFORE tauri::Builder — CefInitialize must run
             // before NSApp's run loop starts, so it CANNOT go here (setup fires
@@ -4812,6 +5376,7 @@ pub fn run() {
             // never wired (found in the 08 warning sweep). No-op if CEF never
             // initialized (CEF_READY guard).
             tauri::RunEvent::Exit => {
+                mcp_client::stop_all();
                 #[cfg(all(target_os = "macos", feature = "engine-cef"))]
                 cef_engine::shutdown_engine();
             }

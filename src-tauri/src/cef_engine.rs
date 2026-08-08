@@ -207,6 +207,14 @@ pub fn init_early() -> bool {
         multi_threaded_message_loop: 0,
         external_message_pump: 1,
         remote_debugging_port: port as _,
+        // POLISH #4a (Mason v1.0.1): without an explicit UA, CEF's default
+        // carries a CEF product token that big sites (Google) classify as a
+        // non-standard browser — they serve the degraded "basic HTML"
+        // experience, which looks nothing like Chrome. Present the canonical
+        // desktop Chrome UA for our engine's major version (151.x).
+        user_agent: CefString::from(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+        ),
         browser_subprocess_path: s(&helper),
         framework_dir_path: s(&fw_dir),
         main_bundle_path: s(&main_bundle),

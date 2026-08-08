@@ -122,7 +122,19 @@ fn stage_all(repo: &Repository) -> Result<git2::Oid, String> {
     // the SHADOW repo but point its work-tree at the user's folder, so the user's
     // .gitignore at the folder root is read. This keeps Save Points lean + fast
     // and makes self-hosted builds viable. Source files still snapshot normally.
+    let workdir = repo.workdir().map(|p| p.to_path_buf());
     let mut filter = |path: &Path, _matched: &[u8]| -> i32 {
+        // NESTED GIT REPOS (v1.0.1 polish #3 — the silent Save Point killer):
+        // a directory containing .git cannot be staged as a plain path;
+        // add_all errors "invalid path: '<dir>/'" and the WHOLE snapshot
+        // fails — silently, because call sites ignore the Result. Any folder
+        // with an agent-cloned repo (AYGENT-Stage/, masonleebuild/) lost ALL
+        // save points. Skip nested repos — they have their own history.
+        if let Some(ref wd) = workdir {
+            if wd.join(path).join(".git").exists() {
+                return 1;
+            }
+        }
         let p = path.to_string_lossy();
         if p.starts_with(".aygent/") || p == ".aygent" { return 1; }
         // Honor .gitignore. status_should_ignore returns Ok(true) => ignored.

@@ -72,10 +72,26 @@ export function Dashboard({
     if (!agentId || building) return;
     const ch = `dash-${agentId}-${Date.now()}`;
     setChannel(ch);
-    void runTurn({
-      agentId, channel: ch, prompt: text,
-      model: null, provider: null, folder: folder ?? null, sessionId: "",
-    })
+    // POLISH #5 (Mason v1.0.1): passing provider/model as null routed EVERY
+    // dashboard build to the Anthropic default path, ignoring the agent's
+    // actual selection — agents on OpenAI/OpenRouter/local errored (“weird
+    // error” in the prompt bar). Resolve the real selection first, exactly
+    // like the Chat pane does.
+    void (async () => {
+      let provider: string | null = null;
+      let model: string | null = null;
+      try {
+        if (folder) {
+          const s = await invoke<{ provider: string; model: string }>("get_selection", { folder });
+          provider = s.provider || null;
+          model = s.model || null;
+        }
+      } catch { /* fall through to defaults */ }
+      return runTurn({
+        agentId, channel: ch, prompt: text,
+        model, provider, folder: folder ?? null, sessionId: "",
+      });
+    })()
       .catch((e) => setNote(String(e)))
       .finally(() => { setChannel(null); load(); });
   }

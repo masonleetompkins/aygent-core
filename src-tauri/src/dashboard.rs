@@ -121,6 +121,7 @@ impl DataSource {
     /// Short human name for error/assertion messages. (Restored: the fd50bcb
     /// warning sweep removed it as dead code while a test still used it —
     /// "unused" must mean unused by tests too.)
+    #[allow(dead_code)] // enum accessor; kept for completeness
     pub fn label(&self) -> &'static str {
         match self {
             DataSource::Static { .. } => "static",

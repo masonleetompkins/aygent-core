@@ -1,9 +1,10 @@
 // AYGENT sidebar nav (icon + label). SF-Symbol-style line glyphs (no emoji).
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { Icon, type IconName } from "./Icon";
 
 export type ScreenId =
-  | "dashboard" | "chat" | "browser" | "agents" | "tools" | "settings" | "scheduler" | "connections" | "savepoints";
+  | "dashboard" | "chat" | "browser" | "agents" | "tools" | "skills" | "sparks" | "mcp" | "settings" | "scheduler" | "connections" | "savepoints";
 
 export type NavGroup = "agent" | "global";
 export interface NavItem { id: ScreenId; label: string; icon: IconName; enabled: boolean; group: NavGroup; }
@@ -19,11 +20,14 @@ export const NAV: NavItem[] = [
   { id: "dashboard", label: "Dashboard", icon: "chart", enabled: true, group: "agent" },
   { id: "chat", label: "Chat", icon: "chat", enabled: true, group: "agent" },
   { id: "browser", label: "Browser", icon: "globe", enabled: true, group: "agent" },
-  { id: "tools", label: "Tools & Skills", icon: "tools", enabled: true, group: "agent" },
+  { id: "tools", label: "Tools", icon: "tools", enabled: true, group: "agent" },
+  { id: "skills", label: "Skills", icon: "sparkles", enabled: true, group: "agent" },
+  { id: "sparks", label: "Sparks", icon: "bolt", enabled: true, group: "agent" },
   { id: "scheduler", label: "Scheduler", icon: "scheduler", enabled: true, group: "agent" },
   { id: "savepoints", label: "Save Points", icon: "savepoints", enabled: true, group: "agent" },
   { id: "agents", label: "Agents", icon: "agents", enabled: true, group: "global" },
   { id: "connections", label: "Connections", icon: "connections", enabled: true, group: "global" },
+  { id: "mcp", label: "MCP", icon: "terminal", enabled: true, group: "global" },
   { id: "settings", label: "Settings", icon: "settings", enabled: true, group: "global" },
 ];
 
@@ -49,9 +53,7 @@ export function Sidebar({ active, onSelect, showBrowser }: { active: ScreenId; o
       {nav.filter((i) => i.group === "global").map((item) => (
         <NavButton key={item.id} item={item} active={active === item.id} onSelect={onSelect} />
       ))}
-      <div style={{ marginTop: "auto", padding: "10px", fontSize: 11, color: "var(--text-faint)" }}>
-        v0.0.1 · Phase 1
-      </div>
+      <VersionTag />
     </nav>
   );
 }
@@ -87,5 +89,17 @@ function NavButton({ item, active, onSelect }: { item: NavItem; active: boolean;
       <span>{item.label}</span>
       {dim && <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--text-faint)" }}>soon</span>}
     </button>
+  );
+}
+
+/** App version, read from the bundle (tauri.conf.json is the single source
+    of truth — the old hardcoded label drifted). */
+function VersionTag() {
+  const [v, setV] = useState("");
+  useEffect(() => { getVersion().then(setV).catch(() => {}); }, []);
+  return (
+    <div style={{ marginTop: "auto", padding: "10px", fontSize: 11, color: "var(--text-faint)" }}>
+      {v ? `AYGENT v${v}` : "AYGENT"}
+    </div>
   );
 }
