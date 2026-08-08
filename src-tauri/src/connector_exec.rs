@@ -196,12 +196,26 @@ pub async fn call(
         // re-do the one thing that isn't broken (seen live: Drive worked while
         // Calendar 403'd because that API was simply disabled in the project).
         let detail = extract_error(&text);
+        // SERVICE-ACCOUNT OWNERSHIP QUIRK (Mason 08-08): a service account has ~0
+        // Drive storage, so any file it CREATES (even inside a My-Drive folder a
+        // human shared) 403s with "storage quota has been exceeded". The share
+        // grants edit rights, not storage. Name the actual fix instead of the
+        // generic scope/API-enabled guesses, which would send the user to fix the
+        // wrong thing. (Same law as the connector suite: good errors name the fix.)
+        let quota = detail.to_lowercase().contains("storage quota");
         let hint = if status == reqwest::StatusCode::UNAUTHORIZED {
-            "The saved credential is being rejected — reconnect it in Connections."
+            "The saved credential is being rejected — reconnect it in Connections.".to_string()
+        } else if quota {
+            "A service account can't OWN new Google Drive files (it has no storage of its own), so \
+             CREATING a file fails even inside a folder shared with it. To WRITE into a doc: have a \
+             person create the Doc, share edit access with the service account, then edit it \
+             (google_edit_doc / google_append_doc / google_write_sheet) — editing a human-owned file \
+             has no quota limit. To CREATE files programmatically, put the folder on a SHARED DRIVE \
+             (files there are owned by the drive, not the account).".to_string()
         } else {
             "The credential is valid but this request was refused. Common causes: the API isn't \
              enabled for the project, the token lacks a required scope, or the resource wasn't \
-             shared with this account."
+             shared with this account.".to_string()
         };
         return Err(format!("{} error {}{detail}\n{hint}", c.label, status.as_u16()));
     }
