@@ -1393,6 +1393,37 @@ const GOOGLE: Connector = Connector {
             ],
             render: Render::One { line: "Created {name}\n{webViewLink}" },
         },
+        // CREATE ANY DRIVE FILE (Mason 08-08: "creating files in Drive of any
+        // kind"). Metadata-only create for an ARBITRARY mimeType inside a shared
+        // folder — e.g. a native Google file, or a folder
+        // (mime_type = "application/vnd.google-apps.folder"). To create a Doc with
+        // text: use google_create_doc (kind=document) then google_append_doc /
+        // google_edit_doc to fill it. (Binary uploads with bytes need multipart,
+        // which is a separate follow-up.)
+        ConnectorTool {
+            base_override: "",
+            danger: false,
+            b64_params: &[],
+            raw_params: &["parents"],
+            name: "google_create_drive_file",
+            description: "Create a file (or folder) of ANY type in Google Drive, inside a folder you've \
+                          shared with the agent. `mime_type` is the Google MIME type, e.g. \
+                          'application/vnd.google-apps.folder' (a folder), 'application/vnd.google-apps.document' \
+                          (a Doc), 'text/plain', etc. `parents` is a JSON array with the shared folder's id. \
+                          Returns the new file's id + link. (For a Doc WITH text, use google_create_doc then \
+                          google_append_doc.)",
+            access: Access::Write,
+            method: "POST",
+            path: "/drive/v3/files",
+            query: &[("fields", "id,name,mimeType,webViewLink")],
+            body: "{\"name\":\"{name}\",\"mimeType\":\"{mime_type}\",\"parents\":{parents}}",
+            params: &[
+                ToolParam { name: "name", ty: "string", description: "File/folder name.", required: true },
+                ToolParam { name: "mime_type", ty: "string", description: "Google MIME type (e.g. application/vnd.google-apps.folder, application/vnd.google-apps.document, text/plain).", required: true },
+                ToolParam { name: "parents", ty: "string", description: "JSON array with the id of a shared folder, e.g. [\"1AbC…\"].", required: true },
+            ],
+            render: Render::One { line: "Created {name} ({mimeType})\n{webViewLink}" },
+        },
         ConnectorTool {
             danger: false, b64_params: &[], raw_params: &["requests"],
             base_override: "https://slides.googleapis.com",
@@ -1450,6 +1481,59 @@ const GOOGLE: Connector = Connector {
             query: &[("mimeType", "text/plain")],
             body: "",
             params: &[ToolParam { name: "file_id", ty: "string", description: "Drive file id of the Doc.", required: true }],
+            render: Render::Json,
+        },
+        // WRITE INTO AN EXISTING DOC (Mason 08-08): documents.batchUpdate, the
+        // Docs equivalent of Slides' batchUpdate. This is what closes the
+        // "I write → you edit → I read your changes" loop. `requests` is spliced
+        // verbatim (raw_params) so the full Docs request grammar is available:
+        // insertText, replaceAllText, deleteContentRange, insert/format, etc.
+        ConnectorTool {
+            base_override: "https://docs.googleapis.com",
+            danger: true,
+            b64_params: &[],
+            raw_params: &["requests"],
+            name: "google_edit_doc",
+            description: "Edit an EXISTING Google Doc with a batch of requests — insert/replace/delete \
+                          text and formatting. `requests` is a JSON array of Docs API request objects, \
+                          e.g. [{\"insertText\":{\"location\":{\"index\":1},\"text\":\"Hello\"}}] or \
+                          [{\"replaceAllText\":{\"containsText\":{\"text\":\"OLD\"},\"replaceText\":\"NEW\"}}]. \
+                          Read the doc first (google_read_doc) to know its contents. This is how you \
+                          write into a doc the user can then edit.",
+            access: Access::Write,
+            method: "POST",
+            path: "/v1/documents/{document_id}:batchUpdate",
+            query: &[],
+            body: "{\"requests\":{requests}}",
+            params: &[
+                ToolParam { name: "document_id", ty: "string", description: "The Doc's Drive file id.", required: true },
+                ToolParam { name: "requests", ty: "string", description: "JSON array of Docs API request objects.", required: true },
+            ],
+            render: Render::Json,
+        },
+        // APPEND TEXT TO A DOC (convenience): the 90% case — add text to the end
+        // without hand-computing indices. endOfSegmentLocation appends at the very
+        // end of the body. `text` is spliced as a JSON string (b64 avoids escaping
+        // pain for multi-line / special chars). Use google_edit_doc for anything
+        // more surgical (replace, insert-at, delete, format).
+        ConnectorTool {
+            base_override: "https://docs.googleapis.com",
+            danger: false,
+            b64_params: &[],
+            raw_params: &["text"],
+            name: "google_append_doc",
+            description: "Append text to the END of an existing Google Doc (the simplest write). \
+                          `text` is a JSON string, e.g. \"\\nNew paragraph.\". Use \\n for line breaks. \
+                          For replacing or inserting at a specific spot, use google_edit_doc.",
+            access: Access::Write,
+            method: "POST",
+            path: "/v1/documents/{document_id}:batchUpdate",
+            query: &[],
+            body: "{\"requests\":[{\"insertText\":{\"endOfSegmentLocation\":{},\"text\":{text}}}]}",
+            params: &[
+                ToolParam { name: "document_id", ty: "string", description: "The Doc's Drive file id.", required: true },
+                ToolParam { name: "text", ty: "string", description: "Text to append, as a JSON string (use \\n for newlines).", required: true },
+            ],
             render: Render::Json,
         },
         ConnectorTool {
