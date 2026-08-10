@@ -7,8 +7,10 @@
 // catalog is curated to 4 families, each gets its own correct handling — very
 // little room for a parser to get confused.
 //
-// The three tools mirror the Anthropic path exactly (read_file/write_file/
+// The file tools mirror the Anthropic path exactly (read_file/write_file/
 // list_files) and execute through the SAME jailed broker (exec_tool in lib.rs).
+// `whoami` is the one read-only, no-arg introspection tool (identity + model +
+// capabilities) — parity with the cloud paths so local agents aren't a gap.
 
 use serde_json::json;
 
@@ -26,6 +28,8 @@ fn tools_description() -> &'static str {
      - read_file(path): read a UTF-8 text file (path relative to the folder root)\n\
      - write_file(path, content): create/overwrite a UTF-8 text file\n\
      - list_files(path): list a directory ('.' for the folder root)\n\
+     - whoami(): report your own name, model, provider, and the tools you have \
+     (read-only; takes no arguments) — use it when asked who or what you are\n\
      Only use a tool when the user's request needs it. After you receive a tool \
      result, continue and give the user a final answer."
 }
@@ -163,8 +167,8 @@ fn call_from_json(s: &str) -> Option<ToolCall> {
 
 fn call_from_value(v: &serde_json::Value) -> Option<ToolCall> {
     let name = v.get("name").and_then(|n| n.as_str())?.to_string();
-    // Only accept our three known tools \u2014 ignore hallucinated tool names.
-    if !matches!(name.as_str(), "read_file" | "write_file" | "list_files") { return None; }
+    // Only accept our known tools \u2014 ignore hallucinated tool names.
+    if !matches!(name.as_str(), "read_file" | "write_file" | "list_files" | "whoami") { return None; }
     let input = v.get("arguments")
         .or_else(|| v.get("parameters"))
         .or_else(|| v.get("input"))
