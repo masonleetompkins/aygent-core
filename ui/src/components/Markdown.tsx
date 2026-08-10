@@ -103,7 +103,56 @@ function renderInline(text: string, keyBase: string): ReactNode[] {
   return nodes;
 }
 
-// Block-level: split into paragraphs, code fences, headings, and list groups.
+// GFM TABLE support. The agent (esp. whoami / connected-account summaries)
+// emits pipe tables; without this they render as a paragraph of raw `|` pipes
+// (Mason 08-10: the connected-accounts table was unreadable). A table is a
+// header row of `| a | b |`, a SEPARATOR row (`|---|:--:|---|` — dashes with
+// optional leading/trailing colons for alignment), then zero+ data rows. The
+// separator is the signature that tells a real table apart from a paragraph
+// that merely contains pipes, so we require it.
+
+/// Is this line a GFM table separator row? Each cell is dashes with optional
+/// alignment colons, e.g. `---`, `:--`, `--:`, `:-:`. Must have >=1 cell.
+function isTableSeparator(line: string): boolean {
+  const t = line.trim();
+  if (!t.includes("-") || !t.includes("|")) return false;
+  const cells = splitRow(t);
+  return cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c.trim()));
+}
+
+/// Split a pipe row into cell strings. Tolerates optional leading/trailing `|`
+/// and escaped pipes (`\|`) inside a cell. Trims each cell.
+function splitRow(line: string): string[] {
+  let t = line.trim();
+  if (t.startsWith("|")) t = t.slice(1);
+  if (t.endsWith("|")) t = t.slice(0, -1);
+  const cells: string[] = [];
+  let buf = "";
+  for (let j = 0; j < t.length; j++) {
+    const ch = t[j];
+    if (ch === "\\" && t[j + 1] === "|") { buf += "|"; j++; continue; }
+    if (ch === "|") { cells.push(buf.trim()); buf = ""; continue; }
+    buf += ch;
+  }
+  cells.push(buf.trim());
+  return cells;
+}
+
+/// Column alignments parsed from the separator row (`:--`=left, `--:`=right,
+/// `:-:`=center, else undefined).
+function parseAligns(sep: string): (("left" | "right" | "center") | undefined)[] {
+  return splitRow(sep).map((c) => {
+    const t = c.trim();
+    const l = t.startsWith(":"), r = t.endsWith(":");
+    if (l && r) return "center";
+    if (r) return "right";
+    if (l) return "left";
+    return undefined;
+  });
+}
+
+// Block-level: split into paragraphs, code fences, headings, list groups, and
+// GFM tables.
 export function Markdown({ text }: { text: string }) {
   const lines = text.replace(/\r\n/g, "\n").split("\n");
   const blocks: ReactNode[] = [];
@@ -134,6 +183,54 @@ export function Markdown({ text }: { text: string }) {
         </div>
       );
       i += 1;
+      continue;
+    }
+
+    // GFM table: a `|`-bearing header line whose NEXT line is a separator row.
+    // (The separator requirement is what keeps a plain paragraph-with-pipes
+    // from being mistaken for a table.)
+    if (
+      line.includes("|") &&
+      i + 1 < lines.length &&
+      isTableSeparator(lines[i + 1])
+    ) {
+      const header = splitRow(line);
+      const aligns = parseAligns(lines[i + 1]);
+      i += 2; // consume header + separator
+      const rows: string[][] = [];
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim() !== "") {
+        // Stop if we hit another block starter (heading/fence/list) defensively.
+        if (lines[i].trim().startsWith("```") || /^(#{1,6})\s+/.test(lines[i])) break;
+        rows.push(splitRow(lines[i]));
+        i += 1;
+      }
+      const alignOf = (idx: number) => aligns[idx] ?? undefined;
+      blocks.push(
+        <div key={`tw${key++}`} style={{ overflowX: "auto", margin: "6px 0" }}>
+          <table style={tableStyle}>
+            <thead>
+              <tr>
+                {header.map((cell, idx) => (
+                  <th key={idx} style={{ ...thStyle, textAlign: alignOf(idx) }}>
+                    {renderInline(cell, `th${key}-${idx}`)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((cells, r) => (
+                <tr key={r}>
+                  {header.map((_, c) => (
+                    <td key={c} style={{ ...tdStyle, textAlign: alignOf(c) }}>
+                      {renderInline(cells[c] ?? "", `td${key}-${r}-${c}`)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
       continue;
     }
 
@@ -168,7 +265,8 @@ export function Markdown({ text }: { text: string }) {
       lines[i].trim() !== "" &&
       !lines[i].trim().startsWith("```") &&
       !/^(#{1,6})\s+/.test(lines[i]) &&
-      !/^\s*([-*+]|\d+\.)\s+/.test(lines[i])
+      !/^\s*([-*+]|\d+\.)\s+/.test(lines[i]) &&
+      !(lines[i].includes("|") && i + 1 < lines.length && isTableSeparator(lines[i + 1]))
     ) {
       para.push(lines[i]);
       i += 1;
@@ -197,3 +295,15 @@ const codeBlock: React.CSSProperties = {
   borderRadius: "var(--radius-control)", whiteSpace: "pre-wrap", overflowWrap: "anywhere",
 };
 const link: React.CSSProperties = { color: "var(--accent)", textDecoration: "underline" };
+const tableStyle: React.CSSProperties = {
+  borderCollapse: "collapse", width: "100%", fontSize: 14, lineHeight: 1.45,
+};
+const thStyle: React.CSSProperties = {
+  textAlign: "left", fontWeight: 700, padding: "6px 10px",
+  borderBottom: "var(--border-width) solid var(--line)",
+  background: "var(--bg)", whiteSpace: "nowrap",
+};
+const tdStyle: React.CSSProperties = {
+  textAlign: "left", padding: "6px 10px", verticalAlign: "top",
+  borderBottom: "var(--border-width) solid var(--line)",
+};

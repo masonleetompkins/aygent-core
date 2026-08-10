@@ -135,26 +135,39 @@ pub fn build_whoami(
             }
         }
 
-        // 3. CONNECTION TOOLS — one entry per enabled provider, listing the
-        //    tools actually granted (same call the agent loop makes).
+        // 3. CONNECTION TOOLS — one row per enabled provider, listing the tools
+        //    actually granted (same call the agent loop makes). Rendered as a
+        //    GFM TABLE (Service | Tools | Access) — the separator row is on its
+        //    OWN line so AYGENT's markdown renderer recognizes it as a table
+        //    (Mason 08-10: a one-line table renders as a wall of raw pipes).
         let providers = crate::connections::enabled_providers_for_agent(db, agent_id);
-        if providers.is_empty() {
+        let mut conn_rows: Vec<(String, usize, String)> = Vec::new();
+        for (provider, _mode) in providers {
+            let Some(def) = crate::connectors::by_id(&provider) else { continue };
+            let off = crate::connections::disabled_tools(db, agent_id, &provider);
+            let granted: Vec<&crate::connectors::ConnectorTool> =
+                def.tools_granted(true, &off).collect();
+            if granted.is_empty() {
+                continue;
+            }
+            // Access summary: "Read + write" if any granted tool mutates, else
+            // "Read-only" — derived from the SAME grant list, so it can't lie.
+            let can_write = granted
+                .iter()
+                .any(|t| t.access == crate::connectors::Access::Write);
+            let access = if can_write { "Read + write" } else { "Read-only" };
+            conn_rows.push((def.label.to_string(), granted.len(), access.to_string()));
+        }
+        if conn_rows.is_empty() {
             out.push_str("\n**Connected accounts:** none enabled for you.\n");
         } else {
-            out.push_str("\n**Connected accounts:**\n");
-            for (provider, _mode) in providers {
-                let Some(def) = crate::connectors::by_id(&provider) else { continue };
-                let off = crate::connections::disabled_tools(db, agent_id, &provider);
-                let names: Vec<&str> = def.tools_granted(true, &off).map(|t| t.name).collect();
-                if names.is_empty() {
-                    continue;
-                }
-                out.push_str(&format!(
-                    "- {} ({} tools): {}\n",
-                    def.label,
-                    names.len(),
-                    names.join(", ")
-                ));
+            out.push_str("\n**Connected accounts:**\n\n");
+            out.push_str("| Service | Tools | Access |\n");
+            out.push_str("|---|--:|---|\n");
+            for (label, n, access) in conn_rows {
+                // Escape any pipe in a label so it can't break the row.
+                let safe = label.replace('|', "\\|");
+                out.push_str(&format!("| {safe} | {n} | {access} |\n"));
             }
         }
 
