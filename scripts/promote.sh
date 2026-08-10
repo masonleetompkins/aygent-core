@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # promote.sh — AYGENT staging → production (Mason's personal harness, not a user
 # feature). Merges staging→main, builds a SIGNED + NOTARIZED release, swaps it
-# into /Applications with instant-rollback backup, and stages the notarized
+# into /Applications with instant-rollback backup, and stages the notarized DMG
 # artifact for the masonlee.build download. Design: Atlas self-hosted-build doc
 # (§3). Core safety property: this replaces the binary ON DISK; it does NOT
 # relaunch the running app. Mason's open stable AYGENT keeps running the OLD code
@@ -133,23 +133,25 @@ fi
 # Now that prod is the notarized build, spctl on it should also pass.
 spctl -a -t install "${PROD_APP}" >/dev/null 2>&1 || warn "spctl on installed prod reported issues — check manually"
 
-# 6. Stage the BUYER ARTIFACT for the site: a zip of the NOTARIZED .app, named
-#    the way scripts/publish-release.js expects. We DON'T publish here (that
-#    uploads to Supabase + emails owners) — we just produce the exact file so
-#    the publish step is a single clean command. Version comes from the config.
+# 6. Stage the BUYER ARTIFACT for the site: the NOTARIZED + STAPLED .dmg, named
+#    the way scripts/publish-release.js expects (AYGENT-<version>-macOS.dmg). A
+#    DMG is what a Mac buyer expects (drag-to-Applications), and the ticket is
+#    stapled so the downloaded copy verifies offline. We DON'T publish here (that
+#    uploads to Supabase + emails owners) — we just place the exact file so the
+#    publish step is a single clean command. Version comes from the config.
 VERSION="$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+"' src-tauri/tauri.conf.json | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
 if [ -n "${VERSION}" ] && [ -d "${SITE_REPO}/product-files" ]; then
-  ZIP="${SITE_REPO}/product-files/AYGENT-${VERSION}-macOS.zip"
-  say "Staging buyer artifact: ${ZIP}"
-  # ditto --keepParent so the zip contains AYGENT.app at its root (what the
-  # publish script + the account-page download expect). Zipping the STAPLED app
-  # preserves the notarization ticket, so the downloaded copy is offline-verifiable.
-  rm -f "${ZIP}"
-  ( cd "$(dirname "${BUILT_APP}")" && ditto -c -k --keepParent "${APP_NAME}" "${ZIP}" ) \
-    && printf "  wrote %s (%s MB)\n" "${ZIP}" "$(du -m "${ZIP}" | cut -f1)" \
-    || warn "could not stage the buyer zip — do it manually (see publish step below)"
+  DEST_DMG="${SITE_REPO}/product-files/AYGENT-${VERSION}-macOS.dmg"
+  say "Staging buyer artifact: ${DEST_DMG}"
+  # Copy the STAPLED dmg under the versioned name the publish script + account-
+  # page download expect. (Remove any stale zip from the pre-signing era.)
+  rm -f "${SITE_REPO}/product-files/AYGENT-${VERSION}-macOS.zip"
+  rm -f "${DEST_DMG}"
+  cp "${BUILT_DMG}" "${DEST_DMG}" \
+    && printf "  wrote %s (%s MB)\n" "${DEST_DMG}" "$(du -m "${DEST_DMG}" | cut -f1)" \
+    || warn "could not stage the buyer dmg — copy ${BUILT_DMG} manually (see publish step below)"
 else
-  warn "site repo product-files not found at ${SITE_REPO}/product-files (or no version parsed) — skipping buyer-zip staging"
+  warn "site repo product-files not found at ${SITE_REPO}/product-files (or no version parsed) — skipping buyer-dmg staging"
 fi
 
 # 7. Back to staging.
