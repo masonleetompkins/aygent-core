@@ -163,7 +163,7 @@ pub fn build_whoami(
         } else {
             out.push_str("\n**Connected accounts:**\n\n");
             out.push_str("| Service | Tools | Access |\n");
-            out.push_str("|---|--:|---|\n");
+            out.push_str("|---|---|---|\n");
             for (label, n, access) in conn_rows {
                 // Escape any pipe in a label so it can't break the row.
                 let safe = label.replace('|', "\\|");

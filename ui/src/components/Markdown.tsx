@@ -33,7 +33,7 @@ function PathLink({ path, mono }: { path: string; mono?: boolean }) {
         borderRadius: mono ? inlineCode.borderRadius : 0,
         border: mono ? inlineCode.border : "none",
         color: "var(--accent)", cursor: "pointer", textDecoration: "underline",
-        textUnderlineOffset: 2, textAlign: "left",
+        textUnderlineOffset: 2, textAlign: "left", whiteSpace: "nowrap",
       }}
     >{path}</button>
   );
@@ -49,7 +49,12 @@ const BARE_FILE_RE = new RegExp(`^[\w-]+\.(?:${PATH_EXT})\b`, "i");
 
 // Inline formatting: **bold**, *italic* / _italic_, `code`, [text](url).
 // Parsed with a single tokenizer pass so nesting like **bold `code`** works.
-function renderInline(text: string, keyBase: string): ReactNode[] {
+// `opts.inCell` = we're inside a TABLE cell: there we do NOT turn tokens into
+// Finder path-links (a cell isn't prose, and the path-link button wrapped
+// mid-token — `introspect.rs` split into `introspect.r`/`s`). Code stays plain
+// inline code there; prose paragraphs keep the clickable-path behavior.
+function renderInline(text: string, keyBase: string, opts?: { inCell?: boolean }): ReactNode[] {
+  const inCell = opts?.inCell ?? false;
   const nodes: ReactNode[] = [];
   let i = 0;
   let k = 0;
@@ -57,15 +62,16 @@ function renderInline(text: string, keyBase: string): ReactNode[] {
 
   // Regex for the next inline token from position i.
   const patterns: { re: RegExp; render: (m: RegExpExecArray) => ReactNode }[] = [
-    { re: /^\*\*([^*]+)\*\*/, render: (m) => <strong>{renderInline(m[1], `${keyBase}-b${k}`)}</strong> },
-    { re: /^__([^_]+)__/, render: (m) => <strong>{renderInline(m[1], `${keyBase}-b2${k}`)}</strong> },
-    { re: /^\*([^*]+)\*/, render: (m) => <em>{renderInline(m[1], `${keyBase}-i${k}`)}</em> },
-    { re: /^_([^_]+)_/, render: (m) => <em>{renderInline(m[1], `${keyBase}-i2${k}`)}</em> },
-    // `code` spans: if the content LOOKS LIKE A FILE PATH, make it a clickable
-    // Finder-reveal link (monospaced, same look as before) instead of inert code.
+    { re: /^\*\*([^*]+)\*\*/, render: (m) => <strong>{renderInline(m[1], `${keyBase}-b${k}`, opts)}</strong> },
+    { re: /^__([^_]+)__/, render: (m) => <strong>{renderInline(m[1], `${keyBase}-b2${k}`, opts)}</strong> },
+    { re: /^\*([^*]+)\*/, render: (m) => <em>{renderInline(m[1], `${keyBase}-i${k}`, opts)}</em> },
+    { re: /^_([^_]+)_/, render: (m) => <em>{renderInline(m[1], `${keyBase}-i2${k}`, opts)}</em> },
+    // `code` spans: OUTSIDE a cell, a path-looking code span becomes a clickable
+    // Finder-reveal link. INSIDE a cell, always plain inline code (no wrapping
+    // mid-token, no reveal button).
     {
       re: /^`([^`]+)`/,
-      render: (m) => (PATH_WITH_SLASH_RE.test(m[1]) || BARE_FILE_RE.test(m[1]))
+      render: (m) => (!inCell && (PATH_WITH_SLASH_RE.test(m[1]) || BARE_FILE_RE.test(m[1])))
         ? <PathLink path={m[1]} mono />
         : <code style={inlineCode}>{m[1]}</code>,
     },
@@ -73,13 +79,14 @@ function renderInline(text: string, keyBase: string): ReactNode[] {
       re: /^\[([^\]]+)\]\(([^)]+)\)/,
       render: (m) => <a href={m[2]} style={link} target="_blank" rel="noreferrer">{m[1]}</a>,
     },
-    // Bare paths mentioned in PLAIN PROSE (not backtick-wrapped): a directory-
-    // style path (has a `/`) OR a bare filename with a recognized extension.
-    // Tried near the end of the pattern list so it never steals a token that a
-    // more specific rule (bold/italic/code/link) should have claimed first.
-    { re: PATH_WITH_SLASH_RE, render: (m) => <PathLink path={m[0]} /> },
-    { re: BARE_FILE_RE, render: (m) => <PathLink path={m[0]} /> },
   ];
+  // Bare-path prose links ONLY outside table cells (see the `introspect.rs`
+  // split bug above). Appended after the specific rules so they never steal a
+  // bold/italic/code/link token.
+  if (!inCell) {
+    patterns.push({ re: PATH_WITH_SLASH_RE, render: (m) => <PathLink path={m[0]} /> });
+    patterns.push({ re: BARE_FILE_RE, render: (m) => <PathLink path={m[0]} /> });
+  }
 
   let buf = "";
   const flush = () => { if (buf) { push(buf); buf = ""; } };
@@ -204,15 +211,15 @@ export function Markdown({ text }: { text: string }) {
         rows.push(splitRow(lines[i]));
         i += 1;
       }
-      const alignOf = (idx: number) => aligns[idx] ?? undefined;
+      const alignOf = (idx: number) => aligns[idx] ?? "left";
       blocks.push(
-        <div key={`tw${key++}`} style={{ overflowX: "auto", margin: "6px 0" }}>
+        <div key={`tw${key++}`} style={{ overflowX: "auto", margin: "10px 0" }}>
           <table style={tableStyle}>
             <thead>
               <tr>
                 {header.map((cell, idx) => (
                   <th key={idx} style={{ ...thStyle, textAlign: alignOf(idx) }}>
-                    {renderInline(cell, `th${key}-${idx}`)}
+                    {renderInline(cell, `th${key}-${idx}`, { inCell: true })}
                   </th>
                 ))}
               </tr>
@@ -222,7 +229,7 @@ export function Markdown({ text }: { text: string }) {
                 <tr key={r}>
                   {header.map((_, c) => (
                     <td key={c} style={{ ...tdStyle, textAlign: alignOf(c) }}>
-                      {renderInline(cells[c] ?? "", `td${key}-${r}-${c}`)}
+                      {renderInline(cells[c] ?? "", `td${key}-${r}-${c}`, { inCell: true })}
                     </td>
                   ))}
                 </tr>
@@ -296,14 +303,22 @@ const codeBlock: React.CSSProperties = {
 };
 const link: React.CSSProperties = { color: "var(--accent)", textDecoration: "underline" };
 const tableStyle: React.CSSProperties = {
-  borderCollapse: "collapse", width: "100%", fontSize: 14, lineHeight: 1.45,
+  borderCollapse: "collapse", width: "100%", fontSize: 14, lineHeight: 1.5,
+  tableLayout: "auto",
 };
 const thStyle: React.CSSProperties = {
-  textAlign: "left", fontWeight: 700, padding: "6px 10px",
-  borderBottom: "var(--border-width) solid var(--line)",
-  background: "var(--bg)", whiteSpace: "nowrap",
+  // A real header rule: heavier bottom border + a touch more bottom padding so
+  // the header reads as a header, not a cramped first row. No top border (the
+  // table's top edge is the container gap).
+  textAlign: "left", fontWeight: 700, padding: "4px 12px 8px",
+  borderBottom: "2px solid var(--line)",
+  whiteSpace: "nowrap", verticalAlign: "bottom",
 };
 const tdStyle: React.CSSProperties = {
-  textAlign: "left", padding: "6px 10px", verticalAlign: "top",
+  // Uniform, comfortable row height. Wrap BETWEEN words in a cell, but a single
+  // long token (a path, a URL) breaks anywhere rather than forcing the column
+  // wide — so no more `introspect.rs` overflow drama.
+  textAlign: "left", padding: "8px 12px", verticalAlign: "top",
   borderBottom: "var(--border-width) solid var(--line)",
+  overflowWrap: "anywhere", wordBreak: "normal",
 };
