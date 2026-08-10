@@ -24,6 +24,7 @@ mod broker_ws;
 mod exec;      // PRO MODE: the process-spawn broker (shell.exec). Only Rust spawns.
 mod paths;     // CONFIG RELOCATION: root-folder pointer + state-dir seam + onboarding paths.
 mod history;
+mod introspect; // Agent self-introspection: the read-only `whoami` tool.
 mod catalog;
 mod connections;
 mod connectors; // CONNECTOR REGISTRY: a provider is data (descriptor), not code.
@@ -3372,6 +3373,18 @@ fn spark_preview_tool() -> serde_json::Value {
     })
 }
 
+/// WHOAMI: lets an agent introspect its OWN identity, model configuration, and
+/// full capability set — even when none of it is written in its Soul. Read-only
+/// and argument-free: an agent can SEE its config but cannot change it (changing
+/// it stays a human action in Settings / Connections / Tools).
+fn whoami_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "whoami",
+        "description": "Report YOUR OWN configuration: your name, your model + provider, your context mode and folder, and every tool, connection, MCP server, and skill you currently have access to — grouped by origin. Use this when the user asks who you are, what model you're running, or what you can do. Read-only: it shows your configuration but cannot change it. Takes no arguments.",
+        "input_schema": { "type": "object", "properties": {} }
+    })
+}
+
 /// The JSON schema for a built-in tool by its agent-facing name.
 fn builtin_tool_schema(name: &str) -> Option<serde_json::Value> {
     match name {
@@ -3427,6 +3440,10 @@ fn agent_tools_for_full(
 ) -> (serde_json::Value, String) {
     let mut tools = base_tools();
     tools.push(task_continue_tool());
+    // WHOAMI is unconditional: an agent can always ask who/what it is, whether or
+    // not it has connections. (The conn_ctx block below WON'T re-add it — see the
+    // dedupe guard there.)
+    tools.push(whoami_tool());
     if has_peers { tools.push(send_message_tool()); }
     let mut extra_instructions = String::new();
 
@@ -3438,6 +3455,10 @@ fn agent_tools_for_full(
         for schema in dashboard::tool_schemas() { tools.push(schema); }
         extra_instructions.push_str(dashboard::tool_instructions());
         tools.push(spark_preview_tool());
+        // WHOAMI is already in the base tool list (added unconditionally above).
+        // Here we only add the instruction that tells the model it exists.
+        extra_instructions.push_str(
+            "\n\nSELF-KNOWLEDGE: call the `whoami` tool to see your own name, model,              provider, and the full list of tools / connections / MCP servers / skills              you have — useful when the user asks who or what you are. It is read-only;              you can see your configuration but not change it.");
         // SPARKS — the embedded skill (data, not a tool): teach every agent how
         // to build an interactive mini-app on request. No new capability; it's a
         // way of using the existing jailed write_file. The Sparks tab renders
@@ -4123,7 +4144,11 @@ async fn agent_stream(
                     "kind": "ToolUse", "id": call_id, "name": c.name,
                     "input": c.input,
                 }));
-                let (result, is_err) = if dashboard::is_dashboard_tool(&c.name) {
+                let (result, is_err) = if c.name == "whoami" {
+                    // SELF-INTROSPECTION (parity with the cloud paths): read-only
+                    // identity + model + capabilities. No jail/broker call needed.
+                    (introspect::build_whoami(&app, &db, &scope_id, folder.as_deref()), false)
+                } else if dashboard::is_dashboard_tool(&c.name) {
                     dashboard::exec_dashboard_tool(&db, &scope_id, &c.name, &c.input)
                 } else {
                     exec_tool_cfg(&broker, &scope_id, &c.name, &c.input, &pdf_cfg)
@@ -4249,7 +4274,9 @@ async fn agent_stream(
                     let args_str = f.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
                     let input: serde_json::Value = serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
                     // M1.4 #7: inter-agent send_message routes through the mailbox.
-                    let (result_text, is_err) = if name == "task_continue" {
+                    let (result_text, is_err) = if name == "whoami" {
+                        (introspect::build_whoami(&app, &db, &scope_id, folder.as_deref()), false)
+                    } else if name == "task_continue" {
                         let delay = input.get("delay_secs").and_then(|d| d.as_u64()).unwrap_or(60).clamp(5, 3600);
                         let note = input.get("note").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
                         if note.is_empty() {
@@ -4484,7 +4511,10 @@ async fn agent_stream(
                     // M1.4 #7: send_message is an inter-agent tool — it enqueues on
                     // the mailbox (needs db, not the broker), delivered ASYNC on
                     // the recipient's lane. Handle it here before the file-tool path.
-                    let (result_text, is_err) = if browser::is_agent_tool(&name) {
+                    let (result_text, is_err) = if name == "whoami" {
+                        // SELF-INTROSPECTION: read-only identity + model + capabilities.
+                        (introspect::build_whoami(&app, &db, &scope_id, folder.as_deref()), false)
+                    } else if browser::is_agent_tool(&name) {
                         // BROWSER TOOLS (Slice 4/5): async, driven through the CDP
                         // session + per-agent domain policy + the shared-control
                         // wheel. Policy keys off the FOLDER (same key as
@@ -4924,7 +4954,9 @@ pub async fn run_headless_turn(
                             let name = blk.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                             let id = blk.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
                             let input = blk.get("input").cloned().unwrap_or(serde_json::json!({}));
-                            let (result_text, is_err) = if name == "task_continue" {
+                            let (result_text, is_err) = if name == "whoami" {
+                                (introspect::build_whoami(app, db, agent_id, Some(&agent.folder_path)), false)
+                            } else if name == "task_continue" {
                                 let delay = input.get("delay_secs").and_then(|d| d.as_u64()).unwrap_or(60).clamp(5, 3600);
                                 let note = input.get("note").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
                                 if note.is_empty() {
