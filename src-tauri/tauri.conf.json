@@ -26,7 +26,8 @@
   "bundle": {
     "active": true,
     "targets": [
-      "app"
+      "app",
+      "dmg"
     ],
     "icon": [
       "icons/icon.icns",
@@ -39,7 +40,9 @@
       "../seatbelt/folder-mode.sb": "seatbelt/folder-mode.sb"
     },
     "macOS": {
-      "minimumSystemVersion": "13.0"
+      "minimumSystemVersion": "13.0",
+      "hardenedRuntime": true,
+      "entitlements": "HardenedRuntime.plist"
     }
   }
 }
