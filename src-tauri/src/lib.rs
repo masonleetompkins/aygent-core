@@ -57,6 +57,7 @@ mod keychain;
 mod local_provider;
 mod local_tools;
 mod openai_provider;
+mod meta_provider; // Muse (Meta): api.meta.ai/v1 /responses (OpenAI Responses API shape) — own module.
 mod pdf_tool;
 mod provider;
 mod provision;
@@ -1419,6 +1420,8 @@ async fn anthropic_models() -> Result<Vec<String>, String> {
 #[tauri::command]
 async fn openai_models(provider: String) -> Result<Vec<String>, String> {
     let key = keychain::get_key(&provider)?;
+    // Meta (Llama API) has its own module (different response shape); route it there.
+    if provider == "meta" { return meta_provider::list_models(&key).await; }
     openai_provider::list_models(&provider, &key).await
 }
 
@@ -1430,6 +1433,7 @@ async fn provider_verify_key(provider: String) -> Result<(), String> {
     let key = keychain::get_key(&provider)?;
     if key.trim().is_empty() { return Err("stored key is empty".into()); }
     if provider == "anthropic" { return anthropic_models().await.map(|_| ()); }
+    if provider == "meta" { return meta_provider::verify_key(&key).await; }
     openai_provider::verify_key(&provider, &key).await
 }
 
@@ -1878,11 +1882,12 @@ async fn agent_generate_soul(
             } else { agent.model.clone() };
             provider::anthropic_complete(&key, &model, &meta).await?
         }
-        "openai" | "openrouter" => {
+        "openai" | "openrouter" | "meta" => {
             let key = keychain::get_key(&provider).map_err(|_| format!("no {provider} key set"))?;
             let model = agent.model.clone();
             if model.trim().is_empty() { return Err("pick a model for this agent first".into()); }
-            openai_provider::complete(&provider, &key, &model, &meta).await?
+            if provider == "meta" { meta_provider::complete(&key, &model, &meta).await? }
+            else { openai_provider::complete(&provider, &key, &model, &meta).await? }
         }
         _ => return Err("Soul generation needs a cloud provider (Anthropic/OpenAI/OpenRouter) \
                          — set one for this agent.".into()),
@@ -4189,7 +4194,7 @@ async fn agent_stream(
     // ---- OPENAI / OPENROUTER PATH ------------------------------------------
     // Shared Chat Completions wire format; one impl, two base URLs. Full tool-
     // use: same jailed exec_tool + broker + SAVE POINTs as every other provider.
-    if provider_kind == "openai" || provider_kind == "openrouter" {
+    if provider_kind == "openai" || provider_kind == "openrouter" || provider_kind == "meta" {
         let key = keychain::get_key(&provider_kind)
             .map_err(|_| format!("no {provider_kind} key set — add one in Settings"))?;
         let model = model.filter(|m| !m.trim().is_empty())
@@ -4245,10 +4250,17 @@ async fn agent_stream(
             }
             let mut round_calls: usize = 0;
             let mut round_errs: usize = 0;
-            let stream_result = openai_provider::openai_stream_turn(
-                &provider_kind, &key, &model, &sys, &messages, &tools, Some(&cancel_flag),
-                |ev| { let _ = app.emit(&channel, &ev); },
-            ).await;
+            let stream_result = if provider_kind == "meta" {
+                meta_provider::meta_stream_turn(
+                    &key, &model, &sys, &messages, &tools, Some(&cancel_flag),
+                    |ev| { let _ = app.emit(&channel, &ev); },
+                ).await
+            } else {
+                openai_provider::openai_stream_turn(
+                    &provider_kind, &key, &model, &sys, &messages, &tools, Some(&cancel_flag),
+                    |ev| { let _ = app.emit(&channel, &ev); },
+                ).await
+            };
             if let Err(e) = &stream_result {
                 if e == "__CANCELLED__" {
                     messages.as_array_mut().unwrap().push(serde_json::json!({
@@ -5007,7 +5019,7 @@ pub async fn run_headless_turn(
             }
             break;
         }
-    } else if provider_kind == "openai" || provider_kind == "openrouter" {
+    } else if provider_kind == "openai" || provider_kind == "openrouter" || provider_kind == "meta" {
         let key = keychain::get_key(&provider_kind).map_err(|_| format!("recipient has no {provider_kind} key"))?;
         if agent.model.trim().is_empty() { return Err("recipient has no model set".into()); }
         // STREAMING (Mason 08-06): stream token-by-token so AYGENT Remote shows
@@ -5017,7 +5029,14 @@ pub async fn run_headless_turn(
         let _ = app.emit(&stream_channel, &provider::StreamEvent::Info { text: "thinking…".into() });
         let msgs = serde_json::json!([{ "role": "user", "content": framed }]);
         let no_tools = serde_json::json!([]);
-        match openai_provider::openai_stream_turn(
+        let hl_stream = if provider_kind == "meta" {
+            meta_provider::meta_stream_turn(&key, &agent.model, &system, &msgs, &no_tools, Some(&hl_cancel_flag),
+                |ev| {
+                    if let provider::StreamEvent::TextDelta { text } = &ev { reply_text.push_str(text); }
+                    let _ = app.emit(&stream_channel, &ev);
+                }).await
+        } else {
+        openai_provider::openai_stream_turn(
             &provider_kind, &key, &agent.model, &system, &msgs, &no_tools, Some(&hl_cancel_flag),
             |ev| {
                 // Accumulate the assistant text AND forward the live event so the
@@ -5025,7 +5044,9 @@ pub async fn run_headless_turn(
                 if let provider::StreamEvent::TextDelta { text } = &ev { reply_text.push_str(text); }
                 let _ = app.emit(&stream_channel, &ev);
             },
-        ).await {
+        ).await
+        };
+        match hl_stream {
             Ok((assistant, _stop)) => {
                 // If the stream produced no TextDelta (some models only fill the
                 // final message content), fall back to the assembled content.
