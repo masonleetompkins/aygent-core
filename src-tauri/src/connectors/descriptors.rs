@@ -164,7 +164,10 @@ const GITHUB: Connector = Connector {
             b64_params: &[],
             danger: false,
             name: "github_read_file",
-            description: "Read a file's contents from a GitHub repo at a given branch or commit.",
+            description: "Read a file's FULL contents from a GitHub repo at a given branch or commit \
+                          (works on private repos; returns the whole decoded file, not base64). The \
+                          first line is a header with the file's sha — pass that sha to github_write_file \
+                          to update it.",
             access: Access::Read,
             method: "GET",
             path: "/repos/{owner}/{repo}/contents/{path}",
@@ -177,7 +180,7 @@ const GITHUB: Connector = Connector {
                 ToolParam { name: "path", ty: "string", description: "File path in the repo.", required: true },
                 ToolParam { name: "ref", ty: "string", description: "Branch, tag, or sha. Omit for default branch.", required: false },
             ],
-            render: Render::Json,
+            render: Render::GithubContent,
         },
         ConnectorTool {
             base_override: "",
