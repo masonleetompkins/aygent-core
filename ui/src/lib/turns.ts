@@ -139,6 +139,11 @@ export type TurnItem =
   | { kind: "text"; text: string }
   | { kind: "tool"; tool: ToolCard };
 
+/** Token accounting accumulated across a turn's provider rounds (context meter
+ *  + $ cost). `input` is the LAST round's input token count = the current
+ *  context-window fill; the others sum across rounds. */
+export type TurnUsage = { input: number; output: number; cacheRead: number; cacheWrite: number; contextWindow?: number };
+
 export type TurnState = {
   status: "idle" | "running";
   liveText: string;          // accumulated streamed tokens (back-compat: full prose)
@@ -148,6 +153,7 @@ export type TurnState = {
   info?: string;             // latest info line (model, save point…)
   memory?: string;           // 🧠 auto-capture note for THIS turn (shown under the user msg)
   error?: string;
+  usage?: TurnUsage;         // token counts for THIS turn (context meter + $ cost)
 };
 
 type AgentSlot = {
@@ -211,6 +217,23 @@ function appendText(t: TurnState, chunk: string): TurnState {
     timeline.push({ kind: "text", text: chunk });
   }
   return { ...t, liveText: t.liveText + chunk, timeline };
+}
+
+/** Accumulate a Usage event into the turn. `input` is the LAST round's input
+ *  token count (the current context-window fill, since each round re-sends the
+ *  whole history); output + cache SUM across the turn's rounds. */
+function accumulateUsage(t: TurnState, m: any): TurnState {
+  const prev = t.usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  const nIn = Number(m.input ?? 0), nOut = Number(m.output ?? 0);
+  const nCr = Number(m.cache_read ?? m.cacheRead ?? 0), nCw = Number(m.cache_write ?? m.cacheWrite ?? 0);
+  const win = Number(m.context_window ?? m.contextWindow ?? 0) || prev.contextWindow || undefined;
+  return { ...t, usage: {
+    input: Math.max(prev.input, nIn),   // context fill = the largest (latest) round
+    output: prev.output + nOut,
+    cacheRead: Math.max(prev.cacheRead, nCr),
+    cacheWrite: prev.cacheWrite + nCw,
+    contextWindow: win,
+  } };
 }
 
 /** Append a NEW tool card. This also closes the open text segment, which is
@@ -404,10 +427,11 @@ export async function runTurn(a: RunArgs): Promise<unknown[]> {
     const cur = slot(a.agentId);
     if (!m) return;
     // Anthropic-style: {TextDelta:{text}} or {kind:"TextDelta"} — accept both.
-    const kind = m.kind || (m.TextDelta ? "TextDelta" : m.Info ? "Info" : m.ToolUseStart ? "ToolUseStart" : m.ToolUseDelta ? "ToolUseDelta" : m.ToolUse ? "ToolUse" : m.ToolResult ? "ToolResult" : m.Done ? "Done" : null);
+    const kind = m.kind || (m.TextDelta ? "TextDelta" : m.Info ? "Info" : m.ToolUseStart ? "ToolUseStart" : m.ToolUseDelta ? "ToolUseDelta" : m.ToolUse ? "ToolUse" : m.ToolResult ? "ToolResult" : m.Usage ? "Usage" : m.Done ? "Done" : null);
     const text = m.text ?? m.TextDelta?.text ?? m.Info?.text ?? "";
     if (handleToolStream(cur, kind, m)) return;
-    if (kind === "TextDelta") { cur.turn = appendText(cur.turn, text); emit(); }
+    if (kind === "Usage") { cur.turn = accumulateUsage(cur.turn, m); emit(); }
+    else if (kind === "TextDelta") { cur.turn = appendText(cur.turn, text); emit(); }
     else if (kind === "Info") { cur.turn = { ...cur.turn, info: text }; emit(); }
     else if (kind === "MemoryCaptured") { cur.turn = { ...cur.turn, memory: m.text }; emit(); }
     else if (kind === "ToolUse") { upsertToolUse(cur, m); }

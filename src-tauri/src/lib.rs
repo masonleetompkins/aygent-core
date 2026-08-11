@@ -60,6 +60,7 @@ mod openai_provider;
 mod meta_provider; // Muse (Meta): api.meta.ai/v1 /responses (OpenAI Responses API shape) — own module.
 mod pdf_tool;
 mod provider;
+mod pricing; // CLOUD model context windows + $/Mtok (context meter + cost).
 mod provision;
 mod mcp_client;
 mod mcp; // MCP manager: registry + catalog + agent-loop bridge + install/uninstall. // MCP client: spawn stdio JSON-RPC servers, discover + route their tools. // Level A: bundle portable node+ffmpeg+hyperframes into app-data (no system installs).
@@ -1473,6 +1474,123 @@ fn set_selection(db: tauri::State<writer::Db>, folder: String, provider: String,
     a.provider = provider;
     a.model = model;
     repo::update_agent(&db, a)
+}
+
+/// CONTEXT METER: the context window (tokens) + $/Mtok price for a model id, so
+/// the chat header can render "62% of context used" + a running $ cost. Cloud
+/// providers (Anthropic/OpenAI/OpenRouter/Meta); local GGUF models report their
+/// window via the catalog, price 0. Pure lookup, no network.
+#[tauri::command]
+fn chat_model_info(model: String) -> serde_json::Value {
+    let info = pricing::lookup(&model);
+    serde_json::json!({
+        "context_tokens": info.context_tokens,
+        "known": info.known,
+        "price": {
+            "input": info.price.input,
+            "output": info.price.output,
+            "cache_read": info.price.cache_read,
+            "cache_write": info.price.cache_write,
+        }
+    })
+}
+
+/// COMPACT CONTEXT: shrink a conversation's provider-format history so a long
+/// chat can keep going without blowing the model context window. The VISIBLE
+/// transcript (msgs) is untouched — only the model-facing `history` is replaced
+/// with a compact summary seed, so the agent keeps the gist while the token load
+/// resets. The model authors the summary using the agent own provider/model.
+/// Returns the new (small) history array; the UI persists it onto the conv.
+#[tauri::command]
+async fn conv_compact(
+    db: tauri::State<'_, writer::Db>,
+    id: String,
+) -> Result<serde_json::Value, String> {
+    let conv = repo::load_conversation(&db, &id)?;
+    let history = conv.history.as_array().cloned().unwrap_or_default();
+    if history.len() < 4 {
+        return Err("not enough conversation to compact yet".into());
+    }
+    // Resolve the agent own provider/model (fallback: anthropic auto/haiku).
+    let agent = repo::get_agent(&db, &conv.agent_id)?.ok_or("agent not found")?;
+    let provider = if agent.provider.is_empty() { "anthropic".to_string() } else { agent.provider.clone() };
+
+    // Flatten the history into a readable transcript for the summarizer. We keep
+    // it bounded (head + tail) so the summarize call itself never overflows.
+    let transcript = flatten_history_for_summary(&history);
+    let ask = format!(
+        "Summarize this conversation so it can CONTINUE with full context but far \
+         fewer tokens. Capture: what the user is doing, decisions made, key facts, \
+         open threads, and any state the assistant must remember (file paths, names, \
+         numbers). Write it as a dense factual briefing in the SECOND person addressed \
+         to the assistant (\"You are helping the user with...\"). Do NOT add pleasantries. \
+         Conversation:\n\n{transcript}"
+    );
+
+    let summary = match provider.as_str() {
+        "anthropic" => {
+            let key = keychain::get_key("anthropic").map_err(|_| "no anthropic key set".to_string())?;
+            let model = if agent.model.trim().is_empty() {
+                let models = provider::anthropic_list_models(&key).await?;
+                models.iter().find(|m| m.contains("haiku")).cloned().or_else(|| models.first().cloned()).ok_or("no model")?
+            } else { agent.model.clone() };
+            provider::anthropic_complete(&key, &model, &ask).await?
+        }
+        "openai" | "openrouter" | "meta" => {
+            let key = keychain::get_key(&provider).map_err(|_| format!("no {provider} key set"))?;
+            if agent.model.trim().is_empty() { return Err("pick a model for this agent first".into()); }
+            if provider == "meta" { meta_provider::complete(&key, &agent.model, &ask).await? }
+            else { openai_provider::complete(&provider, &key, &agent.model, &ask).await? }
+        }
+        _ => return Err("compaction needs a cloud provider (Anthropic/OpenAI/OpenRouter)".into()),
+    };
+
+    // The new history is a SINGLE user turn carrying the briefing, so the next
+    // real turn appends after it. Small, self-contained, resets the token load.
+    let seed = serde_json::json!([
+        { "role": "user", "content": format!("[Context summary of the earlier conversation, compacted to save tokens]\n\n{summary}") },
+        { "role": "assistant", "content": "Understood — I have the summarized context and we can continue." }
+    ]);
+    Ok(seed)
+}
+
+/// Flatten a provider-format history array into a plain transcript for the
+/// summarizer. Bounded (head + tail) so the summarize request never itself
+/// overflows the window on a huge chat. Text + tool intent only (skips raw
+/// tool bytes and images).
+fn flatten_history_for_summary(history: &[serde_json::Value]) -> String {
+    fn content_text(v: &serde_json::Value) -> String {
+        match v.get("content") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(blocks)) => blocks.iter().filter_map(|b| {
+                match b.get("type").and_then(|t| t.as_str()) {
+                    Some("text") | Some("input_text") | Some("output_text") =>
+                        b.get("text").and_then(|t| t.as_str()).map(String::from),
+                    Some("tool_use") => b.get("name").and_then(|n| n.as_str()).map(|n| format!("[called tool: {n}]")),
+                    Some("tool_result") => Some("[tool result]".to_string()),
+                    _ => None,
+                }
+            }).collect::<Vec<_>>().join(" "),
+            _ => String::new(),
+        }
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for m in history {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+        let text = content_text(m);
+        let text = text.trim();
+        if text.is_empty() { continue; }
+        let capped: String = text.chars().take(2000).collect();
+        lines.push(format!("{}: {}", role, capped));
+    }
+    // Bound: keep the first 12 + last 40 turns if very long.
+    if lines.len() > 60 {
+        let head = lines[..12].join("\n");
+        let tail = lines[lines.len()-40..].join("\n");
+        format!("{head}\n\n[...older turns omitted...]\n\n{tail}")
+    } else {
+        lines.join("\n")
+    }
 }
 
 // --- AGENTS (multi-agent profiles) -----------------------------------------
@@ -5245,6 +5363,7 @@ pub fn run() {
             savepoint_undo, savepoint_redo,
             savepoint_get_retention, savepoint_set_retention, savepoint_purge,
             conv_list, conv_load, conv_save, conv_rename, conv_delete, conv_reorder,
+            conv_compact, chat_model_info,
             agents_list, agents_create, agents_update, agents_reorder, agents_delete,
             agents_set_active, agents_get_active, agents_sharing_folder,
             agent_mounts_list, agent_mount_add, agent_mount_remove,

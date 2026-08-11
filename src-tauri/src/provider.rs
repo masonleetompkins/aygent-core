@@ -217,6 +217,10 @@ pub enum StreamEvent {
     ToolUse { id: String, name: String, input: serde_json::Value },
     /// The turn finished. `stop_reason` = "tool_use" | "end_turn" | ...
     Done { stop_reason: String },
+    /// Token accounting for ONE provider turn, parsed from the provider usage
+    /// block (Anthropic message_start/message_delta). Emitted once per streamed
+    /// turn so the UI can meter context fill + $ cost. Counts are for THIS turn.
+    Usage { input: u64, output: u64, cache_read: u64, cache_write: u64, #[serde(default)] context_window: u32 },
     /// A non-fatal note (e.g. fell back to non-streaming).
     Info { text: String },
     /// Fatal error for this turn.
@@ -281,6 +285,11 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
     // per-index scratch for tool_use input JSON being streamed as partial_json
     let mut tool_json: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
     let mut stop_reason = String::from("end_turn");
+    // USAGE (context meter + $ cost): Anthropic streams token counts in the
+    // message_start frame (input_tokens + cache_read/creation) and the final
+    // message_delta frame (output_tokens). We accumulate them and emit a single
+    // Usage event at end-of-turn.
+    let (mut u_in, mut u_out, mut u_cr, mut u_cw): (u64, u64, u64, u64) = (0, 0, 0, 0);
 
     let mut stream = resp.bytes_stream();
     // BUG FIX: buffer RAW BYTES, not a String. The old code did
@@ -325,6 +334,14 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
                     Ok(v) => v, Err(_) => continue,
                 };
                 match ev.get("type").and_then(|t| t.as_str()) {
+                    Some("message_start") => {
+                        // Initial usage: input tokens + cache read/creation counts.
+                        if let Some(us) = ev.get("message").and_then(|m| m.get("usage")) {
+                            u_in = us.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(u_in);
+                            u_cr = us.get("cache_read_input_tokens").and_then(|x| x.as_u64()).unwrap_or(u_cr);
+                            u_cw = us.get("cache_creation_input_tokens").and_then(|x| x.as_u64()).unwrap_or(u_cw);
+                        }
+                    }
                     Some("content_block_start") => {
                         let idx = ev.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                         let block = ev.get("content_block").cloned().unwrap_or(json!({}));
@@ -407,8 +424,15 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
                         if let Some(sr) = ev.get("delta").and_then(|d| d.get("stop_reason")).and_then(|s| s.as_str()) {
                             stop_reason = sr.to_string();
                         }
+                        // Final usage lives on message_delta.usage (output_tokens,
+                        // and Anthropic re-states input on some responses).
+                        if let Some(us) = ev.get("usage") {
+                            if let Some(o) = us.get("output_tokens").and_then(|x| x.as_u64()) { u_out = o; }
+                            if let Some(i) = us.get("input_tokens").and_then(|x| x.as_u64()) { if i > 0 { u_in = i; } }
+                        }
                     }
                     Some("message_stop") => {
+                        on_event(StreamEvent::Usage { input: u_in, output: u_out, cache_read: u_cr, cache_write: u_cw, context_window: 0 });
                         on_event(StreamEvent::Done { stop_reason: stop_reason.clone() });
                         saw_done = true;
                     }
@@ -440,8 +464,12 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
                     if let Some(sr) = ev.get("delta").and_then(|d| d.get("stop_reason")).and_then(|s| s.as_str()) {
                         stop_reason = sr.to_string();
                     }
+                    if let Some(us) = ev.get("usage") {
+                        if let Some(o) = us.get("output_tokens").and_then(|x| x.as_u64()) { u_out = o; }
+                    }
                 }
                 Some("message_stop") => {
+                    on_event(StreamEvent::Usage { input: u_in, output: u_out, cache_read: u_cr, cache_write: u_cw, context_window: 0 });
                     on_event(StreamEvent::Done { stop_reason: stop_reason.clone() });
                     saw_done = true;
                 }
@@ -459,6 +487,7 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
     // message_stop at all — abrupt close, proxy cut, etc.), synthesize one so the
     // UI spinner is always resolved. The turn's content is intact either way.
     if !saw_done {
+        on_event(StreamEvent::Usage { input: u_in, output: u_out, cache_read: u_cr, cache_write: u_cw, context_window: 0 });
         on_event(StreamEvent::Done { stop_reason: stop_reason.clone() });
     }
 

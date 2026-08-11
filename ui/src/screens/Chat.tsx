@@ -9,7 +9,7 @@ import { Icon, type IconName } from "../components/Icon";
 import { Markdown } from "../components/Markdown";
 import { useSparkBlobUrl } from "../lib/sparkChrome";
 import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion, stopTurn } from "../lib/turns";
-import type { TurnItem } from "../lib/turns";
+import type { TurnItem, TurnUsage } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
 
 type ToolLine = { name: string; path: string; ok?: boolean; detail?: string; summary?: string; body?: string; running?: boolean; spark?: { slug: string; title: string; html: string } };
@@ -18,7 +18,7 @@ type Msg =
   // ASSISTANT message it's when the turn COMPLETED (set at finalize, not at
   // first token), which is what the timestamp in the margin claims to mean.
   | { role: "user"; text: string; memory?: string; at?: number }
-  | { role: "assistant"; text: string; tools: ToolLine[]; streaming?: boolean; at?: number; timeline?: TurnItem[] };
+  | { role: "assistant"; text: string; tools: ToolLine[]; streaming?: boolean; at?: number; timeline?: TurnItem[]; usage?: TurnUsage };
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 
@@ -617,7 +617,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
         : "(no reply text came back from the model this turn — try asking a follow-up)";
       const finalMsgs: Msg[] = [
         ...withUserMem,
-        { role: "assistant", text: done.liveText || emptyReplyText, tools: done.liveTools as ToolLine[], timeline: done.timeline, streaming: false, at: Date.now() },
+        { role: "assistant", text: done.liveText || emptyReplyText, tools: done.liveTools as ToolLine[], timeline: done.timeline, streaming: false, at: Date.now(), usage: done.usage },
       ];
       // Only overwrite the visible pane if we're STILL viewing this agent+conv.
       if (agentId === myAgent && convIdRef.current === myConvId) {
@@ -660,6 +660,86 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     // eslint-disable-next-line
   }, [convVersion]);
 
+  // ---- CONTEXT METER + $ COST (Mason, this session) -----------------------
+  // The model's context window + price, fetched Rust-side (pricing.rs). Refetch
+  // when the selected model changes so the % + cost track the real model.
+  type ModelInfo = { context_tokens: number; known: boolean; price: { input: number; output: number; cache_read: number; cache_write: number } };
+  const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!folder) { setModelInfo(null); return; }
+      try {
+        const sel = await invoke<{ provider: string; model: string }>("get_selection", { folder });
+        const name = sel.model || "";
+        // Local (GGUF) models price at 0 and their window comes from the catalog;
+        // for the meter we still call chat_model_info (returns a sane default).
+        const info = await invoke<ModelInfo>("chat_model_info", { model: name });
+        if (!cancelled) setModelInfo(info);
+      } catch { if (!cancelled) setModelInfo(null); }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line
+  }, [folder, convId, running]);
+
+  // Per-conversation totals from the persisted per-message usage: SUM the
+  // output/cache-write costs across turns; the CONTEXT FILL is the LATEST
+  // assistant turn's input tokens (each turn re-sends the whole history, so the
+  // last turn's input IS the current window occupancy). Live turn usage is
+  // folded in so the meter moves DURING a turn, not only after it saves.
+  const liveUsage = running ? turn.usage : undefined;
+  const convUsage = (() => {
+    let cost = 0, tokensIn = 0, tokensOut = 0, lastInput = 0;
+    const price = modelInfo?.price;
+    const add = (u?: TurnUsage) => {
+      if (!u) return;
+      tokensIn += u.input; tokensOut += u.output;
+      lastInput = u.input || lastInput;
+      if (price) {
+        cost += (u.input * price.input + u.output * price.output
+              + u.cacheRead * price.cache_read + u.cacheWrite * price.cache_write) / 1_000_000;
+      }
+    };
+    for (const m of msgs) if (m.role === "assistant" && m.usage) add(m.usage);
+    if (liveUsage) { add(liveUsage); }
+    return { cost, tokensIn, tokensOut, lastInput };
+  })();
+  // Context fill %: latest turn's input tokens over the model window. During a
+  // live turn, prefer the live input count so the bar climbs as work happens.
+  // Prefer a backend-reported window (local GGUF models report their real,
+  // memory-capped window via Usage) over the pricing-table default.
+  const reportedWindow = (() => {
+    if (liveUsage?.contextWindow) return liveUsage.contextWindow;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      if (m.role === "assistant" && m.usage?.contextWindow) return m.usage.contextWindow;
+    }
+    return 0;
+  })();
+  const ctxWindow = reportedWindow || modelInfo?.context_tokens || 0;
+  const ctxTokens = (liveUsage?.input) || convUsage.lastInput || 0;
+  const ctxPct = ctxWindow > 0 ? Math.min(100, Math.round((ctxTokens / ctxWindow) * 100)) : 0;
+  const ctxColor = ctxPct >= 90 ? "var(--danger)" : ctxPct >= 75 ? "#d98a1f" : "var(--text-muted)";
+
+  // COMPACT: summarize the model-facing history so a long chat can keep going.
+  const [compacting, setCompacting] = useState(false);
+  async function compactContext() {
+    if (!convId || compacting || running) return;
+    setCompacting(true);
+    try {
+      const seed = await invoke<unknown[]>("conv_compact", { id: convId });
+      historyRef.current = seed;
+      if (agentId) setHistory(agentId, seed);
+      // Mark it in the transcript so the user sees it happened, then persist the
+      // shrunk history against the (unchanged) visible transcript.
+      const note: Msg = { role: "assistant", text: "\u{1F5DC}\uFE0F Context compacted \u2014 earlier turns summarized to free up the window. The visible chat is unchanged; I kept the gist.", tools: [], streaming: false, at: Date.now() };
+      setMessages([...msgsRef.current, note]);
+      await persistFor(convId, msgsRef.current, seed);
+    } catch (e) {
+      alert("Compact failed: " + String(e));
+    } finally { setCompacting(false); }
+  }
+
   return (
     <div style={{ display: "flex", height: "100%", minHeight: 0, gap: "var(--space-4)" }}>
       {/* MAIN CHAT COLUMN. In multi-pane mode it flexes to share width; solo it
@@ -685,6 +765,46 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               disabled={!folder || !convId}
               onRename={(next) => renameCurrent(next)}
             />
+            {/* CONTEXT METER + $ COST (Mason, this session): a compact row under
+               the chat title showing how full the model's context window is and
+               the running cost of this session, so you SEE the wall coming and
+               can Compact before you hit it. Only shows once we have a window. */}
+            {!!folder && !!convId && ctxWindow > 0 && (
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6, flexWrap: "wrap" }}>
+                <div title={`${ctxTokens.toLocaleString()} / ${ctxWindow.toLocaleString()} tokens in context`}
+                  style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  {/* mini bar */}
+                  <div style={{ width: 64, height: 6, borderRadius: 999, background: "var(--line)", overflow: "hidden" }}>
+                    <div style={{ width: `${ctxPct}%`, height: "100%", background: ctxColor, transition: "width 200ms" }} />
+                  </div>
+                  <span style={{ fontSize: 12, color: ctxColor, fontVariantNumeric: "tabular-nums", fontWeight: ctxPct >= 75 ? 600 : 400 }}>
+                    {ctxPct}% context
+                  </span>
+                </div>
+                {convUsage.cost > 0 && (
+                  <span title="Running cost of this chat, based on the model's price" style={{ fontSize: 12, color: "var(--text-muted)", fontVariantNumeric: "tabular-nums" }}>
+                    · {fmtCost(convUsage.cost)}
+                  </span>
+                )}
+                <button
+                  onClick={() => void compactContext()}
+                  disabled={compacting || running || !convId}
+                  title="Summarize earlier turns to free up the context window (the visible chat is kept)"
+                  style={{
+                    fontSize: 11.5, cursor: compacting || running ? "default" : "pointer",
+                    padding: "2px 8px", borderRadius: 999, fontFamily: "inherit",
+                    border: "var(--border-width) solid var(--line)", background: "var(--bg)",
+                    color: ctxPct >= 75 ? ctxColor : "var(--text-muted)", opacity: compacting ? 0.6 : 1,
+                  }}
+                >{compacting ? "Compacting…" : "⚡ Compact"}</button>
+              </div>
+            )}
+            {/* At-the-wall warning: if context is nearly full, say so plainly. */}
+            {!!folder && !!convId && ctxWindow > 0 && ctxPct >= 85 && (
+              <div style={{ marginTop: 6, fontSize: 12, color: "var(--danger)", maxWidth: 420 }}>
+                Context is {ctxPct}% full — Compact now to avoid losing your next long reply.
+              </div>
+            )}
           </div>
           {closable && (
             <button
@@ -708,7 +828,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           {msgs.length === 0 && !running && !blocked && (
             <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
           )}
-          {msgs.map((m, i) => <Bubble key={i} m={m} agentId={agentId} />)}
+          {msgs.map((m, i) => <Bubble key={i} m={m} agentId={agentId} price={modelInfo?.price} />)}
           {/* LIVE inter-agent inbound message: when a peer dispatches a message
               to the agent you're viewing, show it as a user bubble immediately
               (before the reply streams) so you WATCH the conversation arrive. */}
@@ -1016,6 +1136,28 @@ function ChatTitle({ title, disabled, onRename }: { title: string; disabled: boo
   );
 }
 
+/** Format a $ cost compactly: sub-cent shows more digits so it isn't just $0.00. */
+function fmtCost(usd: number): string {
+  if (!usd || usd <= 0) return "$0.00";
+  if (usd < 0.01) return "$" + usd.toFixed(4);
+  if (usd < 1) return "$" + usd.toFixed(3);
+  return "$" + usd.toFixed(2);
+}
+
+/** Compact token count: 1234 -> "1.2k". */
+function fmtTokens(n: number): string {
+  if (!n) return "0";
+  if (n < 1000) return String(n);
+  return (n / 1000).toFixed(n < 10000 ? 1 : 0) + "k";
+}
+
+/** Per-turn $ cost from a usage record + the model's price ($/Mtok). 0 if no price. */
+function turnCost(u: TurnUsage, price?: { input: number; output: number; cache_read: number; cache_write: number }): number {
+  if (!price) return 0;
+  return (u.input * price.input + u.output * price.output
+        + u.cacheRead * price.cache_read + u.cacheWrite * price.cache_write) / 1_000_000;
+}
+
 /** HH:MM:SS in the user's locale, 24h so it's a fixed width in the margin. */
 function fmtClock(ms?: number): string {
   if (!ms) return "";
@@ -1026,24 +1168,37 @@ function fmtClock(ms?: number): string {
 
 /** Fixed-width gutter stamp. Reserves its width even when empty so bubbles
  *  don't shift horizontally between stamped and unstamped messages. */
-function Stamp({ at }: { at?: number }) {
+function Stamp({ at, usage, price }: { at?: number; usage?: TurnUsage; price?: { input: number; output: number; cache_read: number; cache_write: number } }) {
+  // Under the timestamp: tokens used + $ cost for THIS turn (Mason, this
+  // session). Tokens = input+output for the turn; cost from the model price.
+  const cost = usage ? turnCost(usage, price) : 0;
+  const toks = usage ? usage.input + usage.output : 0;
   return (
     <span style={{
-      width: 62, flexShrink: 0, textAlign: "center",
-      fontSize: 11, lineHeight: "20px", color: "var(--text-faint)",
+      width: 62, flexShrink: 0, textAlign: "center", display: "flex",
+      flexDirection: "column", alignItems: "center", gap: 1,
+      fontSize: 11, lineHeight: "16px", color: "var(--text-faint)",
       fontVariantNumeric: "tabular-nums", userSelect: "none",
-    }}>{fmtClock(at)}</span>
+    }}>
+      <span style={{ lineHeight: "18px" }}>{fmtClock(at)}</span>
+      {usage && toks > 0 && (
+        <span title={`${(usage.input).toLocaleString()} in + ${(usage.output).toLocaleString()} out tokens`}
+          style={{ fontSize: 9.5, lineHeight: "12px", opacity: 0.85 }}>
+          {fmtTokens(toks)} tok{cost > 0 ? <><br/>{fmtCost(cost)}</> : null}
+        </span>
+      )}
+    </span>
   );
 }
 
-function Bubble({ m, agentId }: { m: Msg; agentId?: string | null }) {
+function Bubble({ m, agentId, price }: { m: Msg; agentId?: string | null; price?: { input: number; output: number; cache_read: number; cache_write: number } }) {
   const isUser = m.role === "user";
   const memory = isUser && m.role === "user" ? m.memory : undefined;
   // The stamp lives OUTSIDE the bubble column, in the margin: to the LEFT of
   // the agent's replies and to the RIGHT of the user's prompts.
   return (
     <div style={{ display: "flex", alignItems: "flex-start", justifyContent: isUser ? "flex-end" : "flex-start", gap: 2, width: "100%" }}>
-      {!isUser && <Stamp at={m.at} />}
+      {!isUser && <Stamp at={m.at} usage={m.role === "assistant" ? m.usage : undefined} price={price} />}
       <BubbleBody m={m} isUser={isUser} memory={memory} agentId={agentId} />
       {isUser && <Stamp at={m.at} />}
     </div>

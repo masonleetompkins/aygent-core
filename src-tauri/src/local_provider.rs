@@ -132,15 +132,19 @@ pub async fn local_stream_turn<F: FnMut(StreamEvent)>(
         full.push_str(&t);
         on_event(StreamEvent::TextDelta { text: t });
     }
-    handle.await.map_err(|e| format!("decode task: {e}"))??;
+    let (prompt_tokens, generated) = handle.await.map_err(|e| format!("decode task: {e}"))??;
 
+    // USAGE (context meter): local models have no $ cost, but the token counts +
+    // the REAL (memory-capped) context window drive the fill %. We report the
+    // window we actually ran with so the meter is accurate for THIS machine.
+    on_event(StreamEvent::Usage { input: prompt_tokens, output: generated, cache_read: 0, cache_write: 0, context_window: ctx });
     on_event(StreamEvent::Done { stop_reason: "end_turn".into() });
     let content = serde_json::json!([{ "type": "text", "text": full }]);
     Ok((content, "end_turn".to_string()))
 }
 
 /// The synchronous decode loop (runs on a blocking thread).
-fn decode(path: &str, prompt: &str, ctx_tokens: u32, tx: tokio::sync::mpsc::UnboundedSender<String>) -> Result<(), String> {
+fn decode(path: &str, prompt: &str, ctx_tokens: u32, tx: tokio::sync::mpsc::UnboundedSender<String>) -> Result<(u64, u64), String> {
     let be = backend()?;
     let model = load_model(path)?;
 
@@ -184,6 +188,8 @@ fn decode(path: &str, prompt: &str, ctx_tokens: u32, tx: tokio::sync::mpsc::Unbo
         LlamaSampler::greedy(),
     ]);
 
+    let prompt_tokens = tokens.len() as u64;
+    let mut generated: u64 = 0;
     let mut n_cur = batch.n_tokens();
     for _ in 0..MAX_NEW_TOKENS {
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
@@ -201,12 +207,13 @@ fn decode(path: &str, prompt: &str, ctx_tokens: u32, tx: tokio::sync::mpsc::Unbo
             .unwrap_or_default();
         if tx.send(piece).is_err() { break; } // UI hung up
 
+        generated += 1;
         batch.clear();
         batch.add(token, n_cur, &[0], true).map_err(|e| format!("batch add: {e}"))?;
         n_cur += 1;
         ctx.decode(&mut batch).map_err(|e| format!("decode token: {e}"))?;
     }
-    Ok(())
+    Ok((prompt_tokens, generated))
 }
 
 // ---------------------------------------------------------------------------
