@@ -624,6 +624,7 @@ export function AgentForm({
               <option value="anthropic">Anthropic</option>
               <option value="openai">OpenAI</option>
               <option value="openrouter">OpenRouter</option>
+              <option value="meta">Muse (Meta)</option>
               <option value="local">Local</option>
             </select>
           </label>
