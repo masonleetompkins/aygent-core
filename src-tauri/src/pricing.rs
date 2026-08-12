@@ -60,7 +60,10 @@ pub struct ModelInfo {
     pub known: bool,
 }
 
-const K: u32 = 1024;
+// Context windows are advertised in DECIMAL thousands (200,000 / 1,000,000) by
+// every cloud provider — NOT binary. Using 1024 here made 200*K = 204,800 render
+// as "205k" and 1000*K = 1,024,000 render as "1024k" (Mason caught both). K = 1000.
+const K: u32 = 1000;
 
 /// Look up a model's context window + price by its id (case-insensitive
 /// substring match, most-specific patterns FIRST). Cloud providers only.

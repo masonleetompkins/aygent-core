@@ -1146,11 +1146,14 @@ function fmtCost(usd: number): string {
   return "$" + usd.toFixed(2);
 }
 
-/** Compact token count: 1234 -> "1.2k". */
+/** Compact token count (DECIMAL thousands, matching how context windows are
+ *  advertised): 1234 -> "1.2k", 1_000_000 -> "1M", 1_500_000 -> "1.5M". */
 function fmtTokens(n: number): string {
   if (!n) return "0";
   if (n < 1000) return String(n);
-  return (n / 1000).toFixed(n < 10000 ? 1 : 0) + "k";
+  if (n < 1_000_000) return (n / 1000).toFixed(n < 10000 ? 1 : 0) + "k";
+  const m = n / 1_000_000;
+  return (m < 10 ? m.toFixed(m % 1 === 0 ? 0 : 1) : m.toFixed(0)) + "M";
 }
 
 /** Per-turn $ cost from a usage record + the model's price ($/Mtok). 0 if no price. */

@@ -55,7 +55,6 @@ pub async fn anthropic_model_info(api_key: &str, model_id: &str) -> Result<(u32,
         .get(&url)
         .header("x-api-key", api_key)
         .header("anthropic-version", API_VERSION)
-        .header("anthropic-beta", "true")
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;
