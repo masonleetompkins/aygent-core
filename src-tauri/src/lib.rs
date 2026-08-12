@@ -3393,6 +3393,17 @@ fn exec_tool_cfg(
                 Err(e) => (format!("delete failed: {e}"), true),
             }
         }
+        // @shared discovery (parity with the daemon list path): a bare
+        // "@shared" enumerates the read-only mount LABELS this agent can browse.
+        // Deeper "@shared/<label>/..." falls through to the normal resolve below.
+        "list_files" if path == crate::broker::SHARED_ROOT || path == "@shared/" => {
+            let labels = broker.shared_labels_for(agent_id);
+            if labels.is_empty() {
+                ("(no shared folders are mounted for this agent)".to_string(), false)
+            } else {
+                (labels.join("\n"), false)
+            }
+        }
         "list_files" => match broker.resolve(agent_id, path, broker::Mode::Read) {
             Ok(real) => {
                 if real.is_file() {
@@ -3871,6 +3882,27 @@ fn agent_browser_domains(app: &tauri::AppHandle, folder: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// SHARED CONTEXT prompt block: tell the agent it has READ-ONLY access to other
+/// folders and EXACTLY how to reach them (the @shared namespace). Without this,
+/// an agent never knows a mount exists and never tries — which is why a
+/// mounted folder was "invisible" (Mason 08-12). Assembled from the SAME
+/// broker.shared_labels_for() the resolver uses, so the labels named here are
+/// exactly the ones list_files/read_file accept. Empty when no mounts.
+fn mounts_prompt_block(broker: &Arc<Broker>, agent_id: &str) -> String {
+    let labels = broker.shared_labels_for(agent_id);
+    if labels.is_empty() { return String::new(); }
+    let listed = labels.iter().map(|l| format!("  - @shared/{l}/")).collect::<Vec<_>>().join("\n");
+    format!(
+        "\n\nSHARED CONTEXT (read-only): you have READ access to these other folders, \
+         mounted under the virtual `@shared/` namespace:\n{listed}\n\
+         - List what's shared: `list_files(\"@shared\")` shows the folder labels; \
+         `list_files(\"@shared/<label>\")` browses inside one.\n\
+         - Read a shared file: `read_file(\"@shared/<label>/path/to/file\")`.\n\
+         - These folders are READ-ONLY — you cannot write or delete in them. To use \
+         something you read there, copy it into your OWN folder."
+    )
+}
+
 /// FNV-1a folder key (same scheme as tools/conversations).
 fn folder_key_fnv(folder: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -4274,6 +4306,7 @@ async fn agent_stream(
         if !agent_persona.trim().is_empty() { s.push_str("\n\n"); s.push_str(agent_persona.trim()); }
         s.push_str(&roster_block);
         s.push_str(&context_block);
+        s.push_str(&mounts_prompt_block(&broker, &scope_id));
         s
     };
 
@@ -5130,7 +5163,8 @@ pub async fn run_headless_turn(
         let list = roster.iter().map(|(id, name)| format!("- {name} (id: {id})")).collect::<Vec<_>>().join("\n");
         format!("\n\nOTHER AGENTS you can message with send_message:\n{list}")
     };
-    let system = format!("{AGENT_SYSTEM}{persona}{roster_block}{context_block}");
+    let mounts_block = mounts_prompt_block(broker, agent_id);
+    let system = format!("{AGENT_SYSTEM}{persona}{roster_block}{context_block}{mounts_block}");
 
     // Tools: base file tools + send_message (has_peers = it has a roster).
     let (tools, _reg) = agent_tools_for_ex(app, Some(&agent.id), Some(&agent.folder_path), !roster.is_empty());
