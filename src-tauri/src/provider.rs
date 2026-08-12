@@ -41,6 +41,37 @@ pub async fn anthropic_list_models(api_key: &str) -> Result<Vec<String>, String>
     Ok(ids)
 }
 
+/// Fetch a model's real metadata from the STANDARD models endpoint
+/// (`GET /v1/models/{id}`). VERIFIED LIVE (2026-08-12, Mason's account): the
+/// standard endpoint already returns `max_input_tokens` (the real context
+/// window, e.g. 1,000,000 for the Opus 4.8 / 5-series), `max_tokens` (max
+/// output), and `display_name` on every model object — NO beta flag needed.
+/// (An earlier version used `?beta=true` on a mistaken reading of the SDK spec;
+/// the live standard endpoint carries the same fields, so we dropped it.)
+/// Returns (context_window, max_output, display_name). Errors let the caller
+/// fall back to the curated table.
+pub async fn anthropic_model_info(api_key: &str, model_id: &str) -> Result<(u32, u32, String), String> {
+    let url = format!("{ANTHROPIC_MODELS_URL}/{model_id}");
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", API_VERSION)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("read body failed: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("anthropic {status}: {text}"));
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("bad json: {e}"))?;
+    let ctx = v.get("max_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let max_out = v.get("max_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let name = v.get("display_name").and_then(|x| x.as_str()).unwrap_or(model_id).to_string();
+    Ok((ctx, max_out, name))
+}
+
 /// One-shot Anthropic Messages call. Returns the assistant text, or an error.
 /// `system` may include a note that the agent has a jailed file tool (tool-use
 /// wiring is the next M0.3 sub-step; here we prove key->model->text).
@@ -217,6 +248,10 @@ pub enum StreamEvent {
     ToolUse { id: String, name: String, input: serde_json::Value },
     /// The turn finished. `stop_reason` = "tool_use" | "end_turn" | ...
     Done { stop_reason: String },
+    /// Token accounting for ONE provider turn, parsed from the provider usage
+    /// block (Anthropic message_start/message_delta). Emitted once per streamed
+    /// turn so the UI can meter context fill + $ cost. Counts are for THIS turn.
+    Usage { input: u64, output: u64, cache_read: u64, cache_write: u64, #[serde(default)] context_window: u32 },
     /// A non-fatal note (e.g. fell back to non-streaming).
     Info { text: String },
     /// Fatal error for this turn.
@@ -281,6 +316,11 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
     // per-index scratch for tool_use input JSON being streamed as partial_json
     let mut tool_json: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
     let mut stop_reason = String::from("end_turn");
+    // USAGE (context meter + $ cost): Anthropic streams token counts in the
+    // message_start frame (input_tokens + cache_read/creation) and the final
+    // message_delta frame (output_tokens). We accumulate them and emit a single
+    // Usage event at end-of-turn.
+    let (mut u_in, mut u_out, mut u_cr, mut u_cw): (u64, u64, u64, u64) = (0, 0, 0, 0);
 
     let mut stream = resp.bytes_stream();
     // BUG FIX: buffer RAW BYTES, not a String. The old code did
@@ -325,6 +365,14 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
                     Ok(v) => v, Err(_) => continue,
                 };
                 match ev.get("type").and_then(|t| t.as_str()) {
+                    Some("message_start") => {
+                        // Initial usage: input tokens + cache read/creation counts.
+                        if let Some(us) = ev.get("message").and_then(|m| m.get("usage")) {
+                            u_in = us.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(u_in);
+                            u_cr = us.get("cache_read_input_tokens").and_then(|x| x.as_u64()).unwrap_or(u_cr);
+                            u_cw = us.get("cache_creation_input_tokens").and_then(|x| x.as_u64()).unwrap_or(u_cw);
+                        }
+                    }
                     Some("content_block_start") => {
                         let idx = ev.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                         let block = ev.get("content_block").cloned().unwrap_or(json!({}));
@@ -407,8 +455,15 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
                         if let Some(sr) = ev.get("delta").and_then(|d| d.get("stop_reason")).and_then(|s| s.as_str()) {
                             stop_reason = sr.to_string();
                         }
+                        // Final usage lives on message_delta.usage (output_tokens,
+                        // and Anthropic re-states input on some responses).
+                        if let Some(us) = ev.get("usage") {
+                            if let Some(o) = us.get("output_tokens").and_then(|x| x.as_u64()) { u_out = o; }
+                            if let Some(i) = us.get("input_tokens").and_then(|x| x.as_u64()) { if i > 0 { u_in = i; } }
+                        }
                     }
                     Some("message_stop") => {
+                        on_event(StreamEvent::Usage { input: u_in, output: u_out, cache_read: u_cr, cache_write: u_cw, context_window: 0 });
                         on_event(StreamEvent::Done { stop_reason: stop_reason.clone() });
                         saw_done = true;
                     }
@@ -440,8 +495,12 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
                     if let Some(sr) = ev.get("delta").and_then(|d| d.get("stop_reason")).and_then(|s| s.as_str()) {
                         stop_reason = sr.to_string();
                     }
+                    if let Some(us) = ev.get("usage") {
+                        if let Some(o) = us.get("output_tokens").and_then(|x| x.as_u64()) { u_out = o; }
+                    }
                 }
                 Some("message_stop") => {
+                    on_event(StreamEvent::Usage { input: u_in, output: u_out, cache_read: u_cr, cache_write: u_cw, context_window: 0 });
                     on_event(StreamEvent::Done { stop_reason: stop_reason.clone() });
                     saw_done = true;
                 }
@@ -459,6 +518,7 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
     // message_stop at all — abrupt close, proxy cut, etc.), synthesize one so the
     // UI spinner is always resolved. The turn's content is intact either way.
     if !saw_done {
+        on_event(StreamEvent::Usage { input: u_in, output: u_out, cache_read: u_cr, cache_write: u_cw, context_window: 0 });
         on_event(StreamEvent::Done { stop_reason: stop_reason.clone() });
     }
 

@@ -104,6 +104,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 <option value="anthropic">Anthropic</option>
                 <option value="openai">OpenAI</option>
                 <option value="openrouter">OpenRouter</option>
+                <option value="meta">Muse (Meta)</option>
               </select>
             </label>
             <label style={fieldLabel}>API key

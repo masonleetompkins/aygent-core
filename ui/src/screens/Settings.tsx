@@ -128,6 +128,7 @@ export function Settings({
         <ProviderRow provider="anthropic" label="Anthropic" placeholder="sk-ant-…" />
         <ProviderRow provider="openai" label="OpenAI" placeholder="sk-…" />
         <ProviderRow provider="openrouter" label="OpenRouter" placeholder="sk-or-…" />
+        <ProviderRow provider="meta" label="Muse (Meta)" placeholder="your Muse API key" />
       </Card>
 
       {/* MODEL card removed (Mason cleanup #3) — model choice lives per-agent in

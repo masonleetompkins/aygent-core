@@ -92,6 +92,12 @@ pub enum Render {
     One { line: &'static str },
     /// Pretty-printed JSON, truncated. Escape hatch for shapes not worth modeling.
     Json,
+    /// GitHub Contents API file reply: base64-DECODE `content` and return the
+    /// plain file text (with a 1-line path/sha/size header) instead of dumping
+    /// the base64 envelope through the 4000-char Json cap. Whole-file reads on
+    /// private repos, no client-side base64, no clone. Non-file replies (a dir
+    /// listing array, a >1MB blob pointer) fall back to truncated JSON.
+    GithubContent,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -304,6 +310,7 @@ pub fn fill(tpl: &str, ctx: &serde_json::Value) -> String {
 /// Render a reply per the tool's Render spec.
 pub fn render(r: &Render, body: &serde_json::Value) -> String {
     match r {
+        Render::GithubContent => render_github_content(body),
         Render::Json => {
             let s = serde_json::to_string_pretty(body).unwrap_or_default();
             s.chars().take(4000).collect()
@@ -321,6 +328,50 @@ pub fn render(r: &Render, body: &serde_json::Value) -> String {
             }
             out.trim_end().to_string()
         }
+    }
+}
+
+/// Decode a GitHub Contents API file reply into plain file text. GitHub returns
+/// {content: <base64 with embedded newlines>, encoding:"base64", sha, size, path}
+/// for a file under 1MB. We decode it and return the WHOLE file (capped at a
+/// real source-file size, not 4000 chars) with a 1-line header so the model has
+/// the sha for a later write. Non-file replies degrade to truncated JSON.
+const GH_TEXT_CAP: usize = 200_000; // chars of DECODED text (~a large source file)
+fn render_github_content(body: &serde_json::Value) -> String {
+    use base64::Engine;
+    // A directory listing is a JSON ARRAY, not a file object -> fall back to JSON.
+    if body.is_array() {
+        let s = serde_json::to_string_pretty(body).unwrap_or_default();
+        return s.chars().take(4000).collect();
+    }
+    let encoding = body.get("encoding").and_then(|e| e.as_str()).unwrap_or("");
+    let content_b64 = body.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    let path = body.get("path").and_then(|p| p.as_str()).unwrap_or("");
+    let sha = body.get("sha").and_then(|s| s.as_str()).unwrap_or("");
+    let size = body.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+    // A file >1MB has encoding "none" (or empty content) and must be fetched via
+    // the git blob API -> say so plainly instead of returning an empty file.
+    if encoding != "base64" || content_b64.is_empty() {
+        if size > 1_000_000 {
+            return format!("{path} is {size} bytes (>1MB), which the GitHub Contents API will not inline. Read it via its git blob sha ({sha}) instead.");
+        }
+        // Unknown shape (symlink, submodule, or an error object) -> raw JSON.
+        let s = serde_json::to_string_pretty(body).unwrap_or_default();
+        return s.chars().take(4000).collect();
+    }
+    // GitHub base64 has embedded newlines; strip all whitespace before decoding.
+    let clean: String = content_b64.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(clean.as_bytes()) {
+        Ok(b) => b,
+        Err(e) => return format!("could not decode {path}: base64 error {e}"),
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let header = format!("# {path} · sha {sha} · {size} bytes\n");
+    if text.chars().count() > GH_TEXT_CAP {
+        let truncated: String = text.chars().take(GH_TEXT_CAP).collect();
+        format!("{header}{truncated}\n\n[… file exceeds {GH_TEXT_CAP} chars; showing the first {GH_TEXT_CAP}. This is unusual for a source file.]")
+    } else {
+        format!("{header}{text}")
     }
 }
 
@@ -354,6 +405,34 @@ mod tests {
         let r = Render::Items { root: "items", line: "- {t}", empty: "-" };
         let body = serde_json::json!({ "items": [ { "t": "one" }, { "t": "two" } ] });
         assert_eq!(render(&r, &body), "- one\n- two");
+    }
+
+    /// THE FIX: github_read_file must return the WHOLE decoded file, not a
+    /// 4000-char slice of base64. A CLAUDE.md-sized file is ~10x the old cap.
+    #[test]
+    fn github_content_decodes_full_file_not_truncated_base64() {
+        use base64::Engine;
+        // A body larger than the old 4000-char Json cap once base64-inflated.
+        let file_text = "line\n".repeat(2000); // 10_000 chars of real text
+        let b64 = base64::engine::general_purpose::STANDARD.encode(file_text.as_bytes());
+        // GitHub inserts newlines into the base64 every 60 chars — simulate that.
+        let wrapped: String = b64.as_bytes().chunks(60).map(|c| format!("{}\n", String::from_utf8_lossy(c))).collect();
+        let body = serde_json::json!({
+            "content": wrapped, "encoding": "base64",
+            "path": "CLAUDE.md", "sha": "abc123", "size": file_text.len(),
+        });
+        let out = render(&Render::GithubContent, &body);
+        assert!(out.starts_with("# CLAUDE.md · sha abc123"), "header present: {}", &out[..40]);
+        assert!(out.contains(&file_text), "the FULL decoded file must be present, not a base64 slice");
+        assert!(out.len() > 4000, "must exceed the old 4000-char cap");
+    }
+
+    #[test]
+    fn github_content_directory_listing_falls_back_to_json() {
+        // A directory read returns a JSON ARRAY, not a file object.
+        let body = serde_json::json!([{ "name": "a.rs", "type": "file" }]);
+        let out = render(&Render::GithubContent, &body);
+        assert!(out.contains("a.rs"), "listing still renders: {out}");
     }
 
     /// The invariant that matters: read mode must never surface a write tool.

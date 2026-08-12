@@ -57,13 +57,16 @@ mod keychain;
 mod local_provider;
 mod local_tools;
 mod openai_provider;
+mod meta_provider; // Muse (Meta): api.meta.ai/v1 /responses (OpenAI Responses API shape) — own module.
 mod pdf_tool;
 mod provider;
+mod pricing; // CLOUD model context windows + $/Mtok (context meter + cost).
 mod provision;
 mod mcp_client;
 mod mcp; // MCP manager: registry + catalog + agent-loop bridge + install/uninstall. // MCP client: spawn stdio JSON-RPC servers, discover + route their tools. // Level A: bundle portable node+ffmpeg+hyperframes into app-data (no system installs).
 mod supervisor;
 mod tools_registry;
+mod spark_state; // SPARKS: jailed KV persistence (Sparks/<slug>/state.json) for interactive Sparks.
 
 use std::sync::Arc;
 use rand::Rng;
@@ -1419,6 +1422,8 @@ async fn anthropic_models() -> Result<Vec<String>, String> {
 #[tauri::command]
 async fn openai_models(provider: String) -> Result<Vec<String>, String> {
     let key = keychain::get_key(&provider)?;
+    // Meta (Llama API) has its own module (different response shape); route it there.
+    if provider == "meta" { return meta_provider::list_models(&key).await; }
     openai_provider::list_models(&provider, &key).await
 }
 
@@ -1430,6 +1435,7 @@ async fn provider_verify_key(provider: String) -> Result<(), String> {
     let key = keychain::get_key(&provider)?;
     if key.trim().is_empty() { return Err("stored key is empty".into()); }
     if provider == "anthropic" { return anthropic_models().await.map(|_| ()); }
+    if provider == "meta" { return meta_provider::verify_key(&key).await; }
     openai_provider::verify_key(&provider, &key).await
 }
 
@@ -1469,6 +1475,185 @@ fn set_selection(db: tauri::State<writer::Db>, folder: String, provider: String,
     a.provider = provider;
     a.model = model;
     repo::update_agent(&db, a)
+}
+
+/// CONTEXT METER: the context window (tokens) + $/Mtok price for a model id, so
+/// the chat header can render "62% of context used" + a running $ cost. Cloud
+/// providers (Anthropic/OpenAI/OpenRouter/Meta); local GGUF models report their
+/// window via the catalog, price 0. Pure lookup, no network.
+/// Process-global cache for model metadata so the meter is instant and we don't
+/// refetch the provider catalog on every render. Keyed by (provider, model);
+/// entries live for CTX_TTL. Model specs rarely change within a session, but a
+/// TTL keeps us honest if a model is updated while the app is open.
+static MODEL_INFO_CACHE: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, serde_json::Value)>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+const CTX_TTL: std::time::Duration = std::time::Duration::from_secs(1800); // 30 min
+
+#[tauri::command]
+async fn chat_model_info(provider: Option<String>, model: String) -> serde_json::Value {
+    let provider = provider.unwrap_or_default();
+    let cache_key = format!("{provider}::{model}");
+    // Serve a fresh cached entry.
+    if let Ok(cache) = MODEL_INFO_CACHE.lock() {
+        if let Some((at, val)) = cache.get(&cache_key) {
+            if at.elapsed() < CTX_TTL { return val.clone(); }
+        }
+    }
+
+    // Curated pricing table is the fallback denominator + the price source (no
+    // provider API exposes price for Anthropic/OpenAI; OpenRouter does).
+    let table = pricing::lookup(&model);
+    let mut context_tokens = table.context_tokens;
+    let mut known = table.known;
+    let (mut p_in, mut p_out) = (table.price.input, table.price.output);
+    let (mut p_cr, mut p_cw) = (table.price.cache_read, table.price.cache_write);
+    let mut display_name = model.clone();
+
+    // DYNAMIC window (the fix): fetch the REAL context window from the provider
+    // instead of a hardcoded substring guess. Falls back to the table on any
+    // error (offline, older account, unknown model).
+    match provider.as_str() {
+        "anthropic" | "" => {
+            if let Ok(key) = keychain::get_key("anthropic") {
+                if let Ok((ctx, _max_out, name)) = provider::anthropic_model_info(&key, &model).await {
+                    if ctx > 0 { context_tokens = ctx; known = true; }
+                    if !name.is_empty() { display_name = name; }
+                }
+            }
+        }
+        "openrouter" => {
+            if let Ok(key) = keychain::get_key("openrouter") {
+                if let Ok((ctx, pin, pout)) = openai_provider::openrouter_model_info(&key, &model).await {
+                    if ctx > 0 { context_tokens = ctx; known = true; }
+                    // OpenRouter publishes real price; use it over the table when present.
+                    if pin > 0.0 { p_in = pin; p_cr = pin * 0.1; p_cw = pin * 1.25; }
+                    if pout > 0.0 { p_out = pout; }
+                }
+            }
+        }
+        "meta" => {
+            // Muse: try the dynamic /models window first (if the deployment
+            // publishes one), else keep the curated fallback (Spark = 1M).
+            if let Ok(key) = keychain::get_key("meta") {
+                if let Ok(ctx) = meta_provider::muse_model_info(&key, &model).await {
+                    if ctx > 0 { context_tokens = ctx; known = true; }
+                }
+            }
+        }
+        // openai / local: no dynamic window endpoint. openai keeps the curated
+        // table (documented as the ONLY hardcoded numbers); local reports its
+        // real window through the Usage stream, so the UI overrides this anyway.
+        _ => {}
+    }
+
+    let val = serde_json::json!({
+        "context_tokens": context_tokens,
+        "known": known,
+        "display_name": display_name,
+        "price": { "input": p_in, "output": p_out, "cache_read": p_cr, "cache_write": p_cw }
+    });
+    if let Ok(mut cache) = MODEL_INFO_CACHE.lock() {
+        cache.insert(cache_key, (std::time::Instant::now(), val.clone()));
+    }
+    val
+}
+
+/// COMPACT CONTEXT: shrink a conversation's provider-format history so a long
+/// chat can keep going without blowing the model context window. The VISIBLE
+/// transcript (msgs) is untouched — only the model-facing `history` is replaced
+/// with a compact summary seed, so the agent keeps the gist while the token load
+/// resets. The model authors the summary using the agent own provider/model.
+/// Returns the new (small) history array; the UI persists it onto the conv.
+#[tauri::command]
+async fn conv_compact(
+    db: tauri::State<'_, writer::Db>,
+    id: String,
+) -> Result<serde_json::Value, String> {
+    let conv = repo::load_conversation(&db, &id)?;
+    let history = conv.history.as_array().cloned().unwrap_or_default();
+    if history.len() < 4 {
+        return Err("not enough conversation to compact yet".into());
+    }
+    // Resolve the agent own provider/model (fallback: anthropic auto/haiku).
+    let agent = repo::get_agent(&db, &conv.agent_id)?.ok_or("agent not found")?;
+    let provider = if agent.provider.is_empty() { "anthropic".to_string() } else { agent.provider.clone() };
+
+    // Flatten the history into a readable transcript for the summarizer. We keep
+    // it bounded (head + tail) so the summarize call itself never overflows.
+    let transcript = flatten_history_for_summary(&history);
+    let ask = format!(
+        "Summarize this conversation so it can CONTINUE with full context but far \
+         fewer tokens. Capture: what the user is doing, decisions made, key facts, \
+         open threads, and any state the assistant must remember (file paths, names, \
+         numbers). Write it as a dense factual briefing in the SECOND person addressed \
+         to the assistant (\"You are helping the user with...\"). Do NOT add pleasantries. \
+         Conversation:\n\n{transcript}"
+    );
+
+    let summary = match provider.as_str() {
+        "anthropic" => {
+            let key = keychain::get_key("anthropic").map_err(|_| "no anthropic key set".to_string())?;
+            let model = if agent.model.trim().is_empty() {
+                let models = provider::anthropic_list_models(&key).await?;
+                models.iter().find(|m| m.contains("haiku")).cloned().or_else(|| models.first().cloned()).ok_or("no model")?
+            } else { agent.model.clone() };
+            provider::anthropic_complete(&key, &model, &ask).await?
+        }
+        "openai" | "openrouter" | "meta" => {
+            let key = keychain::get_key(&provider).map_err(|_| format!("no {provider} key set"))?;
+            if agent.model.trim().is_empty() { return Err("pick a model for this agent first".into()); }
+            if provider == "meta" { meta_provider::complete(&key, &agent.model, &ask).await? }
+            else { openai_provider::complete(&provider, &key, &agent.model, &ask).await? }
+        }
+        _ => return Err("compaction needs a cloud provider (Anthropic/OpenAI/OpenRouter)".into()),
+    };
+
+    // The new history is a SINGLE user turn carrying the briefing, so the next
+    // real turn appends after it. Small, self-contained, resets the token load.
+    let seed = serde_json::json!([
+        { "role": "user", "content": format!("[Context summary of the earlier conversation, compacted to save tokens]\n\n{summary}") },
+        { "role": "assistant", "content": "Understood — I have the summarized context and we can continue." }
+    ]);
+    Ok(seed)
+}
+
+/// Flatten a provider-format history array into a plain transcript for the
+/// summarizer. Bounded (head + tail) so the summarize request never itself
+/// overflows the window on a huge chat. Text + tool intent only (skips raw
+/// tool bytes and images).
+fn flatten_history_for_summary(history: &[serde_json::Value]) -> String {
+    fn content_text(v: &serde_json::Value) -> String {
+        match v.get("content") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(blocks)) => blocks.iter().filter_map(|b| {
+                match b.get("type").and_then(|t| t.as_str()) {
+                    Some("text") | Some("input_text") | Some("output_text") =>
+                        b.get("text").and_then(|t| t.as_str()).map(String::from),
+                    Some("tool_use") => b.get("name").and_then(|n| n.as_str()).map(|n| format!("[called tool: {n}]")),
+                    Some("tool_result") => Some("[tool result]".to_string()),
+                    _ => None,
+                }
+            }).collect::<Vec<_>>().join(" "),
+            _ => String::new(),
+        }
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for m in history {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+        let text = content_text(m);
+        let text = text.trim();
+        if text.is_empty() { continue; }
+        let capped: String = text.chars().take(2000).collect();
+        lines.push(format!("{}: {}", role, capped));
+    }
+    // Bound: keep the first 12 + last 40 turns if very long.
+    if lines.len() > 60 {
+        let head = lines[..12].join("\n");
+        let tail = lines[lines.len()-40..].join("\n");
+        format!("{head}\n\n[...older turns omitted...]\n\n{tail}")
+    } else {
+        lines.join("\n")
+    }
 }
 
 // --- AGENTS (multi-agent profiles) -----------------------------------------
@@ -1878,11 +2063,12 @@ async fn agent_generate_soul(
             } else { agent.model.clone() };
             provider::anthropic_complete(&key, &model, &meta).await?
         }
-        "openai" | "openrouter" => {
+        "openai" | "openrouter" | "meta" => {
             let key = keychain::get_key(&provider).map_err(|_| format!("no {provider} key set"))?;
             let model = agent.model.clone();
             if model.trim().is_empty() { return Err("pick a model for this agent first".into()); }
-            openai_provider::complete(&provider, &key, &model, &meta).await?
+            if provider == "meta" { meta_provider::complete(&key, &model, &meta).await? }
+            else { openai_provider::complete(&provider, &key, &model, &meta).await? }
         }
         _ => return Err("Soul generation needs a cloud provider (Anthropic/OpenAI/OpenRouter) \
                          — set one for this agent.".into()),
@@ -2257,6 +2443,32 @@ fn spark_save(
     std::fs::write(&man_abs, serde_json::to_string_pretty(&manifest).unwrap_or_default())
         .map_err(|e| format!("write manifest: {e}"))?;
     Ok(())
+}
+
+// SPARK STATE (jailed KV) — the persistence layer that makes Sparks real apps.
+// The Spark's injected runtime marshals localStorage + window.spark over
+// postMessage to the host; the host lands here, jailed to Sparks/<slug>/.
+
+/// Read a Spark's whole KV blob (jailed). `{}` when it has none yet.
+#[tauri::command]
+fn spark_state_get(broker: tauri::State<Arc<Broker>>, agent_id: String, slug: String) -> Result<serde_json::Value, String> {
+    spark_state::read(&broker, &agent_id, &slug)
+}
+
+/// Overwrite a Spark's whole KV blob (jailed). `values` must be a JSON object.
+#[tauri::command]
+fn spark_state_set(broker: tauri::State<Arc<Broker>>, agent_id: String, slug: String, values: serde_json::Value) -> Result<(), String> {
+    spark_state::write(&broker, &agent_id, &slug, &values)
+}
+
+/// Set OR remove ONE key in a Spark's KV blob (jailed). `value: null` removes.
+#[tauri::command]
+fn spark_state_set_key(broker: tauri::State<Arc<Broker>>, agent_id: String, slug: String, key: String, value: serde_json::Value) -> Result<(), String> {
+    if value.is_null() {
+        spark_state::remove_key(&broker, &agent_id, &slug, &key)
+    } else {
+        spark_state::set_key(&broker, &agent_id, &slug, &key, value)
+    }
 }
 
 /// SKILLS — saved procedures (instructions + an allowed subset of real tools).
@@ -3939,6 +4151,11 @@ EXAMPLE \u{2014} a tip calculator's body (follow this shape, adapt the fields):\
 <div class=\"row\"><span class=\"k\">Per person</span><span class=\"v\" id=\"pp\">$0.00</span></div>\
 </div><script>/* wire it up: recompute on input + seg/stepper clicks */</script>\n\
 \n\
+PERSISTENCE: a Spark's state IS saved \u{2014} localStorage works normally AND persists across \
+sessions (checklists stay checked, counters keep counting when the user leaves and comes back). \
+For structured data use window.spark.set(key,value) / window.spark.get(key) / window.spark.all() \
+(any JSON value). No setup needed \u{2014} great for to-do lists, trackers, saved settings.\n\
+\
 DATA AT BUILD TIME: the Spark is sandboxed \u{2014} it CANNOT call you or read files. If it needs \
 the user's real data, gather it FIRST with your tools, then embed it in the <script> as a \
 JS literal (const DATA = {\u{2026}}). Never put secrets in a Spark.\n\
@@ -4189,7 +4406,7 @@ async fn agent_stream(
     // ---- OPENAI / OPENROUTER PATH ------------------------------------------
     // Shared Chat Completions wire format; one impl, two base URLs. Full tool-
     // use: same jailed exec_tool + broker + SAVE POINTs as every other provider.
-    if provider_kind == "openai" || provider_kind == "openrouter" {
+    if provider_kind == "openai" || provider_kind == "openrouter" || provider_kind == "meta" {
         let key = keychain::get_key(&provider_kind)
             .map_err(|_| format!("no {provider_kind} key set — add one in Settings"))?;
         let model = model.filter(|m| !m.trim().is_empty())
@@ -4245,10 +4462,17 @@ async fn agent_stream(
             }
             let mut round_calls: usize = 0;
             let mut round_errs: usize = 0;
-            let stream_result = openai_provider::openai_stream_turn(
-                &provider_kind, &key, &model, &sys, &messages, &tools, Some(&cancel_flag),
-                |ev| { let _ = app.emit(&channel, &ev); },
-            ).await;
+            let stream_result = if provider_kind == "meta" {
+                meta_provider::meta_stream_turn(
+                    &key, &model, &sys, &messages, &tools, Some(&cancel_flag),
+                    |ev| { let _ = app.emit(&channel, &ev); },
+                ).await
+            } else {
+                openai_provider::openai_stream_turn(
+                    &provider_kind, &key, &model, &sys, &messages, &tools, Some(&cancel_flag),
+                    |ev| { let _ = app.emit(&channel, &ev); },
+                ).await
+            };
             if let Err(e) = &stream_result {
                 if e == "__CANCELLED__" {
                     messages.as_array_mut().unwrap().push(serde_json::json!({
@@ -5007,7 +5231,7 @@ pub async fn run_headless_turn(
             }
             break;
         }
-    } else if provider_kind == "openai" || provider_kind == "openrouter" {
+    } else if provider_kind == "openai" || provider_kind == "openrouter" || provider_kind == "meta" {
         let key = keychain::get_key(&provider_kind).map_err(|_| format!("recipient has no {provider_kind} key"))?;
         if agent.model.trim().is_empty() { return Err("recipient has no model set".into()); }
         // STREAMING (Mason 08-06): stream token-by-token so AYGENT Remote shows
@@ -5017,7 +5241,14 @@ pub async fn run_headless_turn(
         let _ = app.emit(&stream_channel, &provider::StreamEvent::Info { text: "thinking…".into() });
         let msgs = serde_json::json!([{ "role": "user", "content": framed }]);
         let no_tools = serde_json::json!([]);
-        match openai_provider::openai_stream_turn(
+        let hl_stream = if provider_kind == "meta" {
+            meta_provider::meta_stream_turn(&key, &agent.model, &system, &msgs, &no_tools, Some(&hl_cancel_flag),
+                |ev| {
+                    if let provider::StreamEvent::TextDelta { text } = &ev { reply_text.push_str(text); }
+                    let _ = app.emit(&stream_channel, &ev);
+                }).await
+        } else {
+        openai_provider::openai_stream_turn(
             &provider_kind, &key, &agent.model, &system, &msgs, &no_tools, Some(&hl_cancel_flag),
             |ev| {
                 // Accumulate the assistant text AND forward the live event so the
@@ -5025,7 +5256,9 @@ pub async fn run_headless_turn(
                 if let provider::StreamEvent::TextDelta { text } = &ev { reply_text.push_str(text); }
                 let _ = app.emit(&stream_channel, &ev);
             },
-        ).await {
+        ).await
+        };
+        match hl_stream {
             Ok((assistant, _stop)) => {
                 // If the stream produced no TextDelta (some models only fill the
                 // final message content), fall back to the assembled content.
@@ -5214,6 +5447,7 @@ pub fn run() {
             capabilities_list, skills_list,
             sparks_list, sparks_read, sparks_delete,
             spark_save,
+            spark_state_get, spark_state_set, spark_state_set_key,
             dashboard::dashboard_load, dashboard::dashboard_upsert_module,
             dashboard::dashboard_remove_module, dashboard::dashboard_arrange,
             dashboard::dashboard_undo,
@@ -5224,6 +5458,7 @@ pub fn run() {
             savepoint_undo, savepoint_redo,
             savepoint_get_retention, savepoint_set_retention, savepoint_purge,
             conv_list, conv_load, conv_save, conv_rename, conv_delete, conv_reorder,
+            conv_compact, chat_model_info,
             agents_list, agents_create, agents_update, agents_reorder, agents_delete,
             agents_set_active, agents_get_active, agents_sharing_folder,
             agent_mounts_list, agent_mount_add, agent_mount_remove,

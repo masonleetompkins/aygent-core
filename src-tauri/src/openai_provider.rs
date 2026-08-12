@@ -92,6 +92,36 @@ pub async fn list_models(provider: &str, api_key: &str) -> Result<Vec<String>, S
     Ok(ids)
 }
 
+/// DYNAMIC model metadata for OpenRouter: its `/models` list publishes
+/// `context_length` and `pricing.{prompt,completion}` (USD per TOKEN) per model.
+/// Returns (context_window, input_per_mtok, output_per_mtok). OpenAI's /models
+/// does NOT expose a context window or price, so this is OpenRouter-only; the
+/// caller falls back to a small curated map for OpenAI. Best-effort: any error
+/// or missing field -> caller falls back.
+pub async fn openrouter_model_info(api_key: &str, model_id: &str) -> Result<(u32, f64, f64), String> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build().map_err(|e| format!("http: {e}"))?;
+    let req = client.get(format!("{OPENROUTER_BASE}/models")).bearer_auth(api_key);
+    let resp = apply_extra_headers(req, "openrouter")
+        .send().await.map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("read body: {e}"))?;
+    if !status.is_success() { return Err(format!("openrouter {status}: {text}")); }
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("bad json: {e}"))?;
+    let arr = v.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+    let m = arr.iter().find(|m| m.get("id").and_then(|i| i.as_str()) == Some(model_id))
+        .ok_or_else(|| format!("model {model_id} not found in openrouter catalog"))?;
+    let ctx = m.get("context_length").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    // pricing is USD PER TOKEN (strings) -> convert to per-million.
+    let price = m.get("pricing");
+    let per = |k: &str| -> f64 {
+        price.and_then(|p| p.get(k)).and_then(|x| x.as_str())
+            .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0) * 1_000_000.0
+    };
+    Ok((ctx, per("prompt"), per("completion")))
+}
+
 /// Actually verify a key works — unlike `list_models`, which for OpenRouter
 /// hits a PUBLIC endpoint that returns 200 with a full model list even with an
 /// empty/garbage key (confirmed live 2026-08-02: no auth header, still 200).
@@ -276,6 +306,10 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
         "messages": build_openai_messages(system, messages),
         "tools": tools_json,
         "stream": true,
+        // USAGE (context meter + $ cost): ask the API to include a final usage
+        // chunk in the stream (OpenAI + OpenRouter both honor this). It arrives
+        // as a trailing frame with an empty choices[] and a top-level `usage`.
+        "stream_options": { "include_usage": true },
     });
     // BUG FIX (Mason 08-02, refined 08-06): OpenAI's reasoning-family models
     // (o-series, gpt-5.x) reject function tools on /v1/chat/completions unless
@@ -320,6 +354,9 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
     // index -> (id, name, arguments-so-far)
     let mut tool_acc: std::collections::BTreeMap<u64, (String, String, String)> = std::collections::BTreeMap::new();
     let mut stop_reason = String::from("stop");
+    // USAGE: OpenAI/OpenRouter report prompt/completion tokens (+ cached prompt
+    // tokens) in a trailing usage frame; accumulate here, emit at end-of-turn.
+    let (mut u_in, mut u_out, mut u_cr): (u64, u64, u64) = (0, 0, 0);
 
     let mut stream = resp.bytes_stream();
     // BUG FIX (same class as provider.rs): buffer RAW BYTES, not a String. The
@@ -348,6 +385,13 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
             if data.is_empty() { continue; }
             if data == "[DONE]" { continue; }
             let ev: serde_json::Value = match serde_json::from_str(data) { Ok(v) => v, Err(_) => continue };
+            // Usage frame: top-level `usage`, empty choices[]. Capture it before
+            // the choice guard skips a choiceless frame.
+            if let Some(us) = ev.get("usage").filter(|u| !u.is_null()) {
+                if let Some(i) = us.get("prompt_tokens").and_then(|x| x.as_u64()) { u_in = i; }
+                if let Some(o) = us.get("completion_tokens").and_then(|x| x.as_u64()) { u_out = o; }
+                if let Some(c) = us.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")).and_then(|x| x.as_u64()) { u_cr = c; }
+            }
             let Some(choice) = ev.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()) else { continue };
 
             if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
@@ -407,6 +451,10 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
         }));
     }
 
+    // Emit token usage for the meter. OpenAI counts cached_tokens INSIDE
+    // prompt_tokens, so fresh (full-price) input = prompt - cached.
+    let fresh_in = u_in.saturating_sub(u_cr);
+    on_event(StreamEvent::Usage { input: fresh_in, output: u_out, cache_read: u_cr, cache_write: 0, context_window: 0 });
     on_event(StreamEvent::Done { stop_reason: stop_reason.clone() });
 
     let mut assistant = json!({ "role": "assistant", "content": text });

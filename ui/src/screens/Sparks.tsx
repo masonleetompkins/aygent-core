@@ -1,13 +1,16 @@
 // AYGENT — SPARKS. Interactive mini-apps the agent builds for you: a single
 // self-contained HTML file per Spark, rendered LIVE here in a SANDBOXED iframe
 // (sandbox="allow-scripts", NO same-origin) — so a Spark runs its own JS + any
-// data the agent embedded at build time, but can never read your files, reach
-// this machine, or call the agent back. You ask the agent (in Chat) to build or
-// change a Spark; this tab is the library + the live stage.
-import { useCallback, useEffect, useMemo, useState } from "react";
+// data the agent embedded at build time, isolated from your files and this
+// machine. It PERSISTS through a narrow, host-mediated KV channel (localStorage +
+// window.spark → Sparks/<slug>/state.json, jailed) — so buttons work, checklists
+// stick, and state survives a tab switch, all WITHOUT weakening the sandbox. You
+// ask the agent (in Chat) to build or change a Spark; this tab is the library +
+// the live stage.
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Pill } from "../components/ui";
-import { useSparkBlobUrl } from "../lib/sparkChrome";
+import { useSparkBlobUrl, isSparkStateMsg } from "../lib/sparkChrome";
 
 type SparkMeta = {
   slug: string; title: string; description: string; created: number; modified: number;
@@ -20,10 +23,15 @@ export function Sparks({ agentId, onNavigate }: { agentId: string | null; onNavi
   const [sparks, setSparks] = useState<SparkMeta[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [html, setHtml] = useState<string | null>(null);
+  // The saved KV blob for the selected Spark, seeded INTO the iframe so it
+  // restores its state on load (checklists, counters, etc.). Loaded per slug.
+  const [state, setState] = useState<Record<string, unknown>>({});
   const [msg, setMsg] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
   // blob: URL so the app CSP doesn't strip the spark's inline CSS (see sparkChrome).
-  const blobUrl = useSparkBlobUrl(html || "");
+  // Seeded with the loaded state so the Spark restores before its script runs.
+  const blobUrl = useSparkBlobUrl(html || "", state);
 
   const refresh = useCallback(async () => {
     if (!agentId) { setSparks([]); return; }
@@ -40,9 +48,15 @@ export function Sparks({ agentId, onNavigate }: { agentId: string | null; onNavi
 
   const open = useCallback(async (slug: string) => {
     if (!agentId) return;
-    setSelected(slug); setHtml(null); setLoading(true); setMsg(null);
+    setSelected(slug); setHtml(null); setState({}); setLoading(true); setMsg(null);
     try {
+      // Load the Spark's html AND its saved KV state together, so the iframe is
+      // seeded with the state the very first time it mounts (no flash of empty).
       const r = await invoke<{ slug: string; html: string }>("sparks_read", { agentId, slug });
+      let saved: Record<string, unknown> = {};
+      try { saved = await invoke<Record<string, unknown>>("spark_state_get", { agentId, slug }); }
+      catch { /* no state yet — empty */ }
+      setState(saved || {});
       setHtml(r.html);
     } catch (e) { setMsg("✗ " + String(e)); }
     finally { setLoading(false); }
@@ -50,11 +64,38 @@ export function Sparks({ agentId, onNavigate }: { agentId: string | null; onNavi
 
   useEffect(() => { if (selected) void open(selected); /* eslint-disable-next-line */ }, [selected]);
 
+  // PERSISTENCE BRIDGE (the fix): a Spark posts { __spark, kind:'set', key, value }
+  // whenever its localStorage/window.spark changes. We accept ONLY messages from
+  // the CURRENT Spark's iframe (event.source check) and persist each to the jailed
+  // Sparks/<slug>/state.json. This is the sole reach a Spark has back to the host,
+  // and it's narrow, validated, and jailed — the sandbox stays fully isolated.
+  useEffect(() => {
+    function onMessage(ev: MessageEvent) {
+      if (!agentId || !selected) return;
+      // Only trust the frame we're currently showing.
+      if (!iframeRef.current || ev.source !== iframeRef.current.contentWindow) return;
+      if (!isSparkStateMsg(ev.data)) return;
+      const { key, value } = ev.data;
+      // Keep our local mirror in sync so a re-seed (tab switch) has the latest.
+      setState((prev) => {
+        const next = { ...prev };
+        if (value === null || value === undefined) delete next[key];
+        else next[key] = value;
+        return next;
+      });
+      // Persist to the jail (fire-and-forget; a failed write just logs).
+      invoke("spark_state_set_key", { agentId, slug: selected, key, value: value ?? null })
+        .catch((e) => setMsg("✗ save state: " + String(e)));
+    }
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [agentId, selected]);
+
   async function del(slug: string) {
     if (!agentId) return;
     try {
       await invoke("sparks_delete", { agentId, slug });
-      if (selected === slug) { setSelected(null); setHtml(null); }
+      if (selected === slug) { setSelected(null); setHtml(null); setState({}); }
       await refresh();
     } catch (e) { setMsg("✗ " + String(e)); }
   }
@@ -139,12 +180,13 @@ export function Sparks({ agentId, onNavigate }: { agentId: string | null; onNavi
                 // SANDBOXED: allow-scripts only (NO allow-same-origin) — the Spark
                 // runs its own JS + embedded data, isolated from the app/files/agent.
                 // Loaded from a blob: URL (own origin) so the app CSP doesn't strip
-                // its inline styles — srcDoc inherited the parent CSP and rendered
-                // unstyled (Mason 08-08).
+                // its inline styles. Persistence is via the postMessage bridge above,
+                // NOT via same-origin access — the jail stays intact.
                 <iframe
+                  ref={iframeRef}
                   title={selected || "spark"}
                   src={blobUrl}
-                  sandbox="allow-scripts allow-popups allow-forms"
+                  sandbox="allow-scripts allow-popups allow-forms allow-modals"
                   style={{ width: "100%", height: "100%", border: "none", background: "#fff" }}
                 />
               )}
