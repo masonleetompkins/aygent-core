@@ -44,6 +44,40 @@ pub async fn list_models(api_key: &str) -> Result<Vec<String>, String> {
     Ok(arr.iter().filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from)).collect())
 }
 
+/// DYNAMIC model metadata for Muse: fetch /models and read this model's context
+/// window IF the deployment publishes one. Meta's Responses-API /models is NOT
+/// guaranteed to include a window field, and its name isn't standardized, so we
+/// probe the common keys (context_window / context_length / max_input_tokens /
+/// max_context_tokens, nested under a `capabilities` obj too). Returns the window
+/// in tokens, or 0 when absent -> the caller uses the curated fallback (1M for
+/// the Spark family). Best-effort: any error returns 0, never breaks the meter.
+pub async fn muse_model_info(api_key: &str, model_id: &str) -> Result<u32, String> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build().map_err(|e| format!("http: {e}"))?;
+    let resp = client
+        .get(format!("{MUSE_BASE}/models"))
+        .bearer_auth(api_key)
+        .send().await.map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("read body: {e}"))?;
+    if !status.is_success() { return Err(format!("muse {status}: {text}")); }
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("bad json: {e}"))?;
+    let arr = v.get("data").and_then(|d| d.as_array()).or_else(|| v.as_array()).cloned().unwrap_or_default();
+    let Some(m) = arr.iter().find(|m| m.get("id").and_then(|i| i.as_str()) == Some(model_id)) else {
+        return Ok(0);
+    };
+    // Probe common window field names, top-level and under `capabilities`.
+    let keys = ["context_window", "context_length", "max_input_tokens", "max_context_tokens", "max_context_window"];
+    let read = |obj: &serde_json::Value| -> u32 {
+        for k in keys { if let Some(n) = obj.get(k).and_then(|x| x.as_u64()) { if n > 0 { return n as u32; } } }
+        0
+    };
+    let mut ctx = read(m);
+    if ctx == 0 { if let Some(cap) = m.get("capabilities") { ctx = read(cap); } }
+    Ok(ctx)
+}
+
 /// Verify a key works. Prefer /models (auth-gated); if that endpoint is absent
 /// (non-401 error), fall back to a tiny /responses probe so a valid key passes.
 pub async fn verify_key(api_key: &str) -> Result<(), String> {

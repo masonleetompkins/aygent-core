@@ -1530,9 +1530,18 @@ async fn chat_model_info(provider: Option<String>, model: String) -> serde_json:
                 }
             }
         }
-        // openai / meta / local: no dynamic window endpoint. openai/meta keep the
-        // curated table (documented as the ONLY hardcoded numbers); local reports
-        // its real window through the Usage stream, so the UI overrides this anyway.
+        "meta" => {
+            // Muse: try the dynamic /models window first (if the deployment
+            // publishes one), else keep the curated fallback (Spark = 1M).
+            if let Ok(key) = keychain::get_key("meta") {
+                if let Ok(ctx) = meta_provider::muse_model_info(&key, &model).await {
+                    if ctx > 0 { context_tokens = ctx; known = true; }
+                }
+            }
+        }
+        // openai / local: no dynamic window endpoint. openai keeps the curated
+        // table (documented as the ONLY hardcoded numbers); local reports its
+        // real window through the Usage stream, so the UI overrides this anyway.
         _ => {}
     }
 

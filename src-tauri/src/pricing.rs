@@ -99,8 +99,11 @@ pub fn lookup(model_id: &str) -> ModelInfo {
         ("o1-mini",    128 * K, Price::simple(1.10, 4.40)),
         ("o1",         200 * K, Price::simple(15.0, 60.0)),
         // ── Meta (Muse) / Llama-API ───────────────────────────────────────
-        ("muse",   128 * K, Price::zero()),
-        ("llama",  128 * K, Price::zero()),
+        // Muse Spark family (1.1, 1.2, 1.2 contributor) = 1M context window.
+        // FALLBACK only — chat_model_info tries muse_model_info first (dynamic).
+        ("muse-spark", 1000 * K, Price::zero()),
+        ("muse",       1000 * K, Price::zero()),
+        ("llama",       128 * K, Price::zero()),
     ];
 
     for (pat, ctx, price) in table {
