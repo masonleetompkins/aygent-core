@@ -1480,19 +1480,72 @@ fn set_selection(db: tauri::State<writer::Db>, folder: String, provider: String,
 /// the chat header can render "62% of context used" + a running $ cost. Cloud
 /// providers (Anthropic/OpenAI/OpenRouter/Meta); local GGUF models report their
 /// window via the catalog, price 0. Pure lookup, no network.
+/// Process-global cache for model metadata so the meter is instant and we don't
+/// refetch the provider catalog on every render. Keyed by (provider, model);
+/// entries live for CTX_TTL. Model specs rarely change within a session, but a
+/// TTL keeps us honest if a model is updated while the app is open.
+static MODEL_INFO_CACHE: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, serde_json::Value)>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+const CTX_TTL: std::time::Duration = std::time::Duration::from_secs(1800); // 30 min
+
 #[tauri::command]
-fn chat_model_info(model: String) -> serde_json::Value {
-    let info = pricing::lookup(&model);
-    serde_json::json!({
-        "context_tokens": info.context_tokens,
-        "known": info.known,
-        "price": {
-            "input": info.price.input,
-            "output": info.price.output,
-            "cache_read": info.price.cache_read,
-            "cache_write": info.price.cache_write,
+async fn chat_model_info(provider: Option<String>, model: String) -> serde_json::Value {
+    let provider = provider.unwrap_or_default();
+    let cache_key = format!("{provider}::{model}");
+    // Serve a fresh cached entry.
+    if let Ok(cache) = MODEL_INFO_CACHE.lock() {
+        if let Some((at, val)) = cache.get(&cache_key) {
+            if at.elapsed() < CTX_TTL { return val.clone(); }
         }
-    })
+    }
+
+    // Curated pricing table is the fallback denominator + the price source (no
+    // provider API exposes price for Anthropic/OpenAI; OpenRouter does).
+    let table = pricing::lookup(&model);
+    let mut context_tokens = table.context_tokens;
+    let mut known = table.known;
+    let (mut p_in, mut p_out) = (table.price.input, table.price.output);
+    let (mut p_cr, mut p_cw) = (table.price.cache_read, table.price.cache_write);
+    let mut display_name = model.clone();
+
+    // DYNAMIC window (the fix): fetch the REAL context window from the provider
+    // instead of a hardcoded substring guess. Falls back to the table on any
+    // error (offline, older account, unknown model).
+    match provider.as_str() {
+        "anthropic" | "" => {
+            if let Ok(key) = keychain::get_key("anthropic") {
+                if let Ok((ctx, _max_out, name)) = provider::anthropic_model_info(&key, &model).await {
+                    if ctx > 0 { context_tokens = ctx; known = true; }
+                    if !name.is_empty() { display_name = name; }
+                }
+            }
+        }
+        "openrouter" => {
+            if let Ok(key) = keychain::get_key("openrouter") {
+                if let Ok((ctx, pin, pout)) = openai_provider::openrouter_model_info(&key, &model).await {
+                    if ctx > 0 { context_tokens = ctx; known = true; }
+                    // OpenRouter publishes real price; use it over the table when present.
+                    if pin > 0.0 { p_in = pin; p_cr = pin * 0.1; p_cw = pin * 1.25; }
+                    if pout > 0.0 { p_out = pout; }
+                }
+            }
+        }
+        // openai / meta / local: no dynamic window endpoint. openai/meta keep the
+        // curated table (documented as the ONLY hardcoded numbers); local reports
+        // its real window through the Usage stream, so the UI overrides this anyway.
+        _ => {}
+    }
+
+    let val = serde_json::json!({
+        "context_tokens": context_tokens,
+        "known": known,
+        "display_name": display_name,
+        "price": { "input": p_in, "output": p_out, "cache_read": p_cr, "cache_write": p_cw }
+    });
+    if let Ok(mut cache) = MODEL_INFO_CACHE.lock() {
+        cache.insert(cache_key, (std::time::Instant::now(), val.clone()));
+    }
+    val
 }
 
 /// COMPACT CONTEXT: shrink a conversation's provider-format history so a long

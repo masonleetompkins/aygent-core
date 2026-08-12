@@ -92,6 +92,36 @@ pub async fn list_models(provider: &str, api_key: &str) -> Result<Vec<String>, S
     Ok(ids)
 }
 
+/// DYNAMIC model metadata for OpenRouter: its `/models` list publishes
+/// `context_length` and `pricing.{prompt,completion}` (USD per TOKEN) per model.
+/// Returns (context_window, input_per_mtok, output_per_mtok). OpenAI's /models
+/// does NOT expose a context window or price, so this is OpenRouter-only; the
+/// caller falls back to a small curated map for OpenAI. Best-effort: any error
+/// or missing field -> caller falls back.
+pub async fn openrouter_model_info(api_key: &str, model_id: &str) -> Result<(u32, f64, f64), String> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build().map_err(|e| format!("http: {e}"))?;
+    let req = client.get(format!("{OPENROUTER_BASE}/models")).bearer_auth(api_key);
+    let resp = apply_extra_headers(req, "openrouter")
+        .send().await.map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("read body: {e}"))?;
+    if !status.is_success() { return Err(format!("openrouter {status}: {text}")); }
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("bad json: {e}"))?;
+    let arr = v.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+    let m = arr.iter().find(|m| m.get("id").and_then(|i| i.as_str()) == Some(model_id))
+        .ok_or_else(|| format!("model {model_id} not found in openrouter catalog"))?;
+    let ctx = m.get("context_length").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    // pricing is USD PER TOKEN (strings) -> convert to per-million.
+    let price = m.get("pricing");
+    let per = |k: &str| -> f64 {
+        price.and_then(|p| p.get(k)).and_then(|x| x.as_str())
+            .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0) * 1_000_000.0
+    };
+    Ok((ctx, per("prompt"), per("completion")))
+}
+
 /// Actually verify a key works — unlike `list_models`, which for OpenRouter
 /// hits a PUBLIC endpoint that returns 200 with a full model list even with an
 /// empty/garbage key (confirmed live 2026-08-02: no auth header, still 200).

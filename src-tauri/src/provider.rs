@@ -41,6 +41,36 @@ pub async fn anthropic_list_models(api_key: &str) -> Result<Vec<String>, String>
     Ok(ids)
 }
 
+/// Fetch a SINGLE model's real metadata from the beta models endpoint
+/// (`GET /v1/models/{id}?beta=true`). This is the AUTHORITATIVE, DYNAMIC source
+/// for the context window: BetaModelInfo carries `max_input_tokens` (the real
+/// window, e.g. 1,000,000 for Opus 4.8), `max_tokens` (max output), and
+/// `display_name`. The standard /v1/models does NOT include the window, so we
+/// MUST use ?beta=true. Returns (context_window, max_output, display_name).
+/// Errors (offline, older account without beta) let the caller fall back.
+pub async fn anthropic_model_info(api_key: &str, model_id: &str) -> Result<(u32, u32, String), String> {
+    let url = format!("{ANTHROPIC_MODELS_URL}/{model_id}?beta=true");
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", API_VERSION)
+        .header("anthropic-beta", "true")
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("read body failed: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("anthropic {status}: {text}"));
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("bad json: {e}"))?;
+    let ctx = v.get("max_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let max_out = v.get("max_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let name = v.get("display_name").and_then(|x| x.as_str()).unwrap_or(model_id).to_string();
+    Ok((ctx, max_out, name))
+}
+
 /// One-shot Anthropic Messages call. Returns the assistant text, or an error.
 /// `system` may include a note that the agent has a jailed file tool (tool-use
 /// wiring is the next M0.3 sub-step; here we prove key->model->text).

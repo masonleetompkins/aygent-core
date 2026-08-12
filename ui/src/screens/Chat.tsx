@@ -672,9 +672,11 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       try {
         const sel = await invoke<{ provider: string; model: string }>("get_selection", { folder });
         const name = sel.model || "";
-        // Local (GGUF) models price at 0 and their window comes from the catalog;
-        // for the meter we still call chat_model_info (returns a sane default).
-        const info = await invoke<ModelInfo>("chat_model_info", { model: name });
+        // Local (GGUF) models price at 0 and report their real window via Usage;
+        // cloud models resolve the REAL window dynamically from the provider API
+        // (Anthropic beta models / OpenRouter /models) — pass the provider so the
+        // backend hits the right endpoint instead of guessing from the id.
+        const info = await invoke<ModelInfo>("chat_model_info", { provider: sel.provider || "", model: name });
         if (!cancelled) setModelInfo(info);
       } catch { if (!cancelled) setModelInfo(null); }
     })();
@@ -789,14 +791,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
                 <button
                   onClick={() => void compactContext()}
                   disabled={compacting || running || !convId}
-                  title="Summarize earlier turns to free up the context window (the visible chat is kept)"
+                  title="Save context by summarizing chat history with fewer tokens."
                   style={{
                     fontSize: 11.5, cursor: compacting || running ? "default" : "pointer",
                     padding: "2px 8px", borderRadius: 999, fontFamily: "inherit",
                     border: "var(--border-width) solid var(--line)", background: "var(--bg)",
                     color: ctxPct >= 75 ? ctxColor : "var(--text-muted)", opacity: compacting ? 0.6 : 1,
                   }}
-                >{compacting ? "Compacting…" : "⚡ Compact"}</button>
+                >{compacting ? "Compacting…" : "Compact Context"}</button>
               </div>
             )}
             {/* At-the-wall warning: if context is nearly full, say so plainly. */}
