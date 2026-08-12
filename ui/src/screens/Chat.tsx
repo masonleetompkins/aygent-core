@@ -778,7 +778,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
                     <div style={{ width: `${ctxPct}%`, height: "100%", background: ctxColor, transition: "width 200ms" }} />
                   </div>
                   <span style={{ fontSize: 12, color: ctxColor, fontVariantNumeric: "tabular-nums", fontWeight: ctxPct >= 75 ? 600 : 400 }}>
-                    {ctxPct}% context
+                    {fmtTokens(ctxTokens)} / {fmtTokens(ctxWindow)} tokens
                   </span>
                 </div>
                 {convUsage.cost > 0 && (
@@ -802,7 +802,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
             {/* At-the-wall warning: if context is nearly full, say so plainly. */}
             {!!folder && !!convId && ctxWindow > 0 && ctxPct >= 85 && (
               <div style={{ marginTop: 6, fontSize: 12, color: "var(--danger)", maxWidth: 420 }}>
-                Context is {ctxPct}% full — Compact now to avoid losing your next long reply.
+                Context is nearly full ({fmtTokens(ctxTokens)} / {fmtTokens(ctxWindow)} tokens) — Compact now to avoid losing your next long reply.
               </div>
             )}
           </div>
