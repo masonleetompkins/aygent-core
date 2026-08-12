@@ -691,20 +691,24 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // folded in so the meter moves DURING a turn, not only after it saves.
   const liveUsage = running ? turn.usage : undefined;
   const convUsage = (() => {
-    let cost = 0, tokensIn = 0, tokensOut = 0, lastInput = 0;
+    let cost = 0, lastContextInput = 0;
     const price = modelInfo?.price;
     const add = (u?: TurnUsage) => {
       if (!u) return;
-      tokensIn += u.input; tokensOut += u.output;
-      lastInput = u.input || lastInput;
+      // Context fill = the LATEST turn's total input (fresh + cached). Older
+      // saved msgs may predate contextInput; fall back to input for those.
+      const ci = (u.contextInput ?? 0) || (u.input + u.cacheRead + u.cacheWrite) || u.input || 0;
+      if (ci > 0) lastContextInput = ci;
       if (price) {
+        // Cost bills each component at its own rate: fresh input, output, cache
+        // read (cheap), cache creation. This is per-TURN and summed across turns.
         cost += (u.input * price.input + u.output * price.output
               + u.cacheRead * price.cache_read + u.cacheWrite * price.cache_write) / 1_000_000;
       }
     };
     for (const m of msgs) if (m.role === "assistant" && m.usage) add(m.usage);
     if (liveUsage) { add(liveUsage); }
-    return { cost, tokensIn, tokensOut, lastInput };
+    return { cost, lastContextInput };
   })();
   // Context fill %: latest turn's input tokens over the model window. During a
   // live turn, prefer the live input count so the bar climbs as work happens.
@@ -719,8 +723,18 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     return 0;
   })();
   const ctxWindow = reportedWindow || modelInfo?.context_tokens || 0;
-  const ctxTokens = (liveUsage?.input) || convUsage.lastInput || 0;
-  const ctxPct = ctxWindow > 0 ? Math.min(100, Math.round((ctxTokens / ctxWindow) * 100)) : 0;
+  // Context fill = latest turn's TOTAL input (fresh + cache read + cache create),
+  // NOT fresh input alone. With prompt caching, fresh input is tiny (the "2/1M"
+  // bug); the real prompt size is in the cache fields.
+  const liveContextInput = liveUsage ? ((liveUsage.contextInput ?? 0) || (liveUsage.input + liveUsage.cacheRead + liveUsage.cacheWrite)) : 0;
+  const ctxTokens = liveContextInput || convUsage.lastContextInput || 0;
+  // Precise fraction for the BAR width (rounding to an int % made a real 0.4%
+  // fill render as 0 and vanish); ctxPct (rounded) drives the color thresholds.
+  const ctxFrac = ctxWindow > 0 ? Math.min(1, ctxTokens / ctxWindow) : 0;
+  const ctxPct = Math.round(ctxFrac * 100);
+  // Bar width: show at least a 4% sliver once there's ANY usage, so a small fill
+  // is visibly "a little" rather than an empty (broken-looking) bar.
+  const ctxBarWidth = ctxTokens > 0 ? Math.max(4, ctxFrac * 100) : 0;
   const ctxColor = ctxPct >= 90 ? "var(--danger)" : ctxPct >= 75 ? "#d98a1f" : "var(--text-muted)";
 
   // COMPACT: summarize the model-facing history so a long chat can keep going.
@@ -777,7 +791,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
                   style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   {/* mini bar */}
                   <div style={{ width: 64, height: 6, borderRadius: 999, background: "var(--line)", overflow: "hidden" }}>
-                    <div style={{ width: `${ctxPct}%`, height: "100%", background: ctxColor, transition: "width 200ms" }} />
+                    <div style={{ width: `${ctxBarWidth}%`, height: "100%", background: ctxColor, transition: "width 200ms" }} />
                   </div>
                   <span style={{ fontSize: 12, color: ctxColor, fontVariantNumeric: "tabular-nums", fontWeight: ctxPct >= 75 ? 600 : 400 }}>
                     {fmtTokens(ctxTokens)} / {fmtTokens(ctxWindow)} tokens
@@ -1177,7 +1191,10 @@ function Stamp({ at, usage, price }: { at?: number; usage?: TurnUsage; price?: {
   // Under the timestamp: tokens used + $ cost for THIS turn (Mason, this
   // session). Tokens = input+output for the turn; cost from the model price.
   const cost = usage ? turnCost(usage, price) : 0;
-  const toks = usage ? usage.input + usage.output : 0;
+  // Tokens this turn = the model's real INPUT (fresh + cached) + output, so it
+  // matches the top meter for the latest turn (was input+output, missing cache).
+  const ctxIn = usage ? ((usage.contextInput ?? 0) || (usage.input + usage.cacheRead + usage.cacheWrite)) : 0;
+  const toks = usage ? ctxIn + usage.output : 0;
   return (
     <span style={{
       width: 62, flexShrink: 0, textAlign: "center", display: "flex",
@@ -1187,7 +1204,7 @@ function Stamp({ at, usage, price }: { at?: number; usage?: TurnUsage; price?: {
     }}>
       <span style={{ lineHeight: "18px" }}>{fmtClock(at)}</span>
       {usage && toks > 0 && (
-        <span title={`${(usage.input).toLocaleString()} in + ${(usage.output).toLocaleString()} out tokens`}
+        <span title={`${ctxIn.toLocaleString()} in (incl. cache) + ${(usage.output).toLocaleString()} out tokens`}
           style={{ fontSize: 9.5, lineHeight: "12px", opacity: 0.85 }}>
           {fmtTokens(toks)} tok{cost > 0 ? <><br/>{fmtCost(cost)}</> : null}
         </span>

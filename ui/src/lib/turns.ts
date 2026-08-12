@@ -142,7 +142,14 @@ export type TurnItem =
 /** Token accounting accumulated across a turn's provider rounds (context meter
  *  + $ cost). `input` is the LAST round's input token count = the current
  *  context-window fill; the others sum across rounds. */
-export type TurnUsage = { input: number; output: number; cacheRead: number; cacheWrite: number; contextWindow?: number };
+/** Token accounting for a turn.
+ *  - `input`/`cacheRead`/`cacheWrite`/`output`: components for COST (summed as
+ *    appropriate across the turn's tool-loop rounds).
+ *  - `contextInput`: the TOTAL input the model processed on the LATEST round =
+ *    input + cache_read + cache_creation. THIS is the real context-window fill
+ *    (with prompt caching on, plain `input` is tiny because most tokens are
+ *    billed as cache read/creation — that was the "2 / 1M" bug). */
+export type TurnUsage = { input: number; output: number; cacheRead: number; cacheWrite: number; contextInput: number; contextWindow?: number };
 
 export type TurnState = {
   status: "idle" | "running";
@@ -223,15 +230,24 @@ function appendText(t: TurnState, chunk: string): TurnState {
  *  token count (the current context-window fill, since each round re-sends the
  *  whole history); output + cache SUM across the turn's rounds. */
 function accumulateUsage(t: TurnState, m: any): TurnState {
-  const prev = t.usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  const prev = t.usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextInput: 0 };
   const nIn = Number(m.input ?? 0), nOut = Number(m.output ?? 0);
   const nCr = Number(m.cache_read ?? m.cacheRead ?? 0), nCw = Number(m.cache_write ?? m.cacheWrite ?? 0);
   const win = Number(m.context_window ?? m.contextWindow ?? 0) || prev.contextWindow || undefined;
+  // CONTEXT FILL = the TOTAL input the model saw on THIS round: fresh input +
+  // cache reads + cache creation. With caching on, `input` alone is tiny; the
+  // real prompt size lives in the cache fields. Last round wins (it reflects the
+  // full history at turn's end). For COST we still keep per-component sums.
+  const roundContextInput = nIn + nCr + nCw;
   return { ...t, usage: {
-    input: Math.max(prev.input, nIn),   // context fill = the largest (latest) round
+    // Cost components: sum output + cache_creation across rounds; input +
+    // cache_read take the latest round (each round re-sends the whole prompt, so
+    // summing them would multiply the history — the $74 bug). Latest is correct.
+    input: nIn || prev.input,
     output: prev.output + nOut,
-    cacheRead: Math.max(prev.cacheRead, nCr),
+    cacheRead: nCr || prev.cacheRead,
     cacheWrite: prev.cacheWrite + nCw,
+    contextInput: roundContextInput || prev.contextInput,
     contextWindow: win,
   } };
 }
