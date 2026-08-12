@@ -1,4 +1,4 @@
-# AYGENT — Capabilities (v1.0.1)
+# AYGENT — Capabilities (v1.0.2)
 
 _The canonical reference for what AYGENT can do, as shipped in the signed,
 notarized release. This is the source-of-truth capability doc: keep it in
@@ -134,11 +134,17 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 ## 7. Sparks (interactive mini-apps, live in chat)
 - Ask in plain English → the agent builds a real, self-contained **interactive
   mini-app** that renders live inline in chat in seconds (calculator, chart of
-  your real data, sortable table, game).
-- Runs in a **locked-down sandboxed iframe** (no file access, no network back to
-  the machine/agent). Data is embedded at build time. Saves to a per-agent
-  library; iterate by asking in chat. (CSP allows the frame to style/run itself
-  via `'unsafe-inline'` + jsdelivr for charts, while staying sandboxed.)
+  your real data, sortable table, checklist, game).
+- **Fully interactive + persistent (1.0.2):** buttons click, checkboxes toggle,
+  and state **survives closing and reopening** — `localStorage` works normally
+  and there is a `window.spark.get/set/all` API for structured JSON. State is
+  saved to a jailed per-Spark store (`Sparks/<slug>/state.json`) via a narrow,
+  host-mediated channel — great for to-do lists, trackers, saved settings.
+- Runs in a **locked-down sandboxed iframe** (opaque origin, `allow-scripts`
+  only, no same-origin) — no file access, no network back to the machine/agent.
+  Data is embedded at build time. Persistence is validated + jailed to the Spark
+  and does **not** weaken the sandbox. Saves to a per-agent library; iterate by
+  asking in chat.
 
 ## 8. Scheduling & teamwork
 - **Schedules:** cron-style (daily/weekly at a time) + interval "heartbeat"
@@ -185,6 +191,11 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 ---
 
 ## Changelog
+- **1.0.2** (2026-08-12): **Sparks are real interactive mini-apps** — fixed
+  dead buttons/checklists (an opaque-origin `localStorage` throw was aborting the
+  Spark script before any handler wired up) and added **jailed persistence** so
+  state survives closing and reopening (`localStorage` + `window.spark` →
+  `Sparks/<slug>/state.json`, host-mediated, sandbox unchanged).
 - **1.0.1** (2026-08-11): Chat **context-window meter + running $ cost + per-turn
   tokens/cost** across all providers (Anthropic, OpenAI, OpenRouter, Muse, local);
   **in-chat context compaction** (⚡ Compact); **Muse (Meta)** surfaced as a
@@ -193,4 +204,4 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 - **1.0.0** (2026-08-10): Signed/notarized launch — whoami tool, GFM tables,
   dashboards, sparks, remote.
 
-_Last updated 2026-08-11 for 1.0.1. If you add a capability, add it here._
+_Last updated 2026-08-12 for 1.0.2. If you add a capability, add it here._
