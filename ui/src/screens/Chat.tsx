@@ -1428,7 +1428,7 @@ function SparkCard({ spark, agentId }: { spark: { slug: string; title: string; h
         <iframe
           title={spark.slug}
           src={blobUrl}
-          sandbox="allow-scripts allow-popups allow-forms"
+          sandbox="allow-scripts allow-popups allow-forms allow-modals"
           style={{ width: "100%", height: 420, border: "none", background: "#fff", display: "block" }}
         />
         ) : null

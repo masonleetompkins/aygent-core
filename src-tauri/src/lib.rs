@@ -66,6 +66,7 @@ mod mcp_client;
 mod mcp; // MCP manager: registry + catalog + agent-loop bridge + install/uninstall. // MCP client: spawn stdio JSON-RPC servers, discover + route their tools. // Level A: bundle portable node+ffmpeg+hyperframes into app-data (no system installs).
 mod supervisor;
 mod tools_registry;
+mod spark_state; // SPARKS: jailed KV persistence (Sparks/<slug>/state.json) for interactive Sparks.
 
 use std::sync::Arc;
 use rand::Rng;
@@ -2444,6 +2445,32 @@ fn spark_save(
     Ok(())
 }
 
+// SPARK STATE (jailed KV) — the persistence layer that makes Sparks real apps.
+// The Spark's injected runtime marshals localStorage + window.spark over
+// postMessage to the host; the host lands here, jailed to Sparks/<slug>/.
+
+/// Read a Spark's whole KV blob (jailed). `{}` when it has none yet.
+#[tauri::command]
+fn spark_state_get(broker: tauri::State<Arc<Broker>>, agent_id: String, slug: String) -> Result<serde_json::Value, String> {
+    spark_state::read(&broker, &agent_id, &slug)
+}
+
+/// Overwrite a Spark's whole KV blob (jailed). `values` must be a JSON object.
+#[tauri::command]
+fn spark_state_set(broker: tauri::State<Arc<Broker>>, agent_id: String, slug: String, values: serde_json::Value) -> Result<(), String> {
+    spark_state::write(&broker, &agent_id, &slug, &values)
+}
+
+/// Set OR remove ONE key in a Spark's KV blob (jailed). `value: null` removes.
+#[tauri::command]
+fn spark_state_set_key(broker: tauri::State<Arc<Broker>>, agent_id: String, slug: String, key: String, value: serde_json::Value) -> Result<(), String> {
+    if value.is_null() {
+        spark_state::remove_key(&broker, &agent_id, &slug, &key)
+    } else {
+        spark_state::set_key(&broker, &agent_id, &slug, &key, value)
+    }
+}
+
 /// SKILLS — saved procedures (instructions + an allowed subset of real tools).
 /// Same storage as before (`kind: "composed"` in the tools registry); this is a
 /// clearer name and a separate list, not a migration.
@@ -4124,6 +4151,11 @@ EXAMPLE \u{2014} a tip calculator's body (follow this shape, adapt the fields):\
 <div class=\"row\"><span class=\"k\">Per person</span><span class=\"v\" id=\"pp\">$0.00</span></div>\
 </div><script>/* wire it up: recompute on input + seg/stepper clicks */</script>\n\
 \n\
+PERSISTENCE: a Spark's state IS saved \u{2014} localStorage works normally AND persists across \
+sessions (checklists stay checked, counters keep counting when the user leaves and comes back). \
+For structured data use window.spark.set(key,value) / window.spark.get(key) / window.spark.all() \
+(any JSON value). No setup needed \u{2014} great for to-do lists, trackers, saved settings.\n\
+\
 DATA AT BUILD TIME: the Spark is sandboxed \u{2014} it CANNOT call you or read files. If it needs \
 the user's real data, gather it FIRST with your tools, then embed it in the <script> as a \
 JS literal (const DATA = {\u{2026}}). Never put secrets in a Spark.\n\
@@ -5415,6 +5447,7 @@ pub fn run() {
             capabilities_list, skills_list,
             sparks_list, sparks_read, sparks_delete,
             spark_save,
+            spark_state_get, spark_state_set, spark_state_set_key,
             dashboard::dashboard_load, dashboard::dashboard_upsert_module,
             dashboard::dashboard_remove_module, dashboard::dashboard_arrange,
             dashboard::dashboard_undo,
