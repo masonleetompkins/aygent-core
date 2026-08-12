@@ -75,6 +75,13 @@ pub struct Broker {
 
 /// The macOS system/forbidden roots we never admit (Atlas C2 rule 8).
 /// Firmlinks mean /tmp == /private/tmp; we reject both canonical forms.
+/// The virtual prefix for the read-only shared-context namespace. A request
+/// path starting with this addresses a registered mount by label (see resolve).
+/// Chosen so it can never collide with a real relative path an agent owns.
+const SHARED_PREFIX: &str = "@shared/";
+/// Also accept a bare "@shared" (no slash) for the discovery listing.
+pub const SHARED_ROOT: &str = "@shared";
+
 const FORBIDDEN_PREFIXES: &[&str] = &[
     "/tmp",
     "/private/tmp",
@@ -122,6 +129,36 @@ impl Broker {
         self.scopes.lock().unwrap().get(agent_id).map(|s| s.mounts.clone()).unwrap_or_default()
     }
 
+    /// The mount LABELS an agent can address under the @shared/ namespace, in
+    /// registration order. This is the discovery surface: list_files("@shared")
+    /// returns one entry per label. De-duplicated + sanitized so two mounts with
+    /// the same label don't produce an unaddressable collision (later dupes are
+    /// suffixed -2, -3 ...). Empty if the agent has no mounts.
+    pub fn shared_labels_for(&self, agent_id: &str) -> Vec<String> {
+        let mounts = self.mounts_for(agent_id);
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut out = Vec::with_capacity(mounts.len());
+        for m in &mounts {
+            let base = sanitize_label(&m.label);
+            let n = seen.entry(base.clone()).or_insert(0);
+            *n += 1;
+            out.push(if *n == 1 { base } else { format!("{base}-{n}") });
+        }
+        out
+    }
+
+    /// Resolve a `@shared/<label>[/rest]` path to a mount root + the remainder,
+    /// applying the SAME sanitize+dedupe scheme as shared_labels_for so a label
+    /// the agent SEES in a listing is exactly the one it can address. Returns
+    /// (mount_root, rest_path). Read-only: the caller refuses writes. `None` for
+    /// an unknown label (caller maps to NotFound — never leaks which mounts
+    /// exist beyond the labels it already published).
+    fn resolve_shared_label(&self, agent_id: &str, label: &str) -> Option<PathBuf> {
+        let mounts = self.mounts_for(agent_id);
+        let labels = self.shared_labels_for(agent_id);
+        labels.iter().position(|l| l == label).and_then(|i| mounts.get(i).map(|m| m.root.clone()))
+    }
+
     /// Atomically resolve + admit/refuse. Returns the canonical in-scope path
     /// (the fd/Handle wrapping lands with the RPC bridge). SECURITY-CRITICAL —
     /// the escape suite targets this.
@@ -129,6 +166,36 @@ impl Broker {
         let scope = self.scope_for(agent_id)?;
         if scope.bookmark_stale {
             return Err(BrokerError::StaleBookmark); // never silently widen scope
+        }
+
+        // @shared NAMESPACE (explicit, discoverable read-only mounts). A path
+        // beginning `@shared/<label>[/rest]` addresses a REGISTERED mount by the
+        // exact label the agent saw via list_files("@shared"). This is the fix
+        // for "an agent can't SEE a mounted folder": own-root-wins meant a
+        // colliding name could never reach the mount, and there was no way to
+        // browse it. @shared can't collide with a real relative path the agent
+        // owns (no agent file is addressed starting @shared/), so own-root-wins
+        // for every NON-@shared path is untouched. Writes are REFUSED here —
+        // shared context stays strictly read-only.
+        if let Some(rest) = requested.strip_prefix(SHARED_PREFIX) {
+            if mode.is_write() {
+                return Err(BrokerError::Forbidden); // mounts are read-only
+            }
+            // Split "<label>/<rest...>" (or just "<label>").
+            let rest = rest.trim_start_matches('/');
+            let (label, sub) = match rest.split_once('/') {
+                Some((l, s)) => (l, s),
+                None => (rest, ""),
+            };
+            if label.is_empty() {
+                // Bare "@shared" resolves to nothing openable; the LIST op
+                // special-cases it to enumerate labels. A read here is a miss.
+                return Err(BrokerError::NotFound);
+            }
+            let mount_root = self.resolve_shared_label(agent_id, label)
+                .ok_or(BrokerError::NotFound)?;
+            // Same fail-closed kernel inside the mount (traversal/symlink/etc).
+            return Self::resolve_within(&mount_root, sub, mode);
         }
 
         // The agent's OWN root always wins: a mount can never shadow or
@@ -342,6 +409,27 @@ pub fn is_within(root: &Path, candidate: &Path) -> bool {
         return false;
     }
     root_c.iter().zip(cand_c.iter()).all(|(a, b)| a == b)
+}
+
+/// Sanitize a mount label into a single safe path segment for the @shared
+/// namespace: keep alphanumerics/dash/underscore/dot, replace the rest with
+/// '-', collapse repeats, trim, and never allow "."/".."/empty. Deterministic
+/// so the label an agent lists is the label it can address.
+fn sanitize_label(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_dash = false;
+    for ch in raw.chars() {
+        let ok = ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.';
+        if ok {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." { "shared".to_string() } else { trimmed }
 }
 
 /// Walk up from `p` to the deepest ancestor that actually exists on disk.
@@ -564,6 +652,98 @@ mod tests {
         b.set_scope("a1", root.to_path_buf(), false); // re-register
         assert_eq!(b.mounts_for("a1").len(), 1, "mounts dropped on re-register");
         assert!(b.resolve("a1", "notes.md", Mode::Read).is_ok());
+    }
+
+    // -- @shared NAMESPACE (discoverable, unambiguous read-only mounts) --------
+
+    #[test]
+    fn shared_labels_are_listed() {
+        // The discovery surface: an agent can enumerate its mounts by label.
+        let root = tmp_root();
+        let shared = tmp_root();
+        let b = broker_with_mount(&root, &shared); // label "shared"
+        assert_eq!(b.shared_labels_for("a1"), vec!["shared".to_string()]);
+    }
+
+    #[test]
+    fn shared_path_reads_the_mount() {
+        // @shared/<label>/file resolves into the mount root, unambiguously.
+        let root = tmp_root();
+        let shared = tmp_root();
+        fs::write(shared.join("memory.md"), b"cleo brain").unwrap();
+        let b = broker_with_mount(&root, &shared);
+        let got = b.resolve("a1", "@shared/shared/memory.md", Mode::Read).unwrap();
+        assert_eq!(got, shared.join("memory.md"));
+        assert_eq!(fs::read_to_string(got).unwrap(), "cleo brain");
+    }
+
+    #[test]
+    fn shared_path_reaches_a_colliding_name() {
+        // THE bug: a name that exists in BOTH folders. Own-root-wins makes the
+        // plain name hit the agent's own file; @shared explicitly reaches the
+        // mounted one. Both must be addressable.
+        let root = tmp_root();
+        let shared = tmp_root();
+        fs::write(root.join("memory.md"), b"mine").unwrap();
+        fs::write(shared.join("memory.md"), b"theirs").unwrap();
+        let b = broker_with_mount(&root, &shared);
+        // plain -> own
+        let own = b.resolve("a1", "memory.md", Mode::Read).unwrap();
+        assert_eq!(fs::read_to_string(own).unwrap(), "mine");
+        // @shared -> mount
+        let their = b.resolve("a1", "@shared/shared/memory.md", Mode::Read).unwrap();
+        assert_eq!(fs::read_to_string(their).unwrap(), "theirs");
+    }
+
+    #[test]
+    fn shared_write_is_refused() {
+        // Mounts are strictly read-only; a write through @shared is refused and
+        // NEVER lands in the mount.
+        let root = tmp_root();
+        let shared = tmp_root();
+        fs::write(shared.join("memory.md"), b"theirs").unwrap();
+        let b = broker_with_mount(&root, &shared);
+        let r = b.resolve("a1", "@shared/shared/memory.md", Mode::Write);
+        assert_eq!(r, Err(BrokerError::Forbidden));
+        assert_eq!(fs::read_to_string(shared.join("memory.md")).unwrap(), "theirs");
+    }
+
+    #[test]
+    fn shared_unknown_label_is_not_found() {
+        // An unregistered label maps to NotFound — no leak of which mounts exist.
+        let root = tmp_root();
+        let shared = tmp_root();
+        let b = broker_with_mount(&root, &shared);
+        let r = b.resolve("a1", "@shared/nope/x.md", Mode::Read);
+        assert_eq!(r, Err(BrokerError::NotFound));
+    }
+
+    #[test]
+    fn shared_still_refuses_traversal() {
+        // The mount kernel still applies inside @shared: `..` can't escape.
+        let root = tmp_root();
+        let shared = tmp_root();
+        let b = broker_with_mount(&root, &shared);
+        let r = b.resolve("a1", "@shared/shared/../escape.md", Mode::Read);
+        assert!(matches!(r, Err(BrokerError::Traversal)), "got {r:?}");
+    }
+
+    #[test]
+    fn shared_labels_dedupe() {
+        // Two mounts with the same label get distinct, addressable names.
+        let root = tmp_root();
+        let m1 = tmp_root();
+        let m2 = tmp_root();
+        fs::write(m2.join("x.md"), b"from second").unwrap();
+        let b = Broker::new();
+        b.set_scope("a1", root.clone(), false);
+        b.set_mounts("a1", vec![
+            Mount { root: m1.clone(), label: "Cleo".into() },
+            Mount { root: m2.clone(), label: "Cleo".into() },
+        ]);
+        assert_eq!(b.shared_labels_for("a1"), vec!["Cleo".to_string(), "Cleo-2".to_string()]);
+        let got = b.resolve("a1", "@shared/Cleo-2/x.md", Mode::Read).unwrap();
+        assert_eq!(fs::read_to_string(got).unwrap(), "from second");
     }
 
     #[test]

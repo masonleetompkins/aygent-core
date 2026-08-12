@@ -1,4 +1,4 @@
-# AYGENT — Capabilities (v1.0.2)
+# AYGENT — Capabilities (v1.0.3)
 
 _The canonical reference for what AYGENT can do, as shipped in the signed,
 notarized release. This is the source-of-truth capability doc: keep it in
@@ -26,7 +26,12 @@ $20 one-time. macOS 13+. Developer ID signed + Apple-notarized.
   a context pool; `agents_sharing_folder` surfaces who shares a folder + Save
   Point history.
 - **Read-only mounts (shared context):** mount another folder (or another
-  agent's folder) read-only so a team of agents can pool knowledge.
+  agent's folder) read-only so a team of agents can pool knowledge. The agent
+  is told about its mounts and reaches them through a virtual **`@shared/`**
+  namespace: `list_files("@shared")` lists the shared folders by label,
+  `list_files("@shared/<label>")` browses one, and
+  `read_file("@shared/<label>/path")` reads a file — discoverable + unambiguous
+  even when a shared file has the same name as one of the agent's own.
 
 ## 2. Memory (atomized + linked, plain files)
 - Agents remember automatically: durable facts, project state, lessons —
@@ -191,6 +196,12 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 ---
 
 ## Changelog
+- **1.0.3** (2026-08-12): **Shared context is now discoverable + addressable.**
+  Read-only mounts get a virtual `@shared/<label>/` namespace — an agent can
+  `list_files("@shared")` to see shared folders, browse/read inside them, and
+  reach a shared file even when its name collides with one of its own. The agent
+  is also told in its prompt that it has shared access (previously a mounted
+  folder was invisible — the agent was never told and could not enumerate it).
 - **1.0.2** (2026-08-12): **Sparks are real interactive mini-apps** — fixed
   dead buttons/checklists (an opaque-origin `localStorage` throw was aborting the
   Spark script before any handler wired up) and added **jailed persistence** so
@@ -204,4 +215,4 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 - **1.0.0** (2026-08-10): Signed/notarized launch — whoami tool, GFM tables,
   dashboards, sparks, remote.
 
-_Last updated 2026-08-12 for 1.0.2. If you add a capability, add it here._
+_Last updated 2026-08-12 for 1.0.3. If you add a capability, add it here._

@@ -289,6 +289,18 @@ fn handle_op(broker: &Arc<Broker>, v: &serde_json::Value) -> serde_json::Value {
                 Err(err_json) => err_json,
             }
         }
+        // @shared discovery: a bare "@shared" (or "@shared/") lists the mount
+        // LABELS the agent can read — the entry point for browsing shared
+        // context. Deeper "@shared/<label>/..." paths fall through to the normal
+        // resolve() below, which maps them into the mount root.
+        "list" if path == crate::broker::SHARED_ROOT || path == "@shared/" => {
+            let entries: Vec<serde_json::Value> = broker
+                .shared_labels_for(agent)
+                .into_iter()
+                .map(|label| serde_json::json!({ "name": label, "kind": "dir" }))
+                .collect();
+            serde_json::json!({ "ok": true, "entries": entries })
+        }
         "list" => match broker.resolve(agent, path, Mode::Read) {
             Ok(real) => match std::fs::read_dir(&real) {
                 Ok(rd) => {
