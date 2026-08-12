@@ -104,9 +104,16 @@ pub fn lookup(model_id: &str) -> ModelInfo {
         // ── Meta (Muse) / Llama-API ───────────────────────────────────────
         // Muse Spark family (1.1, 1.2, 1.2 contributor) = 1M context window.
         // FALLBACK only — chat_model_info tries muse_model_info first (dynamic).
-        ("muse-spark", 1000 * K, Price::zero()),
-        ("muse",       1000 * K, Price::zero()),
-        ("llama",       128 * K, Price::zero()),
+        // Muse Spark = 1M window; per-tier pricing FROM META'S DOCS (verified
+        // 2026-08-12, $/1M tokens). Tier is keyed by the EXACT id, so the
+        // CONTRIBUTOR id (discounted) MUST match before the generic muse-spark.
+        //   Standard (muse-spark-1.1/-1.2): cached 0.15 / in 1.25 / out 4.25
+        //   Contributor (muse-spark-1.2-contributor): cached 0.002 / in 0.10 / out 0.20
+        ("muse-spark-1.2-contributor", 1000 * K, Price { input: 0.10, output: 0.20, cache_read: 0.002, cache_write: 0.0 }),
+        ("contributor",                1000 * K, Price { input: 0.10, output: 0.20, cache_read: 0.002, cache_write: 0.0 }),
+        ("muse-spark",                 1000 * K, Price { input: 1.25, output: 4.25, cache_read: 0.15, cache_write: 0.0 }),
+        ("muse",                       1000 * K, Price { input: 1.25, output: 4.25, cache_read: 0.15, cache_write: 0.0 }),
+        ("llama",                       128 * K, Price::zero()),
     ];
 
     for (pat, ctx, price) in table {
@@ -127,4 +134,33 @@ pub fn lookup(model_id: &str) -> ModelInfo {
 #[allow(dead_code)]
 pub fn context_window(model_id: &str) -> u32 {
     lookup(model_id).context_tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn muse_tiers_price_correctly() {
+        // Standard tier: muse-spark-1.1 / -1.2 => in 1.25 / out 4.25 / cached 0.15
+        let std12 = lookup("muse-spark-1.2");
+        assert_eq!(std12.price.input, 1.25, "1.2 input");
+        assert_eq!(std12.price.output, 4.25, "1.2 output");
+        assert_eq!(std12.price.cache_read, 0.15, "1.2 cached");
+        assert_eq!(std12.context_tokens, 1_000_000, "1.2 window");
+        let std11 = lookup("muse-spark-1.1");
+        assert_eq!(std11.price.input, 1.25, "1.1 input");
+        // Contributor tier MUST NOT get standard pricing (order-sensitive).
+        let contrib = lookup("muse-spark-1.2-contributor");
+        assert_eq!(contrib.price.input, 0.10, "contributor input");
+        assert_eq!(contrib.price.output, 0.20, "contributor output");
+        assert_eq!(contrib.price.cache_read, 0.002, "contributor cached");
+        assert_eq!(contrib.context_tokens, 1_000_000, "contributor window");
+    }
+    #[test]
+    fn anthropic_fallback_window_is_decimal() {
+        // Fallback table (dynamic API is primary): a Claude id still resolves
+        // to a sane DECIMAL window, not a 1024-inflated one.
+        let s = lookup("claude-3-5-sonnet");
+        assert_eq!(s.context_tokens, 200_000);
+    }
 }
