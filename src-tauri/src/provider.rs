@@ -41,15 +41,17 @@ pub async fn anthropic_list_models(api_key: &str) -> Result<Vec<String>, String>
     Ok(ids)
 }
 
-/// Fetch a SINGLE model's real metadata from the beta models endpoint
-/// (`GET /v1/models/{id}?beta=true`). This is the AUTHORITATIVE, DYNAMIC source
-/// for the context window: BetaModelInfo carries `max_input_tokens` (the real
-/// window, e.g. 1,000,000 for Opus 4.8), `max_tokens` (max output), and
-/// `display_name`. The standard /v1/models does NOT include the window, so we
-/// MUST use ?beta=true. Returns (context_window, max_output, display_name).
-/// Errors (offline, older account without beta) let the caller fall back.
+/// Fetch a model's real metadata from the STANDARD models endpoint
+/// (`GET /v1/models/{id}`). VERIFIED LIVE (2026-08-12, Mason's account): the
+/// standard endpoint already returns `max_input_tokens` (the real context
+/// window, e.g. 1,000,000 for the Opus 4.8 / 5-series), `max_tokens` (max
+/// output), and `display_name` on every model object — NO beta flag needed.
+/// (An earlier version used `?beta=true` on a mistaken reading of the SDK spec;
+/// the live standard endpoint carries the same fields, so we dropped it.)
+/// Returns (context_window, max_output, display_name). Errors let the caller
+/// fall back to the curated table.
 pub async fn anthropic_model_info(api_key: &str, model_id: &str) -> Result<(u32, u32, String), String> {
-    let url = format!("{ANTHROPIC_MODELS_URL}/{model_id}?beta=true");
+    let url = format!("{ANTHROPIC_MODELS_URL}/{model_id}");
     let client = reqwest::Client::new();
     let resp = client
         .get(&url)
