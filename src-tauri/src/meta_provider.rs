@@ -185,6 +185,27 @@ fn build_muse_input(system: &str, messages: &serde_json::Value) -> Vec<serde_jso
             continue;
         }
         if role == "assistant" {
+            // AYGENT also stores Anthropic-shaped history (content = [{type:"tool_use",id,name,input}])
+            // from the browser agent loop. Handle that here so Muse sees the function calls
+            // even when history was written in Anthropic shape (otherwise second turn 400s with
+            // "No function call found for function call output with call_id").
+            let anthropic_uses: Vec<serde_json::Value> = content.as_array().map(|arr|
+                arr.iter().filter(|b| b.get("type").and_then(|x| x.as_str())==Some("tool_use")).cloned().collect()
+            ).unwrap_or_default();
+            if !anthropic_uses.is_empty() {
+                let txt = flatten_text(&content);
+                if !txt.is_empty() {
+                    out.push(json!({ "role": "assistant", "content": [ { "type": "output_text", "text": txt } ] }));
+                }
+                for blk in &anthropic_uses {
+                    let id = blk.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                    let name = blk.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                    let input = blk.get("input").cloned().unwrap_or(json!({}));
+                    let args = if input.is_string() { input.as_str().unwrap_or("{}").to_string() } else { serde_json::to_string(&input).unwrap_or("{}".to_string()) };
+                    out.push(json!({ "type": "function_call", "call_id": id, "name": name, "arguments": args }));
+                }
+                continue;
+            }
             if let Some(tcs) = m.get("tool_calls").and_then(|t| t.as_array()) {
                 let txt = flatten_text(&content);
                 if !txt.is_empty() {

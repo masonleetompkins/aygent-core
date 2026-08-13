@@ -2607,31 +2607,45 @@ async fn agent_run(
     channel: Option<String>,
 ) -> Result<String, String> {
     use tauri::Emitter;
-    let key = keychain::get_key("anthropic")
-        .map_err(|_| "no anthropic key set — add one first".to_string())?;
-    let models = provider::anthropic_list_models(&key).await?;
-    // MODEL: use the agent's CONFIGURED model (per-folder Settings picker). The
-    // Browser panel passes folder:null, so resolve the ACTIVE agent's folder
-    // Rust-side (agent_for_folder("") falls back to the active agent id) and read
-    // ITS configured model. Only if none is set do we auto-pick (prefer sonnet).
-    // This fixes the bug where the hand-off always ran a fallback model because
-    // folder:null skipped the config lookup entirely.
-    let resolved_agent = agent_for_folder(&db, folder.as_deref().unwrap_or("")).ok();
-    let configured = resolved_agent.as_ref()
-        .and_then(|aid| repo::load_settings(&db, aid).ok())
-        .map(|s| s.model)
-        .filter(|m| !m.trim().is_empty());
-    let model = match configured {
-        Some(m) => m,
-        None => models
-            .iter()
-            .find(|m| m.contains("sonnet"))
-            .or_else(|| models.iter().find(|m| !m.contains("haiku")))
-            .cloned()
-            .or_else(|| models.first().cloned())
-            .ok_or_else(|| "account returned no usable models".to_string())?,
+    // Resolve the ACTIVE agent's actual provider + model (the rail selection).
+    // The Browser panel passes folder:null, so we resolve via the active agent id.
+    // Hardcoding Anthropic here meant Muse in the sidebar still ran Anthropic.
+    let resolved_agent_id = agent_for_folder(&db, folder.as_deref().unwrap_or("")).ok();
+    let (provider, configured_model): (String, Option<String>) = match resolved_agent_id.as_deref().and_then(|aid| repo::get_agent(&db, aid).ok()).flatten() {
+        Some(a) => (if a.provider.is_empty() { "anthropic".into() } else { a.provider.clone() }, if a.model.trim().is_empty() { None } else { Some(a.model.clone()) }),
+        None => ("anthropic".into(), None),
     };
-    eprintln!("[aygent][browser][AGENT] model={model} (folder={:?} agent={:?})", folder, resolved_agent);
+    let provider = provider.as_str();
+    let (key, model): (String, String) = match provider {
+        "openai" | "openrouter" => {
+            let k = keychain::get_key(provider).map_err(|_| format!("no {provider} key set — add one in Settings"))?;
+            let m = match configured_model.clone() {
+                Some(m) if !m.trim().is_empty() => m,
+                _ => {
+                    // auto-pick: prefer a cheap/default model from live list
+                    let models = openai_provider::list_models(provider, &k).await.unwrap_or_default();
+                    models.first().cloned().unwrap_or_else(|| if provider=="openai" { "gpt-4o-mini".into() } else { "openai/gpt-4o-mini".into() })
+                }
+            };
+            (k, m)
+        },
+        "meta" => {
+            let k = keychain::get_key("meta").map_err(|_| "no meta key set — add one in Settings".to_string())?;
+            let m = configured_model.clone().filter(|m| !m.trim().is_empty()).unwrap_or_else(|| "muse-spark-1.2".into());
+            (k, m)
+        },
+        _ => {
+            // anthropic + default
+            let k = keychain::get_key("anthropic").map_err(|_| "no anthropic key set — add one first".to_string())?;
+            let models = provider::anthropic_list_models(&k).await?;
+            let m = match configured_model.clone() {
+                Some(m) if !m.trim().is_empty() => m,
+                _ => models.iter().find(|m| m.contains("sonnet")).or_else(|| models.iter().find(|m| !m.contains("haiku"))).cloned().or_else(|| models.first().cloned()).ok_or_else(|| "account returned no usable models".to_string())?,
+            };
+            (k, m)
+        }
+    };
+    eprintln!("[aygent][browser][AGENT] provider={provider} model={model} (resolved={:?})", resolved_agent_id);
 
     // Helper: emit a checklist event to the FE if a channel was provided.
     let emit_ev = |kind: &str, payload: serde_json::Value| {
@@ -2743,7 +2757,33 @@ async fn agent_run(
     let plan_msgs = serde_json::json!([{ "role": "user", "content": prompt }]);
     let no_tools = serde_json::json!([]);
     let mut steps: Vec<String> = Vec::new();
-    if let Ok(resp) = provider::anthropic_turn(&key, &model, plan_system, &plan_msgs, &no_tools).await {
+    // Planner uses the SAME provider/model as the agent (Muse in sidebar -> Muse planner).
+    let plan_resp: Result<serde_json::Value, String> = match provider {
+        "openai" | "openrouter" => {
+            let _msgs = serde_json::json!([{ "role": "user", "content": prompt }]);
+            // Use the provider's raw turn via openai_provider but we need a text-only call; use complete helper via a synthetic turn
+            // Instead do a minimal stream-equivalent: reuse anthropic planner prompt via openai complete
+            // For now, call openai_provider::openai_stream_turn with no tools and collect text
+            let _ = &key; // keeps borrow
+            // Fallback: try anthropic as planner even when browsing on another provider? No — use the right provider.
+            // Simplest: call openai's complete-style turn by using provider::anthropic_turn only as fallback? Let's dispatch properly:
+            // We will attempt to use the selected provider's turn; on error fall back to anthropic if available.
+            // To avoid async borrow issues, just call the provider's one-shot helper.
+            // For openai/openrouter: use openai_provider::complete with the plan prompt
+            match openai_provider::complete(&provider.to_string(), &key, &model, &format!("{plan_system}\n\nTask: {prompt}")).await {
+                Ok(text) => Ok(serde_json::json!({"content": [{"type":"text","text": text}]})),
+                Err(e) => Err(e),
+            }
+        },
+        "meta" => {
+            match meta_provider::complete(&key, &model, &format!("{plan_system}\n\nTask: {prompt}")).await {
+                Ok(text) => Ok(serde_json::json!({"content": [{"type":"text","text": text}]})),
+                Err(e) => Err(e),
+            }
+        },
+        _ => provider::anthropic_turn(&key, &model, plan_system, &plan_msgs, &no_tools).await,
+    };
+    if let Ok(resp) = plan_resp {
         let text = resp.get("content").and_then(|c| c.as_array())
             .map(|arr| arr.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join(""))
             .unwrap_or_default();
@@ -2850,7 +2890,50 @@ async fn agent_run(
                 cur_idx + 1, cur_idx + 1,
             )
         };
-        let resp = provider::anthropic_turn(&key, &model, &turn_system, &messages, &tools).await?;
+        // Dispatch the turn to the agent's actual provider (Muse etc.), not always Anthropic.
+        let resp: serde_json::Value = match provider {
+            "openai" | "openrouter" => {
+                let (assistant, _stop) = openai_provider::openai_stream_turn(&provider.to_string(), &key, &model, &turn_system, &messages, &tools, None, |_| {}).await?;
+                // Convert OpenAI assistant (tool_calls) -> Anthropic-like content for the loop below.
+                // For the browser loop we only need content as Anthropic blocks; synthesize them.
+                let mut blocks: Vec<serde_json::Value> = Vec::new();
+                if let Some(txt) = assistant.get("content").and_then(|c| c.as_str()) {
+                    if !txt.is_empty() { blocks.push(serde_json::json!({"type":"text","text": txt})); }
+                }
+                if let Some(tcs) = assistant.get("tool_calls").and_then(|t| t.as_array()) {
+                    for tc in tcs {
+                        let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                        let f = tc.get("function").cloned().unwrap_or(serde_json::json!({}));
+                        let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                        let args_str = f.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
+                        let input: serde_json::Value = serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+                        blocks.push(serde_json::json!({"type":"tool_use","id": id, "name": name, "input": input}));
+                    }
+                }
+                let stop = if blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str())==Some("tool_use")) { "tool_use" } else { "end_turn" };
+                serde_json::json!({"content": blocks, "stop_reason": stop})
+            },
+            "meta" => {
+                let (assistant, _stop) = meta_provider::meta_stream_turn(&key, &model, &turn_system, &messages, &tools, None, |_| {}).await?;
+                let mut blocks: Vec<serde_json::Value> = Vec::new();
+                if let Some(txt) = assistant.get("content").and_then(|c| c.as_str()) {
+                    if !txt.is_empty() { blocks.push(serde_json::json!({"type":"text","text": txt})); }
+                }
+                if let Some(tcs) = assistant.get("tool_calls").and_then(|t| t.as_array()) {
+                    for tc in tcs {
+                        let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                        let f = tc.get("function").cloned().unwrap_or(serde_json::json!({}));
+                        let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                        let args_str = f.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
+                        let input: serde_json::Value = serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+                        blocks.push(serde_json::json!({"type":"tool_use","id": id, "name": name, "input": input}));
+                    }
+                }
+                let stop = if blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str())==Some("tool_use")) { "tool_use" } else { "end_turn" };
+                serde_json::json!({"content": blocks, "stop_reason": stop})
+            },
+            _ => provider::anthropic_turn(&key, &model, &turn_system, &messages, &tools).await?,
+        };
         let content = resp.get("content").and_then(|c| c.as_array()).cloned().unwrap_or_default();
         let stop = resp.get("stop_reason").and_then(|s| s.as_str()).unwrap_or("");
 
@@ -2935,14 +3018,28 @@ async fn agent_run(
                     // first-result path, and select which to pass below.
                     let first_result_override = name == "browser_click_text"
                         && step_is_first_result(steps.get(next_step).map(|s| s.as_str()).unwrap_or(""));
+                    // IMAGE-INDEX OVERRIDE (Google Images): "click the 5th image" should use browser_click_image, not text match.
+                    // Detect ordinal + image hint in the CURRENT plan step, not the model-supplied text (which is a guessed caption).
+                    let step_text = steps.get(next_step).map(|s| s.as_str()).unwrap_or("");
+                    let is_image_step = step_text.to_ascii_lowercase().contains("image")
+                        && step_text.chars().any(|c| c.is_ascii_digit());
+                    let image_index_override = is_image_step && (name == "browser_click_text" || name == "browser_click_first_result");
                     if first_result_override {
                         eprintln!("[aygent][browser][STEP] OVERRIDE browser_click_text -> browser_click_first_result on first-result step {}/{} (ignoring model text {:?})",
                             next_step + 1, steps.len(),
                             input.get("text").and_then(|t| t.as_str()).unwrap_or(""));
                     }
-                    let name: &str = if first_result_override { "browser_click_first_result" } else { name };
+                    if image_index_override {
+                        let idx = step_text.chars().filter(|c| c.is_ascii_digit()).collect::<String>().parse::<u64>().unwrap_or(1).max(1);
+                        eprintln!("[aygent][browser][STEP] OVERRIDE {} -> browser_click_image[{}] on image step {}/{}: {}", name, idx, next_step+1, steps.len(), step_text);
+                    }
+                    let (name, image_idx): (&str, Option<u64>) = if image_index_override {
+                        let idx = step_text.chars().filter(|c| c.is_ascii_digit()).collect::<String>().parse::<u64>().unwrap_or(1).max(1);
+                        ("browser_click_image", Some(idx))
+                    } else if first_result_override { ("browser_click_first_result", None) } else { (name, None) };
+                    let image_override_input = image_idx.map(|i| serde_json::json!({"index": i})).unwrap_or(serde_json::json!({}));
                     let override_input = serde_json::json!({});
-                    let input: &serde_json::Value = if first_result_override { &override_input } else { &input };
+                    let (input, _image_guard): (&serde_json::Value, bool) = if image_idx.is_some() { (&image_override_input, true) } else if first_result_override { (&override_input, false) } else { (&input, false) };
                     // EXECUTE THROUGH THE BROKER (jailed) — or the browser tools
                     // (act on the VISIBLE tab + per-agent domain policy + wheel).
                     let (result_text, is_err) = if browser::is_agent_tool(name) {
@@ -2953,7 +3050,7 @@ async fn agent_run(
                         // is the code-level backstop that stops the second,
                         // wandering click that landed on the wrong site. Reads are
                         // harmless; only clicks/opens/types wander.
-                        let is_acting = matches!(name, "browser_click_text" | "browser_click_first_result" | "browser_open" | "browser_type_text");
+                        let is_acting = matches!(name, "browser_click_text" | "browser_click_first_result" | "browser_click_image" | "browser_open" | "browser_type_text");
                         if is_acting && satisfied_step == Some(next_step) {
                             let cur = steps.get(next_step).map(|s| s.as_str()).unwrap_or("(current step)");
                             eprintln!("[aygent][browser][STOP] rejected extra {name} on satisfied step {}/{}: {}",
@@ -3036,7 +3133,7 @@ async fn agent_run(
                         }
                         } // end step-overrun-guard else (step not already satisfied)
                     } else { match name {
-                        "read_file" => match broker.resolve_and_open(resolved_agent.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Read) {
+                        "read_file" => match broker.resolve_and_open(resolved_agent_id.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Read) {
                             Ok(mut f) => {
                                 use std::io::Read;
                                 let mut s = String::new();
@@ -3049,10 +3146,10 @@ async fn agent_run(
                         },
                         "write_file" => {
                             let cnt = input.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                            if let Ok(real) = broker.resolve(resolved_agent.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Write) {
+                            if let Ok(real) = broker.resolve(resolved_agent_id.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Write) {
                                 if let Some(parent) = real.parent() { let _ = std::fs::create_dir_all(parent); }
                             }
-                            match broker.resolve_and_open(resolved_agent.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Write) {
+                            match broker.resolve_and_open(resolved_agent_id.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Write) {
                                 Ok(mut f) => {
                                     use std::io::Write as _;
                                     match f.write_all(cnt.as_bytes()) {
@@ -3063,7 +3160,7 @@ async fn agent_run(
                                 Err(e) => (format!("refused by jail: {e:?}"), true),
                             }
                         }
-                        "list_files" => match broker.resolve(resolved_agent.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Read) {
+                        "list_files" => match broker.resolve(resolved_agent_id.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Read) {
                             Ok(real) => match std::fs::read_dir(&real) {
                                 Ok(rd) => {
                                     let names: Vec<String> = rd.filter_map(|e| e.ok())
@@ -3134,7 +3231,7 @@ async fn agent_run(
                     let mut satisfied_now = false;
                     if browser::is_agent_tool(name)
                         && !is_err
-                        && matches!(name, "browser_click_text" | "browser_click_first_result" | "browser_open" | "browser_type_text")
+                        && matches!(name, "browser_click_text" | "browser_click_first_result" | "browser_click_image" | "browser_open" | "browser_type_text")
                         && satisfied_step != Some(next_step)
                     {
                         let cur_step_txt = steps.get(next_step).map(|s| s.as_str()).unwrap_or("");
