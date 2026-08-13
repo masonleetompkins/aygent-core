@@ -3604,9 +3604,9 @@ fn exec_shell_tool(agent_id: &str, name: &str, input: &serde_json::Value) -> (St
     let result = match name {
         "shell_run" => {
             let timeout_ms = input.get("timeout_ms").and_then(|t| t.as_u64()).unwrap_or(120_000);
-            xb.run(&root, program, &args, timeout_ms)
+            xb.run_for_agent(&root, Some(agent_id), program, &args, timeout_ms)
         }
-        "shell_spawn" => xb.spawn(&root, program, &args),
+        "shell_spawn" => xb.spawn_for_agent(&root, Some(agent_id), program, &args),
         "shell_poll" => {
             let cursor = input.get("cursor").and_then(|c| c.as_u64()).unwrap_or(0);
             xb.poll(handle, cursor, /*tail_only=*/ true)
@@ -5658,6 +5658,8 @@ pub fn run() {
                     eprintln!("[aygent] JSON→SQLite migration warning: {e}");
                 }
                 _app.manage(db.clone());
+                // Per-agent shell GitHub PAT scoping: make Db reachable from exec.rs
+                crate::exec::install_db(db.clone());
 
                 // M1.4 DELIVERY ENGINE: spawn the background drainer that runs
                 // recipient inter-agent turns headlessly (independent of any
