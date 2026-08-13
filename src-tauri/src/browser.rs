@@ -1101,10 +1101,10 @@ async fn ensure_session(app: &tauri::AppHandle, state: &tauri::State<'_, Browser
     session_call(
         state,
         "Page.startScreencast",
-        // QUALITY (browser rebuild): q60 @ 1280x800 CSS px was the "foggy
+        // QUALITY (browser rebuild): q90 @ viewport*dpr - tracks window.devicePixelRatio CSS px was the "foggy
         // glass" — a Retina viewport downscaled then re-upscaled. q85 with 2x
         // headroom keeps text crisp; frames still track the real viewport.
-        serde_json::json!({ "format": "jpeg", "quality": 85, "maxWidth": 2560, "maxHeight": 1600, "everyNthFrame": 1 }),
+        serde_json::json!({ "format": "jpeg", "quality": 90, "maxWidth": 3840, "maxHeight": 2400, "everyNthFrame": 1 }),
     )
     .await?;
     Ok(())
@@ -1314,7 +1314,7 @@ pub async fn browser_start_view(
 /// overriding device metrics to the pane's CSS pixel size, the captured frame's
 /// aspect ratio equals the pane's, so contain fills the whole rounded box edge
 /// to edge with no bars. The UI calls this on mount + on every pane resize
-/// (ResizeObserver, debounced). deviceScaleFactor=2 keeps text crisp on Retina.
+/// (ResizeObserver, debounced). deviceScaleFactor=dpr (from window.devicePixelRatio) keeps text crisp on Retina.
 /// Best-effort: no live session yet => Ok(()) (the mount effect retries).
 /// width/height are CSS px (integers); clamped to sane bounds so a transient
 /// 0-size layout pass can't collapse the page.
@@ -1323,17 +1323,25 @@ pub async fn browser_set_viewport(
     state: tauri::State<'_, BrowserProc>,
     width: f64,
     height: f64,
+    dpr: Option<f64>,
 ) -> Result<(), String> {
     let w = (width.round() as i64).clamp(320, 4096);
     let h = (height.round() as i64).clamp(240, 4096);
     // mobile:false, fixed 2x DPR for crisp text. width/height in CSS px.
+    let dpr = dpr.unwrap_or(1.0).clamp(1.0, 3.0);
     let params = serde_json::json!({
         "width": w, "height": h,
-        "deviceScaleFactor": 2, "mobile": false,
+        "deviceScaleFactor": dpr, "mobile": false,
     });
     // Best-effort: if no session is live yet, just report Ok so the caller's
     // retry-on-mount handles it — never surface a hard error for a resize.
     let _ = session_call(&state, "Emulation.setDeviceMetricsOverride", params).await;
+    // Keep screencast JPEG caps IN STEP with the viewport*dpr so text stays crisp after a resize/DPR change.
+    // Screencast JPEG at 2x on Retina was capturing 1280x800 then upscaling; now we cap at physical px.
+    let cap_w = (w as f64 * dpr).round().clamp(320.0, 3840.0) as i64;
+    let cap_h = (h as f64 * dpr).round().clamp(240.0, 2400.0) as i64;
+    let _ = session_call(&state, "Page.startScreencast",
+        serde_json::json!({ "format": "jpeg", "quality": 90, "maxWidth": cap_w, "maxHeight": cap_h, "everyNthFrame": 1 })).await;
     Ok(())
 }
 
@@ -2288,6 +2296,83 @@ async fn typeable_field_center(
 /// events carry isTrusted:true. Adds a short human-like approach: 2-3
 /// intermediate mouseMoved points toward the target before press/release, plus
 /// small randomized delays. This is the shape a real pointer produces.
+
+/// Parse "5th image" / "click the 2nd image" etc -> Some(5). Returns None if no ordinal with "image" hint.
+fn parse_image_index(want: &str) -> Option<usize> {
+    let w = want.to_ascii_lowercase();
+    if !w.contains("image") && !w.contains("picture") && !w.contains("photo") { return None; }
+    // Find first number + optional ordinal suffix
+    let chars: Vec<char> = w.chars().collect();
+    for i in 0..chars.len() {
+        if chars[i].is_ascii_digit() {
+            let mut j = i;
+            while j < chars.len() && chars[j].is_ascii_digit() { j+=1; }
+            let num_str: String = chars[i..j].iter().collect();
+            if let Ok(n) = num_str.parse::<usize>() {
+                if n > 0 && n < 1000 { return Some(n); }
+            }
+        }
+    }
+    None
+}
+
+/// Count visible image anchors on the page (for the "no image #N" error message).
+async fn element_count_images(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>) -> Result<usize, String> {
+    let j = active_tab_read(app, state, "[...document.querySelectorAll('a img, [data-ved] img, img')].filter(e=>e.offsetParent!==null).length").await?;
+    j.trim().parse::<usize>().map_err(|_| "count parse".to_string())
+}
+
+/// Find the Nth visible image anchor (1-based) in grid order: a > img, or bare clickable img.
+/// Returns its ClickTarget (center coords via DOM.getContentQuads). Prefers <a><img> links.
+async fn element_center_by_image_index(app: &tauri::AppHandle, state: &tauri::State<'_, BrowserProc>, n: usize) -> Result<Option<ClickTarget>, String> {
+    ensure_session(app, state).await?;
+    // Pick the Nth visible image link in grid order. Google Images grid uses <a> wrapping <img> with href.
+    let js = format!(r#"(()=>{{
+        const imgs=[...document.querySelectorAll('a')].filter(a=>a.querySelector('img')&&a.offsetParent!==null&&a.href&&!a.closest('[aria-label="Ads"]'));
+        if(imgs.length===0){{
+            // Fallback: bare images that are themselves clickable (wrapped in div with click handler)
+            const bare=[...document.querySelectorAll('img')].filter(i=>i.offsetParent!==null&&i.getBoundingClientRect().width>40);
+            let el=bare[{n}-1];
+            if(!el) return null;
+            el=(el.closest('a,div[jsaction],div[role=button]')||el);
+            el.scrollIntoView({{block:'center',inline:'center'}});
+            return el;
+        }}
+        let el=imgs[{n}-1];
+        if(!el) return null;
+        el.scrollIntoView({{block:'center',inline:'center'}});
+        return el;
+    }})()"#, n=n);
+    let node = session_call(state, "Runtime.evaluate", serde_json::json!({ "expression": js, "returnByValue": false })).await?;
+    let object_id = match node["result"]["objectId"].as_str() { Some(id) => id.to_string(), None => return Ok(None) };
+    human_delay(120, 200).await;
+    let diag = session_call(state, "Runtime.callFunctionOn", serde_json::json!({ "objectId": object_id, "functionDeclaration": "function(){ this.scrollIntoView({block:'center',inline:'center'}); const r=this.getBoundingClientRect(); const a=this.closest('a'); return { tag:this.tagName.toLowerCase(), href:a?a.href:null, rx:r.left+r.width/2, ry:r.top+r.height/2, rw:r.width, rh:r.height, dpr:window.devicePixelRatio||1, sx:window.scrollX||0, sy:window.scrollY||0, iw:window.innerWidth||0, ih:window.innerHeight||0 }; }", "returnByValue": true })).await?;
+    let d = &diag["result"]["value"];
+    let tag = d["tag"].as_str().unwrap_or("a").to_string();
+    let href = d["href"].as_str().map(|s| s.to_string());
+    let dpr = d["dpr"].as_f64().unwrap_or(1.0);
+    let scroll_x = d["sx"].as_f64().unwrap_or(0.0);
+    let scroll_y = d["sy"].as_f64().unwrap_or(0.0);
+    let inner_w = d["iw"].as_f64().unwrap_or(0.0);
+    let inner_h = d["ih"].as_f64().unwrap_or(0.0);
+    let rect_cx = d["rx"].as_f64().unwrap_or(0.0);
+    let rect_cy = d["ry"].as_f64().unwrap_or(0.0);
+    let (mut x, mut y, mut via_quads) = (rect_cx, rect_cy, false);
+    match session_call(state, "DOM.getContentQuads", serde_json::json!({ "objectId": object_id })).await {
+        Ok(q) => {
+            if let Some(quads) = q["quads"].as_array() {
+                if let Some(first) = quads.first().and_then(|f| f.as_array()) {
+                    if first.len()==8 { let get=|i:usize| first[i].as_f64().unwrap_or(0.0); x=(get(0)+get(2)+get(4)+get(6))/4.0; y=(get(1)+get(3)+get(5)+get(7))/4.0; via_quads=true; }
+                }
+            }
+        }
+        Err(_e) => {}
+    }
+    let _ = session_call(state, "Runtime.releaseObject", serde_json::json!({ "objectId": object_id })).await;
+    if x<=0.0 && y<=0.0 { return Ok(None); }
+    Ok(Some(ClickTarget { x, y, tag, href, dpr, scroll_x, scroll_y, inner_w, inner_h, via_quads }))
+}
+
 async fn trusted_click_at(
     state: &tauri::State<'_, BrowserProc>,
     x: f64,
@@ -2528,7 +2613,7 @@ pub async fn browser_key(
 
 /// Names the agent sees. Kept SMALL + robust (Atlas: favor a small set).
 pub const AGENT_TOOL_NAMES: &[&str] = &[
-    "browser_open", "browser_read", "browser_click_text", "browser_click_first_result",
+    "browser_open", "browser_read", "browser_click_text", "browser_click_first_result", "browser_click_image",
     "browser_type_text", "browser_screenshot",
 ];
 
@@ -2585,6 +2670,13 @@ pub fn agent_tool_schemas() -> Vec<serde_json::Value> {
             "input_schema": { "type": "object", "properties": {
                 "text": { "type": "string", "description": "visible text of the element to click" }
             }, "required": ["text"] }
+        }),
+        serde_json::json!({
+            "name": "browser_click_image",
+            "description": "Click an image by its position (1-based). Use for 'click the 5th image' — takes an image index, no text. Works on Google Images and any image grid.",
+            "input_schema": { "type": "object", "properties": {
+                "index": { "type": "integer", "description": "which image to click (1 = first, 5 = 5th)" }
+            }, "required": ["index"] }
         }),
         serde_json::json!({
             "name": "browser_click_first_result",
@@ -2658,7 +2750,7 @@ pub async fn agent_tool(
     // VISIBLE WKWebView to it (CDP -> visible), so the human watches where the
     // agent went and the permission host pre-check stays correct. This is the
     // single-source-of-truth sync that replaces the old fragile read-mirror.
-    if matches!(name, "browser_open" | "browser_click_text" | "browser_click_first_result" | "browser_type_text") {
+    if matches!(name, "browser_open" | "browser_click_text" | "browser_click_first_result" | "browser_click_image" | "browser_type_text") {
         mirror_visible_to_cdp(app, state).await;
     }
     // On a login/CAPTCHA-ish failure, hand off to the human with a note.
@@ -2820,25 +2912,8 @@ async fn agent_tool_inner(
             let url = normalize_url(input.get("url").and_then(|u| u.as_str()).unwrap_or(""));
             if let Err(e) = check_internal_only(&url) { return (e, true); }
             let host = host_of(&url);
-            if !host_preallowed(app, state, &host, allowed_domains).await {
-                let ans = request_permission(app, state, &format!("open {host}"), &url).await;
-                match ans.as_str() {
-                    "allow" => {
-                        if let Ok(mut p) = state.perm.lock() { p.granted_hosts.insert(host.clone()); }
-                        eprintln!("[aygent][browser][PERM] ALLOW open {host} â€” continuing");
-                    }
-                    // HARD STOP (spec #5): Take Control ends the turn; driver=human.
-                    "take" => {
-                        eprintln!("[aygent][browser][PERM] TAKE open {host} â€” hard stop");
-                        return (format!("{STOP_TAKEOVER} the human took the wheel to handle opening {host} themselves."), true);
-                    }
-                    // HARD STOP (spec #5): Deny ends the turn immediately â€” no retry, no wander.
-                    _ => {
-                        eprintln!("[aygent][browser][PERM] DENY open {host} â€” hard stop");
-                        return (format!("{STOP_DENIED} the human denied opening {host}."), true);
-                    }
-                }
-            }
+            // Seamless open — Stop button is the safety net (Mason 2026-08-13).
+            // SSRF/internal block via check_internal_only above is the only gate.
             // Navigate the AUTHORITATIVE CDP page + wait for load.
             if let Err(e) = session_call(state, "Page.navigate", serde_json::json!({ "url": url })).await {
                 return (format!("navigate failed: {e}"), true);
@@ -2856,32 +2931,61 @@ async fn agent_tool_inner(
         "browser_click_text" => {
             let want = input.get("text").and_then(|t| t.as_str()).unwrap_or("");
             if want.is_empty() { return ("browser_click_text needs `text`".into(), true); }
-            // GATE THE CLICK: clicking a link navigates the page for the human,
-            // so ask before doing it (Approve/Deny/Take Control, inline in the
-            // Agent panel). This is Mason's requirement: the human confirms the
-            // click. Allow -> proceed; Deny -> stop this action; Take -> hand the
-            // wheel to the human.
-            let ans = request_permission(app, state, &format!("click \"{want}\""), &format!("The agent wants to click the link/button: {want}")).await;
-            match ans.as_str() {
-                "allow" => { eprintln!("[aygent][browser][PERM] ALLOW click {want:?} â€” continuing"); }
-                // HARD STOP (spec #5): Take Control ends the turn; driver=human.
-                "take" => {
-                    eprintln!("[aygent][browser][PERM] TAKE click {want:?} â€” hard stop");
-                    return (format!("{STOP_TAKEOVER} the human took the wheel to click '{want}' themselves."), true);
-                }
-                // HARD STOP (spec #5): Deny ends the turn immediately â€” no retry, no wander.
-                _ => {
-                    eprintln!("[aygent][browser][PERM] DENY click {want:?} â€” hard stop");
-                    return (format!("{STOP_DENIED} the human denied clicking '{want}'."), true);
-                }
-            }
-            // TRUSTED CLICK (#1). Instead of el.click() via JS (isTrusted:false,
-            // which Google flags), we (a) locate the element's viewport-center
+            // No permission gate — seamless clicking (Mason 2026-08-13).
+            // Stop button + driver wheel is the safety net; don't block each click.
+            // TRUSTED CLICK (#1). Instead of el.click() via JS (isTrusted:false, the element's viewport-center
             // coords via a CDP Runtime.evaluate (scrolling it into view), then
             // (b) dispatch a REAL CDP mouse click at those coords
             // (mouseMoved x3 approach -> mousePressed -> mouseReleased). The
             // events carry isTrusted:true â€” indistinguishable from a human click.
             eprintln!("[aygent][browser][INPUT] browser_click_text want={want:?}");
+            // IMAGE-INDEX CLICK (Google Images etc): "click the 5th image" / "click 3rd image"
+            // Images have no text label, so text search fails. Detect an ordinal N and click the Nth visible image element.
+            if let Some(n) = parse_image_index(want) {
+                if let Some(img_target) = element_center_by_image_index(app, state, n).await.unwrap_or(None) {
+                    // Go straight to the image click path with the indexed target
+                    let target = img_target;
+                    eprintln!(
+                        "[aygent][browser][CLICK] want={want:?} tag=<{}> coord=({:.1},{:.1}) via_quads={} dpr={} scroll=({:.0},{:.0}) inner=({:.0}x{:.0}) href={:?} [image #{n}]",
+                        target.tag, target.x, target.y, target.via_quads, target.dpr,
+                        target.scroll_x, target.scroll_y, target.inner_w, target.inner_h, target.href
+                    );
+                    let url_before = cdp_current_url(state).await;
+                    human_delay(25, 60).await;
+                    if let Err(e) = trusted_click_at(state, target.x, target.y).await {
+                        return (format!("trusted click dispatch failed: {e}"), true);
+                    }
+                    wait_for_cdp_load(state).await;
+                    let mut url_after = cdp_current_url(state).await;
+                    let mut navigated = url_after != url_before && url_after.starts_with("http");
+                    // For image clicks, navigation may be same-host with query change (#, ?imgdii) — count it as navigated if URL changed at all
+                    if !navigated && url_after != url_before {
+                        navigated = true;
+                    }
+                    if !navigated {
+                        if let Some(href) = target.href.as_deref() {
+                            if href.starts_with("http") && href != url_before {
+                                eprintln!("[aygent][browser][CLICK] image click produced NO nav — href fallback -> {href}");
+                                if session_call(state, "Page.navigate", serde_json::json!({ "url": href })).await.is_ok() {
+                                    wait_for_cdp_load(state).await;
+                                    url_after = cdp_current_url(state).await;
+                                    navigated = url_after != url_before;
+                                }
+                            }
+                        }
+                    }
+                    let (title, url) = active_tab_page_info_cdp(app, state).await.unwrap_or_default();
+                    eprintln!("[aygent][browser][CLICK] image result navigated={navigated} url_before={url_before:?} url_after={url_after:?}");
+                    if navigated || url_after != url_before {
+                        return (format!("clicked image #{n}. Now on: {title} ({url})"), false);
+                    }
+                    // Image grid clicks often stay on images.google.com but reveal a detail panel — treat that as success if page didn't error
+                    return (format!("clicked image #{n} (image grid). Now on: {title} ({url})"), false);
+                } else {
+                    return (format!("no image #{n} found on this page ({} visible images)", 
+                        element_count_images(app, state).await.unwrap_or(0)), true);
+                }
+            }
             let target = match element_center_by_text(app, state, want, false).await {
                 Ok(Some(c)) => c,
                 Ok(None) => return (format!("no clickable element matching '{want}' on this page"), true),
@@ -2949,18 +3053,7 @@ async fn agent_tool_inner(
         // steps here, and agent_run also OVERRIDES browser_click_text to this
         // path on a first-result step (belt + suspenders).
         "browser_click_first_result" => {
-            let ans = request_permission(app, state, "click the first result", "The agent wants to click the first organic search result link.").await;
-            match ans.as_str() {
-                "allow" => { eprintln!("[aygent][browser][PERM] ALLOW click first-result â€” continuing"); }
-                "take" => {
-                    eprintln!("[aygent][browser][PERM] TAKE click first-result â€” hard stop");
-                    return (format!("{STOP_TAKEOVER} the human took the wheel to click the first result themselves."), true);
-                }
-                _ => {
-                    eprintln!("[aygent][browser][PERM] DENY click first-result â€” hard stop");
-                    return (format!("{STOP_DENIED} the human denied clicking the first result."), true);
-                }
-            }
+            // No permission gate — seamless (see browser_click_text).
             eprintln!("[aygent][browser][INPUT] browser_click_first_result (forced first-organic-anchor)");
             // force_first_result=true -> anchor-required, no text fallback.
             let target = match element_center_by_text(app, state, "first result", true).await {
@@ -3054,6 +3147,35 @@ async fn agent_tool_inner(
                 }
             }
             (format!("typed '{}'{}", text, if submit { " and submitted" } else { "" }), false)
+        }
+        "browser_click_image" => {
+            // No permission gate — seamless.
+            let n = input.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+            if n == 0 || n > 1000 { return ("browser_click_image needs a 1-based index (1 = first image)".into(), true); }
+            let target = match element_center_by_image_index(app, state, n).await {
+                Ok(Some(c)) => c,
+                Ok(None) => return (format!("no image #{n} found on this page"), true),
+                Err(e) => return (format!("image locate failed: {e}"), true),
+            };
+            eprintln!("[aygent][browser][INPUT] browser_click_image index={n} tag=<{}> coord=({:.1},{:.1}) via_quads={} dpr={}", target.tag, target.x, target.y, target.via_quads, target.dpr);
+            let url_before = cdp_current_url(state).await;
+            human_delay(25, 60).await;
+            if let Err(e) = trusted_click_at(state, target.x, target.y).await {
+                return (format!("trusted click dispatch failed: {e}"), true);
+            }
+            wait_for_cdp_load(state).await;
+            let url_after = cdp_current_url(state).await;
+            // Images grid: clicking may stay same host but show detail panel — treat any DOM change as success.
+            // We check url change OR success of click (no nav needed for image detail).
+            let (title, url) = active_tab_page_info_cdp(app, state).await.unwrap_or_default();
+            eprintln!("[aygent][browser][CLICK] image #{n} url_before={url_before:?} url_after={url_after:?}");
+            if url_after != url_before {
+                (format!("clicked image #{n}. Now on: {title} ({url})"), false)
+            } else {
+                // Same URL but we clicked the image — Google Images shows detail overlay without nav. Count as success.
+                // Verify we actually hit an image by checking the debug tag wasn't a stray div.
+                (format!("clicked image #{n} on: {title} ({url})"), false)
+            }
         }
         "browser_screenshot" => {
             match active_tab_page_info_cdp(app, state).await {

@@ -115,6 +115,18 @@ pub async fn call(
     let ctx = serde_json::Value::Object(ctx);
 
     // Required-arg check up front: a clear message beats a provider 400.
+    // HARNESS FIX: a truncated tool payload parses to {} or a sentinel
+    // __harness_parse_error — without this the validator misreports as
+    // 'requires the `owner` argument' (red herring). Name the real fault.
+    if let Some(obj) = args.as_object() {
+        if let Some(err) = obj.get("__harness_parse_error").and_then(|v| v.as_str()) {
+            let raw_len = obj.get("__raw_len").and_then(|v| v.as_u64()).unwrap_or(0);
+            return Err(format!("`{}` tool input was truncated/failed to parse ({} bytes, error: {}). The `content` is likely too large for a single tool call — try a smaller chunk or split the write.", t.name, raw_len, err));
+        }
+        if obj.is_empty() {
+            return Err(format!("`{}` received empty arguments (likely truncated — content too large). Try a smaller write.", t.name));
+        }
+    }
     for p in t.params {
         if p.required {
             let missing = connectors::dig(args, p.name)

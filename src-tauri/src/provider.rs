@@ -82,7 +82,7 @@ pub async fn anthropic_complete(
 ) -> Result<String, String> {
     let body = json!({
         "model": model,
-        "max_tokens": 1024,
+        "max_tokens": 16384,
         "messages": [{ "role": "user", "content": user_msg }]
     });
 
@@ -197,7 +197,7 @@ pub async fn anthropic_turn(
 ) -> Result<serde_json::Value, String> {
     let body = json!({
         "model": model,
-        "max_tokens": 1024,
+        "max_tokens": 16384,
         "system": cacheable_system(system),
         "tools": cacheable_tools(tools),
         "messages": cacheable_messages(messages),
@@ -286,7 +286,7 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
         // never closes, content_block_stop never finalizes it, so NO ToolUse is
         // emitted, tool_results stays empty, and the loop breaks: a silent death
         // exactly at "generation". 8192 gives tool calls real room.
-        "max_tokens": 8192,
+        "max_tokens": 64000,
         "system": cacheable_system(system),
         "tools": cacheable_tools(tools),
         "messages": cacheable_messages(messages),
@@ -439,8 +439,13 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
                         let idx = ev.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                         // finalize a tool_use block: parse its assembled input JSON + emit
                         if let Some(raw) = tool_json.get(&idx) {
-                            let input: serde_json::Value =
-                                serde_json::from_str(raw).unwrap_or(json!({}));
+                            let input: serde_json::Value = match serde_json::from_str::<serde_json::Value>(raw) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    eprintln!("[aygent][provider] tool input JSON truncated/parse failed ({} bytes): {}", raw.len(), e);
+                                    serde_json::json!({"__harness_parse_error": e.to_string(), "__raw_len": raw.len()})
+                                }
+                            };
                             if let Some(b) = blocks.get_mut(idx) {
                                 b["input"] = input.clone();
                             }

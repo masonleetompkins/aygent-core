@@ -107,7 +107,7 @@ export function Browser() {
     const push = () => {
       const r = el.getBoundingClientRect();
       if (r.width < 8 || r.height < 8) return;
-      invoke("browser_set_viewport", { width: r.width, height: r.height }).catch(() => {});
+      invoke("browser_set_viewport", { width: r.width, height: r.height, dpr: window.devicePixelRatio || 1 }).catch(() => {});
     };
     const ro = new ResizeObserver(() => {
       if (t) clearTimeout(t);
@@ -221,18 +221,29 @@ export function Browser() {
     let un: (() => void) | undefined;
     try {
       un = await listen<Record<string, unknown>>(channel, (ev) => {
-        const p = ev.payload;
+        const p = ev.payload as any;
         if (!p || typeof p !== "object") return;
         if (p.kind === "plan" && Array.isArray(p.steps)) {
           patchRun(runId, { steps: p.steps as string[], stepsDone: 0, planDone: false, action: "" });
-        } else if (p.kind === "step" && typeof p.step === "number") {
-          patchRun(runId, { stepsDone: p.step, action: "" });
-        } else if (p.kind === "action" && typeof p.text === "string") {
-          patchRun(runId, { action: p.text });
+        } else if (p.kind === "step") {
+          // Rust sends {index, done, total}; legacy JS expected {step}. Support both.
+          const doneVal = typeof p.done === "number" ? p.done : typeof p.step === "number" ? p.step : typeof p.index === "number" ? p.index + 1 : 0;
+          if (typeof doneVal === "number" && doneVal > 0) patchRun(runId, { stepsDone: doneVal, action: "" });
+        } else if (p.kind === "action") {
+          const txt = typeof p.text === "string" ? p.text : typeof p.label === "string" ? p.label : "";
+          if (txt) patchRun(runId, { action: txt });
         } else if (p.kind === "stopped") {
-          patchRun(runId, { planDone: true, action: "", stopped: true, summary: String(p.reason || "stopped") });
+          patchRun(runId, { planDone: true, action: "", stopped: true, summary: String(p.reason || p.summary || "stopped") });
         } else if (p.kind === "done") {
-          patchRun(runId, { planDone: true, action: "", summary: String(p.summary || "") });
+          // Rust sends {total, summary} and for stops {stopped:true, reason/summary}. Handle both.
+          const isStopped = !!p.stopped || !!p.reason;
+          const s = String(p.summary || p.reason || "");
+          if (isStopped) patchRun(runId, { planDone: true, action: "", stopped: true, summary: s });
+          else patchRun(runId, { planDone: true, action: "", summary: s });
+          // Ensure checklist ticks to total when done without per-step events
+          if (typeof p.total === "number" && p.total > 0) {
+            patchRun(runId, { stepsDone: p.total });
+          }
         }
       });
       const primed = task;
@@ -456,7 +467,14 @@ export function Browser() {
                 placeholder="Tell the agent&#8230;"
                 style={{ flex: 1, minWidth: 0, height: 34, padding: "0 10px", borderRadius: "var(--radius-control)", border: "var(--border-width) solid var(--line)", background: "var(--bg)", color: "var(--text)", fontSize: 13, outline: "none" }}
               />
-              <Button onClick={() => void runAgent()} disabled={agentBusy || !agentPrompt.trim()}>Act</Button>
+              {agentBusy ? (
+                <Button variant="secondary" onClick={() => {
+                  const last = runs[runs.length - 1];
+                  if (last) invoke("agent_stop", { channel: last.id }).catch(() => {});
+                }}>Stop</Button>
+              ) : (
+                <Button onClick={() => void runAgent()} disabled={!agentPrompt.trim()}>Act</Button>
+              )}
             </div>
           </div>
         )}

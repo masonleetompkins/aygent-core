@@ -232,6 +232,25 @@ fn build_openai_messages(system: &str, messages: &serde_json::Value) -> Vec<serd
             }
 
             if role == "assistant" {
+                // Anthropic-shaped assistant (content = [{type:"tool_use"}]) stored by browser agent.
+                // Translate it to OpenAI tool_calls so history round-trips even when the prior turn
+                // was stored in Anthropic shape.
+                let anthropic_uses: Vec<serde_json::Value> = content.as_array().map(|arr|
+                    arr.iter().filter(|b| b.get("type").and_then(|x| x.as_str())==Some("tool_use")).cloned().collect()
+                ).unwrap_or_default();
+                if !anthropic_uses.is_empty() {
+                    let txt = flatten_text(&content);
+                    let tcs: Vec<serde_json::Value> = anthropic_uses.iter().map(|blk| {
+                        let id = blk.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                        let name = blk.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                        let input = blk.get("input").cloned().unwrap_or(json!({}));
+                        let args = if input.is_string() { input.as_str().unwrap_or("{}").to_string() } else { serde_json::to_string(&input).unwrap_or("{}".to_string()) };
+                        json!({"id": id, "type": "function", "function": {"name": name, "arguments": args}})
+                    }).collect();
+                    let c = if txt.is_empty() { json!(null) } else { json!(txt) };
+                    out.push(json!({"role":"assistant","content": c, "tool_calls": tcs}));
+                    continue;
+                }
                 // Assistant may carry tool_calls (already OpenAI-shaped from us) or text.
                 // BUG FIX (08-06): OpenAI REQUIRES an assistant message that has
                 // tool_calls to carry `content` as a STRING (or null) — never an
@@ -442,7 +461,7 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
     let mut tool_calls_json = Vec::new();
     for (_idx, (id, name, args)) in &tool_acc {
         if name.is_empty() { continue; }
-        let input: serde_json::Value = serde_json::from_str(args).unwrap_or(json!({}));
+        let input: serde_json::Value = match serde_json::from_str::<serde_json::Value>(args) { Ok(v) => v, Err(e) => { eprintln!("[aygent][openai_provider] tool input JSON parse failed ({} bytes): {}", args.len(), e); serde_json::json!({"__harness_parse_error": e.to_string(), "__raw_len": args.len()}) } };
         on_event(StreamEvent::ToolUse { id: id.clone(), name: name.clone(), input: input.clone() });
         tool_calls_json.push(json!({
             "id": id,
