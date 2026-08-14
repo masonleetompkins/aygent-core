@@ -161,11 +161,12 @@ fn handle_exec(
         .unwrap_or_default();
     let handle = v.get("proc_handle").and_then(|h| h.as_str()).unwrap_or("");
 
+    let agent_opt = if agent != "default" && !agent.is_empty() { Some(agent) } else { None };
     let result = match op {
-        "spawn" => exec_broker.spawn(root.as_ref().unwrap(), program, &args),
+        "spawn" => exec_broker.spawn_for_agent(root.as_ref().unwrap(), agent_opt, program, &args),
         "run" => {
             let timeout_ms = v.get("timeout_ms").and_then(|t| t.as_u64()).unwrap_or(120_000);
-            exec_broker.run(root.as_ref().unwrap(), program, &args, timeout_ms)
+            exec_broker.run_for_agent(root.as_ref().unwrap(), agent_opt, program, &args, timeout_ms)
         }
         "poll" => {
             let cursor = v.get("cursor").and_then(|c| c.as_u64()).unwrap_or(0);

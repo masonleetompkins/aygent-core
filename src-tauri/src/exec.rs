@@ -34,6 +34,33 @@ use crate::broker::Broker;
 // managed), so a global handle is the honest shape, not a shortcut.
 static GLOBAL_EXEC: OnceCell<Arc<ExecBroker>> = OnceCell::new();
 static GLOBAL_BROKER: OnceCell<Arc<Broker>> = OnceCell::new();
+static GLOBAL_DB: OnceCell<crate::writer::Db> = OnceCell::new();
+
+/// Install the global Db handle for per-agent GitHub PAT scoping (Pro-Mode shell).
+/// Stored here so ExecBroker::spawn can resolve GITHUB_TOKEN without threading Db through every call.
+/// Cloning Db is cheap (channel + Arc).
+pub fn install_db(db: crate::writer::Db) {
+    let _ = GLOBAL_DB.set(db);
+}
+
+/// Try to inject per-agent GITHUB_TOKEN for this spawn. Fail-open: if no enabled github connection for this agent, just don't inject.
+/// Injects as ephemeral child env only — never touches osxkeychain or global git config.
+fn inject_github_env(cmd: &mut std::process::Command, agent_id: Option<&str>) {
+    let aid = match agent_id { Some(a) if !a.is_empty() && a != "default" => a, _ => return };
+    let db = match GLOBAL_DB.get() { Some(d) => d, None => return };
+    let token = match crate::connections::resolve_github_push_token(db, Some(aid)) {
+        Ok((tok, _login)) => tok,
+        Err(_) => return,
+    };
+    if token.trim().is_empty() { return; }
+    cmd.env("GITHUB_TOKEN", &token);
+    cmd.env("GH_TOKEN", &token);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd.env("GIT_CONFIG_COUNT", "1");
+    cmd.env("GIT_CONFIG_KEY_0", "credential.helper");
+    cmd.env("GIT_CONFIG_VALUE_0", r#"!f() { echo "username=oauth"; echo "password=$GITHUB_TOKEN"; }; f"#);
+    eprintln!("[aygent][exec] injected per-agent GITHUB_TOKEN for {} (ephemeral, keychain untouched)", aid);
+}
 
 /// Install the global exec broker + file broker (called once in lib.rs setup).
 pub fn install_global(exec: Arc<ExecBroker>, broker: Arc<Broker>) {
@@ -286,6 +313,19 @@ impl ExecBroker {
         program: &str,
         args: &[String],
     ) -> Result<serde_json::Value, ExecError> {
+        self.spawn_for_agent(root, None, program, args)
+    }
+
+    /// Same as spawn, but with per-agent GitHub PAT scoping. If agent_id has an enabled github connection,
+    /// the child's env gets GITHUB_TOKEN/GH_TOKEN + a per-process credential.helper that serves it.
+    /// The host keychain + parent shell are untouched.
+    pub fn spawn_for_agent(
+        &self,
+        root: &std::path::Path,
+        agent_id: Option<&str>,
+        program: &str,
+        args: &[String],
+    ) -> Result<serde_json::Value, ExecError> {
         // SAFETY KEYSTONE (Atlas self-hosted-build §2): the DEV agent must never
         // launch a GUI — that's how it would relaunch/replace the very app hosting
         // it (the footgun that locks Mason out of his repair tool). We reject at
@@ -316,6 +356,8 @@ impl ExecBroker {
                 cmd.env(k, v);
             }
         }
+        // Per-agent GitHub PAT injection (ephemeral, no keychain write)
+        inject_github_env(&mut cmd, agent_id);
 
         let mut child = cmd.spawn().map_err(|e| ExecError::Spawn(e.to_string()))?;
 
@@ -362,7 +404,18 @@ impl ExecBroker {
         args: &[String],
         timeout_ms: u64,
     ) -> Result<serde_json::Value, ExecError> {
-        let spawned = self.spawn(root, program, args)?;
+        self.run_for_agent(root, None, program, args, timeout_ms)
+    }
+
+    pub fn run_for_agent(
+        &self,
+        root: &std::path::Path,
+        agent_id: Option<&str>,
+        program: &str,
+        args: &[String],
+        timeout_ms: u64,
+    ) -> Result<serde_json::Value, ExecError> {
+        let spawned = self.spawn_for_agent(root, agent_id, program, args)?;
         let handle = spawned["proc_handle"].as_str().unwrap().to_string();
         let waited = self.wait(&handle, timeout_ms)?;
         // Build a bounded digest from the whole run (cursor 0).
