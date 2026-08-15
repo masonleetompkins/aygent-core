@@ -1,4 +1,4 @@
-# AYGENT — Capabilities (v1.0.3)
+# AYGENT — Capabilities (v1.0.4)
 
 _The canonical reference for what AYGENT can do, as shipped in the signed,
 notarized release. This is the source-of-truth capability doc: keep it in
@@ -119,12 +119,17 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
     envelope. Works on private repos, no clone; the returned sha round-trips
     straight into `github_write_file`. Directory listings and >1MB blobs fall
     back gracefully.
+- **Harness (1.0.4):** large file writes uncapped to **64k** with an honest truncation error instead of silent clipping — fixes the Stanislawski 20KB `routes.ts` red-herring.
 - **MCP servers:** one-click enable built-in catalog (Adobe Premiere Pro,
   Blender) or add custom stdio servers; tools namespaced `mcp__<server>__<tool>`.
   Node/uv provisioned in-app (no system installs).
 - **Pro Mode (shell):** real `shell_run` / `shell_spawn` / `shell_poll` /
-  `shell_write` / `shell_kill`, cwd-pinned to the agent's folder, env-scrubbed.
-  Gated behind an explicit consent screen. This is how AYGENT builds AYGENT.
+  `shell_write` / `shell_kill`, cwd-pinned to the agent's folder, env-scrubbed,
+  **per-agent GitHub PAT** (new in 1.0.4): `git clone/push/pull` in shell now uses
+  the agent's Connections GitHub token as ephemeral `GITHUB_TOKEN`/`GH_TOKEN` +
+  per-PID `credential.helper` — host shell & macOS Keychain untouched (fail-open
+  if no enabled GitHub connection). Gated behind an explicit consent screen. This
+  is how AYGENT builds AYGENT.
 
 ## 6. Dashboards (per-agent, prompt-built, pull-only)
 - Each agent has a dashboard you build by asking ("put my open PRs in a table,"
@@ -196,6 +201,7 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 ---
 
 ## Changelog
+- **1.0.4** (2026-08-13): **Per-agent GitHub PAT in shell** — Pro Mode `shell_run`/`shell_spawn` now injects the agent's Connections GitHub PAT as ephemeral `GITHUB_TOKEN` per-process (no global `osxkeychain` overwrite; host Keychain untouched). **Harness: uncap large file writes** to 64k with honest truncation (fixes 20KB `routes.ts` clip). Signed + notarized + stapled (16.9 MB DMG, `01bf1c9b Accepted`, `Notarized Developer ID`) → `masonleebuild/product-files/AYGENT-1.0.4-macOS.dmg` published via `publish-release.js` (release recorded, 1/1 owners emailed). Commits `2b796d5`, `edb84ac`, `9473288`, `9ea239d`, `2044884` (`tag: v1.0.4` reissued).
 - **1.0.3** (2026-08-12): **Shared context is now discoverable + addressable.**
   Read-only mounts get a virtual `@shared/<label>/` namespace — an agent can
   `list_files("@shared")` to see shared folders, browse/read inside them, and
@@ -215,4 +221,4 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 - **1.0.0** (2026-08-10): Signed/notarized launch — whoami tool, GFM tables,
   dashboards, sparks, remote.
 
-_Last updated 2026-08-12 for 1.0.3. If you add a capability, add it here._
+_Last updated 2026-08-13 for 1.0.4. If you add a capability, add it here._

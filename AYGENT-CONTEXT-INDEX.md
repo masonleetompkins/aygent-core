@@ -1,7 +1,7 @@
 # AYGENT-CONTEXT-INDEX.md
 _A map of the durable context a build agent should read before working on AYGENT
 or the site. Companion to WORKING-ON-AYGENT-AND-THE-SITE.md (the how-to). Written
-by Cleo, 2026-08-12. Most of these live in Cleo's agent folder (mounted read-only
+by Cleo, 2026-08-13 (updated for v1.0.4 — per-agent shell PAT + 64k uncap). Most of these live in Cleo's agent folder (mounted read-only
 as `@shared/<label>/…`); the repo docs live in the repo._
 
 ## Read these first (in order)
