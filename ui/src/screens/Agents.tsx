@@ -853,11 +853,97 @@ export function AgentForm({
           {!folder && <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Set the agent’s folder first.</span>}
         </div>
 
+        {/* TELEGRAM — one bot per agent (Fix 7). Token in Keychain, not in DB/files. */}
+        <TelegramCard agentId={savedId ?? initial?.id ?? null} initial={initial} />
+
         <div style={{ display: "flex", gap: 8 }}>
           <Button onClick={save} disabled={saving || !name.trim()}>{initial ? "Save" : "Create agent"}</Button>
           <Button variant="secondary" onClick={onCancel}>Cancel</Button>
         </div>
       </Card>
+    </div>
+  );
+}
+
+function TelegramCard({ agentId, initial, onSaved }: { agentId: string | null; initial: AgentProfile | null; onSaved?: () => void }) {
+  const [token, setToken] = useState("");
+  const [allowed, setAllowed] = useState(initial?.telegram_allowed_chats ?? "");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [status, setStatus] = useState<{ enabled: boolean; bot_username: string; has_token: boolean; allowed_chats: string } | null>(null);
+  useEffect(() => {
+    if (!agentId) { setStatus(null); return; }
+    invoke<any>("telegram_status", { agentId }).then(setStatus).catch(() => setStatus(null));
+    if (initial) setAllowed(initial.telegram_allowed_chats || "");
+  }, [agentId]);
+  // also sync allowed when initial changes
+  useEffect(() => { if (initial) setAllowed(initial.telegram_allowed_chats || ""); }, [initial?.telegram_allowed_chats]);
+  async function saveToken() {
+    if (!agentId) { setMsg("Save the agent first."); return; }
+    if (!token.trim()) { setMsg("Paste a Bot token from @BotFather first."); return; }
+    setSaving(true); setMsg(null);
+    try {
+      await invoke("telegram_set_token", { agentId, token: token.trim() });
+      const v = await invoke<any>("telegram_test_token", { token: token.trim() });
+      const username = v?.bot_username || "";
+      // persist wiring: enabled + username + allowlist
+      const profile = { ...(initial as any), id: agentId, telegram_enabled: true, telegram_bot_username: username, telegram_allowed_chats: allowed };
+      await invoke("agents_update", { profile: { ...profile, name: profile.name || "Agent" } });
+      setToken(""); setMsg(`✓ Connected as @${username}. Message it on Telegram to chat with this agent.`);
+      const st = await invoke<any>("telegram_status", { agentId }); setStatus(st);
+      onSaved?.();
+    } catch (e) { setMsg("✗ " + String(e)); }
+    finally { setSaving(false); }
+  }
+  async function toggleEnabled(on: boolean) {
+    if (!agentId || !initial) return;
+    try {
+      const profile = { ...initial, id: agentId, telegram_enabled: on } as any;
+      await invoke("agents_update", { profile });
+      setStatus((s) => s ? { ...s, enabled: on } : s);
+    } catch (e) { setMsg(String(e)); }
+  }
+  async function saveAllowlist() {
+    if (!agentId || !initial) { setMsg("Save the agent first."); return; }
+    try {
+      const profile = { ...initial, id: agentId, telegram_allowed_chats: allowed } as any;
+      await invoke("agents_update", { profile });
+      setMsg("✓ Telegram allowlist saved.");
+    } catch (e) { setMsg(String(e)); }
+  }
+  async function clearToken() {
+    if (!agentId) return;
+    try { await invoke("telegram_set_token", { agentId, token: "" }); setStatus((s) => s ? { ...s, has_token: false, enabled: false, bot_username: "" } : s); setMsg("Telegram disconnected."); } catch (e) { setMsg(String(e)); }
+  }
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "12px 14px" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+        <div style={{ fontSize: 13, fontWeight: 600 }}>Telegram — message this agent</div>
+        {status?.has_token && (
+          <label style={{ display: "inline-flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+            <input type="checkbox" checked={!!status?.enabled} onChange={(e) => toggleEnabled(e.target.checked)} />
+            <span style={{ fontSize: 12 }}>{status?.enabled ? "Enabled" : "Paused"}</span>
+          </label>
+        )}
+      </div>
+      <span style={{ ...hint, fontSize: 12 }}>
+        One bot per agent. Create a bot with <b>@BotFather</b> on Telegram (send <code>/newbot</code>), paste its token here, and this agent will reply on Telegram. Token is stored in your macOS Keychain — never in files.
+      </span>
+      {status?.bot_username && <span style={{ fontSize: 12, color: "var(--ok)" }}>@{status.bot_username} {status.has_token ? "· token saved ✓" : ""}</span>}
+      <div style={{ display: "flex", gap: 8 }}>
+        <Input type="password" value={token} onChange={(e) => setToken(e.target.value)} placeholder={status?.has_token ? "token saved — paste to replace" : "123456789:AAH... (from @BotFather)"} />
+        <Button onClick={saveToken} disabled={saving || !agentId}>{saving ? "Saving…" : status?.has_token ? "Update" : "Connect"}</Button>
+      </div>
+      {status?.has_token && <Button variant="secondary" onClick={clearToken}>Disconnect Telegram</Button>}
+      <label style={fieldLabel as any}>Allowed chat IDs (optional)
+        <Input value={allowed} onChange={(e) => setAllowed(e.target.value)} placeholder="e.g. 123456789, 987654321 (leave empty = allow any)" />
+        <span style={{ ...hint, fontSize: 11, color: "var(--text-faint)" }}>Comma-separated Telegram chat IDs that may message this bot. Leave empty to allow anyone who knows the bot.</span>
+      </label>
+      <div style={{ display: "flex", gap: 8 }}>
+        <Button variant="secondary" onClick={saveAllowlist}>Save allowlist</Button>
+      </div>
+      {msg && <span style={{ fontSize: 12, color: msg.startsWith("✓") ? "var(--ok)" : "var(--danger)" }}>{msg}</span>}
+      {!agentId && <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Save the agent first, then connect Telegram.</span>}
     </div>
   );
 }

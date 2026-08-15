@@ -7,7 +7,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Card, Button, Input, Pill } from "../components/ui";
 import { saveTheme, type Mode } from "../lib/theme";
 
-const ACCENT_SWATCHES = ["", "#2dd4bf", "#6366f1", "#e0533d", "#22c55e", "#eab308", "#ec4899"];
+const ACCENT_SWATCHES = ["", "#2dd4bf", "#6366f1", "#4169e1", "#00cafc", "#e0533d", "#22c55e", "#eab308", "#ec4899"]; // royal #4169e1 + electric #00cafc (Mason 7-fix)
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 
 // Cost + context info per model. Anthropic's API doesn't return pricing or

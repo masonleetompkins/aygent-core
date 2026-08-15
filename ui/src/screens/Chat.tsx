@@ -84,6 +84,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   folder: string | null; keySet: boolean; agentId: string | null;
   multi: boolean; closable: boolean; onClose: () => void;
 }) {
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   // `busy` is now DERIVED from the per-agent turn store (see `running` below),
@@ -757,7 +758,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   }
 
   return (
-    <div style={{ display: "flex", height: "100%", minHeight: 0, gap: "var(--space-4)" }}>
+    <div style={{ display: "flex", height: "100%", minHeight: 0, gap: "var(--space-4)", position: "relative" }}>
       {/* MAIN CHAT COLUMN. In multi-pane mode it flexes to share width; solo it
          stays centered. height:100% + flex so the input pins to the bottom. */}
       {/* WIDTH (Mason 08-04): the old `maxWidth: 720` left ~25% dead space on
@@ -822,6 +823,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               </div>
             )}
           </div>
+          <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          {multi && !blocked && (
+            <button
+              onClick={() => setHistoryOpen((o) => !o)}
+              title={historyOpen ? "Hide chats" : "Show chats"}
+              style={{ background: historyOpen ? "var(--surface)" : "none", border: "var(--border-width) solid var(--line)", cursor: "pointer", padding: 4, display: "flex", color: "var(--text-muted)", borderRadius: "var(--radius-control)" }}
+            ><Icon name="chat" size={16} /></button>
+          )}
           {closable && (
             <button
               onClick={onClose}
@@ -829,6 +838,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               style={{ background: "none", border: "none", cursor: "pointer", padding: 4, display: "flex", color: "var(--text-muted)", flexShrink: 0 }}
             ><Icon name="close" size={16} /></button>
           )}
+          </div>
         </div>
 
         {blocked && (
@@ -968,8 +978,8 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
         </div>
       </div>
 
-      {/* HISTORY SIDEBAR — right-hand side, so the active chat stays centered */}
-      {!blocked && (
+      {/* HISTORY SIDEBAR — in multi-pane, behind hamburger to save space; solo, always visible */}
+      {!blocked && !multi && (
         <HistorySidebar
           multi={multi}
           convs={convs} activeId={convId} busy={running} dragId={dragId} overId={overId}
@@ -979,6 +989,23 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           onNew={newConv} onOpen={openConv} onDelete={deleteConv} onRename={renameConv}
           onPin={togglePin} onPointerDragStart={startPointerDrag}
         />
+      )}
+      {!blocked && multi && historyOpen && (
+        <div style={{ position: "absolute", top: 0, right: 0, bottom: 0, width: 230, background: "var(--bg)", borderLeft: "var(--border-width) solid var(--line)", zIndex: 5, padding: "12px 0 12px 14px", display: "flex", flexDirection: "column" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, paddingRight: 8 }}>
+            <span style={{ fontSize: 12, fontWeight: 800, color: "var(--text-faint)" }}>CHATS</span>
+            <button onClick={() => setHistoryOpen(false)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)" }}><Icon name="close" size={14} /></button>
+          </div>
+          <HistorySidebar
+            multi={multi}
+            convs={convs} activeId={convId} busy={running} dragId={dragId} overId={overId}
+            listElRef={listElRef}
+            renamingId={renamingId}
+            onCommitRename={(id, title) => { setRenamingId(null); void saveConvTitle(id, title); }}
+            onNew={() => { newConv(); setHistoryOpen(false); }} onOpen={(id) => { openConv(id); setHistoryOpen(false); }} onDelete={deleteConv} onRename={renameConv}
+            onPin={togglePin} onPointerDragStart={startPointerDrag}
+          />
+        </div>
       )}
     </div>
   );

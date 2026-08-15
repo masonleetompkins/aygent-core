@@ -65,6 +65,7 @@ mod provision;
 mod mcp_client;
 mod mcp; // MCP manager: registry + catalog + agent-loop bridge + install/uninstall. // MCP client: spawn stdio JSON-RPC servers, discover + route their tools. // Level A: bundle portable node+ffmpeg+hyperframes into app-data (no system installs).
 mod supervisor;
+mod telegram;
 mod tools_registry;
 mod spark_state; // SPARKS: jailed KV persistence (Sparks/<slug>/state.json) for interactive Sparks.
 
@@ -352,6 +353,41 @@ async fn github_git_auth(
         return Err(format!("credential store failed: {}", String::from_utf8_lossy(&out.stderr)));
     }
     Ok(format!("git push/pull authenticated as @{login} (stored in macOS Keychain)."))
+}
+
+/// TELEGRAM per-agent (Fix 7): status + token management + test.
+/// Token is stored in the macOS Keychain under service telegram-bot-<agentId>.
+#[tauri::command]
+fn telegram_status(db: tauri::State<writer::Db>, agent_id: String) -> Result<serde_json::Value, String> {
+    let ag = repo::get_agent(&db, &agent_id)?.ok_or("agent not found")?;
+    let has_token = keychain::has_key(&telegram::keychain_service(&agent_id));
+    Ok(serde_json::json!({
+        "enabled": ag.telegram_enabled,
+        "bot_username": ag.telegram_bot_username,
+        "allowed_chats": ag.telegram_allowed_chats,
+        "has_token": has_token,
+    }))
+}
+#[tauri::command]
+fn telegram_set_token(db: tauri::State<writer::Db>, agent_id: String, token: String) -> Result<serde_json::Value, String> {
+    let tok = token.trim().to_string();
+    if tok.is_empty() {
+        // Clear token
+        let _ = keychain::set_key(&telegram::keychain_service(&agent_id), "");
+        let mut ag = repo::get_agent(&db, &agent_id)?.ok_or("agent not found")?;
+        ag.telegram_enabled = false;
+        ag.telegram_bot_username = String::new();
+        repo::update_agent(&db, ag)?;
+        return Ok(serde_json::json!({ "ok": true, "cleared": true }));
+    }
+    if !telegram::looks_like_token(&tok) { return Err("that does not look like a Telegram Bot token (expected 123456:AA...)".into()); }
+    keychain::set_key(&telegram::keychain_service(&agent_id), &tok)?;
+    Ok(serde_json::json!({ "ok": true, "saved": true }))
+}
+#[tauri::command]
+async fn telegram_test_token(token: String) -> Result<serde_json::Value, String> {
+    let username = telegram::validate_token(token.trim()).await?;
+    Ok(serde_json::json!({ "ok": true, "bot_username": username }))
 }
 
 /// PRO MODE: list running/known shell processes (for the UI process panel).
@@ -4454,7 +4490,7 @@ async fn agent_stream(
         });
         // Baseline SAVE POINT before any tool writes (same as Anthropic path).
         if let Ok(root) = broker.root_for(&scope_id) {
-            let _ = savepoint::snapshot(&root, "baseline");
+            let _ = savepoint::snapshot(&root, "Checkpoint");
         }
         // Enabled registry tools (e.g. PDF) contribute extra instructions the
         // local model should know about, appended to its native tool prompt.
@@ -4544,7 +4580,7 @@ async fn agent_stream(
 
         // Baseline SAVE POINT before the turn (rewind anchor), same as Anthropic.
         if let Ok(root) = broker.root_for(&scope_id) {
-            let _ = savepoint::snapshot(&root, "baseline");
+            let _ = savepoint::snapshot(&root, "Checkpoint");
         }
 
         let (tools, reg_instr) = agent_tools_for_full(&app, Some(&scope_id), folder.as_deref(), !roster.is_empty(), Some((&db, &scope_id)));
@@ -4783,7 +4819,7 @@ async fn agent_stream(
     // the bug where a turn's writes were absorbed (mislabeled) into the NEXT
     // turn's pre-snapshot, or lost entirely if they were the last edit.
     if let Ok(root) = broker.root_for(&scope_id) {
-        let _ = savepoint::snapshot(&root, "baseline");
+        let _ = savepoint::snapshot(&root, "Checkpoint");
     }
 
     let (tools, reg_instr) = agent_tools_for_full(&app, Some(&scope_id), folder.as_deref(), !roster.is_empty(), Some((&db, &scope_id)));
@@ -5271,7 +5307,7 @@ pub async fn run_headless_turn(
     let provider_kind = if agent.provider.is_empty() { "anthropic".to_string() } else { agent.provider.clone() };
 
     // Baseline SAVE POINT before any writes.
-    if let Ok(root) = broker.root_for(agent_id) { let _ = savepoint::snapshot(&root, "baseline"); }
+    if let Ok(root) = broker.root_for(agent_id) { let _ = savepoint::snapshot(&root, "Checkpoint"); }
 
     let mut messages = serde_json::json!([{ "role": "user", "content": framed }]);
     let mut reply_text = String::new();
@@ -5415,6 +5451,12 @@ pub async fn run_headless_turn(
     let reply_display = if reply_text.trim().is_empty() {
         "(done — completed the request without a text reply)".to_string()
     } else { reply_text.trim().to_string() };
+    if msg.from_agent.starts_with("telegram:") {
+        let origin = msg.from_agent.clone();
+        let text = reply_display.clone();
+        let aid = agent_id.to_string();
+        tauri::async_runtime::spawn(async move { telegram::reply_to_origin(&aid, &origin, &text).await; });
+    }
 
     // PERSIST to the recipient's conversation. CRITICAL (bug #5): we persist the
     // REAL provider-format `history` (messages), not just a display record — so
@@ -5612,6 +5654,7 @@ pub fn run() {
             memory_get_auto_remember, memory_set_auto_remember,
             pro_mode_get, pro_mode_set, shell_procs, shell_kill_proc,
             github_git_auth,
+            telegram_status, telegram_set_token, telegram_test_token,
             onboarding_status, onboarding_pick_root, onboarding_set_root,
             onboarding_make_agent_home, onboarding_finish, import_memory
         ])
@@ -5676,6 +5719,7 @@ pub fn run() {
                     // session up at boot — with retries, because the browser
                     // key may not be published yet (first-time pairing).
                     remote_runtime::spawn_autostart(_app.handle().clone());
+                    telegram::spawn_all(_app.handle().clone(), db.clone());
                 }
 
                 // M1.8 SCHEDULER: spawn the ticker ("the drainer with a clock in
@@ -5749,26 +5793,25 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building AYGENT")
         .run(|app_handle, event| match event {
-            // The user asked to quit (Cmd+Q / menu). Stop the daemon BEFORE the
-            // process tears down, so we never exit with a live orphaned child —
-            // that is what macOS was reporting as "stopped unexpectedly".
+            // CMD+Q / Quit menu (ExitRequested): clean shutdown. Kill daemon BEFORE exit
+            // so no orphaned child triggers "quit unexpectedly" (was the crash report).
+            // This is the ONLY path that terminates the process.
             tauri::RunEvent::ExitRequested { .. } => {
                 if let Some(state) = app_handle.try_state::<Arc<supervisor::DaemonState>>() {
                     supervisor::shutdown(&state);
                 }
+                // Let Tauri complete the exit cleanly; do NOT call abort/exit(0) here
+                // so Exit handler runs and reports normal termination.
             }
-            // Closing the LAST window should quit. On macOS the default is to
-            // keep running with no windows (right for document apps, wrong for
-            // AYGENT — Mason: "clicking the red X keeps it running in the
-            // background"). Exit explicitly once no windows remain.
+            // Red X (window close) => HIDE, don't quit. Scheduler + drainer keep running
+            // in the background; user reopens via Dock. Only CMD+Q truly quits.
             tauri::RunEvent::WindowEvent {
-                event: tauri::WindowEvent::Destroyed, ..
+                label, event: tauri::WindowEvent::CloseRequested { api, .. }, ..
             } => {
-                if app_handle.webview_windows().is_empty() {
-                    if let Some(state) = app_handle.try_state::<Arc<supervisor::DaemonState>>() {
-                        supervisor::shutdown(&state);
-                    }
-                    app_handle.exit(0);
+                // Prevent the window from being destroyed; hide it instead.
+                api.prevent_close();
+                if let Some(win) = app_handle.get_webview_window(&label) {
+                    let _ = win.hide();
                 }
             }
             // Final teardown: CefShutdown must run once, after the run loop

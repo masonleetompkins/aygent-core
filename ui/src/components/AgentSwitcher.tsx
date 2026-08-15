@@ -19,6 +19,10 @@ export type AgentProfile = {
   created_at: number;
   updated_at: number;
   archived: boolean;
+  sort_order?: number;
+  telegram_enabled?: boolean;
+  telegram_bot_username?: string;
+  telegram_allowed_chats?: string;
 };
 
 export function AgentSwitcher({

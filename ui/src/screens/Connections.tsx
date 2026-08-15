@@ -283,8 +283,8 @@ export function Connections({ agentId }: { agentId: string | null }) {
 
                 <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
                   <Button variant={accounts.length ? "secondary" : "primary"}
-                          onClick={() => setConnectingTo(def)}>
-                    {accounts.length ? "+ Add another account" : `Connect ${def.label}`}
+                          onClick={() => setConnectingTo((cur) => cur?.id === def.id ? null : def)}>
+                    {connectingTo?.id === def.id ? "Cancel" : (accounts.length ? "+ Add another account" : `Connect ${def.label}`)}
                   </Button>
                   {activeAcct && (
                     <Button variant="secondary" onClick={() => stopUsing(activeAcct)}>
@@ -292,20 +292,23 @@ export function Connections({ agentId }: { agentId: string | null }) {
                     </Button>
                   )}
                 </div>
+                {connectingTo?.id === def.id && (
+                  <div style={{ marginTop: 12, paddingTop: 12, borderTop: "var(--border-width) solid var(--line)" }}>
+                    <ConnectSheet
+                      def={connectingTo}
+                      agentId={agentId}
+                      onClose={() => setConnectingTo(null)}
+                      onDone={async (msg) => { setConnectingTo(null); setOk(msg); await refresh(); }}
+                    />
+                  </div>
+                )}
               </Card>
             );
           })}
         </div>
       ))}
 
-      {connectingTo && (
-        <ConnectSheet
-          def={connectingTo}
-          agentId={agentId}
-          onClose={() => setConnectingTo(null)}
-          onDone={async (msg) => { setConnectingTo(null); setOk(msg); await refresh(); }}
-        />
-      )}
+{/* ConnectSheet now renders INLINE inside the card that was clicked (Fix 4) */}
     </div>
   );
 }
@@ -340,7 +343,8 @@ function ConnectSheet({ def, agentId, onClose, onDone }: {
   }
 
   return (
-    <Card title={`Connect ${def.label}`}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <p style={{ ...hint, fontWeight: 600 }}>Enter your {def.label} credentials</p>
       <ol style={{ ...hint, paddingLeft: 20, display: "flex", flexDirection: "column", gap: 6 }}>
         {def.setup_steps.map((s, i) => <li key={i}>{s}</li>)}
       </ol>
@@ -391,6 +395,6 @@ function ConnectSheet({ def, agentId, onClose, onDone }: {
           in the middle of a task.
         </span>
       </div>
-    </Card>
+    </div>
   );
 }

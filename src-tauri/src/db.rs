@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 /// Current schema version. Bump when adding a migration step below.
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// The DB file name under <app_data>.
 pub const DB_FILE: &str = "aygent.db";
@@ -263,6 +263,23 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         ).map_err(|e| format!("migrate v13 (seed sort_order): {e}"))?;
         set_version(conn, 13)?;
         v = 13;
+    }
+
+    if v < 14 {
+        // TELEGRAM PER-AGENT (Mason 7-fix #7): one bot per agent. Token lives in
+        // the macOS Keychain (same as other connectors); DB holds only non-secret
+        // wiring + allowlist. Three ALTER ADDs so existing rows keep defaults.
+        conn.execute_batch(
+            "ALTER TABLE agent ADD COLUMN telegram_enabled INTEGER NOT NULL DEFAULT 0;"
+        ).map_err(|e| format!("migrate v14 (telegram_enabled): {e}"))?;
+        conn.execute_batch(
+            "ALTER TABLE agent ADD COLUMN telegram_bot_username TEXT NOT NULL DEFAULT '';"
+        ).map_err(|e| format!("migrate v14 (bot_username): {e}"))?;
+        conn.execute_batch(
+            "ALTER TABLE agent ADD COLUMN telegram_allowed_chats TEXT NOT NULL DEFAULT '';"
+        ).map_err(|e| format!("migrate v14 (allowed_chats): {e}"))?;
+        set_version(conn, 14)?;
+        v = 14;
     }
 
     debug_assert_eq!(v, SCHEMA_VERSION, "migrate() must end at SCHEMA_VERSION — add the missing step or bump the constant");

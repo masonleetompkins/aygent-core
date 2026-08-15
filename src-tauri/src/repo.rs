@@ -12,6 +12,13 @@
 use crate::writer::Db;
 use rusqlite::{params, OptionalExtension};
 
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -47,6 +54,13 @@ pub struct AgentProfile {
     pub archived: bool,
     #[serde(default)]
     pub sort_order: i64,
+    // Telegram per-agent bot (Fix 7): one bot per agent, token stored in keychain, chat allowlist in DB
+    #[serde(default)]
+    pub telegram_enabled: bool,
+    #[serde(default)]
+    pub telegram_bot_username: String,
+    #[serde(default)]
+    pub telegram_allowed_chats: String, // comma-separated chat_ids, empty = allow any that knows the bot
 }
 fn default_context_mode() -> String { "isolated".to_string() }
 
@@ -95,6 +109,9 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
         updated_at: r.get("updated_at")?,
         archived: r.get::<_, i64>("archived")? != 0,
         sort_order: r.get("sort_order").unwrap_or(0),
+        telegram_enabled: r.get::<_, i64>("telegram_enabled").unwrap_or(0) != 0,
+        telegram_bot_username: r.get::<_, String>("telegram_bot_username").unwrap_or_default(),
+        telegram_allowed_chats: r.get::<_, String>("telegram_allowed_chats").unwrap_or_default(),
     })
 }
 
@@ -177,7 +194,10 @@ pub fn create_agent(
         created_at: now(),
         updated_at: now(),
         archived: false,
-        sort_order: 0, // real value assigned in the txn (max+1)
+        sort_order: 0,
+        telegram_enabled: false,
+        telegram_bot_username: String::new(),
+        telegram_allowed_chats: String::new(), // real value assigned in the txn (max+1)
     };
     let p = profile.clone();
     db.write(move |c| {
@@ -210,8 +230,8 @@ pub fn update_agent(db: &Db, mut profile: AgentProfile) -> Result<(), String> {
     profile.updated_at = now();
     db.write(move |c| {
         let n = c.execute(
-            "UPDATE agent SET name=?2,icon=?3,color=?4,folder_path=?5,model=?6,provider=?7,context_mode=?8,system_prompt=?9,updated_at=?10,archived=?11 WHERE id=?1",
-            params![profile.id, profile.name, profile.icon, profile.color, profile.folder_path, profile.model, profile.provider, profile.context_mode, profile.system_prompt, profile.updated_at, profile.archived as i64],
+            "UPDATE agent SET name=?2,icon=?3,color=?4,folder_path=?5,model=?6,provider=?7,context_mode=?8,system_prompt=?9,updated_at=?10,archived=?11,telegram_enabled=?12,telegram_bot_username=?13,telegram_allowed_chats=?14 WHERE id=?1",
+            params![profile.id, profile.name, profile.icon, profile.color, profile.folder_path, profile.model, profile.provider, profile.context_mode, profile.system_prompt, profile.updated_at, profile.archived as i64, profile.telegram_enabled as i64, profile.telegram_bot_username, profile.telegram_allowed_chats],
         ).map_err(|e| format!("update agent: {e}"))?;
         if n == 0 { return Err("agent not found".into()); }
         Ok(())

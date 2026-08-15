@@ -196,7 +196,15 @@ pub fn snapshot(root: &Path, label: &str) -> Result<Option<String>, String> {
     }
 
     let signature = sig()?;
-    let msg = if label.trim().is_empty() { "save point" } else { label.trim() };
+    let label = label.trim();
+    let owned: String = if label.is_empty() {
+        "Checkpoint".to_string()
+    } else if label == "Checkpoint" || label == "baseline" {
+        format!("Checkpoint \u{2014} {}", chrono::Local::now().format("%b %d %H:%M"))
+    } else {
+        label.to_string()
+    };
+    let msg = owned.as_str();
     let parents: Vec<&git2::Commit> = parent_commit.iter().collect();
     // Commit WITHOUT moving HEAD; we manage our own refs explicitly.
     let oid = repo
