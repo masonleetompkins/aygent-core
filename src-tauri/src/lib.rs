@@ -369,7 +369,7 @@ fn telegram_status(db: tauri::State<writer::Db>, agent_id: String) -> Result<ser
     }))
 }
 #[tauri::command]
-fn telegram_set_token(app: tauri::AppHandle, db: tauri::State<writer::Db>, agent_id: String, token: String) -> Result<serde_json::Value, String> {
+fn telegram_set_token(_app: tauri::AppHandle, db: tauri::State<writer::Db>, agent_id: String, token: String) -> Result<serde_json::Value, String> {
     let tok = token.trim().to_string();
     if tok.is_empty() {
         // Clear token
@@ -5202,7 +5202,20 @@ pub async fn run_headless_turn(
     } else { (None, msg.body.clone()) };
     let msg_body = msg_body.as_str();
 
-    let from_name = if is_remote {
+    let is_telegram = msg.from_agent.starts_with("telegram:");
+    let telegram_chat_id: Option<String> = if is_telegram {
+        let rest = msg.from_agent.strip_prefix("telegram:").unwrap_or("");
+        let chat = rest.split(':').next().unwrap_or(rest).to_string();
+        if chat.is_empty() { None } else { Some(chat) }
+    } else { None };
+    let telegram_cmd = if is_telegram { telegram::parse_command(msg_body) } else { telegram::Command::Chat };
+    // Telegram pinned chat title + commands (Fix 7 follow-up): compact/newsession are local.
+    // This keeps /compact fast (no LLM) and /newsession deterministic (wipe + confirm).
+    let is_telegram_compact = is_telegram && telegram_cmd == telegram::Command::Compact;
+    let is_telegram_new = is_telegram && telegram_cmd == telegram::Command::NewSession;
+    let from_name = if is_telegram {
+        "Telegram".to_string()
+    } else if is_remote {
         "Remote".to_string()
     } else if is_continue {
         "Continuation".to_string()
@@ -5236,6 +5249,9 @@ pub async fn run_headless_turn(
              there is no one to send it to.\n\nTask:\n\n{}",
             msg_body
         )
+    } else if is_telegram {
+        // Telegram: tag the message as from Telegram user; include chat routing.
+        format!("Telegram message (chat {chat}):\n\n{body}", chat=telegram_chat_id.clone().unwrap_or_default(), body=msg_body)
     } else {
         format!(
             "You just received a message from another agent, {from_name} (id: {}). Their message:\n\n{}\n\n\
@@ -5248,9 +5264,13 @@ pub async fn run_headless_turn(
     // The per-agent stream channel the UI subscribes to (SAME id the human path
     // uses for this agent's inbox conversation) so the turn streams LIVE into
     // whichever pane is viewing the recipient — you WATCH the work happen.
-    let stream_channel = match &continue_conv {
-        Some(cid) => cid.clone(),                    // wake-up streams into the origin chat
-        None => format!("inbox-{agent_id}"),
+    let stream_channel = if is_telegram {
+        format!("telegram-{agent_id}")
+    } else {
+        match &continue_conv {
+            Some(cid) => cid.clone(),                    // wake-up streams into the origin chat
+            None => format!("inbox-{agent_id}"),
+        }
     };
 
     // 1) DISPATCH-TIME VISIBILITY: show the inbound message in the recipient's
@@ -5258,16 +5278,16 @@ pub async fn run_headless_turn(
     //    the instant it's sent. We persist it now + emit a stream event so an
     //    open pane renders it live.
     {
-        let conv_id = continue_conv.clone().unwrap_or_else(|| format!("inbox-{agent_id}"));
+        let conv_id = if is_telegram { format!("telegram-{agent_id}") } else { continue_conv.clone().unwrap_or_else(|| format!("inbox-{agent_id}")) };
         let existing = repo::load_conversation(db, &conv_id).ok();
         let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
         let inbound_text = if is_remote { format!("\u{1F4F1} {}", msg_body) }
             else if is_continue { format!("\u{23F0} resumed: {}", msg_body) }
             else { format!("\u{1F4E8} from {from_name}: {}", msg_body) };
         ui_msgs.push(serde_json::json!({ "role": "user", "from": from_name, "text": inbound_text }));
-        let title = existing.as_ref().map(|c| c.title.clone()).unwrap_or_else(|| "Activity".into());
-        let pinned = existing.as_ref().map(|c| c.pinned).unwrap_or(true);
-        let order = existing.as_ref().map(|c| c.order).unwrap_or(1);
+        let title = if is_telegram { "Telegram".to_string() } else { existing.as_ref().map(|c| c.title.clone()).unwrap_or_else(|| "Activity".into()) };
+        let pinned = if is_telegram { true } else { existing.as_ref().map(|c| c.pinned).unwrap_or(true) };
+        let order = if is_telegram { 0 } else { existing.as_ref().map(|c| c.order).unwrap_or(1) };
         let conv = repo::Conversation {
             id: conv_id, agent_id: agent_id.to_string(),
             title, updated: 0, pinned, order,
@@ -5317,6 +5337,31 @@ pub async fn run_headless_turn(
     // Baseline SAVE POINT before any writes.
     if let Ok(root) = broker.root_for(agent_id) { let _ = savepoint::snapshot(&root, "Checkpoint"); }
 
+    // /compact and /newsession are handled LOCALLY for Telegram (no LLM stall).
+    if is_telegram_compact {
+        let conv_id = format!("telegram-{agent_id}");
+        if let Ok(conv) = repo::load_conversation(db, &conv_id) {
+            let hist = conv.history.as_array().cloned().unwrap_or_default();
+            if hist.len() >= 4 {
+                let flat = crate::flatten_history_for_summary(&hist);
+                let clipped = &flat[..flat.len().min(6000)];
+                let seed = serde_json::json!([{"role":"user","content":format!("[Compacted Telegram context]
+{}", clipped)}, {"role":"assistant","content":"Understood \\u2014 context compacted."}]);
+                let _ = repo::save_conversation(db, repo::Conversation { id: conv_id.clone(), agent_id: agent_id.to_string(), title: "Telegram".into(), updated: 0, pinned: true, order: -1, msgs: conv.msgs, history: seed });
+            }
+        }
+        telegram::reply_to_origin(&agent_id, &msg.from_agent, "Compacted context \\u2014 ready for more.").await;
+        return Ok(());
+    }
+    if is_telegram_new {
+        let conv_id = format!("telegram-{agent_id}");
+        // Wipe the Telegram pinned chat and start fresh
+        let _ = repo::delete_conversation(db, &conv_id);
+        let fresh = repo::Conversation { id: conv_id.clone(), agent_id: agent_id.to_string(), title: "Telegram".into(), updated: 0, pinned: true, order: -1, msgs: serde_json::json!([{ "role": "assistant", "text": "Started a new Telegram session." }]), history: serde_json::json!([]) };
+        let _ = repo::save_conversation(db, fresh);
+        telegram::reply_to_origin(&agent_id.to_string(), &msg.from_agent, "Started a new session.").await;
+        return Ok(());
+    }
     let mut messages = serde_json::json!([{ "role": "user", "content": framed }]);
     let mut reply_text = String::new();
 
@@ -5472,7 +5517,7 @@ pub async fn run_headless_turn(
     // the agent's normal chat now share ONE conversation id so when you talk to
     // the agent directly it REMEMBERS the inter-agent message. We append the
     // full turn (framed inbound + assistant reply) to whatever history exists.
-    let conv_id = continue_conv.clone().unwrap_or_else(|| format!("inbox-{agent_id}"));
+    let conv_id = if is_telegram { format!("telegram-{agent_id}") } else { continue_conv.clone().unwrap_or_else(|| format!("inbox-{agent_id}")) };
     let existing = repo::load_conversation(db, &conv_id).ok();
     let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
     // NOTE (Mason 08-03, double-bubble fix): the inbound "resumed:"/"from X:"
@@ -5485,9 +5530,9 @@ pub async fn run_headless_turn(
     // the framed user msg; append the whole thing to prior history.
     let mut hist = existing.as_ref().and_then(|c| c.history.as_array().cloned()).unwrap_or_default();
     if let Some(turn) = messages.as_array() { for m in turn { hist.push(m.clone()); } }
-    let title2 = existing.as_ref().map(|c| c.title.clone()).unwrap_or_else(|| "Activity".into());
-    let pinned2 = existing.as_ref().map(|c| c.pinned).unwrap_or(true);
-    let order2 = existing.as_ref().map(|c| c.order).unwrap_or(1);
+    let title2 = if is_telegram { "Telegram".to_string() } else { existing.as_ref().map(|c| c.title.clone()).unwrap_or_else(|| "Activity".into()) };
+    let pinned2 = if is_telegram { true } else { existing.as_ref().map(|c| c.pinned).unwrap_or(true) };
+    let order2 = if is_telegram { 0 } else { existing.as_ref().map(|c| c.order).unwrap_or(1) };
     let conv = repo::Conversation {
         id: conv_id, agent_id: agent_id.to_string(),
         title: title2, updated: 0, pinned: pinned2, order: order2,
@@ -5507,7 +5552,8 @@ pub async fn run_headless_turn(
 /// fails before it could reply (Atlas #5 cause 3: no key/model → rail rings then
 /// silence). Now the user sees WHY in the thread instead of a blank rail.
 pub fn persist_inbox_error(db: &writer::Db, agent_id: &str, _msg: &mailbox::Message, err: &str) {
-    let conv_id = format!("inbox-{agent_id}");
+    let is_tg = _msg.from_agent.starts_with("telegram:");
+    let conv_id = if is_tg { format!("telegram-{agent_id}") } else { format!("inbox-{agent_id}") };
     let existing = repo::load_conversation(db, &conv_id).ok();
     let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
     // (Mason 08-03) Do NOT re-append the inbound bubble — dispatch-time

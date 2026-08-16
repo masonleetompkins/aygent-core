@@ -35,6 +35,22 @@ pub fn allowed_set(csv: &str) -> Option<HashSet<String>> {
     if set.is_empty() { None } else { Some(set) }
 }
 
+/// Telegram /commands inside the pinned Telegram chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command { Chat, Compact, NewSession }
+
+pub fn parse_command(text: &str) -> Command {
+    let t = text.trim().to_ascii_lowercase();
+    // strip @botname suffix like /compact@MyBot
+    let head = t.split_whitespace().next().unwrap_or("");
+    let cmd = head.split("@").next().unwrap_or(head);
+    match cmd {
+        "/compact" => Command::Compact,
+        "/newsession" | "/new_session" | "/new" | "/restart" | "/clear" => Command::NewSession,
+        _ => Command::Chat,
+    }
+}
+
 pub fn chat_allowed(chat_id: &str, csv: &str) -> bool {
     match allowed_set(csv) {
         None => true,
@@ -208,8 +224,9 @@ async fn run_agent_loop(app: tauri::AppHandle, db: crate::writer::Db, agent_id: 
                         eprintln!("[telegram] blocked chat {} for agent {} (not in allowlist)", chat_id, agent_id);
                         continue;
                     }
-                    // Enqueue into mailbox: from = telegram:<chat_id> so reply can route back.
-                    let from = format!("telegram:{chat_id}");
+                    // Enqueue into mailbox: include update_id so sequential Telegram messages
+                    // are distinct origins (mailbox dedupes identical from+body hops in one turn).
+                    let from = format!("telegram:{chat_id}:{}", u.update_id);
                     let body = text.clone();
                     let dbc = db.clone();
                     let aid = agent_id.clone();
@@ -253,7 +270,9 @@ async fn run_agent_loop(app: tauri::AppHandle, db: crate::writer::Db, agent_id: 
 /// Send a reply back to the originating Telegram chat. Called after a headless
 /// turn that was triggered by telegram:<chat_id> completes.
 pub async fn reply_to_origin(agent_id: &str, origin: &str, text: &str) {
-    let Some(chat_id) = origin.strip_prefix("telegram:") else { return };
+    let Some(rest) = origin.strip_prefix("telegram:") else { return };
+    // origin may be telegram:<chat_id>:<update_id> — strip the trailing :update_id
+    let chat_id = rest.split(':').next().unwrap_or(rest);
     let token = match crate::keychain::get_key(&keychain_service(agent_id)) {
         Ok(t) if !t.trim().is_empty() => t,
         _ => return,
