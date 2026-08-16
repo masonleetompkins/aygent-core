@@ -100,6 +100,15 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   const convIdRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const pinToBottom = (smooth = false) => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        bottomRef.current?.scrollIntoView({ behavior: smooth ? "smooth" : "auto", block: "end" });
+        const el = scrollRef.current; if (el) el.scrollTop = el.scrollHeight;
+      });
+    });
+  };
 
   // #4 @mention: the list of agents to offer in the picker, loaded once.
   const [allAgents, setAllAgents] = useState<Array<{ id: string; name: string; icon: string; color: string }>>([]);
@@ -257,7 +266,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
     // Task #2 (Mason 08-01): a growing input was COVERING the last message —
     // the messages column doesn't reflow on its own. Pin to bottom as we grow.
-    scrollRef.current?.scrollTo({ top: 1e9 });
+    pinToBottom();
   }, [input]);
 
   // #4 detect an @mention token at the caret and surface matching agents.
@@ -352,7 +361,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   const runningChannelRef = useRef<string | null>(null);
   const providerRef = useRef<string>("");
 
-  useEffect(() => { scrollRef.current?.scrollTo({ top: 1e9, behavior: "smooth" }); }, [msgs]);
+  useEffect(() => { pinToBottom(true); }, [msgs]);
 
   function setConv(id: string | null) { convIdRef.current = id; setConvId(id); }
 
@@ -651,8 +660,16 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // unmounts, so the stream is always captured and any pane can reattach.
   const turn = useAgentTurn(agentId);
   const running = turn.status === "running";
-  // Follow the live stream: msgs is static mid-turn now, so scroll on liveText.
-  useEffect(() => { scrollRef.current?.scrollTo({ top: 1e9 }); }, [turn.liveText]);
+  // Follow the live stream: msgs is static mid-turn now, so scroll on liveText + tools + timeline.
+  useEffect(() => { if (running) pinToBottom(); }, [turn.liveText, turn.liveTools, turn.timeline, running]);
+  // Keep pinned while streaming — any height change (new tool card, expanding body, markdown) pins to true bottom so the rounded frame never cuts off.
+  useEffect(() => {
+    const el = scrollRef.current; if (!el) return;
+    const target = el.firstElementChild as Element | null; if (!target) return;
+    const ro = new ResizeObserver(() => { if (running) pinToBottom(); });
+    ro.observe(target);
+    return () => ro.disconnect();
+  }, [running]);
   // UI task #1: reload the viewed conv when a headless/continuation turn
   // persists, so the report STAYS on screen instead of vanishing.
   const convVersion = useConvVersion();
@@ -875,6 +892,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
             }} />
           )}
           </div>
+          <div ref={bottomRef} aria-hidden style={{ height: 8, flexShrink: 0 }} />
         </div>
 
         {/* Task #5: attachment chips above the input */}
