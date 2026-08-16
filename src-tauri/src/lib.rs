@@ -369,7 +369,7 @@ fn telegram_status(db: tauri::State<writer::Db>, agent_id: String) -> Result<ser
     }))
 }
 #[tauri::command]
-fn telegram_set_token(db: tauri::State<writer::Db>, agent_id: String, token: String) -> Result<serde_json::Value, String> {
+fn telegram_set_token(app: tauri::AppHandle, db: tauri::State<writer::Db>, agent_id: String, token: String) -> Result<serde_json::Value, String> {
     let tok = token.trim().to_string();
     if tok.is_empty() {
         // Clear token
@@ -382,6 +382,8 @@ fn telegram_set_token(db: tauri::State<writer::Db>, agent_id: String, token: Str
     }
     if !telegram::looks_like_token(&tok) { return Err("that does not look like a Telegram Bot token (expected 123456:AA...)".into()); }
     keychain::set_key(&telegram::keychain_service(&agent_id), &tok)?;
+    // Don't auto-enable here; the Agent Edit card will validate via getMe, then enable with the real @username.
+    // This keeps the single source of truth (agents_update) and avoids spawning a worker with a bad token.
     Ok(serde_json::json!({ "ok": true, "saved": true }))
 }
 #[tauri::command]
@@ -1735,10 +1737,16 @@ fn agents_create(
 }
 
 #[tauri::command]
-fn agents_update(db: tauri::State<writer::Db>, broker: tauri::State<'_, Arc<Broker>>, profile: repo::AgentProfile) -> Result<(), String> {
+fn agents_update(app: tauri::AppHandle, db: tauri::State<writer::Db>, broker: tauri::State<'_, Arc<Broker>>, profile: repo::AgentProfile) -> Result<(), String> {
+    let enabled = profile.telegram_enabled;
+    let agent_id = profile.id.clone();
     repo::update_agent(&db, profile)?;
     // Folder may have changed — re-register all scopes so the jail tracks it.
     register_all_agent_scopes(&db, &broker);
+    // If Telegram was just enabled, start polling immediately (boot only starts workers for already-enabled agents).
+    if enabled {
+        telegram::spawn_one(app, db.inner().clone(), agent_id);
+    }
     Ok(())
 }
 
@@ -5804,7 +5812,7 @@ pub fn run() {
                 // so Exit handler runs and reports normal termination.
             }
             // Red X (window close) => HIDE, don't quit. Scheduler + drainer keep running
-            // in the background; user reopens via Dock. Only CMD+Q truly quits.
+            // in the background; Dock click reopens the window (Reopen event).
             tauri::RunEvent::WindowEvent {
                 label, event: tauri::WindowEvent::CloseRequested { api, .. }, ..
             } => {
@@ -5812,6 +5820,13 @@ pub fn run() {
                 api.prevent_close();
                 if let Some(win) = app_handle.get_webview_window(&label) {
                     let _ = win.hide();
+                }
+            }
+            // macOS Dock icon click when no windows visible => Reopen (show the window again).
+            tauri::RunEvent::Reopen { .. } => {
+                for (_label, win) in app_handle.webview_windows() {
+                    let _ = win.show();
+                    let _ = win.set_focus();
                 }
             }
             // Final teardown: CefShutdown must run once, after the run loop

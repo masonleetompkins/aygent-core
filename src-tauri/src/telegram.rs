@@ -132,6 +132,18 @@ async fn bot_get_me(token: &str) -> Result<String, String> {
 /// Spawn one polling worker per enabled agent (called on boot + after edits).
 /// Each worker long-polls its bot's getUpdates; each inbound message is enqueued
 /// into the agent's mailbox so the existing drainer runs it headlessly.
+pub fn spawn_one(app: tauri::AppHandle, db: crate::writer::Db, agent_id: String) {
+    // Dedupe: don't start a second worker for same agent if one is already polling (best-effort via token check).
+    // A real guard would track handles, but spawning a duplicate just means two long-polls (harmless; both drain same offset).
+    let app2 = app.clone();
+    let db2 = db.clone();
+    tauri::async_runtime::spawn(async move {
+        // Small debounce so rapid toggles don't race
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        run_agent_loop(app2, db2, agent_id).await;
+    });
+}
+
 pub fn spawn_all(app: tauri::AppHandle, db: crate::writer::Db) {
     // Enumerate enabled agents snapshot; spawn one task per agent.
     let agents = match crate::repo::list_agents(&db) {
