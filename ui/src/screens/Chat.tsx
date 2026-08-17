@@ -101,12 +101,19 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const isNearBottom = (threshold = 80) => {
+    const el = scrollRef.current; if (!el) return true;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+  };
   const pinToBottom = (smooth = false) => {
+    // Only double-rAF when actually pinning; use single scrollTop — scrollIntoView on an
+    // inner anchor can cause layout thrash when called per-keystroke while typing.
+    const el = scrollRef.current;
+    if (!el) return;
     requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        bottomRef.current?.scrollIntoView({ behavior: smooth ? "smooth" : "auto", block: "end" });
-        const el = scrollRef.current; if (el) el.scrollTop = el.scrollHeight;
-      });
+      el.scrollTop = el.scrollHeight;
+      // Anchor as fallback for flex-column bottom gap; no smooth during typing.
+      if (smooth) bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
     });
   };
 
@@ -260,13 +267,18 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // Reset to auto first so it can SHRINK too; when empty, scrollHeight collapses
   // to one line. Cap ~200px (~8 lines), not 50vh (that let an empty box balloon
   // to half the window inside the flex column). Mason 07-28.
+  const prevTaHeightRef = useRef<number>(44);
   useEffect(() => {
     const ta = taRef.current; if (!ta) return;
     ta.style.height = "auto";
-    ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
-    // Task #2 (Mason 08-01): a growing input was COVERING the last message —
-    // the messages column doesn't reflow on its own. Pin to bottom as we grow.
-    pinToBottom();
+    const next = Math.min(ta.scrollHeight, 200);
+    const prev = prevTaHeightRef.current;
+    ta.style.height = next + "px";
+    prevTaHeightRef.current = next;
+    // Only re-pin when the textarea actually GREW (new line / paste). Per-keystroke
+    // pinning while typing on the same line caused visible stutter. Also respect
+    // near-bottom so a user reading history isn't yanked while typing.
+    if (next > prev && isNearBottom(120)) pinToBottom();
   }, [input]);
 
   // #4 detect an @mention token at the caret and surface matching agents.
@@ -661,12 +673,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   const turn = useAgentTurn(agentId);
   const running = turn.status === "running";
   // Follow the live stream: msgs is static mid-turn now, so scroll on liveText + tools + timeline.
-  useEffect(() => { if (running) pinToBottom(); }, [turn.liveText, turn.liveTools, turn.timeline, running]);
+  // Respects user scroll: if they've scrolled up to read, don't yank them to bottom.
+  useEffect(() => { if (running && isNearBottom(160)) pinToBottom(); }, [turn.liveText, turn.liveTools, turn.timeline, running]);
   // Keep pinned while streaming — any height change (new tool card, expanding body, markdown) pins to true bottom so the rounded frame never cuts off.
+  // Guarded so a collapsed card / independent resize while scrolled up doesn't yank.
   useEffect(() => {
     const el = scrollRef.current; if (!el) return;
     const target = el.firstElementChild as Element | null; if (!target) return;
-    const ro = new ResizeObserver(() => { if (running) pinToBottom(); });
+    const ro = new ResizeObserver(() => { if (running && isNearBottom(160)) pinToBottom(); });
     ro.observe(target);
     return () => ro.disconnect();
   }, [running]);
