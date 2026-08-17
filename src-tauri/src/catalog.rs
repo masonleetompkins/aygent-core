@@ -288,6 +288,98 @@ pub fn context_window(lower: &str) -> u32 {
     0
 }
 
+/// Search Hugging Face for GGUF repos matching an arbitrary query (power-user path).
+/// Unlike the curated `fetch`, this does NOT restrict to trusted authors — so a user
+/// can find any model they know exists on HF (e.g. a DeepSeek or Gemma GGUF pack).
+/// Still filters junk + requires at least one usable single-file GGUF quant.
+pub async fn search(query: String, limit: usize) -> Result<Vec<CatalogModel>, String> {
+    let q = query.trim();
+    if q.is_empty() { return Ok(vec![]); }
+    if q.contains('/') && !q.contains(' ') {
+        // Looks like a repo id pasted into search — delegate to lookup for exact match.
+        if let Ok(one) = lookup(q.to_string()).await { return Ok(vec![one]); }
+    }
+    let client = reqwest::Client::builder()
+        .user_agent("aygent/0.1")
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let url = format!(
+        "{HF_API}?search={}&filter=gguf&sort=downloads&direction=-1&limit={}&full=true",
+        urlencoding(q), limit.clamp(1, 40)
+    );
+    let resp = client.get(&url).send().await.map_err(|e| format!("request: {e}"))?;
+    if !resp.status().is_success() { return Err(format!("hf {}", resp.status())); }
+    let arr: serde_json::Value = resp.json().await.map_err(|e| format!("json: {e}"))?;
+    let Some(list) = arr.as_array() else { return Ok(vec![]); };
+    let mut out = Vec::new();
+    for repo in list {
+        if out.len() >= limit { break; }
+        let id = repo.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        if id.is_empty() { continue; }
+        let lower = id.to_lowercase();
+        if is_junk(&lower) { continue; }
+        let params = parse_params(&lower);
+        let quants = extract_quants(repo, id, params);
+        if quants.is_empty() { continue; }
+        let (family, family_label) = infer_family(&lower);
+        out.push(CatalogModel {
+            family: family.to_string(),
+            family_label: family_label.to_string(),
+            repo: id.to_string(),
+            name: clean_name(id),
+            params_billions: params,
+            context_tokens: context_window(&lower),
+            quants,
+            downloads: repo.get("downloads").and_then(|d| d.as_u64()).unwrap_or(0),
+            updated: repo.get("lastModified").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Lookup one exact HF repo by id (e.g. "bartowski/Qwen3-14B-GGUF") and return its
+/// catalog entry. Used for the paste-a-repo-ID power-user path.
+pub async fn lookup(repo_id: String) -> Result<CatalogModel, String> {
+    let id = repo_id.trim().trim_matches('/').to_string();
+    if !id.contains('/') { return Err("repo id should be 'author/name' (e.g. bartowski/Qwen3-14B-GGUF)".into()); }
+    let client = reqwest::Client::builder()
+        .user_agent("aygent/0.1")
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let url = format!("{HF_API}/{}", id);
+    let resp = client.get(&url).send().await.map_err(|e| format!("request: {e}"))?;
+    if !resp.status().is_success() { return Err(format!("hf {} — repo not found?", resp.status())); }
+    let repo: serde_json::Value = resp.json().await.map_err(|e| format!("json: {e}"))?;
+    let lower = id.to_lowercase();
+    // Allow even junk-tagged lookups to surface (user asked for it explicitly) — but still require a GGUF quant.
+    let params = parse_params(&lower);
+    let quants = extract_quants(&repo, &id, params);
+    if quants.is_empty() { return Err("no usable single-file GGUF found in that repo (maybe sharded or no Q4/Q6 quant)".into()); }
+    let (family, family_label) = infer_family(&lower);
+    Ok(CatalogModel {
+        family: family.to_string(),
+        family_label: family_label.to_string(),
+        repo: id.clone(),
+        name: clean_name(&id),
+        params_billions: params,
+        context_tokens: context_window(&lower),
+        quants,
+        downloads: repo.get("downloads").and_then(|d| d.as_u64()).unwrap_or(0),
+        updated: repo.get("lastModified").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+    })
+}
+
+fn infer_family(lower: &str) -> (&'static str, &'static str) {
+    if lower.contains("qwen") { return ("qwen", "Qwen"); }
+    if lower.contains("mistral") || lower.contains("mixtral") { return ("mistral", "Mistral"); }
+    if lower.contains("kimi") { return ("kimi", "Kimi"); }
+    if lower.contains("llama") { return ("llama", "Llama (Meta)"); }
+    if lower.contains("deepseek") { return ("deepseek", "DeepSeek"); }
+    if lower.contains("gemma") { return ("gemma", "Gemma"); }
+    if lower.contains("phi") { return ("phi", "Phi"); }
+    ("other", "Other")
+}
+
 /// Minimal URL-encoding for the query string (space + a few reserved chars).
 fn urlencoding(s: &str) -> String {
     s.chars().map(|c| match c {

@@ -132,16 +132,30 @@ async fn onboarding_pick_root(app: tauri::AppHandle) -> Result<serde_json::Value
     let path = fp.into_path().map_err(|e| e.to_string())?;
     let canonical = std::fs::canonicalize(&path).unwrap_or(path);
     let existing = paths::is_aygent_root(&canonical);
-    // Is the folder otherwise non-empty (a heads-up before we init in it)?
     let non_empty = std::fs::read_dir(&canonical)
         .map(|mut rd| rd.next().is_some())
         .unwrap_or(false);
+    let (agent_count, chat_count) = if existing {
+        count_restore_preview(&canonical).unwrap_or((0,0))
+    } else { (0,0) };
     Ok(serde_json::json!({
         "cancelled": false,
         "path": canonical.to_string_lossy(),
         "existingRoot": existing,
         "nonEmpty": non_empty,
+        "agentCount": agent_count,
+        "chatCount": chat_count,
     }))
+}
+
+fn count_restore_preview(root: &std::path::Path) -> Result<(i64,i64), String> {
+    let db_path = root.join(".aygent").join("aygent.db");
+    if !db_path.is_file() { return Ok((0,0)); }
+    let conn = rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("open preview db: {e}"))?;
+    let agents: i64 = conn.query_row("SELECT COUNT(*) FROM agent WHERE archived=0", [], |r| r.get(0)).unwrap_or(0);
+    let chats: i64 = conn.query_row("SELECT COUNT(*) FROM conversation", [], |r| r.get(0)).unwrap_or(0);
+    Ok((agents, chats))
 }
 
 /// Commit the chosen root: init the folder as an AYGENT root (manifest + .aygent
@@ -2133,7 +2147,7 @@ fn detect_hardware() -> hardware::HardwareInfo {
 #[tauri::command]
 async fn local_catalog(per_family: Option<usize>) -> Result<serde_json::Value, String> {
     let hw = hardware::detect();
-    let models = catalog::fetch(per_family.unwrap_or(4)).await?;
+    let models = catalog::fetch(per_family.unwrap_or(12)).await?;
     // Attach a perf verdict to each quant so the UI can show fit + speed inline.
     let scored: Vec<serde_json::Value> = models.iter().map(|m| {
         let quants: Vec<serde_json::Value> = m.quants.iter().map(|q| {
@@ -2151,6 +2165,52 @@ async fn local_catalog(per_family: Option<usize>) -> Result<serde_json::Value, S
         })
     }).collect();
     Ok(serde_json::json!({ "hardware": hw, "models": scored }))
+}
+
+/// Search Hugging Face for any GGUF repo matching a free-text query (power-user path).
+/// Unlike the curated catalog, this does not restrict to trusted authors, so a DeepSeek
+/// or Gemma GGUF pack can be found. Still filters junk + requires a usable quant.
+#[tauri::command]
+async fn local_search(query: String, limit: Option<usize>) -> Result<serde_json::Value, String> {
+    let hw = hardware::detect();
+    let models = catalog::search(query, limit.unwrap_or(12)).await?;
+    let scored: Vec<serde_json::Value> = models.iter().map(|m| {
+        let quants: Vec<serde_json::Value> = m.quants.iter().map(|q| {
+            let v = hardware::predict(&hw, m.params_billions, q.size_gb);
+            serde_json::json!({
+                "quant": q.quant, "filename": q.filename, "size_gb": q.size_gb,
+                "download_url": q.download_url, "perf": v,
+            })
+        }).collect();
+        serde_json::json!({
+            "family": m.family, "family_label": m.family_label, "repo": m.repo,
+            "name": m.name, "params_billions": m.params_billions,
+            "context_tokens": m.context_tokens,
+            "downloads": m.downloads, "updated": m.updated, "quants": quants,
+        })
+    }).collect();
+    Ok(serde_json::json!({ "hardware": hw, "models": scored }))
+}
+
+/// Lookup one exact HF repo by id (e.g. "bartowski/Qwen3-14B-GGUF") and return its
+/// catalog entry. Used for the paste-a-repo-ID power-user path.
+#[tauri::command]
+async fn local_lookup(repo_id: String) -> Result<serde_json::Value, String> {
+    let hw = hardware::detect();
+    let m = catalog::lookup(repo_id).await?;
+    let quants: Vec<serde_json::Value> = m.quants.iter().map(|q| {
+        let v = hardware::predict(&hw, m.params_billions, q.size_gb);
+        serde_json::json!({
+            "quant": q.quant, "filename": q.filename, "size_gb": q.size_gb,
+            "download_url": q.download_url, "perf": v,
+        })
+    }).collect();
+    Ok(serde_json::json!({
+        "family": m.family, "family_label": m.family_label, "repo": m.repo,
+        "name": m.name, "params_billions": m.params_billions,
+        "context_tokens": m.context_tokens,
+        "downloads": m.downloads, "updated": m.updated, "quants": quants,
+    }))
 }
 
 /// Choose the context window (tokens) for a local model: the model's real
@@ -5654,7 +5714,7 @@ pub fn run() {
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
             agent_stream, reveal_in_finder, get_selected_model, set_selected_model,
-            get_selection, set_selection, detect_hardware, local_catalog, local_downloaded,
+            get_selection, set_selection, detect_hardware, local_catalog, local_search, local_lookup, local_downloaded,
             local_download, local_delete, local_tool_capability, restore_agent_folder,
             browser::browser_status, browser::browser_install, browser::browser_launch_probe,
             browser::browser_navigate, browser::browser_shutdown, browser::browser_uninstall, browser::browser_start_view, browser::browser_set_viewport,
