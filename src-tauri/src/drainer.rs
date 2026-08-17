@@ -88,7 +88,8 @@ pub fn spawn(
                 tauri::async_runtime::spawn(async move {
                     // Dedicated inbox lane so delivery never contends a human's
                     // chat lane. acquire_low yields to any human turn.
-                    let lane_key = format!("inbox:{agent_id}");
+                    let is_tg_pending = crate::mailbox::pending_is_telegram(&db2, &agent_id).unwrap_or(false);
+                    let lane_key = if is_tg_pending { format!("telegram:{agent_id}") } else { format!("inbox:{agent_id}") };
                     let _guard = lanes2.acquire_low(&lane_key).await;
 
                     // Drain ALL currently-pending messages for this agent in one

@@ -84,6 +84,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   folder: string | null; keySet: boolean; agentId: string | null;
   multi: boolean; closable: boolean; onClose: () => void;
 }) {
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   // `busy` is now DERIVED from the per-agent turn store (see `running` below),
@@ -99,6 +100,22 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   const convIdRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const isNearBottom = (threshold = 80) => {
+    const el = scrollRef.current; if (!el) return true;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+  };
+  const pinToBottom = (smooth = false) => {
+    // Only double-rAF when actually pinning; use single scrollTop — scrollIntoView on an
+    // inner anchor can cause layout thrash when called per-keystroke while typing.
+    const el = scrollRef.current;
+    if (!el) return;
+    requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+      // Anchor as fallback for flex-column bottom gap; no smooth during typing.
+      if (smooth) bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    });
+  };
 
   // #4 @mention: the list of agents to offer in the picker, loaded once.
   const [allAgents, setAllAgents] = useState<Array<{ id: string; name: string; icon: string; color: string }>>([]);
@@ -250,13 +267,18 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // Reset to auto first so it can SHRINK too; when empty, scrollHeight collapses
   // to one line. Cap ~200px (~8 lines), not 50vh (that let an empty box balloon
   // to half the window inside the flex column). Mason 07-28.
+  const prevTaHeightRef = useRef<number>(44);
   useEffect(() => {
     const ta = taRef.current; if (!ta) return;
     ta.style.height = "auto";
-    ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
-    // Task #2 (Mason 08-01): a growing input was COVERING the last message —
-    // the messages column doesn't reflow on its own. Pin to bottom as we grow.
-    scrollRef.current?.scrollTo({ top: 1e9 });
+    const next = Math.min(ta.scrollHeight, 200);
+    const prev = prevTaHeightRef.current;
+    ta.style.height = next + "px";
+    prevTaHeightRef.current = next;
+    // Only re-pin when the textarea actually GREW (new line / paste). Per-keystroke
+    // pinning while typing on the same line caused visible stutter. Also respect
+    // near-bottom so a user reading history isn't yanked while typing.
+    if (next > prev && isNearBottom(120)) pinToBottom();
   }, [input]);
 
   // #4 detect an @mention token at the caret and surface matching agents.
@@ -351,7 +373,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   const runningChannelRef = useRef<string | null>(null);
   const providerRef = useRef<string>("");
 
-  useEffect(() => { scrollRef.current?.scrollTo({ top: 1e9, behavior: "smooth" }); }, [msgs]);
+  useEffect(() => { pinToBottom(true); }, [msgs]);
 
   function setConv(id: string | null) { convIdRef.current = id; setConvId(id); }
 
@@ -650,8 +672,18 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // unmounts, so the stream is always captured and any pane can reattach.
   const turn = useAgentTurn(agentId);
   const running = turn.status === "running";
-  // Follow the live stream: msgs is static mid-turn now, so scroll on liveText.
-  useEffect(() => { scrollRef.current?.scrollTo({ top: 1e9 }); }, [turn.liveText]);
+  // Follow the live stream: msgs is static mid-turn now, so scroll on liveText + tools + timeline.
+  // Respects user scroll: if they've scrolled up to read, don't yank them to bottom.
+  useEffect(() => { if (running && isNearBottom(160)) pinToBottom(); }, [turn.liveText, turn.liveTools, turn.timeline, running]);
+  // Keep pinned while streaming — any height change (new tool card, expanding body, markdown) pins to true bottom so the rounded frame never cuts off.
+  // Guarded so a collapsed card / independent resize while scrolled up doesn't yank.
+  useEffect(() => {
+    const el = scrollRef.current; if (!el) return;
+    const target = el.firstElementChild as Element | null; if (!target) return;
+    const ro = new ResizeObserver(() => { if (running && isNearBottom(160)) pinToBottom(); });
+    ro.observe(target);
+    return () => ro.disconnect();
+  }, [running]);
   // UI task #1: reload the viewed conv when a headless/continuation turn
   // persists, so the report STAYS on screen instead of vanishing.
   const convVersion = useConvVersion();
@@ -757,7 +789,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   }
 
   return (
-    <div style={{ display: "flex", height: "100%", minHeight: 0, gap: "var(--space-4)" }}>
+    <div style={{ display: "flex", height: "100%", minHeight: 0, gap: "var(--space-4)", position: "relative" }}>
       {/* MAIN CHAT COLUMN. In multi-pane mode it flexes to share width; solo it
          stays centered. height:100% + flex so the input pins to the bottom. */}
       {/* WIDTH (Mason 08-04): the old `maxWidth: 720` left ~25% dead space on
@@ -822,6 +854,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               </div>
             )}
           </div>
+          <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          {multi && !blocked && (
+            <button
+              onClick={() => setHistoryOpen((o) => !o)}
+              title={historyOpen ? "Hide chats" : "Show chats"}
+              style={{ background: historyOpen ? "var(--surface)" : "none", border: "var(--border-width) solid var(--line)", cursor: "pointer", padding: 4, display: "flex", color: "var(--text-muted)", borderRadius: "var(--radius-control)" }}
+            ><Icon name="chat" size={16} /></button>
+          )}
           {closable && (
             <button
               onClick={onClose}
@@ -829,6 +869,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               style={{ background: "none", border: "none", cursor: "pointer", padding: 4, display: "flex", color: "var(--text-muted)", flexShrink: 0 }}
             ><Icon name="close" size={16} /></button>
           )}
+          </div>
         </div>
 
         {blocked && (
@@ -865,6 +906,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
             }} />
           )}
           </div>
+          <div ref={bottomRef} aria-hidden style={{ height: 8, flexShrink: 0 }} />
         </div>
 
         {/* Task #5: attachment chips above the input */}
@@ -968,8 +1010,8 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
         </div>
       </div>
 
-      {/* HISTORY SIDEBAR — right-hand side, so the active chat stays centered */}
-      {!blocked && (
+      {/* HISTORY SIDEBAR — in multi-pane, behind hamburger to save space; solo, always visible */}
+      {!blocked && !multi && (
         <HistorySidebar
           multi={multi}
           convs={convs} activeId={convId} busy={running} dragId={dragId} overId={overId}
@@ -979,6 +1021,23 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           onNew={newConv} onOpen={openConv} onDelete={deleteConv} onRename={renameConv}
           onPin={togglePin} onPointerDragStart={startPointerDrag}
         />
+      )}
+      {!blocked && multi && historyOpen && (
+        <div style={{ position: "absolute", top: 0, right: 0, bottom: 0, width: 230, background: "var(--bg)", borderLeft: "var(--border-width) solid var(--line)", zIndex: 5, padding: "12px 0 12px 14px", display: "flex", flexDirection: "column" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, paddingRight: 8 }}>
+            <span style={{ fontSize: 12, fontWeight: 800, color: "var(--text-faint)" }}>CHATS</span>
+            <button onClick={() => setHistoryOpen(false)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)" }}><Icon name="close" size={14} /></button>
+          </div>
+          <HistorySidebar
+            multi={multi}
+            convs={convs} activeId={convId} busy={running} dragId={dragId} overId={overId}
+            listElRef={listElRef}
+            renamingId={renamingId}
+            onCommitRename={(id, title) => { setRenamingId(null); void saveConvTitle(id, title); }}
+            onNew={() => { newConv(); setHistoryOpen(false); }} onOpen={(id) => { openConv(id); setHistoryOpen(false); }} onDelete={deleteConv} onRename={renameConv}
+            onPin={togglePin} onPointerDragStart={startPointerDrag}
+          />
+        </div>
       )}
     </div>
   );

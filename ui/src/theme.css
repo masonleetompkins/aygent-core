@@ -135,10 +135,16 @@
   --danger: #ff5c5c;
   --warn: #d7ff3a;
 }
-/* Matrix is inherently accent-colored; a custom accent still retints the
-   outline + card lighting, but the text stays green (the mode's identity). */
+/* Matrix + accent: the accent color TAKES OVER the UI — green is replaced
+   everywhere (text, muted, faint, line, glow). The whole UI becomes the
+   chosen accent color. */
 :root[data-theme="matrix"][data-accent="on"] {
+  --text: var(--accent);
+  --text-muted: rgba(var(--accent-rgb), 0.75);
+  --text-faint: rgba(var(--accent-rgb), 0.5);
   --line: var(--accent);
+  --accent: var(--accent);
+  --ok: var(--accent);
   --elevation: 0 0 12px rgba(var(--accent-rgb), 0.35), 0 0 34px rgba(var(--accent-rgb), 0.2);
   --elevation-hover: 0 0 16px rgba(var(--accent-rgb), 0.5), 0 0 44px rgba(var(--accent-rgb), 0.3);
 }

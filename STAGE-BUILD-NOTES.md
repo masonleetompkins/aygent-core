@@ -1,3 +1,30 @@
+# Stage build — Aug 13, 2026, 17:11 PDT — v1.0.4 (signed, notarized, reissued — current production)
+
+**Status:** ✅ Signed + notarized + stapled. `cargo tauri build` exit 0, **6 warnings, 0 errors** (dead-code only). Apple Developer ID signed + notarized + stapled + verified.
+
+**Version:** `1.0.4` (`src-tauri/tauri.conf.json` + `Cargo.toml` + `ui/package.json` + `Cargo.lock` in lockstep). Tag `v1.0.4` → `2044884` (reissued). `staging` tip `9ea239d` == `main` `2044884` content.
+
+**Commits folded into this v1.0.4 (reissue on top of original v1.0.4):**
+- `2b796d5` — harness: uncap large file writes (provider 64k + honest truncation — fixes Stanislawski 20KB routes.ts red-herring owner bug)
+- `edb84ac` — chore: bump version 1.0.3 → 1.0.4 (uncap large file writes)
+- `9473288` — chore: update Cargo.lock (v1.0.4 release build)
+- `9ea239d` — feat: per-agent GitHub PAT in shell (ephemeral GITHUB_TOKEN, no keychain overwrite) — **Pro Mode shell now injects the agent's Connections PAT per-process (GITHUB_TOKEN/GH_TOKEN + per-PID `GIT_CONFIG credential.helper`), host shell & macOS Keychain untouched**
+- `2044884` — promote: staging → production (v1.0.4 — per-agent GitHub PAT in shell) `tag: v1.0.4` retagged (forced) to `2044884`
+
+**Artifacts (signed + notarized):**
+- app: `src-tauri/target/release/bundle/macos/AYGENT.app` → `/Applications/AYGENT.app` (`Contents/MacOS/aygent` 38,741,936 bytes), `spctl -a -t install` → `accepted source=Notarized Developer ID`
+- dmg: `target/release/bundle/dmg/AYGENT_1.0.4_aarch64.dmg` **16,921,708 bytes (~16.1 MB)**, mtime **Aug 13 17:11**, `notarytool submit --wait` → `01bf1c9b-c364-4779-bfaa-33921336c9da Accepted`, `stapler staple` dmg + app
+- staged site file: `~/AYGENT/Cleo/masonleebuild/product-files/AYGENT-1.0.4-macOS.dmg` (16.9 MB staged), uploaded to Supabase bucket `products/aygent/...` via `node scripts/publish-release.js 1.0.4` → `product_releases 1.0.4 recorded`, emailed `1/1 owners`
+- backup: `~/.aygent-backups/AYGENT.app.20260813-171130/` + `.old` (rollback ready)
+
+**Pro Mode fix (9ea239d):** Shell `git` no longer uses the global `osxkeychain` entry. `exec.rs` (`GLOBAL_DB` + `inject_github_env` + `spawn_for_agent`/`run_for_agent`) + `lib.rs` `install_db` + `exec_shell_tool` now resolve `connections::resolve_github_push_token(db, agent_id)` and inject `GITHUB_TOKEN`/`GH_TOKEN`/`GIT_CONFIG credential.helper` **per-process only** (Pro-Mode gated, fail-open if no enabled GitHub connection). `broker_ws.rs` passes `agent_opt` through. Your personal `security find-internet-password -s github.com` is untouched.
+
+**Harness fix (2b796d5):** Large file writes (>20KB, e.g. `routes.ts`) were clipped before reaching GitHub — provider 64k uncap + honest truncation error surfaced instead of silent vanish.
+
+**To run the new build:** Quit and reopen `/Applications/AYGENT.app` (running process is old binary until relaunch — intended). Verify: `PlistBuddy CFBundleShortVersionString` → `1.0.4`, `spctl` → `Notarized Developer ID`.
+
+---
+
 # Stage build — Aug 11, 2026, 16:45 PDT — v1.0.1 (rebuild, all 3 commits)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0, **0 errors, 0 warnings**. All grid checks + tsc + vite passed. Both bundles produced (.app + notarizable dmg).

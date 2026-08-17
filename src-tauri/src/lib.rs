@@ -65,6 +65,7 @@ mod provision;
 mod mcp_client;
 mod mcp; // MCP manager: registry + catalog + agent-loop bridge + install/uninstall. // MCP client: spawn stdio JSON-RPC servers, discover + route their tools. // Level A: bundle portable node+ffmpeg+hyperframes into app-data (no system installs).
 mod supervisor;
+mod telegram;
 mod tools_registry;
 mod spark_state; // SPARKS: jailed KV persistence (Sparks/<slug>/state.json) for interactive Sparks.
 
@@ -131,16 +132,30 @@ async fn onboarding_pick_root(app: tauri::AppHandle) -> Result<serde_json::Value
     let path = fp.into_path().map_err(|e| e.to_string())?;
     let canonical = std::fs::canonicalize(&path).unwrap_or(path);
     let existing = paths::is_aygent_root(&canonical);
-    // Is the folder otherwise non-empty (a heads-up before we init in it)?
     let non_empty = std::fs::read_dir(&canonical)
         .map(|mut rd| rd.next().is_some())
         .unwrap_or(false);
+    let (agent_count, chat_count) = if existing {
+        count_restore_preview(&canonical).unwrap_or((0,0))
+    } else { (0,0) };
     Ok(serde_json::json!({
         "cancelled": false,
         "path": canonical.to_string_lossy(),
         "existingRoot": existing,
         "nonEmpty": non_empty,
+        "agentCount": agent_count,
+        "chatCount": chat_count,
     }))
+}
+
+fn count_restore_preview(root: &std::path::Path) -> Result<(i64,i64), String> {
+    let db_path = root.join(".aygent").join("aygent.db");
+    if !db_path.is_file() { return Ok((0,0)); }
+    let conn = rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("open preview db: {e}"))?;
+    let agents: i64 = conn.query_row("SELECT COUNT(*) FROM agent WHERE archived=0", [], |r| r.get(0)).unwrap_or(0);
+    let chats: i64 = conn.query_row("SELECT COUNT(*) FROM conversation", [], |r| r.get(0)).unwrap_or(0);
+    Ok((agents, chats))
 }
 
 /// Commit the chosen root: init the folder as an AYGENT root (manifest + .aygent
@@ -352,6 +367,43 @@ async fn github_git_auth(
         return Err(format!("credential store failed: {}", String::from_utf8_lossy(&out.stderr)));
     }
     Ok(format!("git push/pull authenticated as @{login} (stored in macOS Keychain)."))
+}
+
+/// TELEGRAM per-agent (Fix 7): status + token management + test.
+/// Token is stored in the macOS Keychain under service telegram-bot-<agentId>.
+#[tauri::command]
+fn telegram_status(db: tauri::State<writer::Db>, agent_id: String) -> Result<serde_json::Value, String> {
+    let ag = repo::get_agent(&db, &agent_id)?.ok_or("agent not found")?;
+    let has_token = keychain::has_key(&telegram::keychain_service(&agent_id));
+    Ok(serde_json::json!({
+        "enabled": ag.telegram_enabled,
+        "bot_username": ag.telegram_bot_username,
+        "allowed_chats": ag.telegram_allowed_chats,
+        "has_token": has_token,
+    }))
+}
+#[tauri::command]
+fn telegram_set_token(_app: tauri::AppHandle, db: tauri::State<writer::Db>, agent_id: String, token: String) -> Result<serde_json::Value, String> {
+    let tok = token.trim().to_string();
+    if tok.is_empty() {
+        // Clear token
+        let _ = keychain::set_key(&telegram::keychain_service(&agent_id), "");
+        let mut ag = repo::get_agent(&db, &agent_id)?.ok_or("agent not found")?;
+        ag.telegram_enabled = false;
+        ag.telegram_bot_username = String::new();
+        repo::update_agent(&db, ag)?;
+        return Ok(serde_json::json!({ "ok": true, "cleared": true }));
+    }
+    if !telegram::looks_like_token(&tok) { return Err("that does not look like a Telegram Bot token (expected 123456:AA...)".into()); }
+    keychain::set_key(&telegram::keychain_service(&agent_id), &tok)?;
+    // Don't auto-enable here; the Agent Edit card will validate via getMe, then enable with the real @username.
+    // This keeps the single source of truth (agents_update) and avoids spawning a worker with a bad token.
+    Ok(serde_json::json!({ "ok": true, "saved": true }))
+}
+#[tauri::command]
+async fn telegram_test_token(token: String) -> Result<serde_json::Value, String> {
+    let username = telegram::validate_token(token.trim()).await?;
+    Ok(serde_json::json!({ "ok": true, "bot_username": username }))
 }
 
 /// PRO MODE: list running/known shell processes (for the UI process panel).
@@ -1699,10 +1751,16 @@ fn agents_create(
 }
 
 #[tauri::command]
-fn agents_update(db: tauri::State<writer::Db>, broker: tauri::State<'_, Arc<Broker>>, profile: repo::AgentProfile) -> Result<(), String> {
+fn agents_update(app: tauri::AppHandle, db: tauri::State<writer::Db>, broker: tauri::State<'_, Arc<Broker>>, profile: repo::AgentProfile) -> Result<(), String> {
+    let enabled = profile.telegram_enabled;
+    let agent_id = profile.id.clone();
     repo::update_agent(&db, profile)?;
     // Folder may have changed — re-register all scopes so the jail tracks it.
     register_all_agent_scopes(&db, &broker);
+    // If Telegram was just enabled, start polling immediately (boot only starts workers for already-enabled agents).
+    if enabled {
+        telegram::spawn_one(app, db.inner().clone(), agent_id);
+    }
     Ok(())
 }
 
@@ -2089,7 +2147,7 @@ fn detect_hardware() -> hardware::HardwareInfo {
 #[tauri::command]
 async fn local_catalog(per_family: Option<usize>) -> Result<serde_json::Value, String> {
     let hw = hardware::detect();
-    let models = catalog::fetch(per_family.unwrap_or(4)).await?;
+    let models = catalog::fetch(per_family.unwrap_or(12)).await?;
     // Attach a perf verdict to each quant so the UI can show fit + speed inline.
     let scored: Vec<serde_json::Value> = models.iter().map(|m| {
         let quants: Vec<serde_json::Value> = m.quants.iter().map(|q| {
@@ -2107,6 +2165,52 @@ async fn local_catalog(per_family: Option<usize>) -> Result<serde_json::Value, S
         })
     }).collect();
     Ok(serde_json::json!({ "hardware": hw, "models": scored }))
+}
+
+/// Search Hugging Face for any GGUF repo matching a free-text query (power-user path).
+/// Unlike the curated catalog, this does not restrict to trusted authors, so a DeepSeek
+/// or Gemma GGUF pack can be found. Still filters junk + requires a usable quant.
+#[tauri::command]
+async fn local_search(query: String, limit: Option<usize>) -> Result<serde_json::Value, String> {
+    let hw = hardware::detect();
+    let models = catalog::search(query, limit.unwrap_or(12)).await?;
+    let scored: Vec<serde_json::Value> = models.iter().map(|m| {
+        let quants: Vec<serde_json::Value> = m.quants.iter().map(|q| {
+            let v = hardware::predict(&hw, m.params_billions, q.size_gb);
+            serde_json::json!({
+                "quant": q.quant, "filename": q.filename, "size_gb": q.size_gb,
+                "download_url": q.download_url, "perf": v,
+            })
+        }).collect();
+        serde_json::json!({
+            "family": m.family, "family_label": m.family_label, "repo": m.repo,
+            "name": m.name, "params_billions": m.params_billions,
+            "context_tokens": m.context_tokens,
+            "downloads": m.downloads, "updated": m.updated, "quants": quants,
+        })
+    }).collect();
+    Ok(serde_json::json!({ "hardware": hw, "models": scored }))
+}
+
+/// Lookup one exact HF repo by id (e.g. "bartowski/Qwen3-14B-GGUF") and return its
+/// catalog entry. Used for the paste-a-repo-ID power-user path.
+#[tauri::command]
+async fn local_lookup(repo_id: String) -> Result<serde_json::Value, String> {
+    let hw = hardware::detect();
+    let m = catalog::lookup(repo_id).await?;
+    let quants: Vec<serde_json::Value> = m.quants.iter().map(|q| {
+        let v = hardware::predict(&hw, m.params_billions, q.size_gb);
+        serde_json::json!({
+            "quant": q.quant, "filename": q.filename, "size_gb": q.size_gb,
+            "download_url": q.download_url, "perf": v,
+        })
+    }).collect();
+    Ok(serde_json::json!({
+        "family": m.family, "family_label": m.family_label, "repo": m.repo,
+        "name": m.name, "params_billions": m.params_billions,
+        "context_tokens": m.context_tokens,
+        "downloads": m.downloads, "updated": m.updated, "quants": quants,
+    }))
 }
 
 /// Choose the context window (tokens) for a local model: the model's real
@@ -4454,7 +4558,7 @@ async fn agent_stream(
         });
         // Baseline SAVE POINT before any tool writes (same as Anthropic path).
         if let Ok(root) = broker.root_for(&scope_id) {
-            let _ = savepoint::snapshot(&root, "baseline");
+            let _ = savepoint::snapshot(&root, "Checkpoint");
         }
         // Enabled registry tools (e.g. PDF) contribute extra instructions the
         // local model should know about, appended to its native tool prompt.
@@ -4544,7 +4648,7 @@ async fn agent_stream(
 
         // Baseline SAVE POINT before the turn (rewind anchor), same as Anthropic.
         if let Ok(root) = broker.root_for(&scope_id) {
-            let _ = savepoint::snapshot(&root, "baseline");
+            let _ = savepoint::snapshot(&root, "Checkpoint");
         }
 
         let (tools, reg_instr) = agent_tools_for_full(&app, Some(&scope_id), folder.as_deref(), !roster.is_empty(), Some((&db, &scope_id)));
@@ -4783,7 +4887,7 @@ async fn agent_stream(
     // the bug where a turn's writes were absorbed (mislabeled) into the NEXT
     // turn's pre-snapshot, or lost entirely if they were the last edit.
     if let Ok(root) = broker.root_for(&scope_id) {
-        let _ = savepoint::snapshot(&root, "baseline");
+        let _ = savepoint::snapshot(&root, "Checkpoint");
     }
 
     let (tools, reg_instr) = agent_tools_for_full(&app, Some(&scope_id), folder.as_deref(), !roster.is_empty(), Some((&db, &scope_id)));
@@ -5158,7 +5262,20 @@ pub async fn run_headless_turn(
     } else { (None, msg.body.clone()) };
     let msg_body = msg_body.as_str();
 
-    let from_name = if is_remote {
+    let is_telegram = msg.from_agent.starts_with("telegram:");
+    let telegram_chat_id: Option<String> = if is_telegram {
+        let rest = msg.from_agent.strip_prefix("telegram:").unwrap_or("");
+        let chat = rest.split(':').next().unwrap_or(rest).to_string();
+        if chat.is_empty() { None } else { Some(chat) }
+    } else { None };
+    let telegram_cmd = if is_telegram { telegram::parse_command(msg_body) } else { telegram::Command::Chat };
+    // Telegram pinned chat title + commands (Fix 7 follow-up): compact/newsession are local.
+    // This keeps /compact fast (no LLM) and /newsession deterministic (wipe + confirm).
+    let is_telegram_compact = is_telegram && telegram_cmd == telegram::Command::Compact;
+    let is_telegram_new = is_telegram && telegram_cmd == telegram::Command::NewSession;
+    let from_name = if is_telegram {
+        "Telegram".to_string()
+    } else if is_remote {
         "Remote".to_string()
     } else if is_continue {
         "Continuation".to_string()
@@ -5192,6 +5309,9 @@ pub async fn run_headless_turn(
              there is no one to send it to.\n\nTask:\n\n{}",
             msg_body
         )
+    } else if is_telegram {
+        // Telegram: tag the message as from Telegram user; include chat routing.
+        format!("Telegram message (chat {chat}):\n\n{body}", chat=telegram_chat_id.clone().unwrap_or_default(), body=msg_body)
     } else {
         format!(
             "You just received a message from another agent, {from_name} (id: {}). Their message:\n\n{}\n\n\
@@ -5204,9 +5324,13 @@ pub async fn run_headless_turn(
     // The per-agent stream channel the UI subscribes to (SAME id the human path
     // uses for this agent's inbox conversation) so the turn streams LIVE into
     // whichever pane is viewing the recipient — you WATCH the work happen.
-    let stream_channel = match &continue_conv {
-        Some(cid) => cid.clone(),                    // wake-up streams into the origin chat
-        None => format!("inbox-{agent_id}"),
+    let stream_channel = if is_telegram {
+        format!("telegram-{agent_id}")
+    } else {
+        match &continue_conv {
+            Some(cid) => cid.clone(),                    // wake-up streams into the origin chat
+            None => format!("inbox-{agent_id}"),
+        }
     };
 
     // 1) DISPATCH-TIME VISIBILITY: show the inbound message in the recipient's
@@ -5214,16 +5338,16 @@ pub async fn run_headless_turn(
     //    the instant it's sent. We persist it now + emit a stream event so an
     //    open pane renders it live.
     {
-        let conv_id = continue_conv.clone().unwrap_or_else(|| format!("inbox-{agent_id}"));
+        let conv_id = if is_telegram { format!("telegram-{agent_id}") } else { continue_conv.clone().unwrap_or_else(|| format!("inbox-{agent_id}")) };
         let existing = repo::load_conversation(db, &conv_id).ok();
         let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
         let inbound_text = if is_remote { format!("\u{1F4F1} {}", msg_body) }
             else if is_continue { format!("\u{23F0} resumed: {}", msg_body) }
             else { format!("\u{1F4E8} from {from_name}: {}", msg_body) };
         ui_msgs.push(serde_json::json!({ "role": "user", "from": from_name, "text": inbound_text }));
-        let title = existing.as_ref().map(|c| c.title.clone()).unwrap_or_else(|| "Activity".into());
-        let pinned = existing.as_ref().map(|c| c.pinned).unwrap_or(true);
-        let order = existing.as_ref().map(|c| c.order).unwrap_or(1);
+        let title = if is_telegram { "Telegram".to_string() } else { existing.as_ref().map(|c| c.title.clone()).unwrap_or_else(|| "Activity".into()) };
+        let pinned = if is_telegram { true } else { existing.as_ref().map(|c| c.pinned).unwrap_or(true) };
+        let order = if is_telegram { 0 } else { existing.as_ref().map(|c| c.order).unwrap_or(1) };
         let conv = repo::Conversation {
             id: conv_id, agent_id: agent_id.to_string(),
             title, updated: 0, pinned, order,
@@ -5271,8 +5395,33 @@ pub async fn run_headless_turn(
     let provider_kind = if agent.provider.is_empty() { "anthropic".to_string() } else { agent.provider.clone() };
 
     // Baseline SAVE POINT before any writes.
-    if let Ok(root) = broker.root_for(agent_id) { let _ = savepoint::snapshot(&root, "baseline"); }
+    if let Ok(root) = broker.root_for(agent_id) { let _ = savepoint::snapshot(&root, "Checkpoint"); }
 
+    // /compact and /newsession are handled LOCALLY for Telegram (no LLM stall).
+    if is_telegram_compact {
+        let conv_id = format!("telegram-{agent_id}");
+        if let Ok(conv) = repo::load_conversation(db, &conv_id) {
+            let hist = conv.history.as_array().cloned().unwrap_or_default();
+            if hist.len() >= 4 {
+                let flat = crate::flatten_history_for_summary(&hist);
+                let clipped = &flat[..flat.len().min(6000)];
+                let seed = serde_json::json!([{"role":"user","content":format!("[Compacted Telegram context]
+{}", clipped)}, {"role":"assistant","content":"Understood \\u2014 context compacted."}]);
+                let _ = repo::save_conversation(db, repo::Conversation { id: conv_id.clone(), agent_id: agent_id.to_string(), title: "Telegram".into(), updated: 0, pinned: true, order: -1, msgs: conv.msgs, history: seed });
+            }
+        }
+        telegram::reply_to_origin(&agent_id, &msg.from_agent, "Compacted context \\u2014 ready for more.").await;
+        return Ok(());
+    }
+    if is_telegram_new {
+        let conv_id = format!("telegram-{agent_id}");
+        // Wipe the Telegram pinned chat and start fresh
+        let _ = repo::delete_conversation(db, &conv_id);
+        let fresh = repo::Conversation { id: conv_id.clone(), agent_id: agent_id.to_string(), title: "Telegram".into(), updated: 0, pinned: true, order: -1, msgs: serde_json::json!([{ "role": "assistant", "text": "Started a new Telegram session." }]), history: serde_json::json!([]) };
+        let _ = repo::save_conversation(db, fresh);
+        telegram::reply_to_origin(&agent_id.to_string(), &msg.from_agent, "Started a new session.").await;
+        return Ok(());
+    }
     let mut messages = serde_json::json!([{ "role": "user", "content": framed }]);
     let mut reply_text = String::new();
 
@@ -5415,6 +5564,12 @@ pub async fn run_headless_turn(
     let reply_display = if reply_text.trim().is_empty() {
         "(done — completed the request without a text reply)".to_string()
     } else { reply_text.trim().to_string() };
+    if msg.from_agent.starts_with("telegram:") {
+        let origin = msg.from_agent.clone();
+        let text = reply_display.clone();
+        let aid = agent_id.to_string();
+        tauri::async_runtime::spawn(async move { telegram::reply_to_origin(&aid, &origin, &text).await; });
+    }
 
     // PERSIST to the recipient's conversation. CRITICAL (bug #5): we persist the
     // REAL provider-format `history` (messages), not just a display record — so
@@ -5422,7 +5577,7 @@ pub async fn run_headless_turn(
     // the agent's normal chat now share ONE conversation id so when you talk to
     // the agent directly it REMEMBERS the inter-agent message. We append the
     // full turn (framed inbound + assistant reply) to whatever history exists.
-    let conv_id = continue_conv.clone().unwrap_or_else(|| format!("inbox-{agent_id}"));
+    let conv_id = if is_telegram { format!("telegram-{agent_id}") } else { continue_conv.clone().unwrap_or_else(|| format!("inbox-{agent_id}")) };
     let existing = repo::load_conversation(db, &conv_id).ok();
     let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
     // NOTE (Mason 08-03, double-bubble fix): the inbound "resumed:"/"from X:"
@@ -5435,9 +5590,9 @@ pub async fn run_headless_turn(
     // the framed user msg; append the whole thing to prior history.
     let mut hist = existing.as_ref().and_then(|c| c.history.as_array().cloned()).unwrap_or_default();
     if let Some(turn) = messages.as_array() { for m in turn { hist.push(m.clone()); } }
-    let title2 = existing.as_ref().map(|c| c.title.clone()).unwrap_or_else(|| "Activity".into());
-    let pinned2 = existing.as_ref().map(|c| c.pinned).unwrap_or(true);
-    let order2 = existing.as_ref().map(|c| c.order).unwrap_or(1);
+    let title2 = if is_telegram { "Telegram".to_string() } else { existing.as_ref().map(|c| c.title.clone()).unwrap_or_else(|| "Activity".into()) };
+    let pinned2 = if is_telegram { true } else { existing.as_ref().map(|c| c.pinned).unwrap_or(true) };
+    let order2 = if is_telegram { 0 } else { existing.as_ref().map(|c| c.order).unwrap_or(1) };
     let conv = repo::Conversation {
         id: conv_id, agent_id: agent_id.to_string(),
         title: title2, updated: 0, pinned: pinned2, order: order2,
@@ -5457,7 +5612,8 @@ pub async fn run_headless_turn(
 /// fails before it could reply (Atlas #5 cause 3: no key/model → rail rings then
 /// silence). Now the user sees WHY in the thread instead of a blank rail.
 pub fn persist_inbox_error(db: &writer::Db, agent_id: &str, _msg: &mailbox::Message, err: &str) {
-    let conv_id = format!("inbox-{agent_id}");
+    let is_tg = _msg.from_agent.starts_with("telegram:");
+    let conv_id = if is_tg { format!("telegram-{agent_id}") } else { format!("inbox-{agent_id}") };
     let existing = repo::load_conversation(db, &conv_id).ok();
     let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
     // (Mason 08-03) Do NOT re-append the inbound bubble — dispatch-time
@@ -5558,7 +5714,7 @@ pub fn run() {
             daemon_info, pick_agent_folder, broker_probe,
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
             agent_stream, reveal_in_finder, get_selected_model, set_selected_model,
-            get_selection, set_selection, detect_hardware, local_catalog, local_downloaded,
+            get_selection, set_selection, detect_hardware, local_catalog, local_search, local_lookup, local_downloaded,
             local_download, local_delete, local_tool_capability, restore_agent_folder,
             browser::browser_status, browser::browser_install, browser::browser_launch_probe,
             browser::browser_navigate, browser::browser_shutdown, browser::browser_uninstall, browser::browser_start_view, browser::browser_set_viewport,
@@ -5612,6 +5768,7 @@ pub fn run() {
             memory_get_auto_remember, memory_set_auto_remember,
             pro_mode_get, pro_mode_set, shell_procs, shell_kill_proc,
             github_git_auth,
+            telegram_status, telegram_set_token, telegram_test_token,
             onboarding_status, onboarding_pick_root, onboarding_set_root,
             onboarding_make_agent_home, onboarding_finish, import_memory
         ])
@@ -5676,6 +5833,7 @@ pub fn run() {
                     // session up at boot — with retries, because the browser
                     // key may not be published yet (first-time pairing).
                     remote_runtime::spawn_autostart(_app.handle().clone());
+                    telegram::spawn_all(_app.handle().clone(), db.clone());
                 }
 
                 // M1.8 SCHEDULER: spawn the ticker ("the drainer with a clock in
@@ -5749,26 +5907,32 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building AYGENT")
         .run(|app_handle, event| match event {
-            // The user asked to quit (Cmd+Q / menu). Stop the daemon BEFORE the
-            // process tears down, so we never exit with a live orphaned child —
-            // that is what macOS was reporting as "stopped unexpectedly".
+            // CMD+Q / Quit menu (ExitRequested): clean shutdown. Kill daemon BEFORE exit
+            // so no orphaned child triggers "quit unexpectedly" (was the crash report).
+            // This is the ONLY path that terminates the process.
             tauri::RunEvent::ExitRequested { .. } => {
                 if let Some(state) = app_handle.try_state::<Arc<supervisor::DaemonState>>() {
                     supervisor::shutdown(&state);
                 }
+                // Let Tauri complete the exit cleanly; do NOT call abort/exit(0) here
+                // so Exit handler runs and reports normal termination.
             }
-            // Closing the LAST window should quit. On macOS the default is to
-            // keep running with no windows (right for document apps, wrong for
-            // AYGENT — Mason: "clicking the red X keeps it running in the
-            // background"). Exit explicitly once no windows remain.
+            // Red X (window close) => HIDE, don't quit. Scheduler + drainer keep running
+            // in the background; Dock click reopens the window (Reopen event).
             tauri::RunEvent::WindowEvent {
-                event: tauri::WindowEvent::Destroyed, ..
+                label, event: tauri::WindowEvent::CloseRequested { api, .. }, ..
             } => {
-                if app_handle.webview_windows().is_empty() {
-                    if let Some(state) = app_handle.try_state::<Arc<supervisor::DaemonState>>() {
-                        supervisor::shutdown(&state);
-                    }
-                    app_handle.exit(0);
+                // Prevent the window from being destroyed; hide it instead.
+                api.prevent_close();
+                if let Some(win) = app_handle.get_webview_window(&label) {
+                    let _ = win.hide();
+                }
+            }
+            // macOS Dock icon click when no windows visible => Reopen (show the window again).
+            tauri::RunEvent::Reopen { .. } => {
+                for (_label, win) in app_handle.webview_windows() {
+                    let _ = win.show();
+                    let _ = win.set_focus();
                 }
             }
             // Final teardown: CefShutdown must run once, after the run loop

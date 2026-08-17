@@ -270,6 +270,14 @@ pub fn take_next_for(db: &Db, to_agent: &str) -> Result<Option<Message>, String>
 
 /// The list of OTHER agents this agent can message (id + name), so the model's
 /// send_message tool knows valid recipients and the UI can show the roster.
+pub fn pending_is_telegram(db: &Db, agent_id: &str) -> Result<bool, String> {
+    let conn = db.reader()?;
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM mailbox WHERE to_agent = ?1 AND status = 'pending' AND from_agent LIKE 'telegram:%'",
+        rusqlite::params![agent_id], |r| r.get(0)).map_err(|e| format!("pending_is_telegram: {e}"))?;
+    Ok(n > 0)
+}
+
 pub fn roster(db: &Db, self_id: &str) -> Result<Vec<(String, String)>, String> {
     let conn = db.reader()?;
     let mut stmt = conn.prepare(
