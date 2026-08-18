@@ -10,7 +10,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Pill } from "../components/ui";
-import { useSparkBlobUrl, isSparkStateMsg } from "../lib/sparkChrome";
+import { useSparkBlobUrl, useSparkThemeSync, isSparkStateMsg } from "../lib/sparkChrome";
 
 type SparkMeta = {
   slug: string; title: string; description: string; created: number; modified: number;
@@ -23,15 +23,15 @@ export function Sparks({ agentId, onNavigate }: { agentId: string | null; onNavi
   const [sparks, setSparks] = useState<SparkMeta[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [html, setHtml] = useState<string | null>(null);
-  // The saved KV blob for the selected Spark, seeded INTO the iframe so it
-  // restores its state on load (checklists, counters, etc.). Loaded per slug.
-  const [state, setState] = useState<Record<string, unknown>>({});
+  // Seeded once per open — the blob URL is minted from THIS snapshot only.
+  // Live writes from the Spark update state.json via postMessage but do NOT
+  // re-mint the blob (that was the stutter: every keystroke rebuilt the iframe).
+  const [seedState, setSeedState] = useState<Record<string, unknown>>({});
   const [msg, setMsg] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
-  // blob: URL so the app CSP doesn't strip the spark's inline CSS (see sparkChrome).
-  // Seeded with the loaded state so the Spark restores before its script runs.
-  const blobUrl = useSparkBlobUrl(html || "", state);
+  const blobUrl = useSparkBlobUrl(html || "", seedState);
+  useSparkThemeSync(iframeRef);
 
   const refresh = useCallback(async () => {
     if (!agentId) { setSparks([]); return; }
@@ -48,15 +48,13 @@ export function Sparks({ agentId, onNavigate }: { agentId: string | null; onNavi
 
   const open = useCallback(async (slug: string) => {
     if (!agentId) return;
-    setSelected(slug); setHtml(null); setState({}); setLoading(true); setMsg(null);
+    setSelected(slug); setHtml(null); setSeedState({}); setLoading(true); setMsg(null);
     try {
-      // Load the Spark's html AND its saved KV state together, so the iframe is
-      // seeded with the state the very first time it mounts (no flash of empty).
       const r = await invoke<{ slug: string; html: string }>("sparks_read", { agentId, slug });
       let saved: Record<string, unknown> = {};
       try { saved = await invoke<Record<string, unknown>>("spark_state_get", { agentId, slug }); }
       catch { /* no state yet — empty */ }
-      setState(saved || {});
+      setSeedState(saved || {});
       setHtml(r.html);
     } catch (e) { setMsg("✗ " + String(e)); }
     finally { setLoading(false); }
@@ -64,26 +62,17 @@ export function Sparks({ agentId, onNavigate }: { agentId: string | null; onNavi
 
   useEffect(() => { if (selected) void open(selected); /* eslint-disable-next-line */ }, [selected]);
 
-  // PERSISTENCE BRIDGE (the fix): a Spark posts { __spark, kind:'set', key, value }
+  // PERSISTENCE BRIDGE: a Spark posts { __spark, kind:'set', key, value }
   // whenever its localStorage/window.spark changes. We accept ONLY messages from
-  // the CURRENT Spark's iframe (event.source check) and persist each to the jailed
-  // Sparks/<slug>/state.json. This is the sole reach a Spark has back to the host,
-  // and it's narrow, validated, and jailed — the sandbox stays fully isolated.
+  // the CURRENT Spark's iframe and persist to the jailed state.json.
+  // IMPORTANT: we do NOT update seedState here — that would re-mint the blob and
+  // reload mid-click. The seed is the initial snapshot only.
   useEffect(() => {
     function onMessage(ev: MessageEvent) {
       if (!agentId || !selected) return;
-      // Only trust the frame we're currently showing.
       if (!iframeRef.current || ev.source !== iframeRef.current.contentWindow) return;
       if (!isSparkStateMsg(ev.data)) return;
       const { key, value } = ev.data;
-      // Keep our local mirror in sync so a re-seed (tab switch) has the latest.
-      setState((prev) => {
-        const next = { ...prev };
-        if (value === null || value === undefined) delete next[key];
-        else next[key] = value;
-        return next;
-      });
-      // Persist to the jail (fire-and-forget; a failed write just logs).
       invoke("spark_state_set_key", { agentId, slug: selected, key, value: value ?? null })
         .catch((e) => setMsg("✗ save state: " + String(e)));
     }
@@ -95,7 +84,7 @@ export function Sparks({ agentId, onNavigate }: { agentId: string | null; onNavi
     if (!agentId) return;
     try {
       await invoke("sparks_delete", { agentId, slug });
-      if (selected === slug) { setSelected(null); setHtml(null); setState({}); }
+      if (selected === slug) { setSelected(null); setHtml(null); setSeedState({}); }
       await refresh();
     } catch (e) { setMsg("✗ " + String(e)); }
   }
@@ -174,14 +163,9 @@ export function Sparks({ agentId, onNavigate }: { agentId: string | null; onNavi
               <span style={faint}>ask Chat to edit</span>
               {selected && <Button variant="secondary" onClick={() => void del(selected)}>Delete</Button>}
             </div>
-            <div style={{ flex: 1, minHeight: 0, background: "#ffffff" }}>
+            <div style={{ flex: 1, minHeight: 0, background: "#fff" }}>
               {loading && <div style={{ ...hint, padding: 16 }}>Loading…</div>}
               {!loading && html != null && blobUrl && (
-                // SANDBOXED: allow-scripts only (NO allow-same-origin) — the Spark
-                // runs its own JS + embedded data, isolated from the app/files/agent.
-                // Loaded from a blob: URL (own origin) so the app CSP doesn't strip
-                // its inline styles. Persistence is via the postMessage bridge above,
-                // NOT via same-origin access — the jail stays intact.
                 <iframe
                   ref={iframeRef}
                   title={selected || "spark"}

@@ -3662,17 +3662,42 @@ fn exec_tool_cfg(
         // 90% one-shot (git/cargo/npm); shell_spawn/poll/kill drive long-lived
         // processes like `cargo tauri dev`. The daemon can't spawn — only the
         // exec broker does.
-        // SPARKS: a preview is a NO-OP on the backend (no file written) — it just
-        // validates and acks. The UI renders the html (from this call's input)
-        // inline in chat; the user saves it later via the spark_save command.
+        // SPARKS: auto-save the preview so it JUST WORKS on both Chat and Library.
+        // The agent calls spark_preview with body-only html; we persist it via the
+        // jailed broker to Sparks/<slug>/index.html + spark.json so the Sparks tab
+        // sees it immediately. Still renders live in Chat via the same blobUrl.
+        // Deleting from the Library (sparks_delete) removes the whole folder.
         "spark_preview" => {
-            let slug = input.get("slug").and_then(|x| x.as_str()).unwrap_or("");
-            let title = input.get("title").and_then(|x| x.as_str()).unwrap_or("");
-            let html = input.get("html").and_then(|x| x.as_str()).unwrap_or("");
-            if slug.trim().is_empty() || html.trim().is_empty() {
+            let slug = input.get("slug").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            let title = input.get("title").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            let html = input.get("html").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            if slug.is_empty() || html.trim().is_empty() {
                 ("spark_preview needs a slug and full html".to_string(), true)
+            } else if !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') || slug.len() > 80 {
+                ("invalid slug \u{2014} use lowercase letters, digits, hyphens".to_string(), true)
             } else {
-                (format!("Spark \"{}\" ({}) is previewing live in the chat. Ask the user for changes, or they can Save it to the library.", if title.is_empty() { slug } else { title }, slug), false)
+                let html_rel = format!("Sparks/{}/index.html", slug);
+                match broker.resolve(agent_id, &html_rel, broker::Mode::Write) {
+                    Ok(abs) => {
+                        if let Some(parent) = abs.parent() { let _ = std::fs::create_dir_all(parent); }
+                        if let Err(e) = std::fs::write(&abs, html.as_bytes()) {
+                            (format!("spark save failed: {e}"), true)
+                        } else {
+                            let man_rel = format!("Sparks/{}/spark.json", slug);
+                            if let Ok(mabs) = broker.resolve(agent_id, &man_rel, broker::Mode::Write) {
+                                let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+                                let manifest = serde_json::json!({
+                                    "title": if title.is_empty() { slug.clone() } else { title.clone() },
+                                    "description": "",
+                                    "created": created,
+                                });
+                                let _ = std::fs::write(&mabs, serde_json::to_string_pretty(&manifest).unwrap_or_default());
+                            }
+                            (format!("Spark \"{}\" ({}) is live \u{2014} previewing in chat and saved to Library (Sparks/{}/index.html). Ask for tweaks to hot-swap; delete it from the Sparks tab to remove its files.", if title.is_empty() { slug.clone() } else { title.clone() }, slug, slug), false)
+                        }
+                    }
+                    Err(e) => (format!("spark save refused by jail: {e:?}"), true),
+                }
             }
         }
         "shell_run" | "shell_spawn" | "shell_poll" | "shell_write" | "shell_kill" => {
@@ -5406,11 +5431,11 @@ pub async fn run_headless_turn(
                 let flat = crate::flatten_history_for_summary(&hist);
                 let clipped = &flat[..flat.len().min(6000)];
                 let seed = serde_json::json!([{"role":"user","content":format!("[Compacted Telegram context]
-{}", clipped)}, {"role":"assistant","content":"Understood \\u2014 context compacted."}]);
+{}", clipped)}, {"role":"assistant","content":"Understood \\u{2014} context compacted."}]);
                 let _ = repo::save_conversation(db, repo::Conversation { id: conv_id.clone(), agent_id: agent_id.to_string(), title: "Telegram".into(), updated: 0, pinned: true, order: -1, msgs: conv.msgs, history: seed });
             }
         }
-        telegram::reply_to_origin(&agent_id, &msg.from_agent, "Compacted context \\u2014 ready for more.").await;
+        telegram::reply_to_origin(&agent_id, &msg.from_agent, "Compacted context \\u{2014} ready for more.").await;
         return Ok(());
     }
     if is_telegram_new {
