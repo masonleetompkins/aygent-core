@@ -190,16 +190,19 @@ fn build_openai_messages(system: &str, messages: &serde_json::Value) -> Vec<serd
                         .collect();
                     if !tool_blocks.is_empty() {
                         for b in tool_blocks {
-                            // CLEO-GUARD (2026-08-02): only emit a tool result if it references a
-                            // REAL preceding assistant tool_call (non-empty, matching id). Some
-                            // reasoning models (gpt-5.6-sol) yield orphaned tool blocks; drop them.
+                            // CLEO-GUARD (2026-08-02, fixed 2026-08-17): only emit a tool result if it references a
+                            // REAL preceding assistant tool_call (non-empty, matching id). Search BACKWARDS
+                            // for a matching assistant, not just out.last(), so parallel tool_calls
+                            // (assistant with 2 tool_calls -> 2 separate tool result messages) all survive.
+                            // Some reasoning models (gpt-5.6-sol) yield orphaned tool blocks; those are still dropped.
                             let tcid = b.get("tool_use_id").and_then(|x| x.as_str()).unwrap_or("");
                             let prev_ok = !tcid.is_empty()
-                                && out.last()
-                                    .and_then(|pm| pm.get("tool_calls"))
-                                    .and_then(|tc| tc.as_array())
-                                    .map(|arr| arr.iter().any(|c| c.get("id").and_then(|i| i.as_str()) == Some(tcid)))
-                                    .unwrap_or(false);
+                                && out.iter().rev().any(|pm| {
+                                    pm.get("tool_calls")
+                                        .and_then(|tc| tc.as_array())
+                                        .map(|arr| arr.iter().any(|c| c.get("id").and_then(|i| i.as_str()) == Some(tcid)))
+                                        .unwrap_or(false)
+                                });
                             if !prev_ok { continue; }
 
                             out.push(json!({
