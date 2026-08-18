@@ -7,7 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Button } from "../components/ui";
 import { Icon, type IconName } from "../components/Icon";
 import { Markdown } from "../components/Markdown";
-import { useSparkBlobUrl } from "../lib/sparkChrome";
+import { useSparkBlobUrl, useSparkThemeSync, isSparkStateMsg } from "../lib/sparkChrome";
 import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion, stopTurn } from "../lib/turns";
 import type { TurnItem, TurnUsage } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
@@ -1443,9 +1443,26 @@ function SparkCard({ spark, agentId }: { spark: { slug: string; title: string; h
   const [saved, setSaved] = useState(false);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  // Load via a blob: URL so the app's CSP doesn't strip the spark's inline CSS
-  // (srcDoc inherits the parent CSP; a blob URL is its own origin). See sparkChrome.
-  const blobUrl = useSparkBlobUrl(spark.html);
+  const [seedState, setSeedState] = useState<Record<string, unknown>>({});
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const blobUrl = useSparkBlobUrl(spark.html, seedState);
+  useSparkThemeSync(iframeRef);
+  useEffect(() => {
+    if (!agentId || !spark.slug) return;
+    invoke<Record<string, unknown>>("spark_state_get", { agentId, slug: spark.slug })
+      .then((saved) => { if (saved && Object.keys(saved).length) setSeedState(saved); })
+      .catch(() => {});
+  }, [agentId, spark.slug]);
+  useEffect(() => {
+    function onMessage(ev: MessageEvent) {
+      if (!agentId || !spark.slug) return;
+      if (!iframeRef.current || ev.source !== iframeRef.current.contentWindow) return;
+      if (!isSparkStateMsg(ev.data)) return;
+      invoke("spark_state_set_key", { agentId, slug: spark.slug, key: ev.data.key, value: ev.data.value ?? null }).catch(() => {});
+    }
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [agentId, spark.slug]);
 
   async function save() {
     if (!agentId) { setErr("no agent"); return; }
@@ -1485,6 +1502,7 @@ function SparkCard({ spark, agentId }: { spark: { slug: string; title: string; h
       {expanded && (
         blobUrl ? (
         <iframe
+          ref={iframeRef}
           title={spark.slug}
           src={blobUrl}
           sandbox="allow-scripts allow-popups allow-forms allow-modals"
