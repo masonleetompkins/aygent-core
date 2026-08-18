@@ -20,7 +20,8 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: blob:; frame-src blob:; connect-src 'self' ws://127.0.0.1:* ws://localhost:*"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: blob:; frame-src blob:; connect-src 'self' ws://127.0.0.1:* ws://localhost:*",
+      "dangerousDisableAssetCspModification": ["script-src"]
     }
   },
   "bundle": {

@@ -691,7 +691,17 @@ fn bust_webview_cache_on_version_change(app: &tauri::AppHandle) {
     // Vite regenerates on every real UI change). Read it from the embedded
     // index.html via the resource dir; fall back to just the version.
     let version = app.package_info().version.to_string();
-    let build_id = frontend_build_id(app).unwrap_or_else(|| version.clone());
+    // Include the running BINARY's mtime in the build id: a rebuild at the SAME
+    // version with the same asset hash (e.g. a CSP/config-only change) must
+    // still bust the WKWebView cache — the injected meta-CSP lives in the
+    // cached HTML. This was why the second 1.0.8 build never re-busted.
+    let exe_stamp = std::env::current_exe().ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default();
+    let build_id = format!("{}:{}:{}", version, frontend_build_id(app).unwrap_or_default(), exe_stamp);
     let Ok(cache_dir) = app.path().app_cache_dir() else {
         eprintln!("[aygent][cache] no app cache dir — skipping cache-bust");
         return;
