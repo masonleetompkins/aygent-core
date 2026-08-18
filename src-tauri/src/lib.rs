@@ -4390,9 +4390,9 @@ LAYOUT RECIPE (compose from these \u{2014} they are pre-styled):\n\
 - Shell: <h1>Name</h1><p class=\"sub\">one line</p> then ONE <div class=\"card\">\u{2026}</div>.\n\
 - A field: <label>Bill amount</label> then its control.\n\
 - Money input: <div class=\"input-money\"><span>$</span><input id=\"bill\" type=\"number\" inputmode=\"decimal\" placeholder=\"0.00\"></div>.\n\
-- A pick-one set (tip %, options): <div class=\"seg\"><button>10%</button><button class=\"active\">15%</button><button>20%</button></div> \u{2014} exactly ONE has class active; in JS, on click move the active class and recompute.\n\
-- A count (+/\u{2212}): <div class=\"stepper\"><button>\u{2212}</button><span class=\"val\" id=\"n\">1</span><button>+</button></div>.\n\
-- A big live result: <div class=\"stat\" id=\"total\">$0.00</div> \u{2014} use this for the primary output.\n\
+- A pick-one set (tip %, options): <div class=\"seg\"><button type=\"button\">10%</button><button type=\"button\" class=\"active\">15%</button><button type=\"button\">20%</button></div> \u{2014} exactly ONE has class active; in JS, on click move the active class and recompute.\n\
+- A count (+/\u{2212}): <div class=\"stepper\"><button type=\"button\">\u{2212}</button><span class=\"val\" id=\"n\">1</span><button type=\"button\">+</button></div>.\n\
+Use type=\"button\" on EVERY button so it never submits a form. In JS guard every getElementById: if(el) el.addEventListener(...).\n\nJS SAFETY (Sparks run sandboxed \u{2014} no console): null.addEventListener throws kill the whole script and buttons appear dead. Never call getElementById(...).addEventListener without a null check.\n\n- A big live result: <div class=\"stat\" id=\"total\">$0.00</div> \u{2014} use this for the primary output.\n\
 - Secondary results: <div class=\"row\"><span class=\"k\">Per person</span><span class=\"v\" id=\"pp\">$0.00</span></div> (label left, value right \u{2014} NEVER put label and value adjacent in plain text).\n\
 - Side-by-side metrics: <div class=\"grid\">\u{2026}</div>. Tables: plain <table>.\n\
 Put ALL logic in one <script> at the end: read inputs, wire addEventListener, update result \
@@ -4402,8 +4402,8 @@ EXAMPLE \u{2014} a tip calculator's body (follow this shape, adapt the fields):\
 <h1>Tip Calculator</h1><p class=\"sub\">Split the bill, no mental math.</p>\
 <div class=\"card\">\
 <label>Bill amount</label><div class=\"input-money\"><span>$</span><input id=\"bill\" type=\"number\" inputmode=\"decimal\" placeholder=\"0.00\"></div>\
-<label>Tip</label><div class=\"seg\"><button>10%</button><button class=\"active\">15%</button><button>20%</button></div>\
-<label>Split between</label><div class=\"stepper\"><button id=\"dec\">\u{2212}</button><span class=\"val\" id=\"n\">1</span><button id=\"inc\">+</button></div>\
+<label>Tip</label><div class=\"seg\"><button type=\"button\">10%</button><button type=\"button\" class=\"active\">15%</button><button type=\"button\">20%</button></div>\
+<label>Split between</label><div class=\"stepper\"><button type=\"button\" id=\"dec\">\u{2212}</button><span class=\"val\" id=\"n\">1</span><button type=\"button\" id=\"inc\">+</button></div>\
 <div class=\"stat\" id=\"total\" style=\"margin-top:14px\">$0.00</div>\
 <div class=\"row\"><span class=\"k\">Tip</span><span class=\"v\" id=\"tip\">$0.00</span></div>\
 <div class=\"row\"><span class=\"k\">Per person</span><span class=\"v\" id=\"pp\">$0.00</span></div>\

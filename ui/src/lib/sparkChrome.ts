@@ -1,6 +1,7 @@
 // AYGENT — SPARK CHROME. The single source of truth for how a Spark LOOKS +
 // how it PERSISTS + why its buttons actually work.
 //
+// 2026-08-18 FIX: seamless interactivity — per-listener isolation + null-safe getElementById + type=button auto-fix
 // 2026-08-17 FIX: the reload loop was fixed (seed-once, postMessage live),
 // but the tip calculator was STILL dead: its script ran as a bare <script>
 // in the wrapped body. Any uncaught throw (e.g. getElementById→null →
@@ -111,6 +112,26 @@ const SPARK_RUNTIME = `
   }
   try{ Object.defineProperty(window,'localStorage',{value:makeStorage(true),configurable:true}); }catch(e){}
   try{ Object.defineProperty(window,'sessionStorage',{value:makeStorage(false),configurable:true}); }catch(e){}
+  // SAFETY: one missing #id must not kill the whole Spark (opaque blob iframes show no console).
+  // Patch getElementById to return a no-op dummy instead of null so null.addEventListener never throws.
+  try{
+    var _gid = Document.prototype.getElementById;
+    Document.prototype.getElementById = function(id){
+      var el = _gid.call(this, id);
+      if(el) return el;
+      console.warn('[Spark] missing #' + id + ' — dummy');
+      var dummy = document.createElement('div');
+      dummy.addEventListener = dummy.removeEventListener = function(){};
+      dummy.__sparkDummy = true;
+      return dummy;
+    };
+  }catch(e){}
+  // Auto-fix bare <button> (no type => implicit submit => iframe reload) — runs after DOM
+  try{
+    var fixButtons = function(){ try{ document.querySelectorAll('button:not([type])').forEach(function(b){ b.setAttribute('type','button'); }); }catch(e){} };
+    if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', fixButtons);
+    else fixButtons();
+  }catch(e){}
   window.spark={ get:function(k){return (k in store)?store[k]:undefined;}, all:function(){return Object.assign({},store);}, set:function(k,v){store[k]=v; post({kind:'set',key:String(k),value:v});}, remove:function(k){delete store[k]; post({kind:'set',key:String(k),value:null});} };
   // Global error → post to parent + show banner (otherwise silent in blob iframe)
   window.addEventListener('error', function(ev){
@@ -175,6 +196,16 @@ export function wrapSparkHtml(html: string, state?: Record<string, unknown>, the
 (function(){
   function __sparkBoot(){
     try {
+      try{
+        var _add = EventTarget.prototype.addEventListener;
+        EventTarget.prototype.addEventListener = function(type, fn, opts){
+          if(typeof fn!=='function') return _add.call(this, type, fn, opts);
+          var wrappedFn = function(e){ try{ return fn.call(this, e); }catch(err){ var m=(err&&err.stack)?err.stack:String(err); console.error('[Spark handler]',err); try{ parent.postMessage({__spark:true,kind:'error',message:m.slice(0,2000)},'*'); }catch(_){} var b=document.createElement('div'); b.className='__sparkErr'; b.textContent='Handler error: '+m.slice(0,400); document.body&&document.body.prepend(b); }};
+          return _add.call(this, type, wrappedFn, opts);
+        };
+      }catch(e){}
+      var $ = function(id){ return document.getElementById(id); };
+      try{ document.querySelectorAll('button:not([type])').forEach(function(b){ b.setAttribute('type','button'); }); }catch(e){}
       ${code}
       try{ parent.postMessage({__spark:true, kind:'boot', ok:true}, '*'); }catch(e){}
     } catch(e){
