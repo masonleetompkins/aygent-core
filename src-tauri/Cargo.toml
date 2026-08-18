@@ -1,6 +1,6 @@
 [package]
 name = "aygent"
-version = "1.0.7"
+version = "1.0.8"
 description = "The AI agent you actually own"
 authors = ["Mason Tompkins"]
 edition = "2021"

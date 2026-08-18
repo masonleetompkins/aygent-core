@@ -1,4 +1,4 @@
-# AYGENT — Capabilities (v1.0.4)
+# AYGENT — Capabilities (v1.0.8)
 
 _The canonical reference for what AYGENT can do, as shipped in the signed,
 notarized release. This is the source-of-truth capability doc: keep it in
@@ -81,6 +81,7 @@ $20 one-time. macOS 13+. Developer ID signed + Apple-notarized.
   (real prompt/generated token counts + true capped window). Prices come from a
   curated table (`pricing.rs`); an unknown model shows tokens + % but no cost
   rather than a wrong number.
+- **Chat polish (1.0.5):** conversation history tucks behind a **hamburger drawer** (no split-pane waste), scroll pins to the true bottom so tool cards never clip at the rounded frame, and per-keystroke pin stutter is gone. **OpenAI/OpenRouter parallel tools (1.0.6)** no longer 400 — the history guard now searches backwards so both parallel tool_results survive.
 
 ## 5. Tools — 94+ real-world capabilities
 Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
@@ -120,6 +121,8 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
     straight into `github_write_file`. Directory listings and >1MB blobs fall
     back gracefully.
 - **Harness (1.0.4):** large file writes uncapped to **64k** with an honest truncation error instead of silent clipping — fixes the Stanislawski 20KB `routes.ts` red-herring.
+- **Connections inline (1.0.5):** credential form renders inside the clicked card (no modal shuffle). **Save Points labeled “Checkpoint + timestamp”** so the timeline isn't a wall of baselines.
+- **Provider reliability (1.0.6):** OpenAI/OpenRouter parallel `tool_calls` handling fixed — both results now reach the model instead of the second being dropped and 400'ing.
 - **MCP servers:** one-click enable built-in catalog (Adobe Premiere Pro,
   Blender) or add custom stdio servers; tools namespaced `mcp__<server>__<tool>`.
   Node/uv provisioned in-app (no system installs).
@@ -150,6 +153,8 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
   and there is a `window.spark.get/set/all` API for structured JSON. State is
   saved to a jailed per-Spark store (`Sparks/<slug>/state.json`) via a narrow,
   host-mediated channel — great for to-do lists, trackers, saved settings.
+- **Harness + theme sync (1.0.5):** fault-tolerant boot harness (`DOMContentLoaded` + try/catch + visible `__sparkErr` banner), seed-once blob lifecycle (no reload on live state writes), app-driven theme injection (`getAppTheme`/`wrapSparkHtml` + live `__sparkTheme` MutationObserver) — hover no longer fakes interactivity; buttons/inputs and light/dark/neutral/matrix + accent now match Settings in both Library and inline Chat. `spark_preview` auto-saves via the jailed broker to `Sparks/<slug>/index.html` + `spark.json` (live in chat AND Library on same slug, hot-swap on re-preview).
+- **Seamless interactivity (1.0.7):** `sparkChrome.ts` runtime shims — dummy `getElementById` return for missing ids, auto `type="button"` on bare buttons, per-listener `EventTarget.addEventListener` wrap so one handler error shows a banner but doesn't kill siblings; helper `$` + `type="button"` recipe in `SPARKS_INSTRUCTIONS`. Sandbox stays opaque (`allow-scripts` only, `postMessage` KV only).
 - Runs in a **locked-down sandboxed iframe** (opaque origin, `allow-scripts`
   only, no same-origin) — no file access, no network back to the machine/agent.
   Data is embedded at build time. Persistence is validated + jailed to the Spark
@@ -163,6 +168,7 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 - **Self-set wake-ups** (`task_continue`) and **inter-agent messages** with a
   budget/chain guardrail; the headless drainer runs recipient turns independent
   of any open chat pane.
+- **Clean lifecycle (1.0.5):** `Cmd+Q` cleanly shuts down the daemon (no orphan `aygent` + no “quit unexpectedly” report); red-X hides the window instead of killing the process so schedules and the drainer keep running — Dock click reopens.
 
 ## 9. Save Points (rewindable everything)
 - Every turn snapshots the agent's folder into a **Save Point** (a shadow git
@@ -171,13 +177,20 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 - Timeline with undo/redo/rewind-to-here; configurable retention; purge. A Stop
   button always available mid-turn.
 
-## 10. Make it yours (themes)
-- Four hand-built themes: Light, Dark, Neutral, Matrix. An **accent** color runs
-  through the whole UI as lighting (retints outlines/shadows/glows), preset
-  swatches or custom hex. Per-agent icons. The Dock icon persists the theme.
-- Theme + accent follow you to **AYGENT Remote**.
+## 10. Onboarding (own your agent, one folder) — new in 1.0.5
+- **3-step wizard:** Welcome → **Home** (pick or restore your AYGENT root folder; detects an existing root and shows agent/chat counts) → **Agent Setup** (name, icon, personality, model). Creates `<root>/<AgentName>/` + `context/` + `memory/` + `.aygent/` skeleton and flips the `root.json` pointer live (no restart; `writer::Db::repoint`). Works for first-run and new-machine restore.
+- Replaces the old single-file picker + manual restart flow. The DB re-points live and the agent home is ready before the first turn.
 
-## 11. AYGENT Remote (add-on, $4.99/mo)
+## 11. Make it yours (themes)
+- Four hand-built themes: Light, Dark, Neutral, Matrix. **Matrix + accent takeover (1.0.5):** accent replaces green everywhere (text/muted/faint/line/glow). New swatches **Royal blue #4169e1** + **Electric blue #00cafc** plus lighter purples. An **accent** color runs through the whole UI as lighting (retints outlines/shadows/glows), preset swatches or custom hex. Per-agent icons. The Dock icon persists the theme (via `NSWorkspace setIcon:forFile:`) and stays flat (no glow).
+- Theme + accent follow you to **AYGENT Remote** and to **Sparks** (live sync).
+
+## 12. Telegram (per-agent, optional) — new in 1.0.5
+- **One bot per agent:** paste a BotFather token (stored in macOS Keychain under `telegram-bot-<agentId>`; never in DB/files). Per-agent `telegram_enabled`, `telegram_bot_username`, `telegram_allowed_chats` (CSV allowlist; empty = allow any) in `agent` table (`db.rs`/`repo.rs`). Inline validation via `getMe` shows the `@username` before enabling.
+- **Polling + mailbox:** `telegram.rs` long-polls `getUpdates?timeout=25` per enabled agent (`spawn_one`/`spawn_all`), enqueues each inbound as `telegram:<chat_id>:<update_id>` into `mailbox` (deduped by origin), nudges the `drainer` — replies route back via `sendMessage` (clipped at 3500 chars). Backlog is skipped on boot (`max update_id + 1`). Allowlist is re-read live so edits apply immediately. ` /compact` and `/newsession` are handled locally in the pinned chat (no LLM stall) — compact summarizes the pinned `telegram-<id>` history, newsession wipes it.
+- **UI:** per-agent Telegram card in `Agents.tsx` (enable, token field with Test, allowed chats, bot username); pinned `telegram-<id>` chat (always pinned, order 0) streams like any other conversation; `onboarding`/`agents_create` wiring + `AppHandle` spawn on enable.
+
+## 13. AYGENT Remote (add-on, $4.99/mo)
 - Use your local agents from **any browser you're logged into** (phone
   included). Pair the Mac once with an 8-char code.
 - Live streamed replies, full history, same design/theme as the app.
@@ -186,7 +199,7 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
   online/offline toggle on the Mac is a real kill switch.
 - Fully **optional** — the app is complete without it.
 
-## 12. Security model (why "you own it" is real)
+## 14. Security model (why "you own it" is real)
 - **Jailed daemon:** the Node "brain" runs under a macOS Seatbelt profile that
   denies ambient file + exec. All file ops go through the privileged **path
   broker** (fail-closed, per-agent scope). All process spawns go through the
@@ -201,6 +214,10 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 ---
 
 ## Changelog
+- **1.0.8** (2026-08-18): **Sparks verified interactive** — staging hardening + WKWebView cache-bust verified (frontend_build_id hash in bust_webview_cache_on_version_change) so the `sparkChrome.ts` harness (dummy getElementById, auto type=button, per-listener EventTarget wrap + __sparkErr) actually ships; tip calculator and library Sparks now accept input + click in both inline Chat and Sparks tab without reload. Sandbox stays opaque (`allow-scripts` only, `postMessage` KV). Bump `1.0.7 → 1.0.8`.
+- **1.0.7** (2026-08-18): **Sparks seamless interactivity** — fault-isolated handlers + auto `type="button"` so a single null `getElementById` or bare `<button>` no longer kills the whole Spark script; per-listener `EventTarget` wrap with `__sparkErr` banner + helper `$` shim (`sparkChrome.ts` `SPARK_RUNTIME`/`wrapSparkHtml`). Recipe now enforces `type="button"` + null-guarded `getElementById` (`lib.rs` `SPARKS_INSTRUCTIONS`). Sandbox stays opaque (`allow-scripts` only, `postMessage` KV only). Bump `1.0.6 → 1.0.7` (`c137750`).
+- **1.0.6** (2026-08-17): **OpenAI/OpenRouter parallel tools 400 fix** — `build_openai_messages` now searches the full history for the matching assistant `tool_calls` (`out.iter().rev().any`) instead of only `out.last()`, so both parallel tool_results survive and no longer 400 with “must be followed by tool messages”. Bump `1.0.5 → 1.0.6` (`efe5ec3`).
+- **1.0.5** (2026-08-17): **Onboarding v2 + 7-fix bundle + Sparks harness** — 3-step wizard (Welcome → Home with restore detection + counts → Agent Setup, `catalog.rs` curated families + `paths::init_agent_home`, live `Db::repoint` no-restart) (`ddb12b4`, `40f3708`); 7 fixes: hamburger history drawer (`Chat.tsx` absolute drawer), Matrix accent takeover (`4d813d6` — accent replaces green text/muted/faint/line/glow), Royal #4169e1 + Electric #00cafc swatches, inline Connections credential form, Save Points → “Checkpoint + timestamp”, clean quit (daemon `shutdown` on `RunEvent::ExitRequested`, red-X hides not kills, scheduler stays alive), Telegram per-agent (token in Keychain, `telegram.rs` `getUpdates` long-poll → `mailbox` → `drainer`, `telegram:<chat_id>` pinned chat + `/compact`/`/newsession`, `Agents.tsx` card) (`191ec1d` + `e9b1ac4`/`6db963d`), chat pin-to-true-bottom (`92a6e59`) + stutter removal (`3e09284`), Sparks harness pass + seed-once + theme sync (fault-tolerant boot + `spark.json` auto-save + `seedState` snapshot + `useSparkThemeSync` + jailed `state.json` bridge) (`5120e36`). Promoted `78fe848` (`tag: v1.0.5`).
 - **1.0.4** (2026-08-13): **Per-agent GitHub PAT in shell** — Pro Mode `shell_run`/`shell_spawn` now injects the agent's Connections GitHub PAT as ephemeral `GITHUB_TOKEN` per-process (no global `osxkeychain` overwrite; host Keychain untouched). **Harness: uncap large file writes** to 64k with honest truncation (fixes 20KB `routes.ts` clip). Signed + notarized + stapled (16.9 MB DMG, `01bf1c9b Accepted`, `Notarized Developer ID`) → `masonleebuild/product-files/AYGENT-1.0.4-macOS.dmg` published via `publish-release.js` (release recorded, 1/1 owners emailed). Commits `2b796d5`, `edb84ac`, `9473288`, `9ea239d`, `2044884` (`tag: v1.0.4` reissued).
 - **1.0.3** (2026-08-12): **Shared context is now discoverable + addressable.**
   Read-only mounts get a virtual `@shared/<label>/` namespace — an agent can
@@ -221,4 +238,4 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 - **1.0.0** (2026-08-10): Signed/notarized launch — whoami tool, GFM tables,
   dashboards, sparks, remote.
 
-_Last updated 2026-08-13 for 1.0.4. If you add a capability, add it here._
+_Last updated 2026-08-18 for 1.0.8. If you add a capability, add it here._
