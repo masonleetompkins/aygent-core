@@ -41,7 +41,7 @@ NOTARY_PROFILE="${AYGENT_NOTARY_PROFILE:-AYGENT-NOTARY}"
 
 # Where the site repo lives (for staging the buyer artifact). Best-effort: if it
 # isn't there, we skip that step and just tell Mason how to do it.
-SITE_REPO="${AYGENT_SITE_REPO:-${HOME}/AYGENT/Cleo/masonleebuild}"
+SITE_REPO="${AYGENT_SITE_REPO:-$(dirname "$(git rev-parse --show-toplevel 2>/dev/null)")/masonleebuild}"  # sibling to AYGENT-Stage (was: ~/AYGENT/Cleo/masonleebuild — stale Cleo path, fixed 2026-08-18 for Muse)
 
 say() { printf "\n\033[1m▶ %s\033[0m\n" "$*"; }
 warn() { printf "\033[33m⚠ %s\033[0m\n" "$*"; }
@@ -54,6 +54,20 @@ BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 if ! git diff --quiet || ! git diff --cached --quiet; then
   die "uncommitted changes on staging. Commit them first (the agent should have)."
 fi
+
+# 0a. CAPABILITIES drift guard — version in tauri.conf.json MUST match docs/CAPABILITIES.md header.
+# CAPABILITIES is the shipped user truth; if it lags, buyers see stale docs. Fail fast here
+# rather than publish a DMG whose “what's new” is wrong.
+say "Checking CAPABILITIES.md version sync"
+TAURI_VER="$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+"' src-tauri/tauri.conf.json | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+CAP_VER="$(grep -oE '# AYGENT [^\(]*\(v[0-9]+\.[0-9]+\.[0-9]+\)' docs/CAPABILITIES.md | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+if [ -z "$TAURI_VER" ] || [ -z "$CAP_VER" ]; then
+  die "could not parse versions (tauri=$TAURI_VER cap=$CAP_VER) — ensure tauri.conf.json and docs/CAPABILITIES.md headers exist"
+fi
+if [ "$TAURI_VER" != "$CAP_VER" ]; then
+  die "version drift: tauri.conf.json is $TAURI_VER but docs/CAPABILITIES.md header is $CAP_VER — update docs/CAPABILITIES.md (header + Changelog + Last updated) to $TAURI_VER before promoting"
+fi
+printf "  version %s — CAPABILITIES in sync\n" "$TAURI_VER"
 
 # 0b. Signing preflight — FAIL FAST rather than ship prod unsigned.
 say "Preflight: signing identity + notary profile"
