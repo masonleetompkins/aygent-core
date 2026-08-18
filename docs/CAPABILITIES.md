@@ -1,4 +1,4 @@
-# AYGENT — Capabilities (v1.0.7)
+# AYGENT — Capabilities (v1.0.8)
 
 _The canonical reference for what AYGENT can do, as shipped in the signed,
 notarized release. This is the source-of-truth capability doc: keep it in
@@ -214,6 +214,7 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 ---
 
 ## Changelog
+- **1.0.8** (2026-08-18): **Sparks verified interactive** — staging hardening + WKWebView cache-bust verified (frontend_build_id hash in bust_webview_cache_on_version_change) so the `sparkChrome.ts` harness (dummy getElementById, auto type=button, per-listener EventTarget wrap + __sparkErr) actually ships; tip calculator and library Sparks now accept input + click in both inline Chat and Sparks tab without reload. Sandbox stays opaque (`allow-scripts` only, `postMessage` KV). Bump `1.0.7 → 1.0.8`.
 - **1.0.7** (2026-08-18): **Sparks seamless interactivity** — fault-isolated handlers + auto `type="button"` so a single null `getElementById` or bare `<button>` no longer kills the whole Spark script; per-listener `EventTarget` wrap with `__sparkErr` banner + helper `$` shim (`sparkChrome.ts` `SPARK_RUNTIME`/`wrapSparkHtml`). Recipe now enforces `type="button"` + null-guarded `getElementById` (`lib.rs` `SPARKS_INSTRUCTIONS`). Sandbox stays opaque (`allow-scripts` only, `postMessage` KV only). Bump `1.0.6 → 1.0.7` (`c137750`).
 - **1.0.6** (2026-08-17): **OpenAI/OpenRouter parallel tools 400 fix** — `build_openai_messages` now searches the full history for the matching assistant `tool_calls` (`out.iter().rev().any`) instead of only `out.last()`, so both parallel tool_results survive and no longer 400 with “must be followed by tool messages”. Bump `1.0.5 → 1.0.6` (`efe5ec3`).
 - **1.0.5** (2026-08-17): **Onboarding v2 + 7-fix bundle + Sparks harness** — 3-step wizard (Welcome → Home with restore detection + counts → Agent Setup, `catalog.rs` curated families + `paths::init_agent_home`, live `Db::repoint` no-restart) (`ddb12b4`, `40f3708`); 7 fixes: hamburger history drawer (`Chat.tsx` absolute drawer), Matrix accent takeover (`4d813d6` — accent replaces green text/muted/faint/line/glow), Royal #4169e1 + Electric #00cafc swatches, inline Connections credential form, Save Points → “Checkpoint + timestamp”, clean quit (daemon `shutdown` on `RunEvent::ExitRequested`, red-X hides not kills, scheduler stays alive), Telegram per-agent (token in Keychain, `telegram.rs` `getUpdates` long-poll → `mailbox` → `drainer`, `telegram:<chat_id>` pinned chat + `/compact`/`/newsession`, `Agents.tsx` card) (`191ec1d` + `e9b1ac4`/`6db963d`), chat pin-to-true-bottom (`92a6e59`) + stutter removal (`3e09284`), Sparks harness pass + seed-once + theme sync (fault-tolerant boot + `spark.json` auto-save + `seedState` snapshot + `useSparkThemeSync` + jailed `state.json` bridge) (`5120e36`). Promoted `78fe848` (`tag: v1.0.5`).
@@ -237,4 +238,4 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 - **1.0.0** (2026-08-10): Signed/notarized launch — whoami tool, GFM tables,
   dashboards, sparks, remote.
 
-_Last updated 2026-08-18 for 1.0.7. If you add a capability, add it here._
+_Last updated 2026-08-18 for 1.0.8. If you add a capability, add it here._
