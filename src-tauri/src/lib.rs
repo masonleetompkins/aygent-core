@@ -4633,9 +4633,30 @@ async fn agent_stream(
                 "role": "assistant", "content": content
             }));
 
-            // Parse tool calls in the model's native format.
-            let calls = local_tools::parse_tool_calls(&text, &cap.format);
-            if calls.is_empty() { break; } // no tool wanted → done
+            // Parse tool calls in the model's native format — from the VISIBLE
+            // text only: reasoning models (Qwen3) muse about hypothetical calls
+            // inside <think> blocks; those must never execute.
+            let visible = local_tools::strip_think(&text);
+            let calls = local_tools::parse_tool_calls(&visible, &cap.format);
+            if calls.is_empty() {
+                // The model TRIED to call a tool but we couldn't parse it
+                // (malformed JSON, raw newlines in strings...). Silently
+                // breaking here made the write "look emitted but never run"
+                // (Mason 08-19, bug #2b) — instead, tell the model what went
+                // wrong so it can retry within the turn cap.
+                if local_tools::has_tool_marker(&visible, &cap.format) && turn + 1 < LOCAL_TOOL_TURN_CAP {
+                    let _ = app.emit(&channel, &provider::StreamEvent::Info {
+                        text: "tool call couldn't be parsed — asking the model to retry".to_string(),
+                    });
+                    messages.as_array_mut().unwrap().push(serde_json::json!({
+                        "role": "user",
+                        "content": local_tools::format_tool_result(&cap.format, "parser",
+                            "Your tool call could not be parsed. Emit EXACTLY one tool call with valid single-line JSON: {\"name\": \"write_file\", \"arguments\": {\"path\": \"...\", \"content\": \"...\"}} — escape newlines in strings as \\n, and put path/content directly inside \"arguments\" (do not nest another \"arguments\" object).", true),
+                    }));
+                    continue;
+                }
+                break; // no tool wanted → done
+            }
 
             // Execute each call through the SAME jailed broker + emit UI events.
             // Local calls have no provider tool_use id — synthesize one so the
@@ -4826,6 +4847,13 @@ async fn agent_stream(
                                 }
                             }
                         }
+                    } else if connectors::is_connector_tool(&name) {
+                        // Registry-driven connector tools (GitHub, Notion, ...):
+                        // same privileged-side credential attach as the Anthropic
+                        // path. This branch was MISSING here — the schemas were
+                        // offered (agent_tools_for_full with conn_ctx) but dispatch
+                        // fell through to "unknown tool" (Mason 08-19, bug #1).
+                        connector_exec::exec(&db, &scope_id, &name, &input).await
                     } else if mcp::is_mcp_tool(&name) {
                         mcp::exec(&name, &input)
                     } else if dashboard::is_dashboard_tool(&name) {

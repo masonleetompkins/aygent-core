@@ -169,11 +169,23 @@ fn call_from_value(v: &serde_json::Value) -> Option<ToolCall> {
     let name = v.get("name").and_then(|n| n.as_str())?.to_string();
     // Only accept our known tools \u2014 ignore hallucinated tool names.
     if !matches!(name.as_str(), "read_file" | "write_file" | "list_files" | "whoami") { return None; }
-    let input = v.get("arguments")
+    let mut input = v.get("arguments")
         .or_else(|| v.get("parameters"))
         .or_else(|| v.get("input"))
         .cloned()
         .unwrap_or_else(|| json!({}));
+    // REPAIR a common small-model malformation (Mason 08-19, Gwen/Qwen3):
+    // {"arguments": {"path": "...", "arguments": {"content": "..."}}} \u2014 the
+    // model nests a second arguments object. Hoist its keys up (without
+    // clobbering real top-level keys) so the write actually carries content.
+    if let Some(obj) = input.as_object_mut() {
+        let nested = obj.get("arguments").or_else(|| obj.get("parameters")).cloned();
+        if let Some(serde_json::Value::Object(inner)) = nested {
+            obj.remove("arguments");
+            obj.remove("parameters");
+            for (k, val) in inner { obj.entry(k).or_insert(val); }
+        }
+    }
     Some(ToolCall { name, input })
 }
 
@@ -184,4 +196,38 @@ pub fn format_tool_result(format: &str, name: &str, result: &str, is_error: bool
         "qwen" | "chatml" => format!("<tool_response>\n{{\"tool\":\"{name}\",\"status\":\"{status}\",\"result\":{}}}\n</tool_response>", json!(result)),
         _ => format!("[TOOL RESULT: {name} ({status})]\n{result}"),
     }
+}
+
+/// True if the text contains this family's tool-call SIGNATURE, even if no
+/// call could be parsed out of it \u2014 used to give the model corrective
+/// feedback instead of silently dropping a malformed call (Mason 08-19).
+pub fn has_tool_marker(text: &str, format: &str) -> bool {
+    match format {
+        "qwen" | "chatml" => text.contains("<tool_call>"),
+        "mistral" => text.contains("[TOOL_CALLS]"),
+        _ => text.contains("\"name\"") && (text.contains("\"arguments\"") || text.contains("\"parameters\"")),
+    }
+}
+
+/// Remove <think>...</think> reasoning blocks before parsing tool calls, so a
+/// hypothetical call the model MUSED about inside its thinking ("I could call
+/// write_file like {...}") is never executed. An unclosed <think> (mid-stream
+/// or runaway) strips to the end. Display-side collapsing is the UI's job \u2014
+/// this is only the parse guard.
+pub fn strip_think(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        match rest.find("<think>") {
+            None => { out.push_str(rest); break; }
+            Some(s) => {
+                out.push_str(&rest[..s]);
+                match rest[s..].find("</think>") {
+                    None => break, // unclosed \u2014 drop the tail
+                    Some(e_rel) => { rest = &rest[s + e_rel + "</think>".len()..]; }
+                }
+            }
+        }
+    }
+    out
 }
