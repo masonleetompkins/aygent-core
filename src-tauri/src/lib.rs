@@ -3462,6 +3462,23 @@ fn step_is_first_result(step: &str) -> bool {
         || s.contains("click the first")
 }
 
+fn is_placeholder_spin(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    // Muse Spark 1.2 at 150k+ tokens emits these placeholder prefixes (see screenshot 18:24-18:47)
+    // They are text-only turns with zero tool_calls that stall until user says "continue"
+    t.contains("reworking your")
+        || t.contains("matching that")
+        || t.contains("building your")
+        || t.contains("mapping the current")
+        || t.contains("pulling your current")
+        || t.contains("tracing how")
+        || t.contains("lining up")
+        || t.contains("digging into")
+        || (t.contains("openrouter") && t.contains("search"))
+        || (t.contains("wiring") && t.contains("type-ahead"))
+        || (t.contains("openrouter-style") && t.len() < 220)
+}
+
 fn step_is_nav(step: &str) -> bool {
     let s = step.to_ascii_lowercase();
     // Any verb that means "end up on a different page/destination".
@@ -4716,6 +4733,7 @@ async fn agent_stream(
         let mut same_sig_streak: usize = 0;
         let mut err_round_streak: usize = 0;
         let mut stall_reason: Option<String> = None;
+        let mut placeholder_streak: usize = 0;
         let mut finished_naturally = false;
         while rounds < max_rounds {
             rounds += 1;
@@ -4755,7 +4773,12 @@ async fn agent_stream(
 
             // Push the assistant message (OpenAI-native shape, may carry tool_calls).
             messages.as_array_mut().unwrap().push(assistant.clone());
-
+            // 1.0.9 placeholder-spin guard (Muse 1.2 at 150k+ tok: see screenshots)
+            {
+                let is_ph = assistant.get("content").and_then(|c| c.as_str()).map(|s| is_placeholder_spin(s)).unwrap_or(false);
+                let has_tools = assistant.get("tool_calls").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+                if is_ph && !has_tools { placeholder_streak += 1; } else if has_tools { placeholder_streak = 0; } else if !is_ph { placeholder_streak = 0; }
+            }
             // Execute tool_calls (OpenAI shape) through the SAME jailed broker.
             let mut had_tools = false;
             if let Some(tcs) = assistant.get("tool_calls").and_then(|t| t.as_array()) {
@@ -4855,10 +4878,10 @@ async fn agent_stream(
             if had_tools {
                 if round_calls > 0 && round_errs == round_calls { err_round_streak += 1; } else { err_round_streak = 0; }
                 // STALL DETECTOR (see the Anthropic path): nudge once, then pause.
-                let stalled = same_sig_streak >= 5 || err_round_streak >= 4;
+                let stalled = same_sig_streak >= 5 || err_round_streak >= 4 || placeholder_streak >= 3;
                 if stalled {
                     if stall_reason.is_none() {
-                        stall_reason = Some(if same_sig_streak >= 5 { "repeating the same call".to_string() } else { "every tool call failing".to_string() });
+                        stall_reason = Some(if placeholder_streak >= 3 { "placeholder spin (model stalled without tools)".to_string() } else if same_sig_streak >= 5 { "repeating the same call".to_string() } else { "every tool call failing".to_string() });
                         same_sig_streak = 0; err_round_streak = 0;
                         messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user",
                             "content": "[system note] You appear stuck (repeating calls / repeated failures). Change approach, or stop calling tools and summarize where you are and what is blocking you." }));
@@ -4956,6 +4979,7 @@ async fn agent_stream(
     let mut same_sig_streak: usize = 0;          // consecutive IDENTICAL calls
     let mut err_round_streak: usize = 0;         // consecutive rounds where EVERY tool errored
     let mut stall_reason: Option<String> = None;
+    let mut placeholder_streak: usize = 0;
     let mut finished_naturally = false;
     while rounds < max_rounds {
         rounds += 1;
@@ -5106,6 +5130,12 @@ async fn agent_stream(
             }
         }
 
+        // 1.0.9 placeholder-spin (anthropic): count text-only placeholder turns
+        if tool_results.is_empty() {
+            let txt = content.as_array().and_then(|a| a.iter().find_map(|b| b.get("text").and_then(|v| v.as_str()))).unwrap_or("");
+            if is_placeholder_spin(txt) { placeholder_streak += 1; } else { placeholder_streak = 0; }
+        } else { placeholder_streak = 0; }
+
         // CRITICAL Anthropic invariant: EVERY tool_use block MUST be followed
         // immediately by a message containing its matching tool_result. So the
         // decision to send results is driven by "did we produce any tool_use
@@ -5125,10 +5155,10 @@ async fn agent_stream(
             // all-errored rounds → first offense injects a course-correct nudge
             // the model sees with its tool results; a persisting stall pauses the
             // turn with an HONEST status instead of looping forever.
-            let stalled = same_sig_streak >= 5 || err_round_streak >= 4;
+            let stalled = same_sig_streak >= 5 || err_round_streak >= 4 || placeholder_streak >= 3;
             if stalled {
                 if stall_reason.is_none() {
-                    stall_reason = Some(if same_sig_streak >= 5 { "repeating the same call".to_string() } else { "every tool call failing".to_string() });
+                    stall_reason = Some(if placeholder_streak >= 3 { "placeholder spin (model stalled without tools)".to_string() } else if same_sig_streak >= 5 { "repeating the same call".to_string() } else { "every tool call failing".to_string() });
                     same_sig_streak = 0; err_round_streak = 0;
                     messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": [{ "type": "text",
                         "text": "[system note] You appear stuck (repeating calls / repeated failures). Change approach, or stop calling tools and summarize where you are and what is blocking you." }] }));

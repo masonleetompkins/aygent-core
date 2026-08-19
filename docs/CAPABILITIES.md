@@ -1,4 +1,4 @@
-# AYGENT — Capabilities (v1.0.8)
+# AYGENT — Capabilities (v1.0.9)
 
 _The canonical reference for what AYGENT can do, as shipped in the signed,
 notarized release. This is the source-of-truth capability doc: keep it in
@@ -214,6 +214,8 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 ---
 
 ## Changelog
+- **1.0.9** (2026-08-18): **Muse Spark stall + FD jam fixes** — bump 1.0.8 → 1.0.9. Headroom 8192->32000 max_output_tokens; continue-spin guard + compact nudge.
+
 - **1.0.8** (2026-08-18): **Sparks verified interactive** — staging hardening + WKWebView cache-bust verified (frontend_build_id hash in bust_webview_cache_on_version_change) so the `sparkChrome.ts` harness (dummy getElementById, auto type=button, per-listener EventTarget wrap + __sparkErr) actually ships; tip calculator and library Sparks now accept input + click in both inline Chat and Sparks tab without reload. Sandbox stays opaque (`allow-scripts` only, `postMessage` KV). Bump `1.0.7 → 1.0.8`.
 - **1.0.7** (2026-08-18): **Sparks seamless interactivity** — fault-isolated handlers + auto `type="button"` so a single null `getElementById` or bare `<button>` no longer kills the whole Spark script; per-listener `EventTarget` wrap with `__sparkErr` banner + helper `$` shim (`sparkChrome.ts` `SPARK_RUNTIME`/`wrapSparkHtml`). Recipe now enforces `type="button"` + null-guarded `getElementById` (`lib.rs` `SPARKS_INSTRUCTIONS`). Sandbox stays opaque (`allow-scripts` only, `postMessage` KV only). Bump `1.0.6 → 1.0.7` (`c137750`).
 - **1.0.6** (2026-08-17): **OpenAI/OpenRouter parallel tools 400 fix** — `build_openai_messages` now searches the full history for the matching assistant `tool_calls` (`out.iter().rev().any`) instead of only `out.last()`, so both parallel tool_results survive and no longer 400 with “must be followed by tool messages”. Bump `1.0.5 → 1.0.6` (`efe5ec3`).
@@ -238,4 +240,4 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 - **1.0.0** (2026-08-10): Signed/notarized launch — whoami tool, GFM tables,
   dashboards, sparks, remote.
 
-_Last updated 2026-08-18 for 1.0.8. If you add a capability, add it here._
+_Last updated 2026-08-18 for 1.0.9. If you add a capability, add it here._
