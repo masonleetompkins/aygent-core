@@ -47,6 +47,8 @@ const DEFAULT_CTX_TOKENS: u32 = 4096;
 const MIN_CTX_TOKENS: u32 = 2048;
 const MAX_CTX_TOKENS: u32 = 131072;
 const MAX_NEW_TOKENS: usize = 1024;
+/// Floor for the context's logical batch size (llama.cpp's default).
+const MIN_BATCH_TOKENS: u32 = 512;
 
 fn backend() -> Result<&'static LlamaBackend, String> {
     BACKEND.as_ref().map_err(|e| e.clone())
@@ -167,13 +169,12 @@ fn decode(path: &str, prompt: &str, ctx_tokens: u32, tx: tokio::sync::mpsc::Unbo
     let be = backend()?;
     let model = load_model(path, gpu_layers_for(path, ctx_tokens))?;
 
-    let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(std::num::NonZeroU32::new(ctx_tokens));
-    let mut ctx = model
-        .new_context(be, ctx_params)
-        .map_err(|e| format!("create context: {e}"))?;
-
-    // Tokenize the prompt.
+    // Tokenize BEFORE building the context: the context's logical batch size
+    // (n_batch) must cover the whole prompt we submit in one llama_decode call.
+    // llama.cpp enforces `n_tokens <= n_batch` with a GGML_ASSERT — which calls
+    // abort(), killing the entire app with SIGABRT (no catchable error). The
+    // default n_batch is 2048, so this crashed as soon as a conversation grew
+    // past ~2048 prompt tokens ("works for a few turns, then AYGENT dies").
     let mut tokens = model
         .str_to_token(prompt, AddBos::Always)
         .map_err(|e| format!("tokenize: {e}"))?;
@@ -187,6 +188,16 @@ fn decode(path: &str, prompt: &str, ctx_tokens: u32, tx: tokio::sync::mpsc::Unbo
         let drop = tokens.len() - max_prompt;
         tokens.drain(0..drop);
     }
+
+    // n_batch sized to the (truncated) prompt so the single-shot prompt decode
+    // below never trips the assert. Always ≤ n_ctx because max_prompt < ctx.
+    let n_batch = (tokens.len() as u32).max(MIN_BATCH_TOKENS);
+    let ctx_params = LlamaContextParams::default()
+        .with_n_ctx(std::num::NonZeroU32::new(ctx_tokens))
+        .with_n_batch(n_batch);
+    let mut ctx = model
+        .new_context(be, ctx_params)
+        .map_err(|e| format!("create context: {e}"))?;
 
     // Batch capacity must cover the whole prompt (was hardcoded 512 — too small
     // once the conversation exceeded ~512 tokens). Single-token decode steps
@@ -289,24 +300,31 @@ fn embed_blocking(model_path: &str, text: &str) -> Result<Vec<f32>, String> {
     // the budget check is just consistency with the chat path.
     let model = load_model(model_path, gpu_layers_for(model_path, 2048))?;
 
-    // Embeddings need a context built with embeddings ENABLED + MEAN pooling so
-    // we get ONE vector for the whole input (not per-token). n_ctx sized to the
-    // embed model's training window (nomic = 2048); a long note is truncated to
-    // fit rather than erroring.
-    let ctx_params = LlamaContextParams::default()
-        .with_embeddings(true)
-        .with_pooling_type(LlamaPoolingType::Mean);
-    let mut ctx = model
-        .new_context(be, ctx_params)
-        .map_err(|e| format!("embed context: {e}"))?;
-
-    let n_ctx = ctx.n_ctx() as usize;
+    // Tokenize first so the context's n_batch can cover the whole sequence —
+    // same GGML_ASSERT(abort) hazard as the chat path if input > n_batch.
     let mut tokens = model
         .str_to_token(text, AddBos::Always)
         .map_err(|e| format!("embed tokenize: {e}"))?;
     if tokens.is_empty() {
         return Err("embed: empty input after tokenize".into());
     }
+
+    // Embeddings need a context built with embeddings ENABLED + MEAN pooling so
+    // we get ONE vector for the whole input (not per-token). n_ctx sized to the
+    // embed model's training window (nomic = 2048); a long note is truncated to
+    // fit rather than erroring. n_batch must cover the full sequence because
+    // pooled embeddings require the whole sequence in one ubatch.
+    let n_batch = (tokens.len() as u32).max(MIN_BATCH_TOKENS);
+    let ctx_params = LlamaContextParams::default()
+        .with_embeddings(true)
+        .with_pooling_type(LlamaPoolingType::Mean)
+        .with_n_batch(n_batch)
+        .with_n_ubatch(n_batch);
+    let mut ctx = model
+        .new_context(be, ctx_params)
+        .map_err(|e| format!("embed context: {e}"))?;
+
+    let n_ctx = ctx.n_ctx() as usize;
     // Truncate to the context window (keep the head — title + lead of the note).
     if tokens.len() > n_ctx {
         tokens.truncate(n_ctx);
