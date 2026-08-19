@@ -372,6 +372,10 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // outside send()'s closure -- knows exactly which turn to cancel.
   const runningChannelRef = useRef<string | null>(null);
   const providerRef = useRef<string>("");
+  // Reactive mirror of "this pane runs a local model" — gates the <think>
+  // Thoughts-bar parsing so cloud chats that merely MENTION <think> in prose
+  // or code are never chopped up (Mason 08-19). Refs don't re-render; this does.
+  const [isLocal, setIsLocal] = useState(false);
 
   useEffect(() => { pinToBottom(true); }, [msgs]);
 
@@ -387,7 +391,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   useEffect(() => {
     if (!folder) { setConvs([]); setConv(null); setMessages([]); historyRef.current = []; return; }
     invoke<{ provider: string; model: string }>("get_selection", { folder })
-      .then((s) => { providerRef.current = s.provider; modelRef.current = s.model; }).catch(() => {});
+      .then((s) => { providerRef.current = s.provider; modelRef.current = s.model; setIsLocal(s.provider === "local"); }).catch(() => {});
     (async () => {
       try {
         const list = await invoke<ConvMeta[]>("conv_list", { folder });
@@ -600,7 +604,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     if (folder) {
       try {
         const s = await invoke<{ provider: string; model: string }>("get_selection", { folder });
-        providerRef.current = s.provider; modelRef.current = s.model;
+        providerRef.current = s.provider; modelRef.current = s.model; setIsLocal(s.provider === "local");
       } catch { /* keep last */ }
     }
 
@@ -885,7 +889,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           {msgs.length === 0 && !running && !blocked && (
             <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
           )}
-          {msgs.map((m, i) => <Bubble key={i} m={m} agentId={agentId} price={modelInfo?.price} />)}
+          {msgs.map((m, i) => <Bubble key={i} m={m} agentId={agentId} price={modelInfo?.price} local={isLocal} />)}
           {/* LIVE inter-agent inbound message: when a peer dispatches a message
               to the agent you're viewing, show it as a user bubble immediately
               (before the reply streams) so you WATCH the conversation arrive. */}
@@ -897,7 +901,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               tokens + tool cards arriving mid-flight (Atlas #2), for BOTH human
               turns and headless inter-agent turns (same store slot). */}
           {running && !(msgs.length > 0 && msgs[msgs.length - 1].role === "assistant" && (msgs[msgs.length - 1] as { streaming?: boolean }).streaming) && (
-            <Bubble agentId={agentId} m={{
+            <Bubble agentId={agentId} local={isLocal} m={{
               role: "assistant",
               text: turn.liveText,
               tools: turn.liveTools.map((t) => ({ name: t.name, path: t.path ?? "", ok: t.ok, detail: t.detail, summary: t.summary, body: t.body, running: t.running, spark: t.spark })),
@@ -1274,7 +1278,7 @@ function Stamp({ at, usage, price }: { at?: number; usage?: TurnUsage; price?: {
   );
 }
 
-function Bubble({ m, agentId, price }: { m: Msg; agentId?: string | null; price?: { input: number; output: number; cache_read: number; cache_write: number } }) {
+function Bubble({ m, agentId, price, local }: { m: Msg; agentId?: string | null; price?: { input: number; output: number; cache_read: number; cache_write: number }; local?: boolean }) {
   const isUser = m.role === "user";
   const memory = isUser && m.role === "user" ? m.memory : undefined;
   // The stamp lives OUTSIDE the bubble column, in the margin: to the LEFT of
@@ -1282,13 +1286,13 @@ function Bubble({ m, agentId, price }: { m: Msg; agentId?: string | null; price?
   return (
     <div style={{ display: "flex", alignItems: "flex-start", justifyContent: isUser ? "flex-end" : "flex-start", gap: 2, width: "100%" }}>
       {!isUser && <Stamp at={m.at} usage={m.role === "assistant" ? m.usage : undefined} price={price} />}
-      <BubbleBody m={m} isUser={isUser} memory={memory} agentId={agentId} />
+      <BubbleBody m={m} isUser={isUser} local={local} memory={memory} agentId={agentId} />
       {isUser && <Stamp at={m.at} />}
     </div>
   );
 }
 
-function BubbleBody({ m, isUser, memory, agentId }: { m: Msg; isUser: boolean; memory?: string; agentId?: string | null }) {
+function BubbleBody({ m, isUser, memory, agentId, local }: { m: Msg; isUser: boolean; memory?: string; agentId?: string | null; local?: boolean }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start", minWidth: 0, flex: 1 }}>
       <div style={{
@@ -1323,7 +1327,7 @@ function BubbleBody({ m, isUser, memory, agentId }: { m: Msg; isUser: boolean; m
             if (!text) return null;
             return (
               <div key={i} style={{ marginTop: i === 0 ? 0 : 10 }}>
-                <TextWithThoughts text={text} streaming={m.streaming} />
+                <TextWithThoughts text={text} streaming={m.streaming} enabled={local} />
               </div>
             );
           })
@@ -1332,7 +1336,7 @@ function BubbleBody({ m, isUser, memory, agentId }: { m: Msg; isUser: boolean; m
             {!isUser && m.role === "assistant" && m.tools.map((t, i) => <ToolCard key={i} t={t} agentId={agentId} />)}
             {m.text && (isUser
               ? <span style={{ whiteSpace: "pre-wrap", lineHeight: 1.55, fontSize: 15 }}>{m.text}</span>
-              : <TextWithThoughts text={m.text} streaming={(m as { streaming?: boolean }).streaming} />)}
+              : <TextWithThoughts text={m.text} streaming={(m as { streaming?: boolean }).streaming} enabled={local} />)}
           </>
         )}
         {!isUser && m.role === "assistant" && m.streaming && !m.text && <Thinking />}
@@ -1572,8 +1576,8 @@ function ThoughtBar({ text, live }: { text: string; live?: boolean }) {
   );
 }
 
-function TextWithThoughts({ text, streaming }: { text: string; streaming?: boolean }) {
-  if (!text.includes("<think>")) return <Markdown text={text} />;
+function TextWithThoughts({ text, streaming, enabled }: { text: string; streaming?: boolean; enabled?: boolean }) {
+  if (!enabled || !text.includes("<think>")) return <Markdown text={text} />;
   const segs = splitThinkSegments(text);
   return (
     <>
