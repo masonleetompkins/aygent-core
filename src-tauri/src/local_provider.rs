@@ -34,15 +34,11 @@ use std::sync::Arc;
 static BACKEND: Lazy<Result<LlamaBackend, String>> =
     Lazy::new(|| LlamaBackend::init().map_err(|e| format!("llama backend init: {e}")));
 
-/// Loaded-model cache keyed by absolute GGUF path (avoids re-loading weights
-/// every turn — model load is the expensive part).
+/// Loaded-model cache keyed by absolute GGUF path + offload mode (avoids
+/// re-loading weights every turn — model load is the expensive part).
 static MODELS: Lazy<Mutex<HashMap<String, Arc<LlamaModel>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// How many layers to offload to the GPU. u32::MAX = "all layers" (llama.cpp
-/// clamps to the model's actual layer count). On CPU-only builds this is simply
-/// ignored by the backend.
-const GPU_LAYERS: u32 = u32::MAX;
 /// Fallback context if the caller doesn't know the model's real window.
 const DEFAULT_CTX_TOKENS: u32 = 4096;
 /// Hard floor/ceiling so a wild value can't underflow or blow up memory. The
@@ -56,21 +52,44 @@ fn backend() -> Result<&'static LlamaBackend, String> {
     BACKEND.as_ref().map_err(|e| e.clone())
 }
 
-/// Load (or fetch cached) a model from a local GGUF path.
-fn load_model(path: &str) -> Result<Arc<LlamaModel>, String> {
+/// Decide GPU offload for a model on THIS machine. Metal caps a process's GPU
+/// working set (~2/3 of RAM on Macs ≤36GB, ~75% above). If weights + KV cache
+/// + compute buffers exceed that cap, a fully-offloaded model LOADS fine and
+/// even decodes the prompt — then llama_decode dies mid-generation with a fatal
+/// backend error ("Decode Error -3"). That's exactly what happened with a 16GB
+/// 27B GGUF on a 24GB Mac: the weights alone fill the ~16GB working set.
+/// All-or-nothing: offload every layer when the total fits, otherwise run on
+/// CPU (slower, but it completes — RAM is the budget there, not the GPU cap).
+fn gpu_layers_for(path: &str, ctx_tokens: u32) -> u32 {
+    let hw = crate::hardware::detect();
+    let ram = hw.ram_gb as f64;
+    let working_set = if ram <= 36.0 { ram * (2.0 / 3.0) } else { ram * 0.75 };
+    let weights_gb = std::fs::metadata(path)
+        .map(|m| m.len() as f64 / 1_073_741_824.0)
+        .unwrap_or(0.0);
+    let kv_gb = ctx_tokens as f64 * 0.00025; // ~0.25MB/token, conservative
+    const OVERHEAD_GB: f64 = 1.5; // compute buffers + scratch
+    if weights_gb + kv_gb + OVERHEAD_GB <= working_set { u32::MAX } else { 0 }
+}
+
+/// Load (or fetch cached) a model from a local GGUF path with the given GPU
+/// offload (u32::MAX = all layers; 0 = CPU). Cache key includes the offload so
+/// a budget change after a context resize can't serve a mismatched instance.
+fn load_model(path: &str, gpu_layers: u32) -> Result<Arc<LlamaModel>, String> {
     if !Path::new(path).exists() {
         return Err(format!("model file not found: {path}"));
     }
+    let key = format!("{path}#{gpu_layers}");
     {
         let cache = MODELS.lock().unwrap();
-        if let Some(m) = cache.get(path) { return Ok(m.clone()); }
+        if let Some(m) = cache.get(&key) { return Ok(m.clone()); }
     }
     let be = backend()?;
-    let params = LlamaModelParams::default().with_n_gpu_layers(GPU_LAYERS);
+    let params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
     let model = LlamaModel::load_from_file(be, path, &params)
         .map_err(|e| format!("load model: {e}"))?;
     let arc = Arc::new(model);
-    MODELS.lock().unwrap().insert(path.to_string(), arc.clone());
+    MODELS.lock().unwrap().insert(key, arc.clone());
     Ok(arc)
 }
 
@@ -146,7 +165,7 @@ pub async fn local_stream_turn<F: FnMut(StreamEvent)>(
 /// The synchronous decode loop (runs on a blocking thread).
 fn decode(path: &str, prompt: &str, ctx_tokens: u32, tx: tokio::sync::mpsc::UnboundedSender<String>) -> Result<(u64, u64), String> {
     let be = backend()?;
-    let model = load_model(path)?;
+    let model = load_model(path, gpu_layers_for(path, ctx_tokens))?;
 
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(std::num::NonZeroU32::new(ctx_tokens));
@@ -179,7 +198,7 @@ fn decode(path: &str, prompt: &str, ctx_tokens: u32, tx: tokio::sync::mpsc::Unbo
         batch.add(*tok, i as i32, &[0], i as i32 == last)
             .map_err(|e| format!("batch add: {e}"))?;
     }
-    ctx.decode(&mut batch).map_err(|e| format!("decode prompt: {e}"))?;
+    ctx.decode(&mut batch).map_err(|e| decode_err("decode prompt", e))?;
 
     // Greedy-ish sampler with light temperature for natural chat.
     let mut sampler = LlamaSampler::chain_simple([
@@ -211,9 +230,21 @@ fn decode(path: &str, prompt: &str, ctx_tokens: u32, tx: tokio::sync::mpsc::Unbo
         batch.clear();
         batch.add(token, n_cur, &[0], true).map_err(|e| format!("batch add: {e}"))?;
         n_cur += 1;
-        ctx.decode(&mut batch).map_err(|e| format!("decode token: {e}"))?;
+        ctx.decode(&mut batch).map_err(|e| decode_err("decode token", e))?;
     }
     Ok((prompt_tokens, generated))
+}
+
+/// Map a llama_decode failure to a message the USER can act on. Fatal backend
+/// codes (≤ -2) on Metal almost always mean the model + context blew past the
+/// GPU working-set limit — say so instead of the opaque "Decode Error -3".
+fn decode_err(stage: &str, e: impl std::fmt::Display) -> String {
+    let msg = e.to_string();
+    if msg.contains("-2") || msg.contains("-3") {
+        format!("{stage}: {msg} — the model ran out of memory on this machine. Try a smaller model or quantization (this often means the GGUF is too large for the GPU's memory limit).")
+    } else {
+        format!("{stage}: {msg}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -254,7 +285,9 @@ pub async fn embed_local(model_path: String, text: String) -> Result<Vec<f32>, S
 
 fn embed_blocking(model_path: &str, text: &str) -> Result<Vec<f32>, String> {
     let be = backend()?;
-    let model = load_model(model_path)?;
+    // Embedding GGUFs are tiny (~80MB) so this virtually always full-offloads;
+    // the budget check is just consistency with the chat path.
+    let model = load_model(model_path, gpu_layers_for(model_path, 2048))?;
 
     // Embeddings need a context built with embeddings ENABLED + MEAN pooling so
     // we get ONE vector for the whole input (not per-token). n_ctx sized to the
