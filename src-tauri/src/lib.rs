@@ -4637,14 +4637,22 @@ async fn agent_stream(
             // text only: reasoning models (Qwen3) muse about hypothetical calls
             // inside <think> blocks; those must never execute.
             let visible = local_tools::strip_think(&text);
-            let calls = local_tools::parse_tool_calls(&visible, &cap.format);
+            let mut calls = local_tools::parse_tool_calls(&visible, &cap.format);
+            if calls.is_empty() {
+                // Qwen3 sometimes emits the call INSIDE an unclosed <think>
+                // ("memory call stuffed in a thought", Mason 08-19) — rescue it.
+                calls = local_tools::rescue_call_from_unclosed_think(&text, &cap.format);
+            }
             if calls.is_empty() {
                 // The model TRIED to call a tool but we couldn't parse it
                 // (malformed JSON, raw newlines in strings...). Silently
                 // breaking here made the write "look emitted but never run"
                 // (Mason 08-19, bug #2b) — instead, tell the model what went
                 // wrong so it can retry within the turn cap.
-                if local_tools::has_tool_marker(&visible, &cap.format) && turn + 1 < LOCAL_TOOL_TURN_CAP {
+                let tried = local_tools::has_tool_marker(&visible, &cap.format)
+                    || local_tools::unclosed_think_tail(&text)
+                        .is_some_and(|t| local_tools::has_tool_marker(t, &cap.format));
+                if tried && turn + 1 < LOCAL_TOOL_TURN_CAP {
                     let _ = app.emit(&channel, &provider::StreamEvent::Info {
                         text: "tool call couldn't be parsed — asking the model to retry".to_string(),
                     });

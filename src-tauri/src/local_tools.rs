@@ -203,7 +203,7 @@ pub fn format_tool_result(format: &str, name: &str, result: &str, is_error: bool
 /// feedback instead of silently dropping a malformed call (Mason 08-19).
 pub fn has_tool_marker(text: &str, format: &str) -> bool {
     match format {
-        "qwen" | "chatml" => text.contains("<tool_call>"),
+        "qwen" | "chatml" => text.contains("<tool_call>") || text.contains("</tool_call>"),
         "mistral" => text.contains("[TOOL_CALLS]"),
         _ => text.contains("\"name\"") && (text.contains("\"arguments\"") || text.contains("\"parameters\"")),
     }
@@ -230,4 +230,32 @@ pub fn strip_think(text: &str) -> String {
         }
     }
     out
+}
+
+/// The tail of an UNCLOSED <think> block (text after the last `<think>` that
+/// has no matching `</think>`), or None if every think block is closed.
+pub fn unclosed_think_tail(text: &str) -> Option<&str> {
+    let s = text.rfind("<think>")?;
+    let tail = &text[s + "<think>".len()..];
+    if tail.contains("</think>") { return None; }
+    Some(tail)
+}
+
+/// RESCUE a tool call emitted inside an unclosed <think> (Mason 08-19, Gwen/
+/// Qwen3): the model opens <think>, decides to act, and emits the call JSON —
+/// often with only the closing </tool_call> tag — without ever closing the
+/// think. strip_think() rightly drops unclosed thinks, but here it swallowed a
+/// REAL call ("memory call stuffed in a thought"). Executing from a CLOSED
+/// think stays forbidden — that is musing followed by a real answer. Recover
+/// ONLY when:
+///   1. the <think> is unclosed — there is no visible answer at all, and
+///   2. the tail ENDS with the completed call (whitespace aside) — a model
+///      that kept writing prose after the JSON was musing, not calling.
+pub fn rescue_call_from_unclosed_think(text: &str, format: &str) -> Vec<ToolCall> {
+    let Some(tail) = unclosed_think_tail(text) else { return Vec::new() };
+    let t = tail.trim_end();
+    if !(t.ends_with("</tool_call>") || t.ends_with('}') || t.ends_with(']')) {
+        return Vec::new();
+    }
+    parse_tool_calls(t, format)
 }
