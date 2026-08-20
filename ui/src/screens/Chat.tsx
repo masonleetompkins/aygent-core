@@ -372,6 +372,10 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // outside send()'s closure -- knows exactly which turn to cancel.
   const runningChannelRef = useRef<string | null>(null);
   const providerRef = useRef<string>("");
+  // Reactive mirror of "this pane runs a local model" — gates the <think>
+  // Thoughts-bar parsing so cloud chats that merely MENTION <think> in prose
+  // or code are never chopped up (Mason 08-19). Refs don't re-render; this does.
+  const [isLocal, setIsLocal] = useState(false);
 
   useEffect(() => { pinToBottom(true); }, [msgs]);
 
@@ -387,7 +391,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   useEffect(() => {
     if (!folder) { setConvs([]); setConv(null); setMessages([]); historyRef.current = []; return; }
     invoke<{ provider: string; model: string }>("get_selection", { folder })
-      .then((s) => { providerRef.current = s.provider; modelRef.current = s.model; }).catch(() => {});
+      .then((s) => { providerRef.current = s.provider; modelRef.current = s.model; setIsLocal(s.provider === "local"); }).catch(() => {});
     (async () => {
       try {
         const list = await invoke<ConvMeta[]>("conv_list", { folder });
@@ -600,7 +604,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     if (folder) {
       try {
         const s = await invoke<{ provider: string; model: string }>("get_selection", { folder });
-        providerRef.current = s.provider; modelRef.current = s.model;
+        providerRef.current = s.provider; modelRef.current = s.model; setIsLocal(s.provider === "local");
       } catch { /* keep last */ }
     }
 
@@ -885,7 +889,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           {msgs.length === 0 && !running && !blocked && (
             <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
           )}
-          {msgs.map((m, i) => <Bubble key={i} m={m} agentId={agentId} price={modelInfo?.price} />)}
+          {msgs.map((m, i) => <Bubble key={i} m={m} agentId={agentId} price={modelInfo?.price} local={isLocal} />)}
           {/* LIVE inter-agent inbound message: when a peer dispatches a message
               to the agent you're viewing, show it as a user bubble immediately
               (before the reply streams) so you WATCH the conversation arrive. */}
@@ -897,7 +901,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               tokens + tool cards arriving mid-flight (Atlas #2), for BOTH human
               turns and headless inter-agent turns (same store slot). */}
           {running && !(msgs.length > 0 && msgs[msgs.length - 1].role === "assistant" && (msgs[msgs.length - 1] as { streaming?: boolean }).streaming) && (
-            <Bubble agentId={agentId} m={{
+            <Bubble agentId={agentId} local={isLocal} m={{
               role: "assistant",
               text: turn.liveText,
               tools: turn.liveTools.map((t) => ({ name: t.name, path: t.path ?? "", ok: t.ok, detail: t.detail, summary: t.summary, body: t.body, running: t.running, spark: t.spark })),
@@ -1061,19 +1065,21 @@ function HistorySidebar({
 }) {
   return (
     <div style={{
-      width: 230, flexShrink: 0, display: "flex", flexDirection: "column", gap: 8,
-      // SINGLE pane: bleed past App.tsx's 28px top/bottom padding so the
-      // divider reaches the window edges (grow height by the bled amount — a
-      // negative margin SHIFTS, it doesn't stretch). MULTI pane: the pane is a
-      // rounded card; bleeding overflows the card bounds (Mason, v1.0.1 polish
-      // #2), so stay at 100% of the container.
+      display: "flex", flexDirection: "column", gap: 8,
+      // SINGLE pane: fixed 230px column with its own divider; bleed past
+      // App.tsx's 28px top/bottom padding so the divider reaches the window
+      // edges (grow height by the bled amount — a negative margin SHIFTS, it
+      // doesn't stretch). MULTI pane: the hamburger OVERLAY already provides
+      // the width, left divider and padding — duplicating them here overflowed
+      // the overlay and drew a second, misaligned line (Mason 08-19, bug #3).
       ...(multi
-        ? { height: "100%" }
+        ? { height: "100%", minHeight: 0, width: "100%", paddingRight: 8 }
         : {
+            width: 230, flexShrink: 0,
             height: "calc(100% + 56px)",
             marginTop: -28, marginBottom: -28, paddingTop: 28, paddingBottom: 28,
+            borderLeft: "var(--border-width) solid var(--line)", paddingLeft: 14,
           }),
-      borderLeft: "var(--border-width) solid var(--line)", paddingLeft: 14,
     }}>
       <Button onClick={onNew} disabled={busy}>+ New chat</Button>
       <div ref={listElRef} className="aygent-scroll" style={{ overflowY: "auto", display: "flex", flexDirection: "column", gap: 4, marginTop: 4, flex: 1, minHeight: 0 }}>
@@ -1272,7 +1278,7 @@ function Stamp({ at, usage, price }: { at?: number; usage?: TurnUsage; price?: {
   );
 }
 
-function Bubble({ m, agentId, price }: { m: Msg; agentId?: string | null; price?: { input: number; output: number; cache_read: number; cache_write: number } }) {
+function Bubble({ m, agentId, price, local }: { m: Msg; agentId?: string | null; price?: { input: number; output: number; cache_read: number; cache_write: number }; local?: boolean }) {
   const isUser = m.role === "user";
   const memory = isUser && m.role === "user" ? m.memory : undefined;
   // The stamp lives OUTSIDE the bubble column, in the margin: to the LEFT of
@@ -1280,13 +1286,13 @@ function Bubble({ m, agentId, price }: { m: Msg; agentId?: string | null; price?
   return (
     <div style={{ display: "flex", alignItems: "flex-start", justifyContent: isUser ? "flex-end" : "flex-start", gap: 2, width: "100%" }}>
       {!isUser && <Stamp at={m.at} usage={m.role === "assistant" ? m.usage : undefined} price={price} />}
-      <BubbleBody m={m} isUser={isUser} memory={memory} agentId={agentId} />
+      <BubbleBody m={m} isUser={isUser} local={local} memory={memory} agentId={agentId} />
       {isUser && <Stamp at={m.at} />}
     </div>
   );
 }
 
-function BubbleBody({ m, isUser, memory, agentId }: { m: Msg; isUser: boolean; memory?: string; agentId?: string | null }) {
+function BubbleBody({ m, isUser, memory, agentId, local }: { m: Msg; isUser: boolean; memory?: string; agentId?: string | null; local?: boolean }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start", minWidth: 0, flex: 1 }}>
       <div style={{
@@ -1321,7 +1327,7 @@ function BubbleBody({ m, isUser, memory, agentId }: { m: Msg; isUser: boolean; m
             if (!text) return null;
             return (
               <div key={i} style={{ marginTop: i === 0 ? 0 : 10 }}>
-                <Markdown text={text} />
+                <TextWithThoughts text={text} streaming={m.streaming} enabled={local} />
               </div>
             );
           })
@@ -1330,7 +1336,7 @@ function BubbleBody({ m, isUser, memory, agentId }: { m: Msg; isUser: boolean; m
             {!isUser && m.role === "assistant" && m.tools.map((t, i) => <ToolCard key={i} t={t} agentId={agentId} />)}
             {m.text && (isUser
               ? <span style={{ whiteSpace: "pre-wrap", lineHeight: 1.55, fontSize: 15 }}>{m.text}</span>
-              : <Markdown text={m.text} />)}
+              : <TextWithThoughts text={m.text} streaming={(m as { streaming?: boolean }).streaming} enabled={local} />)}
           </>
         )}
         {!isUser && m.role === "assistant" && m.streaming && !m.text && <Thinking />}
@@ -1511,6 +1517,76 @@ function SparkCard({ spark, agentId }: { spark: { slug: string; title: string; h
         ) : null
       )}
     </div>
+  );
+}
+
+// LOCAL REASONING MODELS (Mason 08-19): Qwen3-style models emit <think>...
+// </think> blocks before their answer. Raw, that reads as the agent dumping its
+// inner monologue into chat. Split them out and render each as a collapsed
+// "Thoughts" bar (same chrome as a tool card); the visible answer stays
+// normal Markdown. An UNCLOSED <think> while streaming shows as a live
+// "Thinking..." bar so tokens still visibly arrive.
+type TextSeg = { kind: "text" | "think"; text: string; open?: boolean };
+
+function splitThinkSegments(text: string): TextSeg[] {
+  const segs: TextSeg[] = [];
+  let rest = text;
+  for (;;) {
+    const s = rest.indexOf("<think>");
+    if (s < 0) { if (rest) segs.push({ kind: "text", text: rest }); break; }
+    if (s > 0) segs.push({ kind: "text", text: rest.slice(0, s) });
+    const after = rest.slice(s + 7);
+    const e = after.indexOf("</think>");
+    if (e < 0) { segs.push({ kind: "think", text: after, open: true }); break; }
+    segs.push({ kind: "think", text: after.slice(0, e) });
+    rest = after.slice(e + 8);
+  }
+  return segs;
+}
+
+function ThoughtBar({ text, live }: { text: string; live?: boolean }) {
+  const [open, setOpen] = useState(false);
+  const words = text.trim() ? text.trim().split(/\s+/).length : 0;
+  return (
+    <div style={{
+      fontSize: 12.5, fontFamily: "ui-monospace, SFMono-Regular, monospace",
+      border: "var(--border-width) solid var(--line)",
+      borderRadius: "var(--radius-control)", color: "var(--text-muted)",
+      background: "var(--bg)", overflow: "hidden", margin: "2px 0",
+    }}>
+      <div
+        onClick={() => setOpen((o) => !o)}
+        title={open ? "Collapse" : "Expand"}
+        style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", cursor: "pointer", userSelect: "none" }}
+      >
+        <span style={{ fontSize: 10, opacity: 0.7, transform: open ? "rotate(90deg)" : "none", transition: "transform 120ms" }}>▶</span>
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
+          💭 {live ? "Thinking…" : `Thoughts · ${words} word${words === 1 ? "" : "s"}`}
+        </span>
+        {live && <span style={{ flexShrink: 0 }}>…</span>}
+      </div>
+      {open && (
+        <div style={{
+          borderTop: "var(--border-width) solid var(--line)",
+          maxHeight: 300, overflow: "auto", padding: "8px 10px",
+          whiteSpace: "pre-wrap", lineHeight: 1.5,
+        }}>{text.trim()}</div>
+      )}
+    </div>
+  );
+}
+
+function TextWithThoughts({ text, streaming, enabled }: { text: string; streaming?: boolean; enabled?: boolean }) {
+  if (!enabled || !text.includes("<think>")) return <Markdown text={text} />;
+  const segs = splitThinkSegments(text);
+  return (
+    <>
+      {segs.map((seg, i) =>
+        seg.kind === "think"
+          ? <ThoughtBar key={i} text={seg.text} live={!!seg.open && !!streaming} />
+          : (seg.text.trim() ? <Markdown key={i} text={seg.text.trim()} /> : null),
+      )}
+    </>
   );
 }
 

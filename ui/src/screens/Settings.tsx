@@ -134,8 +134,7 @@ export function Settings({
       {/* MODEL card removed (Mason cleanup #3) — model choice lives per-agent in
           the Agents tab. */}
 
-      {/* LOCAL MODELS — DOWNLOAD-ONLY here (Mason cleanup #4). Downloaded models
-          show up per-agent in the Agents tab to be selected; no selection here. */}
+      {/* LOCAL MODELS — OpenRouter-style search (replaces the old Browse button) */}
       <LocalModels folder={folder} activePath="" onChoose={() => {}} />
 
       {/* MEMORY (M1.7) */}
@@ -243,13 +242,12 @@ function ModelRow({ active, onClick, title, sub, meta, mono }: {
 }
 
 // ---- LOCAL MODELS ---------------------------------------------------------
-// Browse a live, curated GGUF catalog (Qwen/Mistral/Kimi/Llama), see how each
-// will run on THIS machine, download in-app, and pick one to chat with. Fully
-// self-contained: no Ollama, no terminal.
+// OpenRouter-style search: type to live-search Hugging Face GGUF models,
+// auto-fills model strings, select (or paste exact repo id) to show the same
+// info card (speed/memory/perf + quant download choices) we already use.
 type Perf = { tier: string; badge: string; tokens_per_sec: string; note: string; fits: boolean };
 type Quant = { tier: string; quant: string; filename: string; size_gb: number; download_url: string; perf: Perf };
 
-// Turn a raw tok/s range into plain language for an inexperienced user.
 function speedWords(perf: Perf): string {
   switch (perf.tier) {
     case "great": return "fast";
@@ -259,8 +257,6 @@ function speedWords(perf: Perf): string {
   }
 }
 
-// Friendly context-window label: tokens → "~24,000 words of conversation".
-// (1 token ≈ 0.75 words.) Shows the raw "128k" too for people who know it.
 function contextWords(tokens: number): { short: string; long: string } {
   if (!tokens) return { short: "—", long: "context size unknown" };
   const k = Math.round(tokens / 1024);
@@ -268,12 +264,7 @@ function contextWords(tokens: number): { short: string; long: string } {
   return { short: `${k}k`, long: `can hold about ${words.toLocaleString()},000 words of conversation` };
 }
 
-// Per-quant friendly framing: the SAME model at different compression levels.
-// The tradeoff is QUALITY vs DOWNLOAD SIZE — speed is essentially the same.
-// Match on the RAW quant code, not the tier label, so the two rows always read
-// distinctly even if tier strings ever collide.
 function quantBlurb(quant: string): { title: string; sub: string } {
-  // Higher-precision quants (more bits per weight = sharper, bigger file).
   const higher = ["Q5_K_M", "Q6_K", "Q8_0"];
   if (higher.includes(quant)) {
     return { title: "Higher quality", sub: "sharper answers · larger file · needs more memory" };
@@ -284,23 +275,37 @@ type CatModel = { family: string; family_label: string; repo: string; name: stri
 type HW = { summary: string };
 type Downloaded = { filename: string; path: string; size_gb: number };
 
+function isRepoId(s: string): boolean {
+  const t = s.trim();
+  if (!t.includes("/")) return false;
+  if (t.includes(" ")) return false;
+  return /^[^\/\s]+\/[^\/\s]+$/.test(t);
+}
+
 function LocalModels({ folder, activePath, onChoose }: {
   folder: string | null; activePath: string; onChoose: (path: string, name: string) => void;
 }) {
   const [hw, setHw] = useState<HW | null>(null);
-  const [catalog, setCatalog] = useState<CatModel[]>([]);
   const [downloaded, setDownloaded] = useState<Downloaded[]>([]);
-  const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [progress, setProgress] = useState<Record<string, number>>({}); // filename -> 0..1
-  const [toolCaps, setToolCaps] = useState<Record<string, boolean>>({}); // path -> tools_supported
-  const unlistenRef = useRef<null | (() => void)>(null);
+  const [progress, setProgress] = useState<Record<string, number>>({});
+  const [toolCaps, setToolCaps] = useState<Record<string, boolean>>({});
+
+  // OpenRouter-style search state
+  const [query, setQuery] = useState("");
+  const [focused, setFocused] = useState(false);
+  const [searching, setSearching] = useState(false);
+  const [results, setResults] = useState<CatModel[]>([]);
+  const [selected, setSelected] = useState<CatModel | null>(null);
+  const [highlight, setHighlight] = useState(-1);
+  const seqRef = useRef(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
 
   async function refreshDownloaded() {
     try {
       const list = await invoke<Downloaded[]>("local_downloaded");
       setDownloaded(list);
-      // Detect each installed model's tool capability (from its GGUF template).
       for (const d of list) {
         invoke<{ tools_supported: boolean }>("local_tool_capability", { path: d.path })
           .then((c) => setToolCaps((m) => ({ ...m, [d.path]: c.tools_supported })))
@@ -314,19 +319,117 @@ function LocalModels({ folder, activePath, onChoose }: {
     refreshDownloaded();
   }, []);
 
-  async function loadCatalog() {
-    setLoading(true); setErr(null);
+  // click outside to close dropdown
+  useEffect(() => {
+    function onDoc(e: MouseEvent) {
+      if (!wrapRef.current) return;
+      if (!wrapRef.current.contains(e.target as Node)) setFocused(false);
+    }
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, []);
+
+  // debounced Hugging Face search — auto-fills model strings as you type
+  useEffect(() => {
+    const q = query.trim();
+    if (q.length < 2) {
+      setResults([]);
+      setSearching(false);
+      setErr(null);
+      return;
+    }
+    // if a valid selection is showing and query still equals its repo, keep it (don't re-search to avoid flicker)
+    if (selected && q === selected.repo) {
+      setResults([]);
+      return;
+    }
+    // repo-id exact path: we don't live-search for "author/name" while typing it — wait for Enter/blur to lookup
+    // but if user is still mid-typing a repo-like string with no space, we still offer search results for convenience
+    const seq = ++seqRef.current;
+    const t = setTimeout(async () => {
+      setSearching(true);
+      setErr(null);
+      try {
+        const res = await invoke<{ hardware: HW; models: CatModel[] }>("local_search", { query: q, limit: 8 });
+        if (seq !== seqRef.current) return;
+        setHw(res.hardware);
+        setResults(res.models || []);
+        setHighlight(-1);
+      } catch (e) {
+        if (seq !== seqRef.current) return;
+        setErr(String(e));
+        setResults([]);
+      } finally {
+        if (seq === seqRef.current) setSearching(false);
+      }
+    }, 280);
+    return () => clearTimeout(t);
+  }, [query, selected]);
+
+  async function pickModel(m: CatModel) {
+    setSelected(m);
+    setQuery(m.repo);
+    setResults([]);
+    setFocused(false);
+    setHighlight(-1);
+    setErr(null);
+  }
+
+  async function resolveExactRepo(repo: string) {
+    const r = repo.trim();
+    if (!isRepoId(r)) return false;
+    setSearching(true);
+    setErr(null);
     try {
-      const res = await invoke<{ hardware: HW; models: CatModel[] }>("local_catalog", { perFamily: 4 });
-      setHw(res.hardware); setCatalog(res.models);
-    } catch (e) { setErr(String(e)); }
-    finally { setLoading(false); }
+      const m = await invoke<CatModel>("local_lookup", { repoId: r });
+      // local_lookup returns a single scored model object; normalize shape
+      // Some backends return { ...model } directly, others may wrap — handle both
+      const model = (m as any).repo ? (m as CatModel) : (m as any).model as CatModel;
+      if (model && (model as any).repo) {
+        setSelected(model);
+        setQuery((model as any).repo);
+        setResults([]);
+        setFocused(false);
+        return true;
+      }
+      // fallback: if lookup returned wrapper, try to use it
+      if ((m as any).repo) {
+        setSelected(m as CatModel);
+        setQuery((m as any).repo);
+        setResults([]);
+        setFocused(false);
+        return true;
+      }
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setSearching(false);
+    }
+    return false;
+  }
+
+  async function handleSubmit() {
+    const q = query.trim();
+    if (!q) return;
+    // exact repo id -> lookup and show card
+    if (isRepoId(q)) {
+      const ok = await resolveExactRepo(q);
+      if (ok) return;
+    }
+    // otherwise if highlighted result exists, pick it
+    if (highlight >= 0 && results[highlight]) {
+      await pickModel(results[highlight]);
+      return;
+    }
+    // if single result, auto-pick
+    if (results.length === 1) {
+      await pickModel(results[0]);
+      return;
+    }
+    // no exact match — keep dropdown open for disambiguation
   }
 
   async function download(q: Quant) {
-    // Tauri event names must be simple (alphanumeric/-/_/ /:) — a channel built
-    // from the filename (dots, slashes) can make listen() silently no-op, which
-    // looked exactly like a frozen 0%. Use a safe, unique channel instead.
     const channel = `dl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     setErr(null);
     setProgress((p) => ({ ...p, [q.filename]: 0 }));
@@ -334,7 +437,6 @@ function LocalModels({ folder, activePath, onChoose }: {
       const { got, total, done } = e.payload || {};
       setProgress((p) => ({ ...p, [q.filename]: done ? 1 : (total ? got / total : 0) }));
     });
-    unlistenRef.current = un;
     try {
       await invoke("local_download", { channel, url: q.download_url, filename: q.filename });
       await refreshDownloaded();
@@ -343,18 +445,65 @@ function LocalModels({ folder, activePath, onChoose }: {
   }
 
   async function del(d: Downloaded) {
-    try { await invoke("local_delete", { filename: d.filename }); await refreshDownloaded(); }
+    try { await invoke("local_delete", { filename: d.filename }); await refreshDownloaded(); if (selected && d.filename && selected.quants.some(q => q.filename === d.filename)) { /* keep card */ } }
     catch (e) { setErr(String(e)); }
   }
 
   const isDown = (fname: string) => downloaded.some((d) => d.filename === fname);
+  const showDropdown = focused && results.length > 0;
+
+  function renderModelCard(m: CatModel) {
+    const rec = m.quants[0];
+    const perf = rec?.perf;
+    const ctx = contextWords(m.context_tokens);
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 6, paddingTop: 12, borderTop: "var(--border-width) solid var(--line)" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+            <span style={{ fontWeight: 800, fontSize: 15 }}>{m.name}</span>
+            <span style={{ fontSize: 12, color: "var(--text-faint)" }}>{m.family_label} · {m.params_billions}B</span>
+            <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 11, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.repo}</span>
+          </div>
+          <div style={{ display: "flex", gap: 14, flexWrap: "wrap", fontSize: 13 }}>
+            {perf && (
+              <span title={perf.note}>
+                {perf.badge} <b>Speed on your Mac:</b>{" "}
+                {perf.fits ? <>{speedWords(perf)}{perf.tokens_per_sec && <span style={{ color: "var(--text-faint)" }}> ({perf.tokens_per_sec})</span>}</> : "won't fit"}
+              </span>
+            )}
+            <span title={ctx.long}>
+              🧠 <b>Memory:</b> {ctx.short === "—" ? "unknown" : <>{ctx.short} tokens <span style={{ color: "var(--text-faint)" }}>(≈ a {m.context_tokens >= 100000 ? "whole book" : m.context_tokens >= 30000 ? "long essay" : "few pages"} of conversation)</span></>}
+            </span>
+          </div>
+        </div>
+        {m.quants.map((q) => {
+          const pct = progress[q.filename];
+          const downloading = pct !== undefined;
+          return (
+            <div key={q.filename} style={{ display: "flex", alignItems: "center", gap: 12, paddingLeft: 4 }}>
+              {(() => { const b = quantBlurb(q.quant); return (
+              <span style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0 }}>
+                <span style={{ fontSize: 13, fontWeight: 700 }}>{b.title} <span style={{ fontWeight: 400, color: "var(--text-muted)" }}>— {b.sub}</span></span>
+                <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 10, color: "var(--text-faint)" }}>~{q.size_gb.toFixed(1)}GB download · {q.quant} · {q.filename}</span>
+              </span>
+              ); })()}
+              {isDown(q.filename)
+                ? <Pill tone="ok">installed ✓</Pill>
+                : downloading
+                  ? <span style={{ fontSize: 12, fontFamily: "ui-monospace, monospace", width: 90, textAlign: "right" }}>{Math.round(pct * 100)}%</span>
+                  : <Button variant="secondary" onClick={() => download(q)} disabled={!q.perf.fits}>Download</Button>}
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
 
   return (
     <Card title="Local Models">
       <p style={hint}>Download and run open models entirely on your machine — no accounts, no cloud, fully private. Powered by an engine built right into AYGENT.</p>
       {hw && <Pill tone="muted">🖥 {hw.summary}</Pill>}
 
-      {/* Downloaded models — pick one to chat with */}
       {downloaded.length > 0 && (
         <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
           <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text-muted)" }}>Installed</span>
@@ -362,9 +511,6 @@ function LocalModels({ folder, activePath, onChoose }: {
             const toolable = toolCaps[d.path];
             return (
             <div key={d.filename} style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              {/* Non-selectable info row (Mason: models are picked per-agent in
-                  the Agents tab, so NO radio/select here — just show what's
-                  installed). */}
               <div style={{ flex: 1, border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-card)", padding: "10px 14px", background: "var(--bg)", boxShadow: "var(--elevation)" }}>
                 <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
                   <b style={{ fontSize: 14 }}>{d.filename.replace(/\.gguf$/i, "")}</b>
@@ -388,68 +534,99 @@ function LocalModels({ folder, activePath, onChoose }: {
         </p>
       )}
 
-      {/* Catalog browser */}
-      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6 }}>
-        <Button onClick={loadCatalog} disabled={loading}>{loading ? "Loading…" : catalog.length ? "Refresh catalog" : "Browse models"}</Button>
-        <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Latest Qwen · Mistral · Kimi · Llama</span>
-      </div>
-      {err && <Pill tone="danger">✗ {err}</Pill>}
-
-      {catalog.map((m) => {
-        // Speed + context belong to the MODEL (both downloads run at the same
-        // speed — the quant tradeoff is quality vs download size, not speed).
-        const rec = m.quants[0];
-        const perf = rec?.perf;
-        const ctx = contextWords(m.context_tokens);
-        return (
-          <div key={m.repo} style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 6, paddingTop: 12, borderTop: "var(--border-width) solid var(--line)" }}>
-            {/* MODEL HEADER: name + the two facts that matter (speed, memory) */}
-            <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-              <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
-                <span style={{ fontWeight: 800, fontSize: 15 }}>{m.name}</span>
-                <span style={{ fontSize: 12, color: "var(--text-faint)" }}>{m.family_label} · {m.params_billions}B</span>
-              </div>
-              <div style={{ display: "flex", gap: 14, flexWrap: "wrap", fontSize: 13 }}>
-                {perf && (
-                  <span title={perf.note}>
-                    {perf.badge} <b>Speed on your Mac:</b>{" "}
-                    {perf.fits ? <>{speedWords(perf)}{perf.tokens_per_sec && <span style={{ color: "var(--text-faint)" }}> ({perf.tokens_per_sec})</span>}</> : "won't fit"}
-                  </span>
-                )}
-                <span title={ctx.long}>
-                  🧠 <b>Memory:</b> {ctx.short === "—" ? "unknown" : <>{ctx.short} tokens <span style={{ color: "var(--text-faint)" }}>(≈ a {m.context_tokens >= 100000 ? "whole book" : m.context_tokens >= 30000 ? "long essay" : "few pages"} of conversation)</span></>}
-                </span>
-              </div>
-            </div>
-            {/* DOWNLOAD CHOICES: same model, different compression. Quality vs size. */}
-            {m.quants.map((q) => {
-              const pct = progress[q.filename];
-              const downloading = pct !== undefined;
-              return (
-                <div key={q.filename} style={{ display: "flex", alignItems: "center", gap: 12, paddingLeft: 4 }}>
-                  {(() => { const b = quantBlurb(q.quant); return (
-                  <span style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0 }}>
-                    <span style={{ fontSize: 13, fontWeight: 700 }}>{b.title} <span style={{ fontWeight: 400, color: "var(--text-muted)" }}>— {b.sub}</span></span>
-                    <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 10, color: "var(--text-faint)" }}>~{q.size_gb.toFixed(1)}GB download · {q.quant}</span>
-                  </span>
-                  ); })()}
-                  {isDown(q.filename)
-                    ? <Pill tone="ok">installed ✓</Pill>
-                    : downloading
-                      ? <span style={{ fontSize: 12, fontFamily: "ui-monospace, monospace", width: 90, textAlign: "right" }}>{Math.round(pct * 100)}%</span>
-                      : <Button variant="secondary" onClick={() => download(q)} disabled={!q.perf.fits}>Download</Button>}
-                </div>
-              );
-            })}
+      {/* OpenRouter-style search */}
+      <div ref={wrapRef} style={{ position: "relative", marginTop: 6 }}>
+        <div style={{ display: "flex", gap: 8 }}>
+          <div style={{ flex: 1, position: "relative" }}>
+            <span style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", color: "var(--text-faint)", fontSize: 14, pointerEvents: "none" }}>⌕</span>
+            <input
+              ref={inputRef}
+              value={query}
+              onChange={(e) => { setQuery(e.target.value); if (selected && e.target.value !== selected.repo) setSelected(null); }}
+              onFocus={() => setFocused(true)}
+              onKeyDown={(e) => {
+                if (e.key === "ArrowDown") { e.preventDefault(); setFocused(true); setHighlight((h) => Math.min(results.length - 1, h + 1)); }
+                else if (e.key === "ArrowUp") { e.preventDefault(); setHighlight((h) => Math.max(-1, h - 1)); }
+                else if (e.key === "Enter") { e.preventDefault(); void handleSubmit(); }
+                else if (e.key === "Escape") { setFocused(false); setHighlight(-1); }
+              }}
+              placeholder="Search Hugging Face — type 'Qwen', 'Mistral 7B', or paste a repo like bartowski/Qwen3-14B-GGUF"
+              style={{
+                width: "100%", padding: "10px 36px 10px 32px",
+                background: "var(--bg)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)",
+                color: "var(--text)", fontSize: 14, boxShadow: "var(--elevation)", outline: "none",
+              }}
+            />
+            {query && (
+              <button
+                onClick={() => { setQuery(""); setResults([]); setSelected(null); setErr(null); inputRef.current?.focus(); }}
+                style={{
+                  position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)",
+                  background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: 999,
+                  width: 22, height: 22, display: "flex", alignItems: "center", justifyContent: "center",
+                  cursor: "pointer", color: "var(--text-muted)", fontSize: 12, lineHeight: 1,
+                }}
+                aria-label="Clear"
+              >✕</button>
+            )}
           </div>
-        );
-      })}
-      {catalog.length > 0 && (
+          <Button variant="secondary" onClick={() => void handleSubmit()} disabled={searching}>
+            {searching ? "…" : "Go"}
+          </Button>
+        </div>
+
+        {/* dropdown */}
+        {showDropdown && (
+          <div style={{
+            position: "absolute", left: 0, right: 48, top: "calc(100% + 6px)", zIndex: 20,
+            background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-card)",
+            boxShadow: "var(--elevation)", overflow: "hidden", maxHeight: 360, overflowY: "auto",
+          }}>
+            {results.map((m, idx) => (
+              <button
+                key={m.repo}
+                onMouseEnter={() => setHighlight(idx)}
+                onClick={() => void pickModel(m)}
+                style={{
+                  display: "flex", flexDirection: "column", gap: 2, width: "100%", textAlign: "left", cursor: "pointer",
+                  padding: "10px 12px", border: "none", borderBottom: "var(--border-width) solid var(--line)",
+                  background: highlight === idx ? "var(--bg)" : "var(--surface)", color: "var(--text)", font: "inherit",
+                }}
+              >
+                <span style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+                  <span style={{ fontWeight: 700, fontSize: 13 }}>{m.repo}</span>
+                  <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{m.family_label} · {m.params_billions}B · {m.quants.map(q=>q.quant).join(", ")}</span>
+                </span>
+                <span style={{ fontSize: 12, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name} · {m.downloads.toLocaleString()} downloads</span>
+              </button>
+            ))}
+            <div style={{ padding: "8px 12px", fontSize: 11, color: "var(--text-faint)" }}>
+              {searching ? "Searching Hugging Face…" : `${results.length} result${results.length===1?"":"s"} — auto-filled from Hugging Face`}
+            </div>
+          </div>
+        )}
+
+        {searching && !showDropdown && <div style={{ fontSize: 12, color: "var(--text-faint)", marginTop: 6 }}>Searching Hugging Face…</div>}
+        {err && <Pill tone="danger">✗ {err}</Pill>}
+        {!searching && focused && !showDropdown && query.trim().length >= 2 && results.length === 0 && !selected && (
+          <div style={{ fontSize: 12, color: "var(--text-faint)", marginTop: 6 }}>No GGUF models found. Try a broader term or paste an exact repo id like <code>bartowski/Qwen3-14B-GGUF</code> and press Go.</div>
+        )}
+      </div>
+
+      {/* selected info card — same data as before */}
+      {selected && renderModelCard(selected)}
+
+      {selected && (
         <div style={{ ...hint, fontSize: 12, color: "var(--text-faint)", marginTop: 8, display: "flex", flexDirection: "column", gap: 3 }}>
           <span><b>Which download should I pick?</b> Both are the exact same model at different compression. “Recommended” is nearly identical quality in a smaller file — pick it unless you have plenty of free memory and want the absolute best.</span>
           <span><b>Speed</b> (“tok/s” = tokens per second) is how fast the AI types. ~15+ feels quick; under ~8 feels sluggish. <b>Memory</b> is how much conversation the model can keep in mind at once. Estimates, not benchmarks.</span>
-          <span>Local models run in chat mode; file tools are coming soon.</span>
         </div>
+      )}
+
+      {!selected && (
+        <p style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>
+          Start typing to search Hugging Face — results auto-fill as you type. Paste an exact repo id (e.g. <code>bartowski/Qwen3-14B-GGUF</code>) and press Enter/Go to jump straight to its info card with the same speed &amp; download choices.
+        </p>
       )}
     </Card>
   );

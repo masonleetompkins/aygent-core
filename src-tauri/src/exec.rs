@@ -359,7 +359,12 @@ impl ExecBroker {
         // Per-agent GitHub PAT injection (ephemeral, no keychain write)
         inject_github_env(&mut cmd, agent_id);
 
-        let mut child = cmd.spawn().map_err(|e| ExecError::Spawn(e.to_string()))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("Too many open files") || e.raw_os_error() == Some(24) {
+                ExecError::Spawn(format!("{} — FD table jammed (256 limit, ~25 shell_run in one session). Fix: run `git push` from Terminal outside AYGENT, or Quit+Reopen to reset FD table.", msg))
+            } else { ExecError::Spawn(msg) }
+        })?;
 
         let output = Arc::new(Mutex::new(OutputStore::new(Some(log_path.clone()))));
 
@@ -386,6 +391,17 @@ impl ExecBroker {
             exit_code: Mutex::new(None),
         });
         self.procs.lock().unwrap().insert(handle.clone(), proc);
+        // FD-JAM GUARD (1.0.9): reap dead handles so 25 shell_runs do not eat the 256 FD table
+        {
+            let mut tbl = self.procs.lock().unwrap();
+            let cutoff = Instant::now() - Duration::from_secs(300);
+            tbl.retain(|_, pr| {
+                if pr.exit_code.lock().unwrap().is_some() && pr.started < cutoff { false } else { true }
+            });
+            while tbl.len() > 40 {
+                if let Some(k) = tbl.keys().next().cloned() { tbl.remove(&k); } else { break; }
+            }
+        }
 
         Ok(serde_json::json!({
             "ok": true,

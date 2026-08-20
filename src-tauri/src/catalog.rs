@@ -104,8 +104,8 @@ async fn fetch_family(
         let author = id.split('/').next().unwrap_or("");
         let lower = id.to_lowercase();
 
-        // FILTER junk: keep it clean + safe.
-        if is_junk(&lower) { continue; }
+        // Curated default list: technically-usable AND standard instruct models.
+        if is_unusable(&lower) || is_off_catalog(&lower) { continue; }
         // Prefer trusted authors; skip unknown authors to guarantee quality.
         if !fam.trusted_authors.iter().any(|a| a.eq_ignore_ascii_case(author)) { continue; }
 
@@ -128,14 +128,29 @@ async fn fetch_family(
     Ok(models)
 }
 
-/// Reject repos that aren't clean instruct models suitable for a general user.
-fn is_junk(lower: &str) -> bool {
+/// Reject repos that WON'T WORK as a chat model in AYGENT: adapters and base
+/// models (no instruct tuning), and non-chat modalities (vision/audio/
+/// embedding/reranker GGUFs). This is a TECHNICAL filter, not a content one —
+/// these downloads would simply not function as a chat agent.
+fn is_unusable(lower: &str) -> bool {
     const BAD: &[&str] = &[
-        "abliterated", "uncensored", "heretic", "lora", "adapter", "-sft",
-        "roleplay", "rp-", "erotic", "nsfw", "toxic", "base_model", "draft",
+        "lora", "adapter", "-sft", "base_model", "draft",
         "vision", "vl-", "-vl", "audio", "embedding", "reranker",
     ];
     BAD.iter().any(|b| lower.contains(b))
+}
+
+/// Content-style tags (uncensored/abliterated/roleplay...) — kept OUT of the
+/// curated default catalog so the out-of-the-box list stays predictable, but
+/// deliberately NOT applied to search/lookup: the user owns this machine and
+/// can download any model they explicitly go looking for (Mason 08-19 —
+/// "if I'm using local models, I understand the risk").
+fn is_off_catalog(lower: &str) -> bool {
+    const TAGS: &[&str] = &[
+        "abliterated", "uncensored", "heretic", "roleplay", "rp-",
+        "erotic", "nsfw", "toxic",
+    ];
+    TAGS.iter().any(|t| lower.contains(t))
 }
 
 /// Pull GGUF quants and collapse them to just TWO friendly choices for an
@@ -317,7 +332,9 @@ pub async fn search(query: String, limit: usize) -> Result<Vec<CatalogModel>, St
         let id = repo.get("id").and_then(|i| i.as_str()).unwrap_or("");
         if id.is_empty() { continue; }
         let lower = id.to_lowercase();
-        if is_junk(&lower) { continue; }
+        // Search is the power-user path: only skip repos that literally will not
+        // run as a chat model. No content filtering — the user searched for it.
+        if is_unusable(&lower) { continue; }
         let params = parse_params(&lower);
         let quants = extract_quants(repo, id, params);
         if quants.is_empty() { continue; }

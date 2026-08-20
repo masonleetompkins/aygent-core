@@ -302,7 +302,7 @@ pub async fn meta_stream_turn<F: FnMut(StreamEvent)>(
     let mut body = json!({
         "model": model,
         "input": build_muse_input(system, messages),
-        "max_output_tokens": 8192,
+        "max_output_tokens": 32000,
         "stream": true,
     });
     if !tools_json.as_array().map(|a| a.is_empty()).unwrap_or(true) {

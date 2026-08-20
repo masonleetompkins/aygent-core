@@ -1667,7 +1667,31 @@ async fn conv_compact(
             if provider == "meta" { meta_provider::complete(&key, &agent.model, &ask).await? }
             else { openai_provider::complete(&provider, &key, &agent.model, &ask).await? }
         }
-        _ => return Err("compaction needs a cloud provider (Anthropic/OpenAI/OpenRouter)".into()),
+        "local" => {
+            // LOCAL MODELS COMPACT TOO (Mason 08-19): Gwen authors her own
+            // summary in-process — no cloud key needed, which matters MOST here
+            // because small context windows are exactly where compaction is
+            // needed. `agent.model` is the absolute GGUF path on this provider.
+            if agent.model.trim().is_empty() { return Err("no local model selected for this agent".into()); }
+            let path = agent.model.clone();
+            let ctx_tokens = local_context_budget(&path);
+            let msgs = serde_json::json!([{ "role": "user", "content": ask }]);
+            let (content, _stop) = local_provider::local_stream_turn(
+                &path,
+                "You are a precise summarizer. Output only the summary — no preamble.",
+                &msgs, ctx_tokens, |_| {},
+            ).await?;
+            let raw = content.as_array()
+                .and_then(|a| a.first())
+                .and_then(|b| b.get("text")).and_then(|t| t.as_str())
+                .unwrap_or("").to_string();
+            // Reasoning models (Qwen3) may wrap musing in <think> blocks — the
+            // briefing must be the visible answer only.
+            let cleaned = local_tools::strip_think(&raw).trim().to_string();
+            if cleaned.is_empty() { return Err("local model produced an empty summary — try again".into()); }
+            cleaned
+        }
+        _ => return Err("compaction needs a cloud provider (Anthropic/OpenAI/OpenRouter) or a local model".into()),
     };
 
     // The new history is a SINGLE user turn carrying the briefing, so the next
@@ -3462,6 +3486,23 @@ fn step_is_first_result(step: &str) -> bool {
         || s.contains("click the first")
 }
 
+fn is_placeholder_spin(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    // Muse Spark 1.2 at 150k+ tokens emits these placeholder prefixes (see screenshot 18:24-18:47)
+    // They are text-only turns with zero tool_calls that stall until user says "continue"
+    t.contains("reworking your")
+        || t.contains("matching that")
+        || t.contains("building your")
+        || t.contains("mapping the current")
+        || t.contains("pulling your current")
+        || t.contains("tracing how")
+        || t.contains("lining up")
+        || t.contains("digging into")
+        || (t.contains("openrouter") && t.contains("search"))
+        || (t.contains("wiring") && t.contains("type-ahead"))
+        || (t.contains("openrouter-style") && t.len() < 220)
+}
+
 fn step_is_nav(step: &str) -> bool {
     let s = step.to_ascii_lowercase();
     // Any verb that means "end up on a different page/destination".
@@ -4599,7 +4640,26 @@ async fn agent_stream(
         // local model should know about, appended to its native tool prompt.
         let (_reg_tools, reg_instr) = agent_tools_for(&app, Some(&scope_id), folder.as_deref());
         let pdf_cfg = pdf_config_for(&app, Some(&scope_id), folder.as_deref());
-        let base_sys = format!("{AGENT_SYSTEM_LOCAL}{extra_block}{reg_instr}");
+        // AUTO-INJECT MEMORY (RAG, Mason 08-19): retrieve notes relevant to THIS
+        // prompt and put them straight into the system block. Small local models
+        // are unreliable at *choosing* to call a memory tool — this way relevant
+        // memory is simply present, no call required. The recall tool remains for
+        // explicit searches ("read your memory about X"). Failures are silent:
+        // memory is an enhancement, never a blocker for the turn.
+        let memory_block: String = match ensure_embed_model(&app).await {
+            Ok(em) => match memory::retrieve(&db, "agent", &scope_id, &prompt, 3, 1, &em, "").await {
+                Ok(notes) if !notes.is_empty() => {
+                    let mut b = String::from("\n\nRelevant notes from your long-term memory (use them if they help):\n");
+                    for n in &notes {
+                        b.push_str(&format!("- [{}] {}: {}\n", n.ntype, n.title, n.snippet));
+                    }
+                    b
+                }
+                _ => String::new(),
+            },
+            Err(_) => String::new(),
+        };
+        let base_sys = format!("{AGENT_SYSTEM_LOCAL}{extra_block}{reg_instr}{memory_block}");
         let sys = local_tools::system_prompt_with_tools(&base_sys, &cap.format);
 
         for turn in 0..LOCAL_TOOL_TURN_CAP {
@@ -4616,9 +4676,38 @@ async fn agent_stream(
                 "role": "assistant", "content": content
             }));
 
-            // Parse tool calls in the model's native format.
-            let calls = local_tools::parse_tool_calls(&text, &cap.format);
-            if calls.is_empty() { break; } // no tool wanted → done
+            // Parse tool calls in the model's native format — from the VISIBLE
+            // text only: reasoning models (Qwen3) muse about hypothetical calls
+            // inside <think> blocks; those must never execute.
+            let visible = local_tools::strip_think(&text);
+            let mut calls = local_tools::parse_tool_calls(&visible, &cap.format);
+            if calls.is_empty() {
+                // Qwen3 sometimes emits the call INSIDE an unclosed <think>
+                // ("memory call stuffed in a thought", Mason 08-19) — rescue it.
+                calls = local_tools::rescue_call_from_unclosed_think(&text, &cap.format);
+            }
+            if calls.is_empty() {
+                // The model TRIED to call a tool but we couldn't parse it
+                // (malformed JSON, raw newlines in strings...). Silently
+                // breaking here made the write "look emitted but never run"
+                // (Mason 08-19, bug #2b) — instead, tell the model what went
+                // wrong so it can retry within the turn cap.
+                let tried = local_tools::has_tool_marker(&visible, &cap.format)
+                    || local_tools::unclosed_think_tail(&text)
+                        .is_some_and(|t| local_tools::has_tool_marker(t, &cap.format));
+                if tried && turn + 1 < LOCAL_TOOL_TURN_CAP {
+                    let _ = app.emit(&channel, &provider::StreamEvent::Info {
+                        text: "tool call couldn't be parsed — asking the model to retry".to_string(),
+                    });
+                    messages.as_array_mut().unwrap().push(serde_json::json!({
+                        "role": "user",
+                        "content": local_tools::format_tool_result(&cap.format, "parser",
+                            "Your tool call could not be parsed. Emit EXACTLY one tool call with valid single-line JSON: {\"name\": \"write_file\", \"arguments\": {\"path\": \"...\", \"content\": \"...\"}} — escape newlines in strings as \\n, and put path/content directly inside \"arguments\" (do not nest another \"arguments\" object).", true),
+                    }));
+                    continue;
+                }
+                break; // no tool wanted → done
+            }
 
             // Execute each call through the SAME jailed broker + emit UI events.
             // Local calls have no provider tool_use id — synthesize one so the
@@ -4634,6 +4723,29 @@ async fn agent_stream(
                     // SELF-INTROSPECTION (parity with the cloud paths): read-only
                     // identity + model + capabilities. No jail/broker call needed.
                     (introspect::build_whoami(&app, &db, &scope_id, folder.as_deref()), false)
+                } else if c.name == "recall" {
+                    // MEMORY SEARCH (Mason 08-19): semantic retrieval over the
+                    // agent's vault — the read path local models were missing
+                    // ("read your memory" used to have no correct tool).
+                    let q = c.input.get("query").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                    if q.is_empty() {
+                        ("recall needs a \"query\" argument — what should I search my memory for?".to_string(), true)
+                    } else {
+                        match ensure_embed_model(&app).await {
+                            Err(e) => (format!("memory unavailable: {e}"), true),
+                            Ok(em) => match memory::retrieve(&db, "agent", &scope_id, &q, 4, 1, &em, "").await {
+                                Err(e) => (format!("memory search failed: {e}"), true),
+                                Ok(notes) if notes.is_empty() => (format!("No memories found for \"{q}\"."), false),
+                                Ok(notes) => {
+                                    let mut r = String::new();
+                                    for n in &notes {
+                                        r.push_str(&format!("[{}] {} — {}\n", n.ntype, n.title, n.snippet));
+                                    }
+                                    (r, false)
+                                }
+                            },
+                        }
+                    }
                 } else if dashboard::is_dashboard_tool(&c.name) {
                     dashboard::exec_dashboard_tool(&db, &scope_id, &c.name, &c.input)
                 } else {
@@ -4716,6 +4828,7 @@ async fn agent_stream(
         let mut same_sig_streak: usize = 0;
         let mut err_round_streak: usize = 0;
         let mut stall_reason: Option<String> = None;
+        let mut placeholder_streak: usize = 0;
         let mut finished_naturally = false;
         while rounds < max_rounds {
             rounds += 1;
@@ -4755,7 +4868,12 @@ async fn agent_stream(
 
             // Push the assistant message (OpenAI-native shape, may carry tool_calls).
             messages.as_array_mut().unwrap().push(assistant.clone());
-
+            // 1.0.9 placeholder-spin guard (Muse 1.2 at 150k+ tok: see screenshots)
+            {
+                let is_ph = assistant.get("content").and_then(|c| c.as_str()).map(|s| is_placeholder_spin(s)).unwrap_or(false);
+                let has_tools = assistant.get("tool_calls").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+                if is_ph && !has_tools { placeholder_streak += 1; } else if has_tools { placeholder_streak = 0; } else if !is_ph { placeholder_streak = 0; }
+            }
             // Execute tool_calls (OpenAI shape) through the SAME jailed broker.
             let mut had_tools = false;
             if let Some(tcs) = assistant.get("tool_calls").and_then(|t| t.as_array()) {
@@ -4803,6 +4921,13 @@ async fn agent_stream(
                                 }
                             }
                         }
+                    } else if connectors::is_connector_tool(&name) {
+                        // Registry-driven connector tools (GitHub, Notion, ...):
+                        // same privileged-side credential attach as the Anthropic
+                        // path. This branch was MISSING here — the schemas were
+                        // offered (agent_tools_for_full with conn_ctx) but dispatch
+                        // fell through to "unknown tool" (Mason 08-19, bug #1).
+                        connector_exec::exec(&db, &scope_id, &name, &input).await
                     } else if mcp::is_mcp_tool(&name) {
                         mcp::exec(&name, &input)
                     } else if dashboard::is_dashboard_tool(&name) {
@@ -4855,10 +4980,10 @@ async fn agent_stream(
             if had_tools {
                 if round_calls > 0 && round_errs == round_calls { err_round_streak += 1; } else { err_round_streak = 0; }
                 // STALL DETECTOR (see the Anthropic path): nudge once, then pause.
-                let stalled = same_sig_streak >= 5 || err_round_streak >= 4;
+                let stalled = same_sig_streak >= 5 || err_round_streak >= 4 || placeholder_streak >= 3;
                 if stalled {
                     if stall_reason.is_none() {
-                        stall_reason = Some(if same_sig_streak >= 5 { "repeating the same call".to_string() } else { "every tool call failing".to_string() });
+                        stall_reason = Some(if placeholder_streak >= 3 { "placeholder spin (model stalled without tools)".to_string() } else if same_sig_streak >= 5 { "repeating the same call".to_string() } else { "every tool call failing".to_string() });
                         same_sig_streak = 0; err_round_streak = 0;
                         messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user",
                             "content": "[system note] You appear stuck (repeating calls / repeated failures). Change approach, or stop calling tools and summarize where you are and what is blocking you." }));
@@ -4956,6 +5081,7 @@ async fn agent_stream(
     let mut same_sig_streak: usize = 0;          // consecutive IDENTICAL calls
     let mut err_round_streak: usize = 0;         // consecutive rounds where EVERY tool errored
     let mut stall_reason: Option<String> = None;
+    let mut placeholder_streak: usize = 0;
     let mut finished_naturally = false;
     while rounds < max_rounds {
         rounds += 1;
@@ -5106,6 +5232,12 @@ async fn agent_stream(
             }
         }
 
+        // 1.0.9 placeholder-spin (anthropic): count text-only placeholder turns
+        if tool_results.is_empty() {
+            let txt = content.as_array().and_then(|a| a.iter().find_map(|b| b.get("text").and_then(|v| v.as_str()))).unwrap_or("");
+            if is_placeholder_spin(txt) { placeholder_streak += 1; } else { placeholder_streak = 0; }
+        } else { placeholder_streak = 0; }
+
         // CRITICAL Anthropic invariant: EVERY tool_use block MUST be followed
         // immediately by a message containing its matching tool_result. So the
         // decision to send results is driven by "did we produce any tool_use
@@ -5125,10 +5257,10 @@ async fn agent_stream(
             // all-errored rounds → first offense injects a course-correct nudge
             // the model sees with its tool results; a persisting stall pauses the
             // turn with an HONEST status instead of looping forever.
-            let stalled = same_sig_streak >= 5 || err_round_streak >= 4;
+            let stalled = same_sig_streak >= 5 || err_round_streak >= 4 || placeholder_streak >= 3;
             if stalled {
                 if stall_reason.is_none() {
-                    stall_reason = Some(if same_sig_streak >= 5 { "repeating the same call".to_string() } else { "every tool call failing".to_string() });
+                    stall_reason = Some(if placeholder_streak >= 3 { "placeholder spin (model stalled without tools)".to_string() } else if same_sig_streak >= 5 { "repeating the same call".to_string() } else { "every tool call failing".to_string() });
                     same_sig_streak = 0; err_round_streak = 0;
                     messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": [{ "type": "text",
                         "text": "[system note] You appear stuck (repeating calls / repeated failures). Change approach, or stop calling tools and summarize where you are and what is blocking you." }] }));

@@ -1,3 +1,129 @@
+# Stage build — Aug 19, 2026, 19:05 PDT — v1.0.10 (REBUILD #2 → promoted with recall/RAG on top)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, **0 errors** (dead-code warnings only). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**This rebuild SUPERSEDES both prior v1.0.10 builds** — the 17:32 build (3 commits) and the 18:26 rebuild (6 commits, never shipped to these notes). Same version number — all additions are non-breaking fixes/features.
+
+**Commits folded in (all on `staging`, HEAD `f6470e5`):**
+- `86940db` — fix(local): SIGABRT crash on long local-model chats — size llama.cpp n_batch to the prompt
+- `758afbb` — perf(local): partial GPU offload — kill the CPU cliff
+- `42d8b90` — perf(local): KV-cache reuse across turns — persistent llama sessions; v1.0.10
+- `5889490` — fix(local): rescue tool calls emitted inside an unclosed `<think>` block
+- `e13e23a` — fix(local): Compact works for local-model agents — summarize in-process
+- `692fe34` — feat(catalog): unblock uncensored/abliterated models in HF search + lookup
+- `f6470e5` — fix(local): evict old model sessions + weights when switching models **(new vs. 18:26)**
+- `791ad98` — feat(local): recall memory tool + RAG auto-inject + few-shot tool examples **(landed after this bundle; included in the promoted production build)**
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 39,334,296 bytes), mtime **Aug 19 19:05**
+- dmg: `dmg/AYGENT_1.0.10_aarch64.dmg`, **17,208,677 bytes (~16.4 MB)**, mtime **Aug 19 19:05**
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## What this rebuild adds vs. 18:26
+1. **Model-switch eviction (`f6470e5`)** — switching a local agent to a different GGUF now evicts the old model's persistent sessions AND unloads the old weights before loading the new model. Previously both models' weights could sit in memory simultaneously → memory error / failed load on the second model.
+
+## Carried from 18:26 (still in this bundle)
+- **Think-rescue (`5889490`)** — tool calls emitted inside an unclosed `<think>` block are rescued and executed.
+- **Local Compact (`e13e23a`)** — Compact works on local-model agents; summary generated in-process.
+- **Catalog unblock (`692fe34`)** — HF search/lookup no longer filters uncensored/abliterated models.
+
+## Carried from 17:32 (still in this bundle)
+- **Partial GPU offload (`758afbb`)** — oversized GGUFs offload as many layers as fit instead of dropping to all-CPU.
+- **KV-cache reuse (`42d8b90`)** — persistent llama sessions across turns; turn 2+ prefill near-instant.
+- **SIGABRT fix (`86940db`)** — n_batch sized to the prompt; long local prompts don't abort.
+
+## Smoke QA for this build (~12 min)
+**New in this rebuild:**
+1. **Model switch** — on a local agent, load GGUF A, chat a turn, switch to GGUF B, chat again → **second model loads and runs, no memory error**; then switch back → still fine.
+
+**Carried:**
+2. **Think-rescue** — on Gwen (local agent), ask "read your memory" → the `whoami`/tool call **executes** instead of being stuffed into the Thoughts bar.
+3. **Local Compact** — hit **Compact** on a long local-model conversation → runs, context% drops, summary seed is coherent.
+4. **Catalog unblock** — HF search for **"uncensored"** / **"abliterated"** → results return, a model downloads successfully.
+5. **KV-cache reuse** — long local chat: turn 2+ prefill near-instant.
+6. **Partial offload** — oversized GGUF partially offloads instead of all-CPU.
+7. **Long chat past the window** — no crash (SIGABRT fix holds with sessions).
+8. **Regenerate / edit history mid-chat** — coherent output, no stale-cache garbage.
+9. **Embeddings** — embed/index a long note on the local path → completes, no abort.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Browser** — open a page in the in-app browser, agent read of the page.
+6. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
+# Stage build — Aug 19, 2026, 17:32 PDT — v1.0.10 (local perf: partial GPU offload + KV-cache reuse)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, **0 errors, 10 warnings** (dead-code only, telegram/browser/exec — same set as v1.0.9). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (both on `staging`):**
+- `758afbb` — perf(local): partial GPU offload — kill the CPU cliff
+- `42d8b90` — perf(local): KV-cache reuse across turns — persistent llama sessions; v1.0.10
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app`, mtime **Aug 19 17:32**
+- dmg: `dmg/AYGENT_1.0.10_aarch64.dmg`, **17,197,325 bytes (~16.4 MB)**, mtime **Aug 19 17:32**
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## What this build adds
+1. **Partial GPU offload (`758afbb`)** — a GGUF too big for full Metal offload now offloads as many layers as fit instead of silently falling back to all-CPU (the "CPU cliff"). Oversized models get proportionally faster instead of 10x slower.
+2. **KV-cache reuse / persistent sessions (`42d8b90`)** — the llama context persists across turns in a conversation, so turn 2+ reuses the KV cache instead of re-decoding the whole prompt from scratch. Long local chats: the prompt phase on follow-up turns should be near-instant.
+
+## Smoke QA for this build (~8 min)
+1. **KV-cache reuse (the headline)** — long local-model chat: turn 1 normal, then **turn 2+ must be much faster** — prompt/prefill phase near-instant, only generation takes time.
+2. **Partial offload** — load a GGUF too big for full GPU offload → it **partially offloads** (faster than before) instead of dropping to all-CPU.
+3. **Regenerate** — regenerate a response mid-chat → works, output coherent (cache invalidation on divergence).
+4. **Edit history mid-chat** — edit an earlier message and continue → works, no stale-cache garbage in the reply.
+5. **Idle then resume** — leave a local chat idle ~5 min, send a new turn → still works (session survives or rebuilds cleanly).
+6. **Long chat past the window** — push a local chat past the context window → still **no crash** (v1.0.9 SIGABRT fix holds with sessions).
+7. **Embeddings** — embed/index a long note on the local path → completes, no abort.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Browser** — open a page in the in-app browser, agent read of the page.
+6. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
+# Stage build — Aug 19, 2026, 15:23 PDT — v1.0.9 (local-model SIGABRT fix)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, **0 errors, 10 warnings** (dead-code only, telegram/browser/exec). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit:** `86940db` — fix(local): SIGABRT crash on long local-model chats — size llama.cpp n_batch to the prompt
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app`, mtime **Aug 19 15:23**
+- dmg: `dmg/AYGENT_1.0.9_aarch64.dmg`, **~16 MB**, mtime **Aug 19 15:23**
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## What this build fixes
+**Root cause:** llama.cpp was initialized with a fixed `n_batch` smaller than long prompts; feeding a prompt past ~2048 tokens tripped a `GGML_ASSERT` → **SIGABRT**, killing the whole app mid-chat. `n_batch` is now sized to the actual prompt, so long local-model prompts decode instead of aborting.
+
+## Smoke QA for this build (~5 min)
+1. **The fix** — on a llama.cpp agent, run a LONG chat (paste enough to push the prompt past **~2048 tokens**, or accumulate turns) → response streams normally, **no crash / no SIGABRT**.
+2. **Embeddings on a long note** — embed/index a long note on the local path → completes, no abort.
+3. **Short local turn** — a normal-length local chat still streams fine (no regression from batch sizing).
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Browser** — open a page in the in-app browser, agent read of the page.
+6. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
 # Stage build — Aug 13, 2026, 17:11 PDT — v1.0.4 (signed, notarized, reissued — current production)
 
 **Status:** ✅ Signed + notarized + stapled. `cargo tauri build` exit 0, **6 warnings, 0 errors** (dead-code only). Apple Developer ID signed + notarized + stapled + verified.
