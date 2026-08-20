@@ -28,6 +28,9 @@ fn tools_description() -> &'static str {
      - read_file(path): read a UTF-8 text file (path relative to the folder root)\n\
      - write_file(path, content): create/overwrite a UTF-8 text file\n\
      - list_files(path): list a directory ('.' for the folder root)\n\
+     - recall(query): search your long-term MEMORY (the user's notes and things \
+     you were told to remember) — use it when asked about your memory, past \
+     conversations, or anything you might have notes about\n\
      - whoami(): report your own name, model, provider, and the tools you have \
      (read-only; takes no arguments) — use it when asked who or what you are\n\
      Only use a tool when the user's request needs it. After you receive a tool \
@@ -42,12 +45,22 @@ pub fn system_prompt_with_tools(base: &str, format: &str) -> String {
         "qwen" | "chatml" => format!(
             "{base}\n\n{desc}\n\n\
              To call a tool, output a line with ONLY this JSON wrapped in tags:\n\
-             <tool_call>{{\"name\": \"read_file\", \"arguments\": {{\"path\": \"notes.md\"}}}}</tool_call>"
+             <tool_call>{{\"name\": \"read_file\", \"arguments\": {{\"path\": \"notes.md\"}}}}</tool_call>\n\n\
+             Examples (imitate these EXACTLY):\n\
+             User: read your memory about the launch\n\
+             You: <tool_call>{{\"name\": \"recall\", \"arguments\": {{\"query\": \"launch\"}}}}</tool_call>\n\
+             User: read todo.md\n\
+             You: <tool_call>{{\"name\": \"read_file\", \"arguments\": {{\"path\": \"todo.md\"}}}}</tool_call>\n\
+             User: how are you today?\n\
+             You: I'm doing well — how can I help? (no tool — plain answer)"
         ),
         "llama" => format!(
             "{base}\n\n{desc}\n\n\
              To call a tool, respond with ONLY a JSON object of the form:\n\
-             {{\"name\": \"read_file\", \"parameters\": {{\"path\": \"notes.md\"}}}}"
+             {{\"name\": \"read_file\", \"parameters\": {{\"path\": \"notes.md\"}}}}\n\n\
+             Example — User: read your memory about the launch\n\
+             You: {{\"name\": \"recall\", \"parameters\": {{\"query\": \"launch\"}}}}\n\
+             A question that needs no tool gets a plain answer, no JSON."
         ),
         "mistral" => format!(
             "{base}\n\n{desc}\n\n\
@@ -168,7 +181,7 @@ fn call_from_json(s: &str) -> Option<ToolCall> {
 fn call_from_value(v: &serde_json::Value) -> Option<ToolCall> {
     let name = v.get("name").and_then(|n| n.as_str())?.to_string();
     // Only accept our known tools \u2014 ignore hallucinated tool names.
-    if !matches!(name.as_str(), "read_file" | "write_file" | "list_files" | "whoami") { return None; }
+    if !matches!(name.as_str(), "read_file" | "write_file" | "list_files" | "whoami" | "recall") { return None; }
     let mut input = v.get("arguments")
         .or_else(|| v.get("parameters"))
         .or_else(|| v.get("input"))

@@ -4640,7 +4640,26 @@ async fn agent_stream(
         // local model should know about, appended to its native tool prompt.
         let (_reg_tools, reg_instr) = agent_tools_for(&app, Some(&scope_id), folder.as_deref());
         let pdf_cfg = pdf_config_for(&app, Some(&scope_id), folder.as_deref());
-        let base_sys = format!("{AGENT_SYSTEM_LOCAL}{extra_block}{reg_instr}");
+        // AUTO-INJECT MEMORY (RAG, Mason 08-19): retrieve notes relevant to THIS
+        // prompt and put them straight into the system block. Small local models
+        // are unreliable at *choosing* to call a memory tool — this way relevant
+        // memory is simply present, no call required. The recall tool remains for
+        // explicit searches ("read your memory about X"). Failures are silent:
+        // memory is an enhancement, never a blocker for the turn.
+        let memory_block: String = match ensure_embed_model(&app).await {
+            Ok(em) => match memory::retrieve(&db, "agent", &scope_id, &prompt, 3, 1, &em, "").await {
+                Ok(notes) if !notes.is_empty() => {
+                    let mut b = String::from("\n\nRelevant notes from your long-term memory (use them if they help):\n");
+                    for n in &notes {
+                        b.push_str(&format!("- [{}] {}: {}\n", n.ntype, n.title, n.snippet));
+                    }
+                    b
+                }
+                _ => String::new(),
+            },
+            Err(_) => String::new(),
+        };
+        let base_sys = format!("{AGENT_SYSTEM_LOCAL}{extra_block}{reg_instr}{memory_block}");
         let sys = local_tools::system_prompt_with_tools(&base_sys, &cap.format);
 
         for turn in 0..LOCAL_TOOL_TURN_CAP {
@@ -4704,6 +4723,29 @@ async fn agent_stream(
                     // SELF-INTROSPECTION (parity with the cloud paths): read-only
                     // identity + model + capabilities. No jail/broker call needed.
                     (introspect::build_whoami(&app, &db, &scope_id, folder.as_deref()), false)
+                } else if c.name == "recall" {
+                    // MEMORY SEARCH (Mason 08-19): semantic retrieval over the
+                    // agent's vault — the read path local models were missing
+                    // ("read your memory" used to have no correct tool).
+                    let q = c.input.get("query").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                    if q.is_empty() {
+                        ("recall needs a \"query\" argument — what should I search my memory for?".to_string(), true)
+                    } else {
+                        match ensure_embed_model(&app).await {
+                            Err(e) => (format!("memory unavailable: {e}"), true),
+                            Ok(em) => match memory::retrieve(&db, "agent", &scope_id, &q, 4, 1, &em, "").await {
+                                Err(e) => (format!("memory search failed: {e}"), true),
+                                Ok(notes) if notes.is_empty() => (format!("No memories found for \"{q}\"."), false),
+                                Ok(notes) => {
+                                    let mut r = String::new();
+                                    for n in &notes {
+                                        r.push_str(&format!("[{}] {} — {}\n", n.ntype, n.title, n.snippet));
+                                    }
+                                    (r, false)
+                                }
+                            },
+                        }
+                    }
                 } else if dashboard::is_dashboard_tool(&c.name) {
                     dashboard::exec_dashboard_tool(&db, &scope_id, &c.name, &c.input)
                 } else {
