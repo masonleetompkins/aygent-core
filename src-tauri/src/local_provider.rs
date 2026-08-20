@@ -211,6 +211,19 @@ fn session_sender(path: &str, ctx_tokens: u32) -> std::sync::mpsc::Sender<TurnRe
     if let Some(entry) = map.get(&key) {
         return entry.tx.clone();
     }
+    // EVICT other sessions + cached weights BEFORE starting a new one (Mason
+    // 08-19: switching models left the OLD model's weights + KV resident, so
+    // even a much smaller model hit the Metal working-set cap and died with
+    // memory errors). Dropping a SessionEntry drops its tx — the parked
+    // session thread wakes from recv (Disconnected), exits, and frees its
+    // context/KV + model Arc. Purging MODELS releases the weight cache for
+    // every other path (the small embed GGUF just reloads on next use).
+    // One chat model resident at a time — that is the memory model users
+    // actually expect on a laptop.
+    map.retain(|k, _| k == &key);
+    MODELS.lock().unwrap().retain(|k, _| {
+        k.rsplit_once('#').map(|(p, _)| p) == Some(path)
+    });
     let id = SESSION_IDS.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = std::sync::mpsc::channel::<TurnRequest>();
     let (p, k) = (path.to_string(), key.clone());
