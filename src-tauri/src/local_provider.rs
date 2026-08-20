@@ -8,6 +8,12 @@
 // This module emits the SAME `StreamEvent`s as the Anthropic provider, so the
 // Chat UI needs zero changes — the provider-agnostic foundation pays off.
 //
+// SPEED: turns are served by a persistent SESSION (one thread per model+window
+// that owns the llama context). The KV cache survives across turns, so each
+// turn only decodes the NEW tokens since last time (prefix reuse) instead of
+// re-decoding the whole conversation — prompt work per turn is ~constant, not
+// linear in chat length. Sessions idle out after a few minutes to free the KV.
+//
 // NOTE ON THE BUILD: llama-cpp-2 links llama.cpp. The first compile is SLOW
 // (builds the engine) — expected, not a hang. If the crate's API drifted from
 // what's coded here, this is the single file to reconcile; the surface is small
@@ -22,13 +28,17 @@ use std::sync::Mutex;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Process-wide llama.cpp backend (initializes GPU/Metal once).
 static BACKEND: Lazy<Result<LlamaBackend, String>> =
@@ -47,8 +57,16 @@ const DEFAULT_CTX_TOKENS: u32 = 4096;
 const MIN_CTX_TOKENS: u32 = 2048;
 const MAX_CTX_TOKENS: u32 = 131072;
 const MAX_NEW_TOKENS: usize = 1024;
-/// Floor for the context's logical batch size (llama.cpp's default).
+/// Logical batch size for the persistent context. Prompt suffixes longer than
+/// this are decoded in chunks of N_BATCH (the llama-server approach), so the
+/// context never needs prompt-sized compute buffers AND llama.cpp's
+/// GGML_ASSERT(n_tokens <= n_batch) — which abort()s the whole app — can't fire.
+const N_BATCH: u32 = 2048;
+/// Floor for the embed context's logical batch size (llama.cpp's default).
 const MIN_BATCH_TOKENS: u32 = 512;
+/// A session with no turns for this long drops its context (frees the KV cache;
+/// the model weights stay cached in MODELS, so the next turn is still warm-ish).
+const SESSION_IDLE_SECS: u64 = 300;
 
 fn backend() -> Result<&'static LlamaBackend, String> {
     BACKEND.as_ref().map_err(|e| e.clone())
@@ -144,12 +162,269 @@ fn render_prompt(system: &str, messages: &serde_json::Value) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// PERSISTENT SESSIONS — KV-cache reuse across turns.
+//
+// A `LlamaContext` borrows its `LlamaModel`, so it can't live in a static map.
+// Instead each (model path, context size) gets a dedicated OS thread that OWNS
+// the model Arc + context as stack locals and serves turns from a channel. The
+// conversation's tokens stay in the KV cache between turns; the next turn
+// prefix-matches its retokenized prompt against the cache and only decodes the
+// suffix (usually just the newest user message + template framing).
+//
+// Correctness never depends on the cache: any divergence (edited history,
+// switched conversation, truncation after overflow) shortens the matched
+// prefix, we `kv_cache_seq_rm` the stale tail, and re-decode from there. Worst
+// case is exactly the old behavior (full re-decode); best case is ~constant
+// prompt work per turn instead of linear in conversation length.
+// ---------------------------------------------------------------------------
+
+/// One turn's work order, sent to a session thread.
+struct TurnRequest {
+    prompt: String,
+    /// Live token stream back to the async side.
+    tokens_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Final (prompt_tokens, generated) or error.
+    done_tx: std::sync::mpsc::Sender<Result<(u64, u64), String>>,
+}
+
+struct SessionEntry {
+    id: u64,
+    tx: std::sync::mpsc::Sender<TurnRequest>,
+}
+
+/// Live sessions keyed by "path#ctx". A session removes ITSELF on exit, but
+/// only if the registry still holds its own id — a dispatcher may already have
+/// replaced a dead entry, and we must not tear down the replacement.
+static SESSIONS: Lazy<Mutex<HashMap<String, SessionEntry>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static SESSION_IDS: AtomicU64 = AtomicU64::new(1);
+
+fn session_key(path: &str, ctx_tokens: u32) -> String {
+    format!("{path}#{ctx_tokens}")
+}
+
+/// Get (or spawn) the session for this model+window and return its sender.
+fn session_sender(path: &str, ctx_tokens: u32) -> std::sync::mpsc::Sender<TurnRequest> {
+    let key = session_key(path, ctx_tokens);
+    let mut map = SESSIONS.lock().unwrap();
+    if let Some(entry) = map.get(&key) {
+        return entry.tx.clone();
+    }
+    let id = SESSION_IDS.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = std::sync::mpsc::channel::<TurnRequest>();
+    let (p, k) = (path.to_string(), key.clone());
+    let _ = std::thread::Builder::new()
+        .name("llama-session".into())
+        .spawn(move || run_session(id, k, p, ctx_tokens, rx));
+    map.insert(key, SessionEntry { id, tx: tx.clone() });
+    tx
+}
+
+/// Drop a session's registry entry (it may already be gone — fine).
+fn remove_session(path: &str, ctx_tokens: u32) {
+    SESSIONS.lock().unwrap().remove(&session_key(path, ctx_tokens));
+}
+
+/// Session thread body: owns the model + context, serves turns until idle.
+fn run_session(
+    id: u64,
+    key: String,
+    path: String,
+    ctx_tokens: u32,
+    rx: std::sync::mpsc::Receiver<TurnRequest>,
+) {
+    // Remove OUR OWN entry on the way out (not a replacement made after a
+    // dispatcher declared us dead).
+    let cleanup = || {
+        let mut map = SESSIONS.lock().unwrap();
+        if map.get(&key).is_some_and(|e| e.id == id) {
+            map.remove(&key);
+        }
+    };
+
+    // Heavy setup. On failure, deliver the error to every queued request so the
+    // user sees a real message, then exit.
+    let fail_all = |rx: std::sync::mpsc::Receiver<TurnRequest>, err: String| {
+        while let Ok(req) = rx.recv_timeout(Duration::from_millis(100)) {
+            let _ = req.done_tx.send(Err(err.clone()));
+        }
+    };
+    let be = match backend() {
+        Ok(b) => b,
+        Err(e) => { fail_all(rx, e); cleanup(); return; }
+    };
+    let model = match load_model(&path, gpu_layers_for(&path, ctx_tokens)) {
+        Ok(m) => m,
+        Err(e) => { fail_all(rx, e); cleanup(); return; }
+    };
+    let ctx_params = LlamaContextParams::default()
+        .with_n_ctx(std::num::NonZeroU32::new(ctx_tokens))
+        .with_n_batch(N_BATCH);
+    let mut ctx = match model.new_context(be, ctx_params) {
+        Ok(c) => c,
+        Err(e) => { fail_all(rx, format!("create context: {e}")); cleanup(); return; }
+    };
+
+    // Exactly the tokens currently held in the KV cache, in order.
+    let mut cached: Vec<LlamaToken> = Vec::new();
+
+    loop {
+        let req = match rx.recv_timeout(Duration::from_secs(SESSION_IDLE_SECS)) {
+            Ok(r) => r,
+            // Idle (or all senders dropped): free the context + KV and exit.
+            Err(_) => break,
+        };
+        let res = run_turn(&model, &mut ctx, &mut cached, ctx_tokens, &req);
+        if res.is_err() {
+            // A failed turn leaves the KV cache in an unknown state — never
+            // trust it for prefix reuse again. Clear and start fresh.
+            ctx.clear_kv_cache();
+            cached.clear();
+        }
+        let _ = req.done_tx.send(res);
+    }
+    cleanup();
+}
+
+/// One turn against the persistent context: prefix-match, trim, decode suffix,
+/// then the token-by-token generation loop.
+fn run_turn(
+    model: &LlamaModel,
+    ctx: &mut LlamaContext,
+    cached: &mut Vec<LlamaToken>,
+    ctx_tokens: u32,
+    req: &TurnRequest,
+) -> Result<(u64, u64), String> {
+    let mut tokens = model
+        .str_to_token(&req.prompt, AddBos::Always)
+        .map_err(|e| format!("tokenize: {e}"))?;
+
+    // The context holds CTX_TOKENS total; leave room for the reply we're about
+    // to generate. If the conversation has grown past that, keep the MOST RECENT
+    // tokens (drop the oldest) so a long chat degrades gracefully. (This also
+    // invalidates the cached prefix — the match below handles that naturally.)
+    let max_prompt = (ctx_tokens as usize).saturating_sub(MAX_NEW_TOKENS + 8);
+    if tokens.len() > max_prompt {
+        let drop = tokens.len() - max_prompt;
+        tokens.drain(0..drop);
+    }
+    if tokens.is_empty() {
+        return Err("empty prompt after tokenize".into());
+    }
+
+    // KV-CACHE REUSE: how much of the new prompt is already decoded?
+    let mut common = cached
+        .iter()
+        .zip(tokens.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    // Always leave at least the final token to decode — generation needs fresh
+    // logits, and a fully-cached prompt (e.g. a regenerate) would otherwise
+    // decode nothing.
+    if common == tokens.len() {
+        common -= 1;
+    }
+    // Drop the stale tail (positions >= common) from the cache, keep the prefix.
+    if common < cached.len() {
+        ctx.kv_cache_seq_rm(0, Some(common as u32), None)
+            .map_err(|e| format!("kv trim: {e}"))?;
+    }
+    cached.truncate(common);
+
+    // Decode the new suffix in N_BATCH-sized chunks (only the overall last
+    // token requests logits). Chunking keeps the context's compute buffers
+    // small and can never trip llama.cpp's n_tokens <= n_batch abort().
+    let suffix = &tokens[common..];
+    let mut batch = LlamaBatch::new(N_BATCH as usize, 1);
+    let mut pos = common as i32;
+    let mut last_logits_idx: i32 = 0;
+    let last_overall = tokens.len() as i32 - 1;
+    for chunk in suffix.chunks(N_BATCH as usize) {
+        batch.clear();
+        for (j, tok) in chunk.iter().enumerate() {
+            let p = pos + j as i32;
+            batch.add(*tok, p, &[0], p == last_overall)
+                .map_err(|e| format!("batch add: {e}"))?;
+        }
+        ctx.decode(&mut batch).map_err(|e| decode_err("decode prompt", e))?;
+        pos += chunk.len() as i32;
+        last_logits_idx = chunk.len() as i32 - 1;
+    }
+    cached.extend_from_slice(suffix);
+
+    // Greedy-ish sampler with light temperature for natural chat.
+    let mut sampler = LlamaSampler::chain_simple([
+        LlamaSampler::temp(0.7),
+        LlamaSampler::top_p(0.95, 1),
+        LlamaSampler::greedy(),
+    ]);
+
+    let prompt_tokens = tokens.len() as u64;
+    let mut generated: u64 = 0;
+    let mut n_cur = tokens.len() as i32;
+    let mut logits_i = last_logits_idx;
+    for _ in 0..MAX_NEW_TOKENS {
+        if n_cur as u32 >= ctx_tokens { break; } // window full — stop cleanly
+        let token = sampler.sample(ctx, logits_i);
+        sampler.accept(token);
+
+        if model.is_eog_token(token) { break; }
+
+        // NOTE: token_to_str is deprecated in llama-cpp-2 (harmless warning) but
+        // its replacement token_to_piece takes a streaming encoding_rs::Decoder +
+        // lstrip arg that isn't worth the complexity here. Keep the simple call;
+        // revisit if the crate actually removes it.
+        #[allow(deprecated)]
+        let piece = model
+            .token_to_str(token, llama_cpp_2::model::Special::Tokenize)
+            .unwrap_or_default();
+        if req.tokens_tx.send(piece).is_err() { break; } // UI hung up
+
+        batch.clear();
+        batch.add(token, n_cur, &[0], true).map_err(|e| format!("batch add: {e}"))?;
+        ctx.decode(&mut batch).map_err(|e| decode_err("decode token", e))?;
+        cached.push(token); // it's in the KV cache now — next turn can reuse it
+        n_cur += 1;
+        generated += 1;
+        logits_i = 0; // single-token batches: logits always at index 0
+    }
+    Ok((prompt_tokens, generated))
+}
+
+/// Hand a turn to the session, retrying once if the session died between
+/// lookup and send (idle-out race) or mid-flight.
+fn dispatch_turn(
+    path: &str,
+    ctx_tokens: u32,
+    prompt: String,
+    tokens_tx: tokio::sync::mpsc::UnboundedSender<String>,
+) -> Result<(u64, u64), String> {
+    for _ in 0..2 {
+        let sender = session_sender(path, ctx_tokens);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let req = TurnRequest { prompt: prompt.clone(), tokens_tx: tokens_tx.clone(), done_tx };
+        if sender.send(req).is_err() {
+            remove_session(path, ctx_tokens); // stale entry — respawn and retry
+            continue;
+        }
+        match done_rx.recv() {
+            Ok(res) => return res,
+            Err(_) => {
+                remove_session(path, ctx_tokens); // thread died mid-flight
+                continue;
+            }
+        }
+    }
+    Err("local model session failed to start (see logs)".into())
+}
+
 /// Stream one CHAT turn from a local GGUF model. Emits TextDelta events as
 /// tokens are produced, then Done. Returns the assistant content array (matching
 /// the Anthropic shape: `[{type:"text", text:"..."}]`) so history is uniform.
 ///
-/// Runs the (blocking, CPU/GPU-bound) decode on a blocking thread so it doesn't
-/// stall the async runtime; tokens are forwarded to `on_event` via a channel.
+/// The turn runs on the model's persistent session thread (KV cache reuse);
+/// this async side just forwards tokens as they arrive.
 pub async fn local_stream_turn<F: FnMut(StreamEvent)>(
     model_path: &str,
     system: &str,
@@ -164,8 +439,8 @@ pub async fn local_stream_turn<F: FnMut(StreamEvent)>(
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-    // Decode on a blocking thread (llama.cpp is synchronous + heavy).
-    let handle = tokio::task::spawn_blocking(move || decode(&path, &prompt, ctx, tx));
+    // The dispatch blocks on the session thread's reply; keep it off the runtime.
+    let handle = tokio::task::spawn_blocking(move || dispatch_turn(&path, ctx, prompt, tx));
 
     // Forward tokens live as they arrive.
     let mut full = String::new();
@@ -182,88 +457,6 @@ pub async fn local_stream_turn<F: FnMut(StreamEvent)>(
     on_event(StreamEvent::Done { stop_reason: "end_turn".into() });
     let content = serde_json::json!([{ "type": "text", "text": full }]);
     Ok((content, "end_turn".to_string()))
-}
-
-/// The synchronous decode loop (runs on a blocking thread).
-fn decode(path: &str, prompt: &str, ctx_tokens: u32, tx: tokio::sync::mpsc::UnboundedSender<String>) -> Result<(u64, u64), String> {
-    let be = backend()?;
-    let model = load_model(path, gpu_layers_for(path, ctx_tokens))?;
-
-    // Tokenize BEFORE building the context: the context's logical batch size
-    // (n_batch) must cover the whole prompt we submit in one llama_decode call.
-    // llama.cpp enforces `n_tokens <= n_batch` with a GGML_ASSERT — which calls
-    // abort(), killing the entire app with SIGABRT (no catchable error). The
-    // default n_batch is 2048, so this crashed as soon as a conversation grew
-    // past ~2048 prompt tokens ("works for a few turns, then AYGENT dies").
-    let mut tokens = model
-        .str_to_token(prompt, AddBos::Always)
-        .map_err(|e| format!("tokenize: {e}"))?;
-
-    // The context holds CTX_TOKENS total; leave room for the reply we're about
-    // to generate. If the conversation has grown past that, keep the MOST RECENT
-    // tokens (drop the oldest) so a long chat degrades gracefully instead of
-    // erroring with "insufficient space" — the bug that surfaced after a few msgs.
-    let max_prompt = (ctx_tokens as usize).saturating_sub(MAX_NEW_TOKENS + 8);
-    if tokens.len() > max_prompt {
-        let drop = tokens.len() - max_prompt;
-        tokens.drain(0..drop);
-    }
-
-    // n_batch sized to the (truncated) prompt so the single-shot prompt decode
-    // below never trips the assert. Always ≤ n_ctx because max_prompt < ctx.
-    let n_batch = (tokens.len() as u32).max(MIN_BATCH_TOKENS);
-    let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(std::num::NonZeroU32::new(ctx_tokens))
-        .with_n_batch(n_batch);
-    let mut ctx = model
-        .new_context(be, ctx_params)
-        .map_err(|e| format!("create context: {e}"))?;
-
-    // Batch capacity must cover the whole prompt (was hardcoded 512 — too small
-    // once the conversation exceeded ~512 tokens). Single-token decode steps
-    // below reuse this same batch, so sizing it to the prompt length is enough.
-    let cap = tokens.len().max(1);
-    let mut batch = LlamaBatch::new(cap, 1);
-    let last = tokens.len() as i32 - 1;
-    for (i, tok) in tokens.iter().enumerate() {
-        batch.add(*tok, i as i32, &[0], i as i32 == last)
-            .map_err(|e| format!("batch add: {e}"))?;
-    }
-    ctx.decode(&mut batch).map_err(|e| decode_err("decode prompt", e))?;
-
-    // Greedy-ish sampler with light temperature for natural chat.
-    let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::temp(0.7),
-        LlamaSampler::top_p(0.95, 1),
-        LlamaSampler::greedy(),
-    ]);
-
-    let prompt_tokens = tokens.len() as u64;
-    let mut generated: u64 = 0;
-    let mut n_cur = batch.n_tokens();
-    for _ in 0..MAX_NEW_TOKENS {
-        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-        sampler.accept(token);
-
-        if model.is_eog_token(token) { break; }
-
-        // NOTE: token_to_str is deprecated in llama-cpp-2 (harmless warning) but
-        // its replacement token_to_piece takes a streaming encoding_rs::Decoder +
-        // lstrip arg that isn't worth the complexity here. Keep the simple call;
-        // revisit if the crate actually removes it.
-        #[allow(deprecated)]
-        let piece = model
-            .token_to_str(token, llama_cpp_2::model::Special::Tokenize)
-            .unwrap_or_default();
-        if tx.send(piece).is_err() { break; } // UI hung up
-
-        generated += 1;
-        batch.clear();
-        batch.add(token, n_cur, &[0], true).map_err(|e| format!("batch add: {e}"))?;
-        n_cur += 1;
-        ctx.decode(&mut batch).map_err(|e| decode_err("decode token", e))?;
-    }
-    Ok((prompt_tokens, generated))
 }
 
 /// Map a llama_decode failure to a message the USER can act on. Fatal backend
