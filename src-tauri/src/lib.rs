@@ -1667,7 +1667,31 @@ async fn conv_compact(
             if provider == "meta" { meta_provider::complete(&key, &agent.model, &ask).await? }
             else { openai_provider::complete(&provider, &key, &agent.model, &ask).await? }
         }
-        _ => return Err("compaction needs a cloud provider (Anthropic/OpenAI/OpenRouter)".into()),
+        "local" => {
+            // LOCAL MODELS COMPACT TOO (Mason 08-19): Gwen authors her own
+            // summary in-process — no cloud key needed, which matters MOST here
+            // because small context windows are exactly where compaction is
+            // needed. `agent.model` is the absolute GGUF path on this provider.
+            if agent.model.trim().is_empty() { return Err("no local model selected for this agent".into()); }
+            let path = agent.model.clone();
+            let ctx_tokens = local_context_budget(&path);
+            let msgs = serde_json::json!([{ "role": "user", "content": ask }]);
+            let (content, _stop) = local_provider::local_stream_turn(
+                &path,
+                "You are a precise summarizer. Output only the summary — no preamble.",
+                &msgs, ctx_tokens, |_| {},
+            ).await?;
+            let raw = content.as_array()
+                .and_then(|a| a.first())
+                .and_then(|b| b.get("text")).and_then(|t| t.as_str())
+                .unwrap_or("").to_string();
+            // Reasoning models (Qwen3) may wrap musing in <think> blocks — the
+            // briefing must be the visible answer only.
+            let cleaned = local_tools::strip_think(&raw).trim().to_string();
+            if cleaned.is_empty() { return Err("local model produced an empty summary — try again".into()); }
+            cleaned
+        }
+        _ => return Err("compaction needs a cloud provider (Anthropic/OpenAI/OpenRouter) or a local model".into()),
     };
 
     // The new history is a SINGLE user turn carrying the briefing, so the next
