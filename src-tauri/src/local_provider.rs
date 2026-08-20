@@ -60,8 +60,12 @@ fn backend() -> Result<&'static LlamaBackend, String> {
 /// even decodes the prompt — then llama_decode dies mid-generation with a fatal
 /// backend error ("Decode Error -3"). That's exactly what happened with a 16GB
 /// 27B GGUF on a 24GB Mac: the weights alone fill the ~16GB working set.
-/// All-or-nothing: offload every layer when the total fits, otherwise run on
-/// CPU (slower, but it completes — RAM is the budget there, not the GPU cap).
+///
+/// PARTIAL offload: when the whole model doesn't fit, offload as many layers as
+/// the budget allows instead of falling all the way to CPU — a model 10% over
+/// budget used to drop from ~30 tok/s to ~5 (the CPU cliff). Layer count comes
+/// from the GGUF header (`<arch>.block_count`); if the header doesn't expose it
+/// we keep the old all-or-nothing behavior (never guess).
 fn gpu_layers_for(path: &str, ctx_tokens: u32) -> u32 {
     let hw = crate::hardware::detect();
     let ram = hw.ram_gb as f64;
@@ -71,7 +75,23 @@ fn gpu_layers_for(path: &str, ctx_tokens: u32) -> u32 {
         .unwrap_or(0.0);
     let kv_gb = ctx_tokens as f64 * 0.00025; // ~0.25MB/token, conservative
     const OVERHEAD_GB: f64 = 1.5; // compute buffers + scratch
-    if weights_gb + kv_gb + OVERHEAD_GB <= working_set { u32::MAX } else { 0 }
+    if weights_gb + kv_gb + OVERHEAD_GB <= working_set {
+        return u32::MAX; // everything fits — full offload
+    }
+
+    // Doesn't all fit: offload the fraction of layers the leftover budget covers.
+    let Some(n_layers) = crate::gguf::read_block_count(path) else { return 0 };
+    if n_layers == 0 { return 0; }
+    // KV cache lives on the GPU only for offloaded layers, so it scales WITH the
+    // fraction we choose. Solve: frac*(weights+kv) + OVERHEAD <= working_set.
+    let budget = working_set - OVERHEAD_GB;
+    if budget <= 0.0 || weights_gb + kv_gb <= 0.0 { return 0; }
+    let frac = budget / (weights_gb + kv_gb);
+    // Count the embedding/output tensors as one extra "layer" of weight so the
+    // per-layer estimate stays conservative (they stay on GPU with any offload).
+    let n = (frac * n_layers as f64 - 1.0).floor();
+    if n < 1.0 { return 0; } // not even one layer fits — CPU
+    (n as u32).min(n_layers)
 }
 
 /// Load (or fetch cached) a model from a local GGUF path with the given GPU

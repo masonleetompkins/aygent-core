@@ -130,6 +130,37 @@ pub fn read_chat_template(path: &str) -> Option<String> {
     tool_use.or(base)
 }
 
+
+/// Read the model's transformer layer count (`<arch>.block_count`, e.g.
+/// `qwen2.block_count`) from the GGUF header. Needed for PARTIAL GPU offload:
+/// deciding how many layers fit must happen BEFORE the model is loaded, and
+/// only the header knows the layer count. Reads only the header, never weights.
+pub fn read_block_count(path: &str) -> Option<u32> {
+    let f = File::open(path).ok()?;
+    let mut r = BufReader::new(f);
+
+    if read_u32(&mut r)? != GGUF_MAGIC { return None; }
+    let _version = read_u32(&mut r)?;
+    let _tensor_count = read_u64(&mut r)?;
+    let kv_count = read_u64(&mut r)?;
+
+    for _ in 0..kv_count {
+        let key = read_gguf_string(&mut r)?;
+        let vtype = read_u32(&mut r)?;
+        let want = key.ends_with(".block_count");
+        // Always CONSUME the value (the format is sequential); capture if wanted.
+        let val: Option<u64> = match vtype {
+            T_UINT32 => Some(read_u32(&mut r)? as u64),
+            T_UINT64 => Some(read_u64(&mut r)?),
+            _ => { if !skip_value(&mut r, vtype)? { return None; } None }
+        };
+        if want {
+            if let Some(v) = val { return u32::try_from(v).ok(); }
+        }
+    }
+    None
+}
+
 // ---- primitive readers ----------------------------------------------------
 
 fn read_u32<R: Read>(r: &mut R) -> Option<u32> {
