@@ -153,9 +153,11 @@ fn is_off_catalog(lower: &str) -> bool {
     TAGS.iter().any(|t| lower.contains(t))
 }
 
-/// Pull GGUF quants and collapse them to just TWO friendly choices for an
-/// inexperienced user: a "Recommended" balanced quant (Q4_K_M) and a "Higher
-/// quality" one (Q6_K/Q8_0). We do NOT surface all six cryptic codes.
+/// Pull GGUF quants and collapse them to THREE friendly choices for an
+/// inexperienced user: a "Recommended" balanced quant (Q4_K_M), a "Higher
+/// quality" one (Q6_K/Q8_0), and an "Efficient" small quant (IQ4_XS → Q2_K)
+/// that makes big models viable on small machines (Mason: 24GB Macs never even
+/// SAW the 2/3-bit quants that would run a 27B). Still not all N cryptic codes.
 ///
 /// SIZE: the bulk HF search endpoint returns `siblings` WITHOUT file sizes, so
 /// we ESTIMATE size from params × bits-per-weight (accurate within a few %).
@@ -166,6 +168,10 @@ fn extract_quants(repo: &serde_json::Value, repo_id: &str, params_b: f32) -> Vec
     // Which quant fills each friendly "tier", in order of preference.
     let recommended = ["Q4_K_M", "Q4_0", "Q3_K_M"];
     let higher = ["Q6_K", "Q8_0", "Q5_K_M"];
+    // Smallest usable quants first by quality-per-bit: IQ4_XS ≈ Q4 quality at
+    // ~12% less memory; the IQ3/IQ2 i-quants degrade gracefully and are the
+    // difference between "won't fit" and "runs" for 20B+ models on 24GB.
+    let efficient = ["IQ4_XS", "IQ3_M", "Q3_K_S", "IQ3_XXS", "Q2_K", "IQ2_M", "IQ2_XS"];
 
     // Collect the single-file gguf names actually present in the repo.
     let present: Vec<(String, String)> = sibs.iter().filter_map(|sib| {
@@ -176,10 +182,26 @@ fn extract_quants(repo: &serde_json::Value, repo_id: &str, params_b: f32) -> Vec
         Some((up, fname.to_string()))
     }).collect();
 
-    // Find the first present filename matching any quant in `prefs`.
+    // Find the first present filename matching any quant in `prefs`. The match
+    // requires the quant code as a delimited token (".Q2_K." matches "Q2_K" but
+    // "Q2_K_S" and "IQ2_K" do not) so tiers never grab a neighboring quant.
+    let has_token = |up: &str, q: &str| -> bool {
+        let qu = q.to_uppercase();
+        let b = up.as_bytes();
+        let mut start = 0;
+        while let Some(i) = up[start..].find(&qu) {
+            let i = start + i;
+            let before_ok = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+            let j = i + qu.len();
+            let after_ok = j >= b.len() || (!b[j].is_ascii_alphanumeric() && b[j] != b'_');
+            if before_ok && after_ok { return true; }
+            start = i + 1;
+        }
+        false
+    };
     let pick = |prefs: &[&str]| -> Option<(String, String)> {
         for q in prefs {
-            if let Some((_, fname)) = present.iter().find(|(up, _)| up.contains(&q.to_uppercase())) {
+            if let Some((_, fname)) = present.iter().find(|(up, _)| has_token(up, q)) {
                 return Some((q.to_string(), fname.clone()));
             }
         }
@@ -208,6 +230,17 @@ fn extract_quants(repo: &serde_json::Value, repo_id: &str, params_b: f32) -> Vec
             });
         }
     }
+    if let Some((quant, fname)) = pick(&efficient) {
+        if !out.iter().any(|o| o.filename == fname) {
+            out.push(QuantOption {
+                tier: "Efficient".into(),
+                quant: quant.clone(),
+                size_gb: estimate_size_gb(params_b, &quant),
+                download_url: format!("https://huggingface.co/{repo_id}/resolve/main/{fname}"),
+                filename: fname,
+            });
+        }
+    }
     out
 }
 
@@ -216,8 +249,10 @@ fn extract_quants(repo: &serde_json::Value, repo_id: &str, params_b: f32) -> Vec
 /// overhead for metadata/embeddings. Good to within a few percent.
 fn estimate_size_gb(params_b: f32, quant: &str) -> f32 {
     let bpw = match quant {
-        "Q2_K" => 3.35, "Q3_K_M" => 3.91, "Q4_0" => 4.55, "Q4_K_M" => 4.85,
-        "Q5_K_M" => 5.69, "Q6_K" => 6.56, "Q8_0" => 8.5, _ => 5.0,
+        "IQ2_XS" => 2.31, "IQ2_M" => 2.7, "IQ3_XXS" => 3.06, "Q2_K" => 3.35,
+        "IQ3_M" => 3.66, "Q3_K_S" => 3.5, "Q3_K_M" => 3.91, "IQ4_XS" => 4.25,
+        "Q4_0" => 4.55, "Q4_K_M" => 4.85, "Q5_K_M" => 5.69, "Q6_K" => 6.56,
+        "Q8_0" => 8.5, _ => 5.0,
     };
     // bytes = params * bpw / 8 ; then to GB, + ~5% overhead
     let bytes = (params_b as f64) * 1e9 * (bpw / 8.0);

@@ -29,7 +29,7 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::context::LlamaContext;
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
@@ -62,6 +62,10 @@ const MAX_NEW_TOKENS: usize = 1024;
 /// context never needs prompt-sized compute buffers AND llama.cpp's
 /// GGML_ASSERT(n_tokens <= n_batch) — which abort()s the whole app — can't fire.
 const N_BATCH: u32 = 2048;
+/// Physical micro-batch: how many tokens ggml actually processes at once.
+/// Smaller than N_BATCH so compute buffers stay small — matters most on
+/// partial-offload runs where every GPU byte is contended.
+const N_UBATCH: u32 = 512;
 /// Floor for the embed context's logical batch size (llama.cpp's default).
 const MIN_BATCH_TOKENS: u32 = 512;
 /// A session with no turns for this long drops its context (frees the KV cache;
@@ -95,7 +99,9 @@ fn gpu_layers_for(path: &str, ctx_tokens: u32) -> u32 {
     let fname = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
     let params_b = crate::catalog::parse_params(&fname);
     let kv_gb = crate::hardware::kv_gb_for(ctx_tokens, params_b);
-    const OVERHEAD_GB: f64 = 1.5; // compute buffers + scratch
+    // Shared with the predictor (hardware::OVERHEAD_GB) so the UI verdict and
+    // the runtime offload decision can never disagree.
+    const OVERHEAD_GB: f64 = crate::hardware::OVERHEAD_GB;
     if weights_gb + kv_gb + OVERHEAD_GB <= working_set {
         return u32::MAX; // everything fits — full offload
     }
@@ -136,15 +142,23 @@ fn load_model(path: &str, gpu_layers: u32) -> Result<Arc<LlamaModel>, String> {
     Ok(arc)
 }
 
-/// Flatten the provider-format `messages` array into a single prompt string
-/// using a generic chat template. Local GGUFs vary in their exact template, but
-/// this ChatML-ish framing works well across Qwen/Mistral/Llama instruct models
-/// for CHAT (tool-use fast-follow will use each model's real template).
-fn render_prompt(system: &str, messages: &serde_json::Value) -> String {
-    let mut out = String::new();
-    if !system.is_empty() {
-        out.push_str(&format!("<|im_start|>system\n{system}<|im_end|>\n"));
+/// Render the system block of the prompt using a generic ChatML-ish template.
+/// Local GGUFs vary in their exact template, but this framing works well
+/// across Qwen/Mistral/Llama instruct models for CHAT (tool-use fast-follow
+/// will use each model's real template).
+fn render_system_block(system: &str) -> String {
+    if system.is_empty() {
+        String::new()
+    } else {
+        format!("<|im_start|>system\n{system}<|im_end|>\n")
     }
+}
+
+/// Render each provider-format message as its own block, oldest → newest.
+/// Keeping them separate lets the session evict WHOLE old messages when the
+/// conversation outgrows the context window (safe compaction).
+fn render_message_blocks(messages: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
     if let Some(arr) = messages.as_array() {
         for m in arr {
             let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
@@ -158,12 +172,19 @@ fn render_prompt(system: &str, messages: &serde_json::Value) -> String {
                     .join("\n"),
                 _ => String::new(),
             };
-            out.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
+            out.push(format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
         }
     }
-    out.push_str("<|im_start|>assistant\n");
     out
 }
+
+/// Marker injected right after the system block when old messages were
+/// evicted, so the model knows the visible history is incomplete.
+const COMPACTION_MARKER: &str =
+    "<|im_start|>system\n[Earlier messages were compacted to fit memory. The conversation continues below.]<|im_end|>\n";
+
+/// The generation cue appended after the last message.
+const ASSISTANT_CUE: &str = "<|im_start|>assistant\n";
 
 // ---------------------------------------------------------------------------
 // PERSISTENT SESSIONS — KV-cache reuse across turns.
@@ -182,9 +203,16 @@ fn render_prompt(system: &str, messages: &serde_json::Value) -> String {
 // prompt work per turn instead of linear in conversation length.
 // ---------------------------------------------------------------------------
 
-/// One turn's work order, sent to a session thread.
+/// One turn's work order, sent to a session thread. The prompt travels as
+/// PIECES (system block + per-message blocks) so the session can compact at
+/// MESSAGE boundaries when the conversation outgrows the window — the old
+/// flat-string design could only drop tokens from the front, which destroyed
+/// the system prompt first (the worst possible eviction order).
 struct TurnRequest {
-    prompt: String,
+    /// Rendered system block (template framing included). NEVER evicted.
+    system_block: String,
+    /// Rendered per-message blocks, oldest → newest. Evicted oldest-first.
+    message_blocks: Vec<String>,
     /// Live token stream back to the async side.
     tokens_tx: tokio::sync::mpsc::UnboundedSender<String>,
     /// Final (prompt_tokens, generated) or error.
@@ -274,12 +302,33 @@ fn run_session(
         Ok(m) => m,
         Err(e) => { fail_all(rx, e); cleanup(); return; }
     };
-    let ctx_params = LlamaContextParams::default()
+    // MEMORY-EFFICIENT context: flash attention + q8_0-quantized KV cache
+    // (~half the memory of fp16 — the difference between an 18GB model
+    // fitting a real context on 24GB or not) + a small physical micro-batch
+    // so compute buffers stay lean. llama.cpp requires flash attention for a
+    // quantized V cache, and a few architectures don't support FA — so if
+    // this context fails to build, fall back to the plain fp16 setup rather
+    // than failing the session. (hardware::kv_per_token_gb assumes the q8
+    // path with margin for this fallback.)
+    let efficient = LlamaContextParams::default()
         .with_n_ctx(std::num::NonZeroU32::new(ctx_tokens))
-        .with_n_batch(N_BATCH);
-    let mut ctx = match model.new_context(be, ctx_params) {
+        .with_n_batch(N_BATCH)
+        .with_n_ubatch(N_UBATCH)
+        .with_flash_attention_policy(1) // LLAMA_FLASH_ATTN_TYPE_ENABLED
+        .with_type_k(KvCacheType::Q8_0)
+        .with_type_v(KvCacheType::Q8_0);
+    let mut ctx = match model.new_context(be, efficient) {
         Ok(c) => c,
-        Err(e) => { fail_all(rx, format!("create context: {e}")); cleanup(); return; }
+        Err(_) => {
+            let plain = LlamaContextParams::default()
+                .with_n_ctx(std::num::NonZeroU32::new(ctx_tokens))
+                .with_n_batch(N_BATCH)
+                .with_n_ubatch(N_UBATCH);
+            match model.new_context(be, plain) {
+                Ok(c) => c,
+                Err(e) => { fail_all(rx, format!("create context: {e}")); cleanup(); return; }
+            }
+        }
     };
 
     // Exactly the tokens currently held in the KV cache, in order.
@@ -312,19 +361,65 @@ fn run_turn(
     ctx_tokens: u32,
     req: &TurnRequest,
 ) -> Result<(u64, u64), String> {
-    let mut tokens = model
-        .str_to_token(&req.prompt, AddBos::Always)
-        .map_err(|e| format!("tokenize: {e}"))?;
-
-    // The context holds CTX_TOKENS total; leave room for the reply we're about
-    // to generate. If the conversation has grown past that, keep the MOST RECENT
-    // tokens (drop the oldest) so a long chat degrades gracefully. (This also
-    // invalidates the cached prefix — the match below handles that naturally.)
+    // SAFE COMPACTION: the context holds CTX_TOKENS total; leave room for the
+    // reply. If the conversation has outgrown that, evict the OLDEST messages
+    // WHOLE (never the system prompt, never a partial message) and inject a
+    // marker so the model knows history was compacted. Because the system
+    // block is always byte-identical, the KV prefix cache still hits on it.
     let max_prompt = (ctx_tokens as usize).saturating_sub(MAX_NEW_TOKENS + 8);
-    if tokens.len() > max_prompt {
-        let drop = tokens.len() - max_prompt;
-        tokens.drain(0..drop);
+
+    let sys_tokens = model
+        .str_to_token(&req.system_block, AddBos::Always)
+        .map_err(|e| format!("tokenize system: {e}"))?;
+    let cue_tokens = model
+        .str_to_token(ASSISTANT_CUE, AddBos::Never)
+        .map_err(|e| format!("tokenize cue: {e}"))?;
+    let marker_tokens = model
+        .str_to_token(COMPACTION_MARKER, AddBos::Never)
+        .map_err(|e| format!("tokenize marker: {e}"))?;
+    let block_tokens: Vec<Vec<LlamaToken>> = req
+        .message_blocks
+        .iter()
+        .map(|b| model.str_to_token(b, AddBos::Never).map_err(|e| format!("tokenize message: {e}")))
+        .collect::<Result<_, _>>()?;
+
+    // Budget for the message blocks (reserve the marker slot up front so a
+    // borderline fit can't flip into overflow when the marker is added).
+    let fixed = sys_tokens.len() + cue_tokens.len() + marker_tokens.len();
+    let budget = max_prompt.saturating_sub(fixed);
+    if budget == 0 {
+        return Err("context window too small for the system prompt — raise the model's context or shorten its instructions".into());
     }
+
+    // Keep newest → oldest while they fit. `keep_from` = first kept index.
+    let mut used = 0usize;
+    let mut keep_from = block_tokens.len();
+    for (i, bt) in block_tokens.iter().enumerate().rev() {
+        if used + bt.len() > budget { break; }
+        used += bt.len();
+        keep_from = i;
+    }
+    let evicted = keep_from > 0;
+
+    let mut tokens: Vec<LlamaToken> = Vec::with_capacity(max_prompt);
+    tokens.extend_from_slice(&sys_tokens);
+    if evicted {
+        tokens.extend_from_slice(&marker_tokens);
+    }
+    if keep_from == block_tokens.len() && !block_tokens.is_empty() {
+        // Even the NEWEST message alone doesn't fit: last-resort token-level
+        // truncation of that one message — drop from its FRONT (keep its tail,
+        // which carries the actual question). The system prompt stays intact.
+        let newest = &block_tokens[block_tokens.len() - 1];
+        let start = newest.len() - budget.min(newest.len());
+        tokens.extend_from_slice(&newest[start..]);
+    } else {
+        for bt in &block_tokens[keep_from..] {
+            tokens.extend_from_slice(bt);
+        }
+    }
+    tokens.extend_from_slice(&cue_tokens);
+
     if tokens.is_empty() {
         return Err("empty prompt after tokenize".into());
     }
@@ -413,13 +508,19 @@ fn run_turn(
 fn dispatch_turn(
     path: &str,
     ctx_tokens: u32,
-    prompt: String,
+    system_block: String,
+    message_blocks: Vec<String>,
     tokens_tx: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> Result<(u64, u64), String> {
     for _ in 0..2 {
         let sender = session_sender(path, ctx_tokens);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let req = TurnRequest { prompt: prompt.clone(), tokens_tx: tokens_tx.clone(), done_tx };
+        let req = TurnRequest {
+            system_block: system_block.clone(),
+            message_blocks: message_blocks.clone(),
+            tokens_tx: tokens_tx.clone(),
+            done_tx,
+        };
         if sender.send(req).is_err() {
             remove_session(path, ctx_tokens); // stale entry — respawn and retry
             continue;
@@ -448,7 +549,8 @@ pub async fn local_stream_turn<F: FnMut(StreamEvent)>(
     ctx_tokens: u32,
     mut on_event: F,
 ) -> Result<(serde_json::Value, String), String> {
-    let prompt = render_prompt(system, messages);
+    let system_block = render_system_block(system);
+    let message_blocks = render_message_blocks(messages);
     let path = model_path.to_string();
     let ctx = if ctx_tokens == 0 { DEFAULT_CTX_TOKENS } else { ctx_tokens }
         .clamp(MIN_CTX_TOKENS, MAX_CTX_TOKENS);
@@ -456,7 +558,9 @@ pub async fn local_stream_turn<F: FnMut(StreamEvent)>(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     // The dispatch blocks on the session thread's reply; keep it off the runtime.
-    let handle = tokio::task::spawn_blocking(move || dispatch_turn(&path, ctx, prompt, tx));
+    let handle = tokio::task::spawn_blocking(move || {
+        dispatch_turn(&path, ctx, system_block, message_blocks, tx)
+    });
 
     // Forward tokens live as they arrive.
     let mut full = String::new();
