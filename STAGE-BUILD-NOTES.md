@@ -1,28 +1,32 @@
-# Stage build — 2026-08-21 11:19 PDT — v1.0.11 (local models: run up to RAM-pool size)
+# Stage build — 2026-08-21 11:49 PDT — v1.0.11 (REBUILD: RAM-pool sizing + kv-trim fallback)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0, **10 warnings, 0 errors** (dead-code only: telegram/browser/exec — same set as prior builds). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
 
-**Commit:** `9ac5f34` — local models: run up to RAM-pool size via offload-aware verdicts, small quants, q8 KV, safe compaction (on `staging`)
+**Commits (on `staging`, HEAD `d2181bf`):**
+- `9ac5f34` — local models: run up to RAM-pool size via offload-aware verdicts, small quants, q8 KV, safe compaction
+- `d2181bf` — fix(local): kv-trim fallback — clear cache + full re-decode when partial `seq_rm` is unsupported (fixes Gwen's mid-chat "kv trim" error)
 
 **Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
-- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 39,270,120 bytes), mtime **2026-08-21 11:19**
-- dmg: `dmg/AYGENT_1.0.11_aarch64.dmg`, **17,198,360 bytes (~16.4 MB)**, mtime **2026-08-21 11:19**
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 39,271,416 bytes), mtime **2026-08-21 11:49**
+- dmg: `dmg/AYGENT_1.0.11_aarch64.dmg`, **17,201,835 bytes (~16.4 MB)**, mtime **2026-08-21 11:49**
 
 **Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
 
-**This build supersedes the 09:22 v1.0.11 build** (`3baacee`, real-fit context window). Same version number — this is the follow-on that lets models near/at the RAM-pool ceiling actually run instead of being rejected.
+**This 11:49 rebuild supersedes both the 11:19 build (`9ac5f34`) and the 09:22 build (`3baacee`).** Same version number — it folds in `d2181bf`, the fix for the mid-chat "kv trim" error Gwen hit on the 11:19 bundle.
 
 ## What this build adds
 1. **Offload-aware verdicts** — fit assessment now accounts for partial GPU offload: a model bigger than the Metal working set but within total RAM gets a 🟡 partial verdict (runs with some layers on CPU) instead of a hard ❌. Verdicts reflect what the runtime will actually do.
 2. **Efficient quant tier** — catalog surfaces an **Efficient** tier (smaller quants — IQ3/Q3-class) on large repos, so a 27B repo offers a pick that fits comfortably where IQ4 is marginal.
 3. **q8 KV cache + flash attention** — KV cache quantized to q8_0 (halves KV memory vs f16) + flash attention enabled on the local path; longer usable context in the same working set.
 4. **Safe compaction** — compaction on local agents preserves the system prompt; long chats keep their identity/instructions after Compact.
+5. **kv-trim fallback (`d2181bf`, new in this rebuild)** — some llama.cpp cache configs (e.g. quantized q8 KV) don't support partial `seq_rm` (trimming only part of a sequence's KV cache). When the trim fails mid-chat, we now clear the cache and do a full prompt re-decode instead of erroring the turn. Slower on that one turn, but the turn completes.
 
 ## Smoke QA for this build (~8 min)
 1. **🟡 partial allowed** — download/assess a **16GB model on the 24GB Mac** → verdict is 🟡 partial (offload), download proceeds, model loads and streams (some layers CPU-side).
 2. **Efficient tier** — open a **27B repo** in the HF catalog → the **Efficient** tier is visible and offers a smaller quant that fits.
 3. **Compaction keeps system prompt** — run a long local chat, hit **Compact** → agent still knows who it is / follows its system prompt after compaction.
 4. **q8 KV headroom** — on the 27B IQ4_XS agent, usable context is larger than the 09:22 build (q8 KV ≈ half the KV memory); no Decode -3.
+5. **kv-trim fallback (the rebuild fix)** — chat **2+ turns** on Gwen's model → no "kv trim" error; every turn streams to completion (turn 2 may prefill slower if the fallback fires — expected).
 
 ## Regression pass (carry-over)
 1. **Launch** — agents + conversations all present.
