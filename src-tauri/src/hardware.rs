@@ -99,6 +99,71 @@ fn detect_accel(ram_gb: f32) -> (String, Accelerator, f32) {
     ("GPU (unmeasured)".to_string(), Accelerator::Cpu, (ram_gb - 2.0).max(1.0))
 }
 
+// ---------------------------------------------------------------------------
+// REAL FIT CALCULATION — weights + KV cache + overhead vs Metal working set
+// ---------------------------------------------------------------------------
+
+/// Metal working-set cap: the GPU's actual limit (~2/3 of RAM on Macs ≤36GB,
+/// ~75% above). This is what llama.cpp hits with "Decode Error -3" — distinct
+/// from the looser `accel_mem_gb` heuristic used for the header summary.
+/// Must match `local_provider::gpu_layers_for` exactly.
+pub fn working_set_gb(ram_gb: f32) -> f32 {
+    if ram_gb <= 36.0 { ram_gb * (2.0 / 3.0) } else { ram_gb * 0.75 }
+}
+
+/// KV cache per token (GB), scales with model size. 7B ~0.25 MB/tok, 27B ~0.45 MB.
+/// Conservative + matches llama.cpp's fp16-ish cache. `local_provider` uses a
+/// fixed 0.00025; we scale gently so 27B@128k doesn't look like it fits.
+pub fn kv_per_token_gb(params_b: f32) -> f64 {
+    // 0.18 MB base + 0.01 MB per billion params
+    0.00018 + (params_b as f64 * 0.00001)
+}
+
+/// KV cache size for a context window.
+pub fn kv_gb_for(ctx_tokens: u32, params_b: f32) -> f64 {
+    ctx_tokens as f64 * kv_per_token_gb(params_b)
+}
+
+/// Max context tokens that fit for this hardware + model size + file.
+/// Uses working_set - overhead - weights. Returns at least MIN_CTX.
+/// This is conservative (assumes full GPU offload) — the runtime will
+/// still apply partial offload if needed, but recommending the fully-fitting
+/// window guarantees "just works" without the CPU cliff.
+pub fn max_context_tokens(hw: &HardwareInfo, params_b: f32, file_size_gb: f32) -> u32 {
+    const OVERHEAD_GB: f64 = 1.5;
+    const MIN_CTX: u32 = 2048;
+    const MAX_CTX: u32 = 131072;
+    let ws = working_set_gb(hw.ram_gb) as f64;
+    let avail = ws - file_size_gb as f64 - OVERHEAD_GB;
+    if avail <= 0.0 {
+        return MIN_CTX;
+    }
+    let per_tok = kv_per_token_gb(params_b);
+    let max = (avail / per_tok) as u32;
+    let snapped = snap_context(max);
+    snapped.clamp(MIN_CTX, MAX_CTX)
+}
+
+fn snap_context(n: u32) -> u32 {
+    const STEPS: &[u32] = &[2048, 4096, 8192, 16384, 24576, 32768, 49152, 65536, 98304, 131072];
+    let mut best = STEPS[0];
+    for &s in STEPS {
+        if n >= s { best = s; } else { break; }
+    }
+    best
+}
+
+/// Recommended context: advertised window capped by what fits. This is the
+/// "correct" window to auto-set on download, and retroactively for existing
+/// models. `advertised` is the catalog's context_window (0 = unknown).
+pub fn recommended_context(hw: &HardwareInfo, params_b: f32, file_size_gb: f32, advertised: u32) -> u32 {
+    let max_fit = max_context_tokens(hw, params_b, file_size_gb);
+    if advertised == 0 {
+        return max_fit.min(8192);
+    }
+    advertised.min(max_fit)
+}
+
 /// Performance verdict for a specific model download.
 #[derive(Debug, Clone, Serialize)]
 pub struct PerfVerdict {
@@ -112,66 +177,84 @@ pub struct PerfVerdict {
     pub note: String,
     /// Whether the model can fully offload to the accelerator.
     pub fits: bool,
+    /// Recommended context window that actually fits on this machine.
+    pub recommended_ctx: u32,
+    /// Advertised context window (for comparison).
+    pub advertised_ctx: u32,
 }
 
 /// Predict performance for a model of `params_billions` at a quant whose file is
-/// `file_size_gb`. We estimate required memory as the weight file + a KV-cache /
-/// runtime overhead that scales with model size, then compare to usable accel
-/// memory and pick a speed tier.
+/// `file_size_gb`. Now accounts for KV cache at the ADVERTISED context — so a
+/// 16GB 27B at 128k correctly shows as tight/won't-fit on 24GB instead of "great".
 pub fn predict(hw: &HardwareInfo, params_billions: f32, file_size_gb: f32) -> PerfVerdict {
-    // Runtime overhead beyond the weights: KV cache + compute buffers. Rough but
-    // honest — scales with model size. ~0.6GB per 7B of params + 0.7GB base.
-    let overhead = 0.7 + (params_billions / 7.0) * 0.6;
-    let required = file_size_gb + overhead;
-    let usable = hw.accel_mem_gb;
+    predict_with_ctx(hw, params_billions, file_size_gb, 0)
+}
 
-    // Won't fit at all (can't even hold weights in usable memory + a little slack)
-    if required > usable * 1.05 {
+/// Same as `predict` but with an explicit advertised context (0 = use catalog default heuristic).
+pub fn predict_with_ctx(hw: &HardwareInfo, params_billions: f32, file_size_gb: f32, advertised_ctx: u32) -> PerfVerdict {
+    let ctx = if advertised_ctx == 0 { 8192 } else { advertised_ctx };
+    let kv = kv_gb_for(ctx, params_billions);
+    let overhead = 1.5;
+    let required = file_size_gb as f64 + kv + overhead;
+    let ws = working_set_gb(hw.ram_gb) as f64;
+    let usable = ws;
+
+    // also compute what WOULD fit
+    let recommended_ctx = recommended_context(hw, params_billions, file_size_gb, if advertised_ctx==0 { 32768 } else { advertised_ctx });
+    let advertised = if advertised_ctx==0 { 0 } else { advertised_ctx };
+
+    if required > usable * 1.02 {
         return PerfVerdict {
             tier: "wont_fit",
             badge: "❌",
             tokens_per_sec: String::new(),
             fits: false,
             note: format!(
-                "Needs ~{required:.1}GB, you have ~{usable:.0}GB usable. Try a smaller model or quant."
+                "Needs ~{:.1}GB at {}k context, you have ~{:.0}GB working set. Fits only at ~{}k or try a smaller quant.",
+                required, ctx/1024, usable, recommended_ctx/1024
             ),
+            recommended_ctx,
+            advertised_ctx: advertised,
         };
     }
 
-    // Tight fit (fits but eats most of memory → will be sluggish / may swap)
     let tight = required > usable * 0.85;
 
     match hw.accel {
         Accelerator::AppleSilicon => {
-            // Metal unified memory: strong. Speed scales inversely with size.
             let (lo, hi) = speed_range(params_billions, 1.0);
             if tight {
                 PerfVerdict { tier: "usable", badge: "👍", tokens_per_sec: format!("{lo}–{hi} tok/s"), fits: true,
-                    note: "Fits, but uses most of your memory — close other apps for best speed.".into() }
+                    note: format!("Fits at ~{}k context (advertised {}k would OOM). Close other apps for best speed.", recommended_ctx/1024, ctx/1024),
+                    recommended_ctx, advertised_ctx: advertised }
             } else {
                 PerfVerdict { tier: "great", badge: "⚡", tokens_per_sec: format!("{lo}–{hi} tok/s"), fits: true,
-                    note: "Runs great — fully GPU-offloaded on Metal.".into() }
+                    note: format!("Runs great at {}k — fully GPU-offloaded on Metal.", recommended_ctx/1024),
+                    recommended_ctx, advertised_ctx: advertised }
             }
         }
         Accelerator::Cuda => {
             let (lo, hi) = speed_range(params_billions, 1.1);
             if tight {
                 PerfVerdict { tier: "usable", badge: "👍", tokens_per_sec: format!("{lo}–{hi} tok/s"), fits: true,
-                    note: "Fits your VRAM but tightly — expect some slowdown.".into() }
+                    note: format!("Fits your VRAM at ~{}k (advertised {}k is tight).", recommended_ctx/1024, ctx/1024),
+                    recommended_ctx, advertised_ctx: advertised }
             } else {
                 PerfVerdict { tier: "great", badge: "⚡", tokens_per_sec: format!("{lo}–{hi} tok/s"), fits: true,
-                    note: "Runs great — fully offloaded to your GPU (CUDA).".into() }
+                    note: "Runs great — fully offloaded to your GPU (CUDA).".into(),
+                    recommended_ctx, advertised_ctx: advertised }
             }
         }
         Accelerator::Cpu => {
-            // CPU inference: works, but slow — and big models crawl.
             let (lo, hi) = speed_range(params_billions, 0.18);
             if params_billions > 14.0 {
                 PerfVerdict { tier: "slow", badge: "🐢", tokens_per_sec: format!("{lo}–{hi} tok/s"), fits: true,
-                    note: "Will run on CPU but slowly at this size — a 7–8B model will feel much better.".into() }
+                    note: "Will run on CPU but slowly at this size — a 7–8B model will feel much better.".into(),
+                    recommended_ctx, advertised_ctx: advertised }
             } else {
                 PerfVerdict { tier: "usable", badge: "👍", tokens_per_sec: format!("{lo}–{hi} tok/s"), fits: true,
-                    note: "Runs on CPU — usable for chat, not instant. No GPU offload detected.".into() }
+                    note: "Runs on CPU — usable for chat, not instant. No GPU offload detected.".into(),
+                    recommended_ctx, advertised_ctx: advertised }
             }
         }
     }

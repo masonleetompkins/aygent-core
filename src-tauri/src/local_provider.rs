@@ -86,12 +86,15 @@ fn backend() -> Result<&'static LlamaBackend, String> {
 /// we keep the old all-or-nothing behavior (never guess).
 fn gpu_layers_for(path: &str, ctx_tokens: u32) -> u32 {
     let hw = crate::hardware::detect();
-    let ram = hw.ram_gb as f64;
-    let working_set = if ram <= 36.0 { ram * (2.0 / 3.0) } else { ram * 0.75 };
+    let working_set = crate::hardware::working_set_gb(hw.ram_gb) as f64;
     let weights_gb = std::fs::metadata(path)
         .map(|m| m.len() as f64 / 1_073_741_824.0)
         .unwrap_or(0.0);
-    let kv_gb = ctx_tokens as f64 * 0.00025; // ~0.25MB/token, conservative
+    // Use size-aware KV estimate so 27B at 128k correctly spills to partial offload
+    // (must match hardware::kv_gb_for for prediction/runtime agreement)
+    let fname = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+    let params_b = crate::catalog::parse_params(&fname);
+    let kv_gb = crate::hardware::kv_gb_for(ctx_tokens, params_b);
     const OVERHEAD_GB: f64 = 1.5; // compute buffers + scratch
     if weights_gb + kv_gb + OVERHEAD_GB <= working_set {
         return u32::MAX; // everything fits — full offload

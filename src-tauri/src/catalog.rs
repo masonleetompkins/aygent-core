@@ -237,7 +237,7 @@ fn clean_name(id: &str) -> String {
 /// then pick the LARGEST plausible one — the real size (e.g. "30" in
 /// "qwen3-coder-30b-a3b") always dominates the version digit and the small MoE
 /// active-params suffix.
-fn parse_params(lower: &str) -> f32 {
+pub fn parse_params(lower: &str) -> f32 {
     let bytes = lower.as_bytes();
     let mut best = 0.0f32;
     let mut i = 0;

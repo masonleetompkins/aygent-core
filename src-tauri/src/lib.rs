@@ -2185,7 +2185,7 @@ async fn local_catalog(per_family: Option<usize>) -> Result<serde_json::Value, S
     // Attach a perf verdict to each quant so the UI can show fit + speed inline.
     let scored: Vec<serde_json::Value> = models.iter().map(|m| {
         let quants: Vec<serde_json::Value> = m.quants.iter().map(|q| {
-            let v = hardware::predict(&hw, m.params_billions, q.size_gb);
+            let v = hardware::predict_with_ctx(&hw, m.params_billions, q.size_gb, m.context_tokens);
             serde_json::json!({
                 "quant": q.quant, "filename": q.filename, "size_gb": q.size_gb,
                 "download_url": q.download_url, "perf": v,
@@ -2210,7 +2210,7 @@ async fn local_search(query: String, limit: Option<usize>) -> Result<serde_json:
     let models = catalog::search(query, limit.unwrap_or(12)).await?;
     let scored: Vec<serde_json::Value> = models.iter().map(|m| {
         let quants: Vec<serde_json::Value> = m.quants.iter().map(|q| {
-            let v = hardware::predict(&hw, m.params_billions, q.size_gb);
+            let v = hardware::predict_with_ctx(&hw, m.params_billions, q.size_gb, m.context_tokens);
             serde_json::json!({
                 "quant": q.quant, "filename": q.filename, "size_gb": q.size_gb,
                 "download_url": q.download_url, "perf": v,
@@ -2233,7 +2233,7 @@ async fn local_lookup(repo_id: String) -> Result<serde_json::Value, String> {
     let hw = hardware::detect();
     let m = catalog::lookup(repo_id).await?;
     let quants: Vec<serde_json::Value> = m.quants.iter().map(|q| {
-        let v = hardware::predict(&hw, m.params_billions, q.size_gb);
+        let v = hardware::predict_with_ctx(&hw, m.params_billions, q.size_gb, m.context_tokens);
         serde_json::json!({
             "quant": q.quant, "filename": q.filename, "size_gb": q.size_gb,
             "download_url": q.download_url, "perf": v,
@@ -2254,22 +2254,24 @@ async fn local_lookup(repo_id: String) -> Result<serde_json::Value, String> {
 /// ~0.5 MB/token for a small model's KV cache. Clamped to sane bounds. This is
 /// intentionally conservative so it "just works" without OOMing a user's Mac.
 fn local_context_budget(gguf_path: &str) -> u32 {
-    // Model's real window, parsed from its filename via the catalog's rules.
-    let name = std::path::Path::new(gguf_path)
-        .file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
-    let model_ctx = catalog::context_window(&name); // 0 if unknown
-
-    // Memory-safe ceiling from detected hardware.
+    let fname = std::path::Path::new(gguf_path)
+        .file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+    let lower = fname.to_lowercase();
+    let model_ctx = catalog::context_window(&lower);
     let hw = hardware::detect();
-    // Reserve ~40% of usable memory for context; ~0.0005 GB per token is a
-    // conservative small-model KV estimate → tokens = mem*0.4 / 0.0005.
+    let params_b = catalog::parse_params(&lower);
+    if let Ok(meta) = std::fs::metadata(gguf_path) {
+        let file_gb = meta.len() as f64 / 1_073_741_824.0;
+        if file_gb > 0.5 {
+            return hardware::recommended_context(&hw, params_b, file_gb as f32, model_ctx);
+        }
+    }
     let mem_tokens = ((hw.accel_mem_gb as f64) * 0.40 / 0.0005) as u32;
-
     let chosen = match (model_ctx, mem_tokens) {
         (0, 0) => 4096,
-        (0, m) => m.min(8192),           // unknown model window: modest default
+        (0, m) => m.min(8192),
         (c, 0) => c.min(8192),
-        (c, m) => c.min(m),              // model window, capped by memory
+        (c, m) => c.min(m),
     };
     chosen.clamp(2048, 131072)
 }
