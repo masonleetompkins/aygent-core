@@ -437,9 +437,15 @@ fn run_turn(
         common -= 1;
     }
     // Drop the stale tail (positions >= common) from the cache, keep the prefix.
-    if common < cached.len() {
-        ctx.kv_cache_seq_rm(0, Some(common as u32), None)
-            .map_err(|e| format!("kv trim: {e}"))?;
+    // Some cache layouts CAN'T remove a partial sequence (sliding-window
+    // attention models like Gemma, recurrent models) — llama.cpp fails the
+    // partial seq_rm. Prefix reuse is an optimization, never correctness:
+    // on failure, clear the WHOLE cache (always allowed) and re-decode the
+    // full prompt — exactly the pre-cache behavior, just slower this turn.
+    if common < cached.len() && ctx.kv_cache_seq_rm(0, Some(common as u32), None).is_err() {
+        ctx.clear_kv_cache();
+        cached.clear();
+        common = 0;
     }
     cached.truncate(common);
 
