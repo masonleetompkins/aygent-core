@@ -252,7 +252,8 @@ function speedWords(perf: Perf): string {
   switch (perf.tier) {
     case "great": return "fast";
     case "usable": return "okay speed";
-    case "slow": return "slow";
+    case "partial": return "runs (GPU + CPU split)";
+    case "slow": return "slow (mostly CPU)";
     default: return "";
   }
 }
@@ -266,8 +267,12 @@ function contextWords(tokens: number): { short: string; long: string } {
 
 function quantBlurb(quant: string): { title: string; sub: string } {
   const higher = ["Q5_K_M", "Q6_K", "Q8_0"];
+  const efficient = ["IQ4_XS", "IQ3_M", "Q3_K_S", "IQ3_XXS", "Q2_K", "IQ2_M", "IQ2_XS"];
   if (higher.includes(quant)) {
     return { title: "Higher quality", sub: "sharper answers · larger file · needs more memory" };
+  }
+  if (efficient.includes(quant)) {
+    return { title: "Efficient", sub: "smallest file · runs big models on modest memory · slight quality dip" };
   }
   return { title: "Recommended", sub: "nearly identical quality · smaller file · best for most people" };
 }
@@ -491,7 +496,7 @@ function LocalModels({ folder, activePath, onChoose }: {
                 ? <Pill tone="ok">installed ✓</Pill>
                 : downloading
                   ? <span style={{ fontSize: 12, fontFamily: "ui-monospace, monospace", width: 90, textAlign: "right" }}>{Math.round(pct * 100)}%</span>
-                  : <Button variant="secondary" onClick={() => download(q)} disabled={!q.perf.fits}>Download</Button>}
+                  : <Button variant="secondary" onClick={() => download(q)} disabled={q.perf.tier === "wont_fit"}>Download</Button>}
             </div>
           );
         })}
@@ -618,7 +623,7 @@ function LocalModels({ folder, activePath, onChoose }: {
 
       {selected && (
         <div style={{ ...hint, fontSize: 12, color: "var(--text-faint)", marginTop: 8, display: "flex", flexDirection: "column", gap: 3 }}>
-          <span><b>Which download should I pick?</b> Both are the exact same model at different compression. “Recommended” is nearly identical quality in a smaller file — pick it unless you have plenty of free memory and want the absolute best.</span>
+          <span><b>Which download should I pick?</b> They're the exact same model at different compression. “Recommended” is nearly identical quality in a smaller file; “Efficient” squeezes big models onto modest memory with a slight quality dip; “Higher quality” needs the most memory. A 🟡 badge means it runs split across GPU + CPU — it works, but the Efficient file will feel much faster.</span>
           <span><b>Speed</b> (“tok/s” = tokens per second) is how fast the AI types. ~15+ feels quick; under ~8 feels sluggish. <b>Memory</b> is how much conversation the model can keep in mind at once. Estimates, not benchmarks.</span>
         </div>
       )}

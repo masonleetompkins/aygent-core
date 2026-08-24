@@ -1,3 +1,80 @@
+# Stage build — 2026-08-21 11:49 PDT — v1.0.11 (REBUILD: RAM-pool sizing + kv-trim fallback)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, **10 warnings, 0 errors** (dead-code only: telegram/browser/exec — same set as prior builds). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, HEAD `d2181bf`):**
+- `9ac5f34` — local models: run up to RAM-pool size via offload-aware verdicts, small quants, q8 KV, safe compaction
+- `d2181bf` — fix(local): kv-trim fallback — clear cache + full re-decode when partial `seq_rm` is unsupported (fixes Gwen's mid-chat "kv trim" error)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 39,271,416 bytes), mtime **2026-08-21 11:49**
+- dmg: `dmg/AYGENT_1.0.11_aarch64.dmg`, **17,201,835 bytes (~16.4 MB)**, mtime **2026-08-21 11:49**
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+**This 11:49 rebuild supersedes both the 11:19 build (`9ac5f34`) and the 09:22 build (`3baacee`).** Same version number — it folds in `d2181bf`, the fix for the mid-chat "kv trim" error Gwen hit on the 11:19 bundle.
+
+## What this build adds
+1. **Offload-aware verdicts** — fit assessment now accounts for partial GPU offload: a model bigger than the Metal working set but within total RAM gets a 🟡 partial verdict (runs with some layers on CPU) instead of a hard ❌. Verdicts reflect what the runtime will actually do.
+2. **Efficient quant tier** — catalog surfaces an **Efficient** tier (smaller quants — IQ3/Q3-class) on large repos, so a 27B repo offers a pick that fits comfortably where IQ4 is marginal.
+3. **q8 KV cache + flash attention** — KV cache quantized to q8_0 (halves KV memory vs f16) + flash attention enabled on the local path; longer usable context in the same working set.
+4. **Safe compaction** — compaction on local agents preserves the system prompt; long chats keep their identity/instructions after Compact.
+5. **kv-trim fallback (`d2181bf`, new in this rebuild)** — some llama.cpp cache configs (e.g. quantized q8 KV) don't support partial `seq_rm` (trimming only part of a sequence's KV cache). When the trim fails mid-chat, we now clear the cache and do a full prompt re-decode instead of erroring the turn. Slower on that one turn, but the turn completes.
+
+## Smoke QA for this build (~8 min)
+1. **🟡 partial allowed** — download/assess a **16GB model on the 24GB Mac** → verdict is 🟡 partial (offload), download proceeds, model loads and streams (some layers CPU-side).
+2. **Efficient tier** — open a **27B repo** in the HF catalog → the **Efficient** tier is visible and offers a smaller quant that fits.
+3. **Compaction keeps system prompt** — run a long local chat, hit **Compact** → agent still knows who it is / follows its system prompt after compaction.
+4. **q8 KV headroom** — on the 27B IQ4_XS agent, usable context is larger than the 09:22 build (q8 KV ≈ half the KV memory); no Decode -3.
+5. **kv-trim fallback (the rebuild fix)** — chat **2+ turns** on Gwen's model → no "kv trim" error; every turn streams to completion (turn 2 may prefill slower if the fallback fires — expected).
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Browser** — open a page in the in-app browser, agent read of the page.
+6. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
+# Stage build — 2026-08-21 09:22 PDT — v1.0.11 (real-fit context window)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, **10 warnings, 0 errors** (dead-code only: telegram/browser/exec — same set as 1.0.10). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit:** `3baacee` — fix(local): real-fit context window — weights+KV+overhead vs Metal working set; v1.0.11 (on `staging`)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 39378152 bytes), mtime **2026-08-21 09:22**
+- dmg: `dmg/AYGENT_1.0.11_aarch64.dmg`, **17209834 bytes (~16.4 MB)**, mtime **2026-08-21 09:22**
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## What this build fixes
+**Root cause:** assessment said 128k but ignored KV. A 27B IQ4_XS GGUF (16GB) at 128k needs ~58GB KV + 16GB weights = 75GB vs ~16GB Metal working set on a 24GB Mac (24 * 2/3) => `Decode Error -3`. The predictor only counted weights + 1.3GB overhead, so it showed ⚡ great.
+
+1. **`hardware.rs`** — `working_set_gb()`, `kv_per_token_gb()` (scales 7B ~0.25MB to 27B ~0.45MB), `max_context_tokens()` (weight+KV+1.5GB vs working set, snapped to 2k/4k/8k/16k...), `recommended_context() = min(advertised, max_that_fits)`, `predict_with_ctx()` now includes KV at the advertised window. Retroactive: already-downloaded models auto-cap via `local_context_budget()` reading the real file size on next run.
+2. **`lib.rs`** — `local_context_budget()` file-size-aware (actual GGUF bytes + `parse_params()` → `recommended_context()`); all 3 catalog paths score with `predict_with_ctx(..., m.context_tokens)`.
+3. **`local_provider.rs`** — `gpu_layers_for()` now uses `hardware::working_set_gb()` + `kv_gb_for()` so runtime agrees with prediction; `catalog.rs` `parse_params` made pub.
+
+**Result for your Qwen3.8-27B IQ4_XS (16GB) on 24GB:** advertised 32k (128k yarn) → **auto-set 8192** (2k-4k on tighter, 32k+ would OOM). For 16k+ pick IQ3_M/Q3_K_L (~11-13GB) from the same repo.
+
+## Smoke QA for this build (~6 min)
+1. **The fix** — on your Qwen3.8-27B IQ4_XS agent, chat a turn → streams fine, no Decode -3; header shows ~8k context (not 128k).
+2. **Catalog badge** — HF search/browsing for that model now shows `👍 Fits at ~8k (advertised 32k would OOM)` instead of `⚡ great`.
+3. **Retroactive** — your already-downloaded 16GB GGUF auto-caps to ~8k on next launch (drop to 4k in Settings if you kept 128k).
+4. **Long context still works** — on a 7B model, full 32k still available.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Browser** — open a page in the in-app browser, agent read of the page.
+6. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
 # Stage build — Aug 19, 2026, 19:05 PDT — v1.0.10 (REBUILD #2 → promoted with recall/RAG on top)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0, **0 errors** (dead-code warnings only). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
@@ -143,7 +220,7 @@
 - staged site file: `~/AYGENT/Cleo/masonleebuild/product-files/AYGENT-1.0.4-macOS.dmg` (16.9 MB staged), uploaded to Supabase bucket `products/aygent/...` via `node scripts/publish-release.js 1.0.4` → `product_releases 1.0.4 recorded`, emailed `1/1 owners`
 - backup: `~/.aygent-backups/AYGENT.app.20260813-171130/` + `.old` (rollback ready)
 
-**Pro Mode fix (9ea239d):** Shell `git` no longer uses the global `osxkeychain` entry. `exec.rs` (`GLOBAL_DB` + `inject_github_env` + `spawn_for_agent`/`run_for_agent`) + `lib.rs` `install_db` + `exec_shell_tool` now resolve `connections::resolve_github_push_token(db, agent_id)` and inject `GITHUB_TOKEN`/`GH_TOKEN`/`GIT_CONFIG credential.helper` **per-process only** (Pro-Mode gated, fail-open if no enabled GitHub connection). `broker_ws.rs` passes `agent_opt` through. Your personal `security find-internet-password -s github.com` is untouched.
+**Pro Mode fix (9ea239d):** Shell `git` no longer uses the global `osxkeychain` entry. `exec.rs` (`GLOBAL_DB` + `inject_github_env` + `spawn_for_agent`/`run_for_agent`) + `lib.rs` `install_db` + `exec_shell_tool` now resolve `connections::resolve_github_push_token(db, agent_id)` and inject `GITHUB_TOKEN`/`GH_TOKEN`/`GIT_CONFIG credential.helper` **per-process only** (Pro-Mode gated, fail-open if no enabled GitHub connection). Your personal `security find-internet-password -s github.com` is untouched.
 
 **Harness fix (2b796d5):** Large file writes (>20KB, e.g. `routes.ts`) were clipped before reaching GitHub — provider 64k uncap + honest truncation error surfaced instead of silent vanish.
 
