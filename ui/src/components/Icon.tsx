@@ -6,7 +6,7 @@ import type { CSSProperties } from "react";
 
 export type IconName =
   // nav
-  | "chat" | "agents" | "tools" | "scheduler" | "connections" | "savepoints" | "settings"
+  | "chat" | "agents" | "tools" | "scheduler" | "connections" | "savepoints" | "settings" | "video"
   // agent-picker symbol set (SF-Symbol-ish)
   | "sparkles" | "brain" | "bolt" | "book" | "flask" | "briefcase" | "palette"
   | "chart" | "leaf" | "compass" | "rocket" | "star" | "terminal" | "globe"
@@ -38,6 +38,8 @@ const PATHS: Record<IconName, JSX.Element> = {
   connections: <path d="M9 12a3 3 0 0 1 0-4l2-2a3 3 0 0 1 4 4l-1 1M15 12a3 3 0 0 1 0 4l-2 2a3 3 0 0 1-4-4l1-1" />,
   savepoints: <path d="M9 14L4 9l5-5M4 9h9a7 7 0 0 1 7 7v3" />,
   settings: <><circle cx="12" cy="12" r="3" /><path d="M12 2v3m0 14v3M4.2 4.2l2.1 2.1m11.4 11.4l2.1 2.1M2 12h3m14 0h3M4.2 19.8l2.1-2.1m11.4-11.4l2.1-2.1" /></>,
+  // VIDEO (v0.1): video-camera body + lens triangle.
+  video: <><rect x="2" y="7" width="13" height="11" rx="2" /><path d="M15 10.5l6-3v9l-6-3" /></>,
 
   sparkles: <path d="M12 3l1.8 4.9L18 9l-4.2 1.1L12 15l-1.8-4.9L6 9l4.2-1.1zM18 14l.9 2.4L21 17l-2.1.6L18 20l-.9-2.4L15 17l2.1-.6z" />,
   brain: <path d="M9 3a3 3 0 0 0-3 3 3 3 0 0 0-1 5 3 3 0 0 0 2 5 3 3 0 0 0 5 1 3 3 0 0 0 5-1 3 3 0 0 0 2-5 3 3 0 0 0-1-5 3 3 0 0 0-3-3 3 3 0 0 0-3 2 3 3 0 0 0-3-2z" />,

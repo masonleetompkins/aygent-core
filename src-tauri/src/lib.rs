@@ -68,6 +68,7 @@ mod supervisor;
 mod telegram;
 mod tools_registry;
 mod spark_state; // SPARKS: jailed KV persistence (Sparks/<slug>/state.json) for interactive Sparks.
+mod video; // VIDEO TOOL v0.1: file-backed project store (Video/<project>/composition.json).
 
 use std::sync::Arc;
 use rand::Rng;
@@ -5921,6 +5922,7 @@ pub fn run() {
             sparks_list, sparks_read, sparks_delete,
             spark_save,
             spark_state_get, spark_state_set, spark_state_set_key,
+            video::video_status, video::video_projects, video::video_load, video::video_save,
             dashboard::dashboard_load, dashboard::dashboard_upsert_module,
             dashboard::dashboard_remove_module, dashboard::dashboard_arrange,
             dashboard::dashboard_undo,

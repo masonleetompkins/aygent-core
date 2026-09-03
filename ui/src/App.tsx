@@ -11,6 +11,7 @@ import { Browser } from "./screens/Browser";
 import { SavePoints } from "./screens/SavePoints";
 import { Tools, Skills } from "./screens/Tools";
 import { Sparks } from "./screens/Sparks";
+import { Video } from "./screens/Video";
 import { McpConnections } from "./screens/McpConnections";
 import { applyAppIcon } from "./lib/appIcon";
 import { Scheduler } from "./screens/Scheduler";
@@ -280,6 +281,7 @@ export function App() {
           {screen === "tools" && <Tools folder={folder} agentId={activeAgent?.id ?? null} />}
           {screen === "skills" && <Skills folder={folder} agentId={activeAgent?.id ?? null} />}
           {screen === "sparks" && <Sparks agentId={activeAgent?.id ?? null} onNavigate={(sc) => setScreen(sc as ScreenId)} />}
+          {screen === "video" && <Video agentId={activeAgent?.id ?? null} />}
           {screen === "mcp" && <McpConnections />}
           {screen === "browser" && <Browser />}
         </div>
