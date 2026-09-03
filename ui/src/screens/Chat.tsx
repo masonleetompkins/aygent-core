@@ -79,6 +79,17 @@ export function Chat({
   );
 }
 
+/** Human label for the "add a key" hint — names the agent's real provider. */
+function providerLabel(p: string | null | undefined): string {
+  switch (p) {
+    case "openai": return "an OpenAI";
+    case "openrouter": return "an OpenRouter";
+    case "meta": return "a Muse (Meta)";
+    case "anthropic": case "": case null: case undefined: return "an Anthropic";
+    default: return `a ${p}`;
+  }
+}
+
 function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: {
   agent: AgentProfile | null;
   folder: string | null; keySet: boolean; agentId: string | null;
@@ -878,7 +889,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
         {blocked && (
           <p style={{ ...hint, marginBottom: 12 }}>
-            {!folder ? "Pick an Agent Folder in Settings, " : ""}{!keySet ? "add an Anthropic key in Settings" : ""} to start.
+            {!folder ? "Pick an Agent Folder in Settings, " : ""}{!keySet ? `add ${providerLabel(providerRef.current)} key in Settings (or switch this agent to a local model)` : ""} to start.
           </p>
         )}
 

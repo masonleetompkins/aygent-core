@@ -111,7 +111,21 @@ export function App() {
     setActiveAgent(a);
     if (a.folder_path) setFolder(a.folder_path);
   }
-  useEffect(() => { invoke<boolean>("has_provider_key", { provider: "anthropic" }).then(setKeySet).catch(() => {}); }, [screen]);
+  // Chat "ready" gate is per-agent: check the key for the provider THIS agent
+  // uses. Local (in-process GGUF) needs no key at all. Previously this was
+  // hardwired to "anthropic", so a local-only (or OpenAI/OpenRouter/Meta-only)
+  // setup was blocked with "add an Anthropic key" even though the backend was fine.
+  useEffect(() => {
+    const p = activeAgent?.provider || "anthropic";
+    if (p === "local") { setKeySet(true); return; }
+    invoke<boolean>("has_provider_key", { provider: p }).then(setKeySet).catch(() => {});
+  }, [screen, activeAgent?.id, activeAgent?.provider]);
+  // Settings can change the active agent's provider/model (set_selection) without
+  // going through the switcher — re-read the profile on every screen change so the
+  // gate above sees the new provider instead of a stale one.
+  useEffect(() => {
+    invoke<AgentProfile | null>("agents_get_active").then((a) => { if (a) setActiveAgent(a); }).catch(() => {});
+  }, [screen]);
   function onTheme(m: Mode, a: string) { setMode(m); setAccent(a); saveTheme(m, a); }
 
   useEffect(() => {

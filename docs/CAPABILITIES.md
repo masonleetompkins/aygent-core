@@ -1,4 +1,4 @@
-# AYGENT — Capabilities (v1.0.11)
+# AYGENT — Capabilities (v1.0.12)
 
 _The canonical reference for what AYGENT can do, as shipped in the signed,
 notarized release. This is the source-of-truth capability doc: keep it in
@@ -230,6 +230,7 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 ---
 
 ## Changelog
+- **1.0.12** (2026-09-04): **Local-only setups no longer blocked by a phantom Anthropic-key check** — the chat "ready" gate was hardwired to `has_provider_key("anthropic")`, so an agent on a **local model** (or OpenAI/OpenRouter/Muse-only) saw "add an Anthropic key in Settings" and a disabled composer even though the backend needed no such key. The gate is now per-agent: `local` is always ready, cloud providers check **their own** key, and the hint names the real provider. Active-agent profile is re-read on screen change so switching provider in Settings takes effect immediately.
 - **1.0.11** (2026-09-03): **Web search + Brave + Playwright** — `web_search` builtin (no-key DuckDuckGo search, wired on every provider path incl. local models and dashboard buttons); **Brave Search connector** (keyed web/news/image/video search); **Playwright MCP** one-click browser automation (isolated Chromium, provisioned Node, no system installs).
 - **1.0.11** (2026-08-21): **Local models sized to your machine** — bump 1.0.10 → 1.0.11. **Real-fit context window** (`3baacee`): the fit predictor now counts weights + KV cache + overhead against the Metal working set, so a big model auto-caps to the context that actually fits instead of advertising 128k and dying with `Decode Error -3`; already-downloaded models retroactively auto-cap on next run. **Run up to RAM-pool size** (`9ac5f34`): offload-aware verdicts — a model bigger than the GPU working set but within total RAM gets a 🟡 partial verdict (some layers on CPU) and downloads instead of a hard ❌; new **Efficient** quant tier (IQ3/Q3-class) surfaces smaller quants on large repos; **q8_0 KV cache + flash attention** on the local path (~half the KV memory → longer usable context); safe compaction preserves the system prompt on local agents. **kv-trim fallback** (`d2181bf`): cache configs that can't trim a partial sequence (q8 KV) now clear + full re-decode instead of erroring the turn.
 - **1.0.10** (2026-08-19): **Local models grow up** — bump 1.0.9 → 1.0.10. Fixes: SIGABRT crash on long local chats (n_batch sized to prompt, `86940db`); tool calls emitted inside an unclosed `<think>` rescued + executed (`5889490`); **Compact now works on local agents** (summary authored in-process by the local model, `e13e23a`); model-switch memory leak — old sessions/weights evicted so a smaller model no longer hits memory errors (`f6470e5`). Perf: **KV-cache reuse across turns** (persistent llama sessions — turn 2+ prefill near-instant, `42d8b90`); **partial GPU offload** (oversized GGUFs offload what fits instead of falling to all-CPU, `758afbb`). Features: **recall(query) memory tool + auto-injected memory (RAG) + few-shot tool examples** for local models (`791ad98`); HF search/lookup no longer blocks uncensored/abliterated models — your machine, your choice (`692fe34`).
@@ -259,4 +260,4 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 - **1.0.0** (2026-08-10): Signed/notarized launch — whoami tool, GFM tables,
   dashboards, sparks, remote.
 
-_Last updated 2026-09-03 for 1.0.11. If you add a capability, add it here._
+_Last updated 2026-09-04 for 1.0.12. If you add a capability, add it here._
