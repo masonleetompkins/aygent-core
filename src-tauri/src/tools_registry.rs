@@ -174,6 +174,20 @@ fn builtins() -> Vec<ToolDef> {
             instructions: String::new(),
             allowed_tools: vec![],
         },
+        ToolDef {
+            id: "builtin.search".into(),
+            name: "web_search".into(),
+            display_name: "Web Search".into(),
+            description: "Search the web (DuckDuckGo, no key needed) and return the top hits as \
+                title + url + snippet. Use when the user asks what's current, or to find a page \
+                to read with fetch_url. The daemon has no network; the search runs on the \
+                privileged side and only titles/urls/snippets are returned. \
+                Args: query (string).".into(),
+            kind: "builtin".into(),
+            builtin: true,
+            instructions: String::new(),
+            allowed_tools: vec![],
+        },
     ]
 }
 

@@ -538,6 +538,7 @@ mod catalog_integrity {
         const EXPECTED: &[&str] = &[
             "github", "notion", "linear", "google", "slack",
             "supabase", "stripe", "resend", "cloudflare", "vercel",
+            "brave",
         ];
         for id in EXPECTED {
             assert!(

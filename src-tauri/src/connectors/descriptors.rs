@@ -2274,11 +2274,139 @@ const VERCEL: Connector = Connector {
     ],
 };
 
+// ---------------------------------------------------------------------------
+// BRAVE SEARCH — keyed web search API. The no-key DuckDuckGo `web_search` tool
+// covers casual "what's current" questions; this connector is the UPGRADE path:
+// higher-quality ranking, news/image/video verticals, and no HTML scraping to
+// break when DDG tweaks its layout. Read-only by construction (search has no
+// writes), so there is no write_warning to write.
+// ---------------------------------------------------------------------------
+
+const BRAVE: Connector = Connector {
+    id: "brave",
+    label: "Brave Search",
+    category: "Research",
+    blurb: "Keyed web search with news, image, and video verticals — better ranking than the built-in search when it matters.",
+    auth_kind: "pat",
+    auth_fields: &[AuthField {
+        key: "token",
+        label: "Brave Search API key",
+        help: "From the Brave Search API dashboard. The free tier covers casual use.",
+        secret: true,
+        placeholder: "BSA…",
+    }],
+    credential_url: "https://brave.com/search/api/",
+    docs_url: "https://api.search.brave.com/app/documentation/web-search/get-started",
+    setup_steps: &[
+        "Open the Brave Search API page and get a key (free tier available).",
+        "Copy the key (starts with BSA…).",
+        "Paste it here.",
+    ],
+    write_warning: "",
+    base_url: "https://api.search.brave.com",
+    auth_header: "X-Subscription-Token",
+    auth_value: "{token}",
+    headers: &[("Accept", "application/json")],
+    // Validation costs one API call (plans are per-query), so keep it to a
+    // single result. identity_path is empty — search has no account name, so the
+    // connection is labeled with the provider name.
+    validate: Some(ValidateSpec {
+        method: "GET",
+        url: "https://api.search.brave.com/res/v1/web/search?q=aygent&count=1",
+        identity_path: "",
+        scopes_header: "",
+        body: "",
+    }),
+    tools: &[
+        ConnectorTool {
+            danger: false, b64_params: &[], raw_params: &[], base_override: "",
+            name: "brave_search_web",
+            description: "Search the web via Brave — titles, urls, and snippets. Better ranking \
+                          than the built-in search; use when result quality matters.",
+            access: Access::Read,
+            method: "GET",
+            path: "/res/v1/web/search",
+            query: &[("q", "{query}"), ("count", "{count}")],
+            body: "",
+            params: &[
+                ToolParam { name: "query", ty: "string", description: "The search query.", required: true },
+                ToolParam { name: "count", ty: "number", description: "How many hits (max 20, default 10).", required: false },
+            ],
+            render: Render::Items {
+                root: "web.results",
+                line: "- {title}\n  {url}\n  {description}",
+                empty: "No results found. Try a different query.",
+            },
+        },
+        ConnectorTool {
+            danger: false, b64_params: &[], raw_params: &[], base_override: "",
+            name: "brave_search_news",
+            description: "Search NEWS via Brave — recent articles with titles, urls, and age. Use \
+                          when the user asks what's happening right now.",
+            access: Access::Read,
+            method: "GET",
+            path: "/res/v1/news/search",
+            query: &[("q", "{query}"), ("count", "{count}")],
+            body: "",
+            params: &[
+                ToolParam { name: "query", ty: "string", description: "The news query.", required: true },
+                ToolParam { name: "count", ty: "number", description: "How many hits (max 20, default 10).", required: false },
+            ],
+            render: Render::Items {
+                root: "results",
+                line: "- {title} · {age}\n  {url}\n  {description}",
+                empty: "No news found. Try a different query.",
+            },
+        },
+        ConnectorTool {
+            danger: false, b64_params: &[], raw_params: &[], base_override: "",
+            name: "brave_search_images",
+            description: "Search IMAGES via Brave — titles plus the page url and direct image src. \
+                          Use when the user needs a picture, logo, or visual reference.",
+            access: Access::Read,
+            method: "GET",
+            path: "/res/v1/images/search",
+            query: &[("q", "{query}"), ("count", "{count}")],
+            body: "",
+            params: &[
+                ToolParam { name: "query", ty: "string", description: "The image query.", required: true },
+                ToolParam { name: "count", ty: "number", description: "How many hits (max 20, default 10).", required: false },
+            ],
+            render: Render::Items {
+                root: "results",
+                line: "- {title}\n  page: {url}\n  image: {properties.url}{src}",
+                empty: "No images found. Try a different query.",
+            },
+        },
+        ConnectorTool {
+            danger: false, b64_params: &[], raw_params: &[], base_override: "",
+            name: "brave_search_videos",
+            description: "Search VIDEOS via Brave — titles, urls, durations, and descriptions. Use \
+                          when the user wants a walkthrough, talk, or clip.",
+            access: Access::Read,
+            method: "GET",
+            path: "/res/v1/videos/search",
+            query: &[("q", "{query}"), ("count", "{count}")],
+            body: "",
+            params: &[
+                ToolParam { name: "query", ty: "string", description: "The video query.", required: true },
+                ToolParam { name: "count", ty: "number", description: "How many hits (max 20, default 10).", required: false },
+            ],
+            render: Render::Items {
+                root: "results",
+                line: "- {title} · {duration}\n  {url}\n  {description}",
+                empty: "No videos found. Try a different query.",
+            },
+        },
+    ],
+};
+
 /// THE CATALOG. Order here is display order in the Connections screen.
 pub const ALL: &[Connector] = &[
     GITHUB, LINEAR, VERCEL, CLOUDFLARE, SUPABASE, // Dev + Infra
     NOTION, GOOGLE,                               // Productivity
     SLACK, RESEND,                                // Comms
     STRIPE,                                       // Business
+    BRAVE,                                        // Research
 ];
 

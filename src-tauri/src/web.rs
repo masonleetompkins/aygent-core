@@ -171,6 +171,182 @@ fn strip_block(s: &str, tag: &str) -> String {
     out
 }
 
+/// One web-search hit: title + url + snippet for the model to reason over.
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+/// Cap search hits so one search can't blow the model's context. 10 hits with
+/// short snippets is plenty for "what's current"; the model fetches the page
+/// itself (fetch_url) when it needs depth.
+const MAX_SEARCH_RESULTS: usize = 10;
+
+/// Web search via DuckDuckGo's HTML endpoint (no key, no account). Runs on the
+/// privileged side like fetch — the jailed daemon never opens a socket itself.
+/// Returns structured hits; use search_blocking for the model-facing string.
+pub async fn search(query: &str) -> Result<Vec<SearchResult>, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Err("search needs a `query`".into());
+    }
+    if q.chars().count() > 500 {
+        return Err("query too long (max 500 chars)".into());
+    }
+    let encoded = urlencoding::encode(q);
+    let url = format!("https://html.duckduckgo.com/html/?q={encoded}");
+
+    let client = reqwest::Client::builder()
+        .user_agent("AYGENT/0.1 (+https://aygent.app)")
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+
+    let resp = client
+        .get(&url)
+        .header("Accept", "text/html")
+        .send()
+        .await
+        .map_err(|e| format!("search request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("search failed: HTTP {}", resp.status()));
+    }
+    let html = resp.text().await.map_err(|e| format!("read search body: {e}"))?;
+    Ok(parse_ddg_html(&html))
+}
+
+/// Parse DuckDuckGo HTML results into structured hits. Dependency-free string
+/// scanning: find each `result__a` anchor (the title link), resolve its href
+/// (unwrapping DDG's //duckduckgo.com/l/?uddg= redirect), then grab the nearby
+/// `result__snippet` text. Anything unparseable is skipped — a half-filled list
+/// beats a hard error on a layout tweak.
+fn parse_ddg_html(html: &str) -> Vec<SearchResult> {
+    let mut out = Vec::new();
+    let mut rest = html;
+    while out.len() < MAX_SEARCH_RESULTS {
+        // Find the next result title anchor.
+        let Some(a_pos) = rest.find("result__a") else { break };
+        let chunk = &rest[a_pos..];
+        // href="..." inside the anchor tag.
+        let href = chunk
+            .find("href=\"")
+            .and_then(|s| {
+                let after = &chunk[s + 6..];
+                after.find('"').map(|e| &after[..e])
+            })
+            .unwrap_or("");
+        // Title = anchor inner text up to </a>, tags stripped.
+        let title = chunk
+            .find('>')
+            .and_then(|s| {
+                let after = &chunk[s + 1..];
+                after.find("</a>").map(|e| strip_tags(&after[..e]))
+            })
+            .unwrap_or_default();
+        // Snippet = first result__snippet AFTER this anchor (bounded scan so we
+        // don't drift into the next result's text on layout changes).
+        let snippet = {
+            let window = &chunk[..chunk.len().min(4000)];
+            window.find("result__snippet").and_then(|s| {
+                let seg = &window[s..];
+                seg.find('>').and_then(|g| {
+                    let after = &seg[g + 1..];
+                    after.find("</").map(|e| strip_tags(&after[..e]))
+                })
+            }).unwrap_or_default()
+        };
+        let url = resolve_ddg_href(href);
+        // Advance past this anchor so the next iteration finds the next result.
+        if let Some(end) = chunk.find("</a>") {
+            rest = &chunk[end + 4..];
+        } else {
+            break;
+        }
+        if url.is_empty() || title.trim().is_empty() {
+            continue;
+        }
+        // DDG sometimes repeats ad/promo blocks — dedupe by URL.
+        if out.iter().any(|r: &SearchResult| r.url == url) {
+            continue;
+        }
+        out.push(SearchResult {
+            title: title.trim().to_string(),
+            url,
+            snippet: snippet.trim().to_string(),
+        });
+    }
+    out
+}
+
+/// Resolve a DDG href to the real target URL. Result links are usually wrapped:
+/// //duckduckgo.com/l/?uddg=<percent-encoded-target>&... — unwrap `uddg`.
+/// Bare https? links (and relative /l/?uddg= forms) pass through; anything else
+/// (javascript:, empty) resolves to "" and is skipped by the caller.
+fn resolve_ddg_href(href: &str) -> String {
+    let h = href.trim();
+    if h.is_empty() {
+        return String::new();
+    }
+    // Unwrap the redirect wrapper.
+    if let Some(pos) = h.find("uddg=") {
+        let after = &h[pos + 5..];
+        let enc = after.split('&').next().unwrap_or("");
+        if let Ok(dec) = urlencoding::decode(enc) {
+            let s = dec.into_owned();
+            if s.starts_with("http://") || s.starts_with("https://") {
+                return s;
+            }
+        }
+    }
+    if h.starts_with("//") {
+        return format!("https:{h}");
+    }
+    if h.starts_with("http://") || h.starts_with("https://") {
+        return h.to_string();
+    }
+    String::new()
+}
+
+/// Strip any <tags> from a short snippet/title fragment + collapse whitespace.
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Blocking bridge for the SYNC tool-exec path (same pattern as fetch_blocking).
+/// Returns a compact, model-friendly list: "- title\n  url\n  snippet".
+pub fn search_blocking(query: &str) -> Result<String, String> {
+    let q = query.to_string();
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|_| "no tokio runtime for web search".to_string())?;
+    let hits =
+        std::thread::scope(|scope| scope.spawn(|| handle.block_on(search(&q))).join().unwrap())?;
+    if hits.is_empty() {
+        return Ok("No results found. Try a different query.".into());
+    }
+    let mut out = String::new();
+    for h in hits {
+        out.push_str(&format!("- {}\n  {}\n", h.title, h.url));
+        if !h.snippet.is_empty() {
+            let snip: String = h.snippet.chars().take(300).collect();
+            out.push_str(&format!("  {snip}\n"));
+        }
+    }
+    Ok(out.trim_end().to_string())
+}
+
 /// Blocking bridge: run the async fetch on a worker so a SYNC tool-exec path can
 /// call it without threading async through every call site (same pattern the
 /// embed path uses). Returns a compact, model-friendly string.

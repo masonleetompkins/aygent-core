@@ -16,7 +16,7 @@ import { AygentHyperFrames } from "../components/AygentHyperFrames";
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 const faint = { ...hint, fontSize: 12, color: "var(--text-faint)" } as const;
-const BASE_TOOLS = ["read_file", "write_file", "list_files", "generate_pdf", "fetch_url"];
+const BASE_TOOLS = ["read_file", "write_file", "list_files", "generate_pdf", "fetch_url", "web_search"];
 
 type Capability = {
   id: string; name: string; display_name: string; description: string;
