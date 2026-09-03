@@ -243,7 +243,7 @@ export function App() {
            children actually shrink below their content size — without it, a
            child measures its frozen intrinsic size (the Browser pane was stuck
            at its large-window rect because this chain couldn't shrink). */}
-        <div style={{ padding: "28px 32px", flex: 1, minHeight: 0, minWidth: 0, display: "flex", flexDirection: "column" }}>
+        <div style={{ padding: screen === "video" ? 0 : "28px 32px", flex: 1, minHeight: 0, minWidth: 0, display: "flex", flexDirection: "column", overflow: screen === "video" ? "hidden" : undefined }}>
           {screen === "dashboard" && (
             <Dashboard agentId={activeAgent?.id ?? null} agentName={activeAgent?.name} folder={folder} onNavigate={(sc) => setScreen(sc as ScreenId)} />
           )}
@@ -281,7 +281,7 @@ export function App() {
           {screen === "tools" && <Tools folder={folder} agentId={activeAgent?.id ?? null} />}
           {screen === "skills" && <Skills folder={folder} agentId={activeAgent?.id ?? null} />}
           {screen === "sparks" && <Sparks agentId={activeAgent?.id ?? null} onNavigate={(sc) => setScreen(sc as ScreenId)} />}
-          {screen === "video" && <Video agentId={activeAgent?.id ?? null} />}
+          {screen === "video" && <Video agentId={activeAgent?.id ?? null} agentName={activeAgent?.name} folder={folder} />}
           {screen === "mcp" && <McpConnections />}
           {screen === "browser" && <Browser />}
         </div>

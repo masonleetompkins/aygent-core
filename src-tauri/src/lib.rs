@@ -68,7 +68,10 @@ mod supervisor;
 mod telegram;
 mod tools_registry;
 mod spark_state; // SPARKS: jailed KV persistence (Sparks/<slug>/state.json) for interactive Sparks.
-mod video; // VIDEO TOOL v0.1: file-backed project store (Video/<project>/composition.json).
+mod video; // VIDEO v0.3: project store + hardlink import + probe/thumbs (Video/<project>/).
+mod video_render; // VIDEO v0.3: composition.json -> ffmpeg filter graph -> MP4/frame.
+mod video_media; // VIDEO v0.3: aygent-media:// jailed range-capable media serving for the editor.
+mod video_tools; // VIDEO v0.3: video_* agent tools (frame-accurate edit helpers).
 
 use std::sync::Arc;
 use rand::Rng;
@@ -3974,6 +3977,9 @@ fn agent_tools_for_full(
     if conn_ctx.is_some() {
         for schema in dashboard::tool_schemas() { tools.push(schema); }
         extra_instructions.push_str(dashboard::tool_instructions());
+        // VIDEO v0.3: frame-accurate edit helpers (jailed; provisioned ffmpeg only).
+        for schema in video_tools::tool_schemas() { tools.push(schema); }
+        extra_instructions.push_str(video_tools::INSTRUCTIONS);
         tools.push(spark_preview_tool());
         // WHOAMI is already in the base tool list (added unconditionally above).
         // Here we only add the instruction that tells the model it exists.
@@ -4104,6 +4110,7 @@ fn agent_tools_for_full(
 /// PRO MODE: is shell.exec enabled for this folder's agent? GUI-managed (no
 /// config files) — the scary-honest consent screen writes a flag per folder,
 /// same scheme as browser-policy. Fails closed (missing => false => Folder Mode).
+pub fn pro_mode_enabled_pub(app: &tauri::AppHandle, folder: &str) -> bool { pro_mode_enabled(app, folder) }
 fn pro_mode_enabled(app: &tauri::AppHandle, folder: &str) -> bool {
     let Ok(ad) = app_data(app) else { return false; };
     let path = ad.join("pro-mode").join(format!("{}.json", folder_key_fnv(folder)));
@@ -4766,6 +4773,8 @@ async fn agent_stream(
                             },
                         }
                     }
+                } else if video_tools::is_video_tool(&c.name) {
+                    video_tools::exec(&broker, &scope_id, &c.name, &c.input)
                 } else if dashboard::is_dashboard_tool(&c.name) {
                     dashboard::exec_dashboard_tool(&db, &scope_id, &c.name, &c.input)
                 } else {
@@ -4950,6 +4959,8 @@ async fn agent_stream(
                         connector_exec::exec(&db, &scope_id, &name, &input).await
                     } else if mcp::is_mcp_tool(&name) {
                         mcp::exec(&name, &input)
+                    } else if video_tools::is_video_tool(&name) {
+                        video_tools::exec(&broker, &scope_id, &name, &input)
                     } else if dashboard::is_dashboard_tool(&name) {
                         dashboard::exec_dashboard_tool(&db, &scope_id, &name, &input)
                     } else {
@@ -5205,6 +5216,8 @@ async fn agent_stream(
                         }
                     } else if mcp::is_mcp_tool(&name) {
                         mcp::exec(&name, &input)
+                    } else if video_tools::is_video_tool(&name) {
+                        video_tools::exec(&broker, &scope_id, &name, &input)
                     } else if dashboard::is_dashboard_tool(&name) {
                         dashboard::exec_dashboard_tool(&db, &scope_id, &name, &input)
                     } else {
@@ -5681,6 +5694,8 @@ pub async fn run_headless_turn(
                                 }
                             } else if mcp::is_mcp_tool(&name) {
                                 mcp::exec(&name, &input)
+                            } else if video_tools::is_video_tool(&name) {
+                                video_tools::exec(broker, agent_id, &name, &input)
                             } else if dashboard::is_dashboard_tool(&name) {
                                 dashboard::exec_dashboard_tool(db, agent_id, &name, &input)
                             } else {
@@ -5922,7 +5937,12 @@ pub fn run() {
             sparks_list, sparks_read, sparks_delete,
             spark_save,
             spark_state_get, spark_state_set, spark_state_set_key,
-            video::video_status, video::video_projects, video::video_load, video::video_save,
+            video::video_status, video::video_projects, video::video_load, video::video_save, video::video_create,
+            video::video_chat_save, video::video_pick_media, video::video_import_paths, video::video_remove_asset,
+            video::video_refresh_thumbs, video::video_list_luts, video::video_pick_lut, video::video_reveal,
+            video_render::video_render, video_render::video_render_cancel, video_render::video_frame,
+            video_render::video_validate, video_render::video_list_renders, video_render::video_caption_lines,
+            video_tools::video_tool, video_tools::video_set_auphonic,
             dashboard::dashboard_load, dashboard::dashboard_upsert_module,
             dashboard::dashboard_remove_module, dashboard::dashboard_arrange,
             dashboard::dashboard_undo,
@@ -5960,7 +5980,9 @@ pub fn run() {
             onboarding_status, onboarding_pick_root, onboarding_set_root,
             onboarding_make_agent_home, onboarding_finish, import_memory
         ])
+        .register_uri_scheme_protocol(video_media::SCHEME, video_media::handle)
         .setup(move |_app| {
+            video_tools::install_app(_app.handle().clone());
             // CACHE-BUST FIRST (Mason 08-08): if this is a new build, clear the
             // stale WKWebView frontend cache before the window loads, so the new
             // UI code actually runs. Must happen before any content load.
