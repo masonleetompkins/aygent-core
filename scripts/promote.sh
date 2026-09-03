@@ -168,6 +168,27 @@ else
   warn "site repo product-files not found at ${SITE_REPO}/product-files (or no version parsed) — skipping buyer-dmg staging"
 fi
 
+# 6b. AUTO-PUBLISH (default when the agent drives a promote). If
+# AYGENT_PUBLISH_NOTES is set, run publish-release.js right now with those
+# notes: upload (upsert) + release row + owner emails. This is what makes "push
+# to main" mean "buyers actually get it" — without it the notarized DMG sits in
+# product-files/ and nobody is told. Manual runs WITHOUT the env var keep the
+# old behavior (print the command, do nothing), so a human promote never emails
+# owners by surprise. AYGENT_PUBLISH_NO_EMAIL=1 adds --no-email (silent publish:
+# upload + release row, no emails).
+if [ -n "${AYGENT_PUBLISH_NOTES:-}" ]; then
+  if [ -d "${SITE_REPO}" ] && [ -f "${SITE_REPO}/scripts/publish-release.js" ]; then
+    say "Publishing release ${VERSION} (upload + release row + owner emails)"
+    PUBLISH_ARGS=("${VERSION}" "${AYGENT_PUBLISH_NOTES}")
+    [ -n "${AYGENT_PUBLISH_NO_EMAIL:-}" ] && PUBLISH_ARGS+=("--no-email")
+    if ! (cd "${SITE_REPO}" && node scripts/publish-release.js "${PUBLISH_ARGS[@]}"); then
+      back_to_staging; die "publish-release FAILED — prod IS live in /Applications, but buyers were not notified. Re-run by hand: cd ${SITE_REPO} && node scripts/publish-release.js ${VERSION} \"notes\""
+    fi
+  else
+    warn "AYGENT_PUBLISH_NOTES was set but site repo not found at ${SITE_REPO} — skipping auto-publish (run it by hand)"
+  fi
+fi
+
 # 7. Back to staging.
 git checkout staging
 
