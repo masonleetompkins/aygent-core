@@ -114,6 +114,29 @@ pub fn catalog() -> Vec<McpConfig> {
             verify_tool: Some("get_objects_summary".into()),
             builtin: true,
         },
+        McpConfig {
+            key: "playwright".into(),
+            label: "Playwright (browser automation)".into(),
+            // Microsoft's official Playwright MCP: visits pages, clicks, types,
+            // reads the live web on the agent's behalf. Installed via OUR
+            // provisioned npm into our node prefix, so no system Node is needed;
+            // the `install-browser` step below downloads a Chromium build through
+            // playwright-core (no system Playwright needed either).
+            // Runs `--isolated` (a fresh browser profile per session) so it never
+            // fights the user's own browser or another client over a profile lock.
+            command: "playwright-mcp".into(),
+            args: vec!["--isolated".into()],
+            env: vec![],
+            enabled: false,
+            needs_node: true,
+            needs_uv: false,
+            setup_note: "Installs Microsoft's `@playwright/mcp` into AYGENT's own space (portable \
+                         Node — nothing touches your system) plus a Chromium build for automation \
+                         (~170MB, cached in your user cache). The agent can then visit pages, click, \
+                         type, and read the live web. Runs isolated: it never touches your own browser.".into(),
+            verify_tool: None,
+            builtin: true,
+        },
     ]
 }
 
@@ -325,6 +348,16 @@ pub fn install_plan(cfg: &McpConfig) -> Vec<(String, String, Vec<String>)> {
             ("Install the Premiere CEP bridge (into Premiere)".into(), "premiere-pro-mcp".into(),
              vec!["--install-cep".into()]),
         ],
+        // The installed `playwright-mcp` bin forwards `install-browser` to
+        // `playwright-core install` (verified against the published CLI), so the
+        // browser download needs no system Playwright. Chromium only — it's what
+        // the MCP server drives by default, and it keeps the download lean.
+        "playwright" => vec![
+            ("Install the Playwright MCP package".into(), "npm".into(),
+             vec!["install".into(), "-g".into(), "@playwright/mcp".into(), "--no-audit".into(), "--no-fund".into()]),
+            ("Install the Chromium browser for automation (~170MB)".into(), "playwright-mcp".into(),
+             vec!["install-browser".into(), "chromium".into()]),
+        ],
         _ => vec![],
     }
 }
@@ -336,6 +369,12 @@ pub fn uninstall_plan(cfg: &McpConfig) -> Vec<(String, String, Vec<String>)> {
         "premiere" => vec![
             ("Remove the Premiere MCP package".into(), "npm".into(),
              vec!["uninstall".into(), "-g".into(), "adobe-premiere-pro-mcp".into()]),
+        ],
+        // The downloaded Chromium stays in the user cache (shared with any other
+        // Playwright on the machine); removing the npm package is the clean part.
+        "playwright" => vec![
+            ("Remove the Playwright MCP package".into(), "npm".into(),
+             vec!["uninstall".into(), "-g".into(), "@playwright/mcp".into()]),
         ],
         _ => vec![],
     }

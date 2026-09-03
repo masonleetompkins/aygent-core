@@ -104,6 +104,7 @@ export function describeToolUse(name: string, input: any): { summary: string; bo
     case "rename_file": return { summary: `➜ ${inp.from ?? "?"} → ${inp.to ?? "?"}` };
     case "delete_file": return { summary: `🗑 ${inp.path ?? "?"}` };
     case "fetch_url": return { summary: `🌐 ${(inp.url ?? "?").slice(0, 160)}` };
+    case "web_search": return { summary: `🔍 ${(inp.query ?? "?").slice(0, 160)}` };
     case "generate_pdf": return { summary: `📕 ${inp.output_path ?? inp.path ?? "document.pdf"}`, body: capBody(typeof inp.content === "string" ? inp.content : undefined) };
     case "send_message": return { summary: `✉ → ${inp.to_agent ?? "?"}`, body: capBody(typeof inp.message === "string" ? inp.message : undefined) };
     case "task_continue": return { summary: `⏰ wake in ${inp.delay_secs ?? 60}s`, body: capBody(typeof inp.note === "string" ? inp.note : undefined) };

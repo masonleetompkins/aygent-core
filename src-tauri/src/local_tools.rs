@@ -33,6 +33,9 @@ fn tools_description() -> &'static str {
      conversations, or anything you might have notes about\n\
      - whoami(): report your own name, model, provider, and the tools you have \
      (read-only; takes no arguments) — use it when asked who or what you are\n\
+     - fetch_url(url): read a web page or API over HTTPS (returns readable text)\n\
+     - web_search(query): search the web and get top hits (title + url + snippet) — \
+     use it when asked what's current, then fetch_url to read a hit in depth\n\
      Only use a tool when the user's request needs it. After you receive a tool \
      result, continue and give the user a final answer."
 }
@@ -181,7 +184,7 @@ fn call_from_json(s: &str) -> Option<ToolCall> {
 fn call_from_value(v: &serde_json::Value) -> Option<ToolCall> {
     let name = v.get("name").and_then(|n| n.as_str())?.to_string();
     // Only accept our known tools \u2014 ignore hallucinated tool names.
-    if !matches!(name.as_str(), "read_file" | "write_file" | "list_files" | "whoami" | "recall") { return None; }
+    if !matches!(name.as_str(), "read_file" | "write_file" | "list_files" | "whoami" | "recall" | "fetch_url" | "web_search") { return None; }
     let mut input = v.get("arguments")
         .or_else(|| v.get("parameters"))
         .or_else(|| v.get("input"))

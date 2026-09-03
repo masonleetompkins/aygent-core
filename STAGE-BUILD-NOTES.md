@@ -1,3 +1,39 @@
+# Stage build — 2026-09-03 ~09:43 PDT — v1.0.11 (web_search + Brave Search + Playwright MCP)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, **10 warnings, 0 errors** (dead-code only: telegram/browser/exec — same set as prior builds). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit:** `b225bd7` — feat: web_search tool (DDG, no key) + Brave Search connector + Playwright MCP entry (on `staging`, pushed to `origin/staging`)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 39,435,304 bytes), mtime **Sep 3 09:43**
+- dmg: `dmg/AYGENT_1.0.11_aarch64.dmg`, **17,250,699 bytes (~16.5 MB)**, mtime **Sep 3 09:43**
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+**This build supersedes the Aug 21 11:49 build (`d2181bf`).** Same version number (1.0.11) — all additions are non-breaking.
+
+## What this build adds
+1. **`web_search` tool (no key, DuckDuckGo)** — new builtin alongside `fetch_url`: search runs on the privileged side (same mediated-reach model), returns title + url + snippet. Wired everywhere: exec arm + schema, Tools registry (`builtin.search`, default ON), local-model allowlist + prompt, `AGENT_SYSTEM` mention, dashboard button whitelist, UI summary line (`🔍 query`) + skill `BASE_TOOLS`.
+2. **Brave Search connector** — new `brave` entry in the Connections catalog (Research): `X-Subscription-Token` auth, 4 read-only tools (web/news/images/videos). The upgrade path when DDG ranking isn't enough.
+3. **Playwright MCP entry** — new `playwright` catalog entry: Microsoft's `@playwright/mcp --isolated` via the provisioned Node (no system Node/Playwright needed); enable step downloads Chromium (~170MB) via the CLI's `install-browser` → `playwright-core`. MCP UI is data-driven so no UI changes were needed.
+
+## Smoke QA for this build (~10 min)
+1. **web_search** — ask a cloud agent "what's current on X" → `🔍` tool line renders, results come back as title/url/snippet; ask it to read one → `fetch_url` follows up.
+2. **Brave** — paste a `BSA…` key under Connections → Research card connects; `brave_search_web` + one vertical (news/images/videos) return real hits.
+3. **Playwright** — enable Playwright in MCP → package installs + Chromium downloads (~170MB); agent can visit a page / click / type via `mcp__playwright__*` tools.
+4. **Local models** — on a tool-capable local agent, "search the web for X" → `web_search` executes (allowlist + prompt wired).
+5. **whoami** — "what can you do?" lists `web_search` under Built-in, Brave under Connected accounts, Playwright under MCP servers.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Browser** — open a page in the in-app browser, agent read of the page.
+6. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
 # Stage build — 2026-08-21 11:49 PDT — v1.0.11 (REBUILD: RAM-pool sizing + kv-trim fallback)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0, **10 warnings, 0 errors** (dead-code only: telegram/browser/exec — same set as prior builds). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.

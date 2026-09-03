@@ -3709,6 +3709,16 @@ fn exec_tool_cfg(
                 Err(e) => (format!("fetch failed: {e}"), true),
             }
         }
+        // WEB SEARCH (no key, DuckDuckGo). Same mediated-reach model as fetch_url:
+        // the privileged side searches, the jailed brain gets titles/urls/snippets.
+        "web_search" => {
+            let q = input.get("query").and_then(|u| u.as_str()).unwrap_or("");
+            if q.trim().is_empty() { return ("web_search needs a `query`".into(), true); }
+            match web::search_blocking(q) {
+                Ok(text) => (text, false),
+                Err(e) => (format!("search failed: {e}"), true),
+            }
+        }
         // PRO MODE SHELL TOOLS (2026-07-31). Gated: exposed to the model ONLY
         // when the agent holds shell.exec (see agent_tools_for_full). cwd is
         // ALWAYS the agent's jailed root (exec broker pins it). shell_run is the
@@ -3912,6 +3922,13 @@ fn builtin_tool_schema(name: &str) -> Option<serde_json::Value> {
             "input_schema": { "type": "object", "properties": {
                 "url": { "type": "string", "description": "the full http(s) URL to fetch" }
             }, "required": ["url"] }
+        })),
+        "web_search" => Some(serde_json::json!({
+            "name": "web_search",
+            "description": "Search the web (no key needed) and return the top hits as title + url + snippet. Use when the user asks what's current, or to find a page to read with fetch_url.",
+            "input_schema": { "type": "object", "properties": {
+                "query": { "type": "string", "description": "the search query" }
+            }, "required": ["query"] }
         })),
         _ => None,
     }
@@ -4483,9 +4500,9 @@ const AGENT_SYSTEM: &str = "You are AYGENT, a helpful, concise, friendly assista
     context'; act only on what was asked. When a task DOES need a tool: use read_file/write_file/\
     list_files for files in the user's chosen folder (you cannot run shell commands). To RENAME or \
     MOVE a file use rename_file (NEVER write a copy under the new name and leave the old file — \
-    rename it); to remove a file use delete_file. Use fetch_url to read a web page/API over HTTPS, \
-    and any connected-service tools (e.g. github_list_prs) for that service. Prefer the smallest \
-    number of tool calls that gets the job done.";
+    rename it); to remove a file use delete_file. Use web_search to search the web, fetch_url to \
+    read a web page/API over HTTPS, and any connected-service tools (e.g. github_list_prs) for \
+    that service. Prefer the smallest number of tool calls that gets the job done.";
 
 // Base system prompt for local models. When the model is tool-capable, we
 // APPEND its family-native tool instructions (local_tools::system_prompt_with_tools).

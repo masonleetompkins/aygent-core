@@ -488,7 +488,7 @@ mod tests {
 /// a dashboard is a control surface, not a second shell. Anything that writes,
 /// deletes, or executes is absent on purpose — those belong in Chat where the
 /// user sees the full reasoning, or behind an approved Exec module.
-pub const BASE_BUTTON_TOOLS: &[&str] = &["fetch_url", "read_file", "list_files"];
+pub const BASE_BUTTON_TOOLS: &[&str] = &["fetch_url", "web_search", "read_file", "list_files"];
 
 /// Tools a dashboard button may invoke: the base set plus every READ-ONLY
 /// connector tool. Derived from the registry, so adding a connector can never
@@ -518,6 +518,15 @@ pub async fn dashboard_run_tool(
             let url = args.get("url").and_then(|u| u.as_str()).unwrap_or("");
             let res = crate::web::fetch(url).await?;
             Ok(res.text.chars().take(2000).collect())
+        }
+        "web_search" => {
+            let q = args.get("query").and_then(|u| u.as_str()).unwrap_or("");
+            let hits = crate::web::search(q).await?;
+            let mut out = String::new();
+            for h in hits.iter().take(10) {
+                out.push_str(&format!("- {}\n  {}\n", h.title, h.url));
+            }
+            Ok(out.chars().take(2000).collect())
         }
         // Any read-only connector tool, registry-driven.
         t if crate::connectors::is_connector_tool(t) => {
