@@ -1,3 +1,37 @@
+# Stage build — 2026-09-04 ~15:06 PDT — v1.0.12 (video Hyperframes rebuild)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit:** `b365023` — feat(video): Hyperframes graphics+captions rebuild, linked clips, style guides (on `staging`, pushed to `origin/staging`)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41,206,264 bytes), mtime **Sep 4 15:06**
+- dmg: `dmg/AYGENT_1.0.12_aarch64.dmg`, **17,925,860 bytes (~17.1 MB)**, mtime **Sep 4 15:06**
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## What this build adds
+1. **Linked A/V clips** — V1 video auto-creates a linked A1 audio follower; split/delete/duplicate/drag keep them together; Inspector shows the link.
+2. **Hyperframes captions** — `video_build_captions` renders transcript words (through the A-roll cuts) to a transparent caption composition in the project's style → T1 overlay clip. ASS/drawtext caption path removed.
+3. **Hyperframes graphics overlays** — `video_render_overlay` renders one approved graphic per call to a transparent V3 clip (plan-first protocol enforced in tool instructions). Graphics panel with instructions + style-guide picker (.md/.txt/.rtf/.pdf/.docx text extraction).
+4. **Backend** — new `video_hyperframes.rs` (toolchain via provisioned runtime, overlay staging/render/register), simplified Captions model, audio-dedupe on export, `video_pick_style_guide` command.
+
+## Smoke QA for this build (~10 min)
+1. **Video tab** — open a project, import media, cut A-roll on V1 → linked A1 follower appears and moves with it.
+2. **Captions** — transcribe, then build captions → T1 overlay appears; toggle Captions on/off in preview + export.
+3. **Graphics** — ask agent for a lower third → it replies with a PLAN first; approve → V3 overlay clip lands.
+4. **Style guide** — pick a .md guide in Graphics panel → agent's next graphic matches it.
+5. **Export** — render landscape → no doubled audio, captions + graphics composited.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
 # Stage build — 2026-09-03 ~09:43 PDT — v1.0.11 (web_search + Brave Search + Playwright MCP)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0, **10 warnings, 0 errors** (dead-code only: telegram/browser/exec — same set as prior builds). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
