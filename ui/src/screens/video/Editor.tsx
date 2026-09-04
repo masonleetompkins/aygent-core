@@ -105,6 +105,16 @@ export function Editor({ agentId, agentName, folder }: { agentId: string | null;
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // dock width drag (persisted) — the grid column is `auto`, so the dock's own
+  // width drives layout and the center column (minmax(0,1fr)) shrinks to fit.
+  const [dockDrag, setDockDrag] = useState(false);
+  function onDockResizeDown(e: React.MouseEvent) {
+    e.preventDefault(); const x0 = e.clientX, w0 = get().dockW; setDockDrag(true);
+    const mv = (ev: MouseEvent) => set({ dockW: Math.max(280, Math.min(640, w0 - (ev.clientX - x0))) });
+    const up = () => { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); setDockDrag(false); localStorage.setItem("aygent.video.dockW", String(get().dockW)); };
+    window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
+  }
+
   const PanelBody = { media: MediaPanel, text: TextPanel, captions: CaptionsPanel, color: ColorPanel, audio: AudioPanel, export: ExportPanel }[s.panel];
   const noProject = !s.project;
 
@@ -165,7 +175,8 @@ export function Editor({ agentId, agentName, folder }: { agentId: string | null;
             <Player />
             <Timeline />
           </div>
-          <div className={`ve-dock ${s.dockOpen ? "" : "closed"}`}>
+          <div className={`ve-dock ${s.dockOpen ? "" : "closed"}`} style={{ "--dock-w": `${s.dockW}px` } as React.CSSProperties}>
+            <div className={`resize-x ${dockDrag ? "on" : ""}`} onMouseDown={onDockResizeDown} title="Drag to resize" />
             <div className="ve-dock-tabs">
               <button className={s.dockTab === "agent" ? "on" : ""} onClick={() => set({ dockTab: "agent" })}>Agent</button>
               <button className={s.dockTab === "inspector" ? "on" : ""} onClick={() => set({ dockTab: "inspector" })}>Inspector{s.selection.length ? ` · ${s.selection.length}` : ""}</button>

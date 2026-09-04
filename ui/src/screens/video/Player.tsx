@@ -5,8 +5,9 @@
 // exact ffmpeg composite (grade + LUT + ASS captions) is one click away via
 // "Render frame" and shows as an overlay badge.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Play, Pause, SkipBack, SkipForward, ChevronLeft, ChevronRight, Repeat, Camera, Maximize2, Volume2, VolumeX } from "lucide-react";
-import { useVideo, seek, togglePlay, stepFrames, set, get, renderFrame } from "./store";
+import { Play, Pause, SkipBack, SkipForward, ChevronLeft, ChevronRight, Repeat, Camera, Maximize2, Volume2, VolumeX, Proportions, X } from "lucide-react";
+import { useVideo, seek, togglePlay, stepFrames, set, get, renderFrame, mutate } from "./store";
+import { Num } from "./Panels";
 import { duration as durOf } from "./model";
 import { type Clip, TRACK_KIND, fmtTime, mediaUrl } from "./model";
 
@@ -68,6 +69,7 @@ export function Player() {
   const size = useStageSize(stageRef);
   const [muted, setMuted] = useState(false);
   const [safe, setSafe] = useState(false);
+  const [sceneOpen, setSceneOpen] = useState(false);
   const { comp, playhead, playing, agentId, project } = s;
   const total = durOf(comp);
   const sceneW = comp.scene.width, sceneH = comp.scene.height;
@@ -144,8 +146,39 @@ export function Player() {
         <button className={`ve-icon-btn ${muted ? "on" : ""}`} title="Mute preview" onClick={() => setMuted(!muted)}>{muted ? <VolumeX size={15} /> : <Volume2 size={15} />}</button>
         <button className={`ve-icon-btn ${safe ? "on" : ""}`} title="Safe margins" onClick={() => setSafe(!safe)}><Maximize2 size={15} /></button>
         <button className="ve-btn sm" title="Render this frame with the real ffmpeg pipeline (grade, LUT, captions)" onClick={() => void renderFrame()}><Camera size={13} /> Render frame</button>
-        <span className="ve-faint ve-mono" style={{ fontSize: 11 }}>{sceneW}×{sceneH} · {fps}fps</span>
+        <button className={`scene-btn ve-mono ${sceneOpen ? "on" : ""}`} title="Canvas size · frame rate" onMouseDown={(e) => e.stopPropagation()} onClick={() => setSceneOpen(!sceneOpen)}><Proportions size={13} />{sceneW}×{sceneH} · {fps}fps</button>
       </div>
+      {sceneOpen && <ScenePopover onClose={() => setSceneOpen(false)} />}
+    </div>
+  );
+}
+
+const SCENE_PRESETS: [string, number, number][] = [["16:9", 1920, 1080], ["16:9 4K", 3840, 2160], ["9:16", 1080, 1920], ["1:1", 1080, 1080], ["4:5", 1080, 1350], ["21:9", 2560, 1080]];
+const even = (v: number) => Math.max(16, Math.round(v / 2) * 2);
+
+/** Canvas size + fps. Exact pixel fields (any size; snapped to even for yuv420p encoders) plus quick presets. */
+function ScenePopover({ onClose }: { onClose: () => void }) {
+  const s = useVideo(); const sc = s.comp.scene;
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const onDown = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) onClose(); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("mousedown", onDown); window.addEventListener("keydown", onKey);
+    return () => { window.removeEventListener("mousedown", onDown); window.removeEventListener("keydown", onKey); };
+  }, [onClose]);
+  const setSize = (w: number, h: number) => mutate((c) => { c.scene.width = even(w); c.scene.height = even(h); });
+  return (
+    <div className="ve-scene-pop" ref={ref}>
+      <h4>Canvas<button className="ve-icon-btn" style={{ width: 22, height: 22 }} onClick={onClose}><X size={12} /></button></h4>
+      <div className="ve-row3">
+        <Num label="Width" value={sc.width} step={2} min={16} max={8192} onChange={(v) => setSize(v, sc.height)} />
+        <Num label="Height" value={sc.height} step={2} min={16} max={8192} onChange={(v) => setSize(sc.width, v)} />
+        <Num label="FPS" value={sc.fps} step={1} min={1} max={120} onChange={(v) => mutate((c) => { c.scene.fps = v; })} />
+      </div>
+      <div className="presets">
+        {SCENE_PRESETS.map(([l, w, h]) => <button key={l} className={w === sc.width && h === sc.height ? "on" : ""} onClick={() => setSize(w, h)}>{l}<span>{w}×{h}</span></button>)}
+      </div>
+      <p className="ve-hint">Any size works; odd values snap to even (H.264/HEVC need it). Exports have their own size in the Export panel.</p>
     </div>
   );
 }

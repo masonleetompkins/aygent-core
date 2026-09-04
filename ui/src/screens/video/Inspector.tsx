@@ -12,8 +12,8 @@ export function Inspector() {
       <div className="ve-insp">
         <Section title="Scene">
           <div className="ve-row3">
-            <Num label="Width" value={s.comp.scene.width} step={2} min={16} onChange={(v) => mutate((c) => { c.scene.width = v; })} />
-            <Num label="Height" value={s.comp.scene.height} step={2} min={16} onChange={(v) => mutate((c) => { c.scene.height = v; })} />
+            <Num label="Width" value={s.comp.scene.width} step={2} min={16} max={8192} onChange={(v) => mutate((c) => { c.scene.width = Math.max(16, Math.round(v / 2) * 2); })} />
+            <Num label="Height" value={s.comp.scene.height} step={2} min={16} max={8192} onChange={(v) => mutate((c) => { c.scene.height = Math.max(16, Math.round(v / 2) * 2); })} />
             <Num label="FPS" value={s.comp.scene.fps} step={1} min={1} max={120} onChange={(v) => mutate((c) => { c.scene.fps = v; })} />
           </div>
           <Seg value={`${s.comp.scene.width}x${s.comp.scene.height}`} options={[{ v: "1920x1080", l: "16:9" }, { v: "1080x1920", l: "9:16" }, { v: "1080x1080", l: "1:1" }, { v: "1080x1350", l: "4:5" }]} onChange={(v) => { const [w, h] = v.split("x").map(Number); mutate((c) => { c.scene.width = w; c.scene.height = h; }); }} />

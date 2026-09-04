@@ -35,6 +35,7 @@ export type State = {
   dockOpen: boolean;
   dockTab: "agent" | "inspector";
   panelOpen: boolean;
+  dockW: number;           // px, user-resizable (persisted)
   toast: { text: string; tone: "ok" | "err" | "info"; at: number } | null;
   render: { pct: number; running: boolean; path?: string; error?: string } | null;
   toolProgress: string | null;
@@ -48,7 +49,7 @@ export type State = {
 let state: State = {
   agentId: null, folder: null, status: null, projects: [], project: null, comp: blankComposition(), assets: [], transcript: null,
   dirty: false, saving: false, playhead: 0, playing: false, loop: false, zoom: 60, scrollX: 0, selection: [], tool: "select", snap: true,
-  panel: "media", dockOpen: true, dockTab: "agent", panelOpen: true, toast: null, render: null, toolProgress: null, frame: null, captionLines: [], luts: [], renders: [], cacheBust: 0,
+  panel: "media", dockOpen: true, dockTab: "agent", panelOpen: true, dockW: Math.max(280, Math.min(640, Number(localStorage.getItem("aygent.video.dockW")) || 360)), toast: null, render: null, toolProgress: null, frame: null, captionLines: [], luts: [], renders: [], cacheBust: 0,
 };
 
 const listeners = new Set<() => void>();

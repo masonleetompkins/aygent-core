@@ -793,7 +793,8 @@ pub fn render(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: 
     let proj = video::project_dir(broker, agent_id, project)?;
     let key = format!("{agent_id}/{project}");
     if running().lock().map(|m| m.contains_key(&key)).unwrap_or(false) { return Err("a render is already running for this project".into()); }
-    let target = Target { w: preset.width.max(16), h: preset.height.max(16), fps: preset.fps };
+    // h264/hevc yuv420p need even dimensions — coerce rather than fail at encode time
+    let target = Target { w: preset.width.max(16) / 2 * 2, h: preset.height.max(16) / 2 * 2, fps: preset.fps };
     let plan = build_plan(app, broker, agent_id, project, comp, &target, "render.filters")?;
     let renders = proj.join("renders");
     std::fs::create_dir_all(&renders).map_err(|e| format!("mkdir renders: {e}"))?;
@@ -884,7 +885,7 @@ fn run_ffmpeg_progress(app: &tauri::AppHandle, key: &str, args: &[String], dur: 
 pub fn frame(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, comp: &Composition, t: f64, max_w: u32) -> Result<String, String> {
     let proj = video::project_dir(broker, agent_id, project)?;
     let scale = if comp.scene.width > max_w { max_w as f64 / comp.scene.width as f64 } else { 1.0 };
-    let target = Target { w: ((comp.scene.width as f64 * scale) as u32).max(16), h: ((comp.scene.height as f64 * scale) as u32).max(16), fps: comp.scene.fps };
+    let target = Target { w: ((comp.scene.width as f64 * scale) as u32).max(16) / 2 * 2, h: ((comp.scene.height as f64 * scale) as u32).max(16) / 2 * 2, fps: comp.scene.fps };
     let plan = build_plan(app, broker, agent_id, project, comp, &target, "frame.filters")?;
     let name = format!("frame-{}.jpg", (t * 1000.0) as i64);
     let out = proj.join(".cache").join(&name);

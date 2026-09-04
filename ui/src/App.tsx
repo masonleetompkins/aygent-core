@@ -234,7 +234,7 @@ export function App() {
         refreshKey={rosterRefresh}
       />
       <Sidebar active={screen} onSelect={setScreen} showBrowser={browserInstalled} />
-      <div style={{ flex: 1, height: "100vh", minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column" }}>
+      <div style={{ flex: 1, height: "100vh", minHeight: 0, minWidth: screen === "video" ? 0 : undefined, overflowY: "auto", display: "flex", flexDirection: "column" }}>
         {/* The persistent daemon-status strip was dev telemetry — removed. The
            connection state now lives as a quiet sanity-check in Settings.
            full-height flex column so height:100% children (Chat) can fill the
