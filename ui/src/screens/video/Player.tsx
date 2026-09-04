@@ -2,14 +2,16 @@
 // aygent-media:// scheme.
 //
 // Smooth, gapless playback design:
-//  · Media elements are PERSISTENT and double-buffered per asset: every clip is
-//    assigned a slot (≥2 <video>/<audio> per asset) so the next clip's element is
-//    already loaded and pre-seeked to its in-point while the current one plays.
-//    A cut is a visibility swap + play(), not a mount + load + seek (which was
-//    the black flash).
-//  · The active V1 video is the MASTER CLOCK while playing: the playhead is
-//    derived from its currentTime, so picture, sound and timecode can't drift.
-//    Other elements are only corrected when they drift > 250 ms (no seek-thrash).
+//  · Media elements are PERSISTENT and pooled per asset (2–3 slots): every clip is
+//    assigned a slot whose previous clip ended ≥ LEAD seconds earlier, so the next
+//    clip's element is free to PRE-ROLL: it starts playing hidden + muted LEAD s
+//    before the cut, already decoding in motion. The cut is a visibility swap +
+//    unmute — no mount, no load, no seek, no decoder spin-up (that spin-up was
+//    the black flash in v0.3 and the ~1 s freeze after the first fix).
+//  · The WALL CLOCK is the master while playing (like an NLE): the playhead never
+//    waits on a decoder. Every element chases the playhead with a small
+//    playbackRate nudge (±6 %); a hard seek only on real drift (>250 ms visible,
+//    >60 ms while still hidden in pre-roll where a seek costs nothing).
 //  · The transport tick publishes on the store's narrow playhead channel
 //    (tickPlayhead/usePlayhead); only the stage, timecode and playhead lines
 //    re-render per frame — the timeline/inspector/dock stay idle.
@@ -37,9 +39,11 @@ function useStageSize(ref: React.RefObject<HTMLDivElement>) {
 }
 
 // ---- slot assignment --------------------------------------------------------
-// Greedy: clips sorted by start; each takes the slot of its asset that has been
-// free the longest (so sequential clips alternate A/B and the idle slot has the
-// whole previous clip's duration to pre-seek). Overlaps open a third slot.
+// Greedy over clips sorted by start. A clip takes the slot of its asset that has
+// been free the longest; if that slot freed up less than LEAD s before the clip
+// starts (no room to pre-roll) and we have < 3 slots for this asset, open another.
+const LEAD = 1.0;        // s of hidden pre-roll before a cut
+const NUDGE_MAX = 0.06;  // max playbackRate deviation used to chase the clock
 type Slot = { id: string; asset: string; kind: "video" | "audio" };
 function assignSlots(comp: Composition, assetKind: (id: string) => "video" | "audio" | "image" | undefined): { slots: Slot[]; slotOf: Map<string, string> } {
   const slots: Slot[] = []; const slotOf = new Map<string, string>();
@@ -50,7 +54,8 @@ function assignSlots(comp: Composition, assetKind: (id: string) => "video" | "au
     const mine = slots.filter((s) => s.asset === c.asset);
     let pick: Slot | undefined; let best = Infinity;
     for (const s of mine) { const le = lastEnd.get(s.id) ?? -Infinity; if (le <= c.start + 1e-6 && le < best) { best = le; pick = s; } }
-    if (!pick || mine.length < 2) { pick = { id: `${c.asset}#${mine.length}`, asset: c.asset, kind: k === "audio" ? "audio" : "video" }; slots.push(pick); }
+    if ((!pick || best > c.start - LEAD) && mine.length < 3) { pick = { id: `${c.asset}#${mine.length}`, asset: c.asset, kind: k === "audio" ? "audio" : "video" }; slots.push(pick); }
+    if (!pick) pick = mine.reduce((a, b) => ((lastEnd.get(a.id) ?? 0) <= (lastEnd.get(b.id) ?? 0) ? a : b)); // 3 overlapping clips of one asset: reuse
     slotOf.set(c.id, pick.id); lastEnd.set(pick.id, c.end);
   }
   return { slots, slotOf };
@@ -91,65 +96,70 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
   }, [comp.clips, slotOf, playhead]);
 
   const active = useMemo(() => comp.clips.filter((c) => !c.hidden && playhead >= c.start && playhead < c.end).sort((a, b) => rank(a.track) - rank(b.track)), [comp.clips, playhead]);
-  const masterClip = active.find((c) => c.type === "video" && TRACK_KIND(c.track) === "video" && slotOf.has(c.id));
 
-  // imperative sync after every render
+  // imperative sync after every render (runs per playhead tick; cheap)
+  const lastSeek = useRef(new Map<string, number>());
+  const setRate = (el: HTMLMediaElement, r: number) => { if (Math.abs(el.playbackRate - r) > 0.004) el.playbackRate = r; };
+  const seekTo = (slotId: string, el: HTMLMediaElement, t: number) => { lastSeek.current.set(slotId, performance.now()); el.currentTime = Math.max(0, t); };
   useLayoutEffect(() => {
+    const now = performance.now();
     for (const slot of slots) {
       const el = els.current.get(slot.id); if (!el) continue;
       const c = assigned.get(slot.id);
       if (!c) { if (!el.paused) el.pause(); continue; }
       const isActive = playhead >= c.start && playhead < c.end;
-      const srcT = c.in + (playhead - c.start) * c.speed;
-      if (el.playbackRate !== c.speed) el.playbackRate = c.speed;
+      const srcT = c.in + (playhead - c.start) * c.speed;   // negative offset before the clip starts
       const wantMuted = muted || c.muted || !isActive;
       if (el.muted !== wantMuted) el.muted = wantMuted;
       const vol = Math.max(0, Math.min(1, Math.pow(10, c.volume / 20)));
       if (Math.abs(el.volume - vol) > 0.005) el.volume = vol;
-      if (!isActive) {
-        // upcoming: park exactly on its in-point so the cut is instant
-        if (!el.paused) el.pause();
-        if (prepared.current.get(slot.id) !== c.id) { prepared.current.set(slot.id, c.id); if (Math.abs(el.currentTime - c.in) > 0.02) el.currentTime = c.in; }
-        continue;
-      }
-      prepared.current.set(slot.id, c.id);
+
       if (!playing) {
+        // paused / scrubbing: frame-accurate park (active → exact frame, upcoming → its first frame)
         if (!el.paused) el.pause();
-        if (!el.seeking && Math.abs(el.currentTime - srcT) > 0.5 / fps) el.currentTime = srcT; // scrub: frame-accurate
+        setRate(el, c.speed);
+        const park = isActive ? srcT : c.in;
+        if (!el.seeking && Math.abs(el.currentTime - park) > 0.5 / fps) seekTo(slot.id, el, park);
         continue;
       }
-      const isMaster = masterClip && masterClip.id === c.id;
-      if (!isMaster && !el.seeking && Math.abs(el.currentTime - srcT) > 0.25) el.currentTime = srcT; // followers: correct only on real drift
+      const preroll = !isActive && c.start - playhead <= LEAD && srcT >= 0;
+      if (!isActive && !preroll) {
+        // upcoming but not yet in the pre-roll window: park where the pre-roll will begin
+        if (!el.paused) el.pause();
+        setRate(el, c.speed);
+        if (prepared.current.get(slot.id) !== c.id) { prepared.current.set(slot.id, c.id); const park = Math.max(0, c.in - LEAD * c.speed); if (Math.abs(el.currentTime - park) > 0.02) seekTo(slot.id, el, park); }
+        continue;
+      }
+      // playing (visible) or pre-rolling (hidden): chase the wall clock
+      prepared.current.set(slot.id, c.id);
       if (el.paused) void el.play().catch(() => {});
+      if (el.seeking) continue;
+      const drift = srcT - el.currentTime;                // > 0: element is behind the playhead
+      const toCut = c.start - playhead;
+      const hard = isActive ? 0.25 : toCut > 0.2 ? 0.06 : 0.25;   // hidden seeks are free, so be strict early in pre-roll
+      if (Math.abs(drift) > hard && now - (lastSeek.current.get(slot.id) ?? 0) > 400) { seekTo(slot.id, el, srcT); setRate(el, c.speed); }
+      else if (Math.abs(drift) < 0.5 / fps) setRate(el, c.speed);
+      else setRate(el, c.speed * (1 + Math.max(-NUDGE_MAX, Math.min(NUDGE_MAX, drift * 0.6))));
     }
   });
   useEffect(() => () => { els.current.forEach((el) => el.pause()); }, []);
 
-  // transport clock — master = active V1 video element when it's actually advancing
+  // transport clock — wall clock is the master; media elements chase it (above)
   const total = durOf(comp);
   useEffect(() => {
     if (!playing) return;
     let raf = 0; let last = performance.now();
     const tick = (now: number) => {
-      const dt = (now - last) / 1000; last = now;
+      const dt = Math.min(0.1, (now - last) / 1000); last = now;   // clamp: a hidden tab shouldn't leap
       const st = get(); if (!st.playing) return;
-      const wall = st.playhead + dt;
-      let t = wall;
-      const mc = st.comp.clips.find((c) => c.type === "video" && !c.hidden && TRACK_KIND(c.track) === "video" && st.playhead >= c.start && st.playhead < c.end && slotOf.has(c.id));
-      if (mc) {
-        const el = els.current.get(slotOf.get(mc.id)!);
-        if (el && !el.paused && el.readyState >= 2) {
-          const mt = mc.start + (el.currentTime - mc.in) / mc.speed;
-          if (Math.abs(mt - wall) < 0.5) t = mt; // trust the picture; fall back to wall clock if it stalls > 0.5s
-        }
-      }
+      const t = st.playhead + dt;
       if (t >= Math.max(total, 0.01)) { if (st.loop) seek(0); else { set({ playing: false }); seek(total); return; } }
       else tickPlayhead(t);
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [playing, total, slotOf]);
+  }, [playing, total]);
 
   const images = active.filter((c) => c.type === "image" && TRACK_KIND(c.track) !== "audio");
   const texts = active.filter((c) => c.type === "text");
