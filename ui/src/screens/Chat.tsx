@@ -2,7 +2,7 @@
 // calls appear as inline cards as they fire, multi-turn history persists.
 // Consumes normalized StreamEvents from the Rust streaming agent loop over a
 // Tauri event channel. Falls back to a thinking animation if no text streams.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useLayoutEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Button } from "../components/ui";
 import { Icon, type IconName } from "../components/Icon";
@@ -279,17 +279,27 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // to one line. Cap ~200px (~8 lines), not 50vh (that let an empty box balloon
   // to half the window inside the flex column). Mason 07-28.
   const prevTaHeightRef = useRef<number>(44);
-  useEffect(() => {
+  useLayoutEffect(() => {
     const ta = taRef.current; if (!ta) return;
+    const prev = prevTaHeightRef.current;
+    // Cheap early-out: on a same-line keystroke scrollHeight can't have changed
+    // unless the line wrapped, and reading it is a layout read — fine, but we only
+    // WRITE (height + scrollTop) when the value actually differs.
     ta.style.height = "auto";
     const next = Math.min(ta.scrollHeight, 200);
-    const prev = prevTaHeightRef.current;
     ta.style.height = next + "px";
+    if (next === prev) return;
     prevTaHeightRef.current = next;
-    // Only re-pin when the textarea actually GREW (new line / paste). Per-keystroke
-    // pinning while typing on the same line caused visible stutter. Also respect
-    // near-bottom so a user reading history isn't yanked while typing.
-    if (next > prev && isNearBottom(120)) pinToBottom();
+    // GROWTH COMPENSATION (Mason 09-04): the composer sits below the message
+    // list, so every extra line steals that many px from the list's viewport
+    // and covered the newest message. Shift the list's scrollTop by EXACTLY the
+    // delta, synchronously (useLayoutEffect — before paint), so the messages
+    // appear to move up one line per line typed. No rAF, no full re-pin, no
+    // "jump to bottom": nothing visible moves except the new line, so there's
+    // nothing to stutter. Skipped when the user has scrolled up to read history.
+    const el = scrollRef.current; if (!el) return;
+    const wasNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160 + Math.max(0, next - prev);
+    if (wasNearBottom) el.scrollTop = el.scrollTop + (next - prev);
   }, [input]);
 
   // #4 detect an @mention token at the caret and surface matching agents.

@@ -3881,7 +3881,7 @@ fn send_message_tool() -> serde_json::Value {
 fn task_continue_tool() -> serde_json::Value {
     serde_json::json!({
         "name": "task_continue",
-        "description": "Schedule YOURSELF a follow-up turn after a delay, so you can end this turn and still continue/report later (e.g. poll a long build). You will be woken with your note in a fresh continuation turn that streams live to your chat. Use this whenever you would otherwise say 'I'll check back' — it is the only way to actually do it.",
+        "description": "Schedule YOURSELF a follow-up turn after a delay, so you can end this turn and still continue the work later (e.g. poll a long build, wait for a render, check a process). You will be woken with your note in a fresh continuation turn that streams live to your chat and has ALL your tools — you keep working there (shell_poll, read files, edit, call task_continue again), not just report. RULE: whenever you would otherwise write 'I'll check back', 'I'll continue later', 'once X finishes' or 'give me a few minutes', you MUST call this tool instead of saying it — words alone never wake you up. Put everything the next turn needs in the note (proc handles, paths, what to check, next step).",
         "input_schema": { "type": "object", "properties": {
             "delay_secs": { "type": "integer", "description": "seconds until wake-up (5-3600, default 60)" },
             "note": { "type": "string", "description": "note to self: exactly what to check/continue on wake-up (include proc handles, file paths, next steps)" }
@@ -4528,6 +4528,12 @@ const AGENT_SYSTEM: &str = "You are AYGENT, a helpful, concise, friendly assista
     read a web page/API over HTTPS, and any connected-service tools (e.g. github_list_prs) for \
     that service. Prefer the smallest number of tool calls that gets the job done.";
 
+/// Appended to the system prompt on the Muse (meta) provider only.
+const MUSE_QUIET_TOOLS: &str = "\n\nTOOL-CALL STYLE: do NOT write a sentence restating or re-affirming the user's request \
+    before a tool call (no \"Pulling X now…\", \"Let me check Y…\", \"Got it — doing Z\"). Call the tool \
+    silently. Write text only when you have something to report: a result, a decision, a question, \
+    or the final answer. One reply at the end beats a status line before every call.";
+
 // Base system prompt for local models. When the model is tool-capable, we
 // APPEND its family-native tool instructions (local_tools::system_prompt_with_tools).
 const AGENT_SYSTEM_LOCAL: &str = "You are AYGENT, a helpful AI assistant running privately \
@@ -4845,7 +4851,12 @@ async fn agent_stream(
 
         let (tools, reg_instr) = agent_tools_for_full(&app, Some(&scope_id), folder.as_deref(), !roster.is_empty(), Some((&db, &scope_id)));
         let pdf_cfg = pdf_config_for(&app, Some(&scope_id), folder.as_deref());
-        let sys = format!("{AGENT_SYSTEM}{extra_block}{reg_instr}");
+        // MUSE SPARK (Mason 09-04): the model narrates a one-line restatement of
+        // the user's intent before EVERY function call ("Pulling PR #3328 — let me
+        // locate that branch…"). Nothing on our side asked for it; it's the model's
+        // habit. Tell it plainly not to, on this provider only.
+        let muse_quiet = if provider_kind == "meta" { MUSE_QUIET_TOOLS } else { "" };
+        let sys = format!("{AGENT_SYSTEM}{extra_block}{reg_instr}{muse_quiet}");
         let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
         // ATTACHMENTS (bug fix — these were SILENTLY DROPPED on OpenAI/OpenRouter:
         // the Anthropic branch built real content blocks from `attachments`, this
@@ -5513,9 +5524,11 @@ pub async fn run_headless_turn(
     } else if is_continue {
         format!(
             "WAKE-UP: you previously called task_continue and asked to resume work. Your note to self:\n\n{}\n\n\
-             Continue the task now: check any processes you started (shell_poll), finish the work, and report \
-             the outcome — this turn streams live to your chat. If you need more time, call task_continue again. \
-             Do NOT use send_message; there is no sender to reply to.",
+             This is a FULL working turn — you have all your tools. Continue the task now: check any processes you \
+             started (shell_poll), read/edit files, run commands, finish the work, then report the outcome — this \
+             turn streams live to your chat. If the work still is not done when you must stop, call task_continue \
+             AGAIN with an updated note (never just say you will check back). Do NOT use send_message; there is no \
+             sender to reply to.",
             msg_body
         )
     } else if is_scheduled {
@@ -5601,14 +5614,16 @@ pub async fn run_headless_turn(
         format!("\n\nOTHER AGENTS you can message with send_message:\n{list}")
     };
     let mounts_block = mounts_prompt_block(broker, agent_id);
-    let system = format!("{AGENT_SYSTEM}{persona}{roster_block}{context_block}{mounts_block}");
-
-    // Tools: base file tools + send_message (has_peers = it has a roster).
-    let (tools, _reg) = agent_tools_for_ex(app, Some(&agent.id), Some(&agent.folder_path), !roster.is_empty());
-    let pdf_cfg = pdf_config_for(app, Some(&agent.id), Some(&agent.folder_path));
-
     // Resolve provider/model (recipient's own; fallback anthropic auto/haiku).
     let provider_kind = if agent.provider.is_empty() { "anthropic".to_string() } else { agent.provider.clone() };
+    let muse_quiet = if provider_kind == "meta" { MUSE_QUIET_TOOLS } else { "" };
+
+    // Tools: the FULL registry (file tools, connectors, MCP, video, dashboard,
+    // task_continue…) — a wake-up must be able to keep doing real work, not just
+    // talk (Mason 09-04). `reg_instr` carries the registry's usage instructions.
+    let (tools, reg_instr) = agent_tools_for_full(app, Some(&agent.id), Some(&agent.folder_path), !roster.is_empty(), Some((db, &agent.id)));
+    let pdf_cfg = pdf_config_for(app, Some(&agent.id), Some(&agent.folder_path));
+    let system = format!("{AGENT_SYSTEM}{persona}{roster_block}{context_block}{mounts_block}{reg_instr}{muse_quiet}");
 
     // Baseline SAVE POINT before any writes.
     if let Ok(root) = broker.root_for(agent_id) { let _ = savepoint::snapshot(&root, "Checkpoint"); }
@@ -5640,6 +5655,23 @@ pub async fn run_headless_turn(
     }
     let mut messages = serde_json::json!([{ "role": "user", "content": framed }]);
     let mut reply_text = String::new();
+    // WAKE-UP CONTEXT (Mason 09-04): a task_continue wake-up must remember what it
+    // was doing. Feed the origin conversation's recent provider-format history to
+    // the model (bounded), while `messages` stays the turn DELTA that gets
+    // appended to that history at persist time (no duplication).
+    let prior_history: Vec<serde_json::Value> = if is_continue {
+        continue_conv.as_ref()
+            .and_then(|cid| repo::load_conversation(db, cid).ok())
+            .and_then(|c| c.history.as_array().cloned())
+            .map(|h| { let n = h.len(); h.into_iter().skip(n.saturating_sub(40)).collect() })
+            .unwrap_or_default()
+    } else { Vec::new() };
+    let with_prior = |turn: &serde_json::Value| -> serde_json::Value {
+        if prior_history.is_empty() { return turn.clone(); }
+        let mut all = prior_history.clone();
+        if let Some(t) = turn.as_array() { all.extend(t.iter().cloned()); }
+        serde_json::Value::Array(all)
+    };
 
     // Only Anthropic + OpenAI/OpenRouter run headless for now (local models are
     // slower + the human path is where they're exercised). Non-cloud recipients
@@ -5655,8 +5687,9 @@ pub async fn run_headless_turn(
             // STREAM LIVE to the recipient's inbox channel — same event shape the
             // human path emits — so an open pane WATCHES the work happen (tokens +
             // tool cards), not just a rail spinner.
+            let model_msgs = with_prior(&messages);
             let (content, stop) = provider::anthropic_stream_turn(
-                &key, &model, &system, &messages, &tools, Some(&hl_cancel_flag),
+                &key, &model, &system, &model_msgs, &tools, Some(&hl_cancel_flag),
                 |ev| { let _ = app.emit(&stream_channel, &ev); },
             ).await?;
             messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": content.clone() }));
@@ -5732,42 +5765,78 @@ pub async fn run_headless_turn(
     } else if provider_kind == "openai" || provider_kind == "openrouter" || provider_kind == "meta" {
         let key = keychain::get_key(&provider_kind).map_err(|_| format!("recipient has no {provider_kind} key"))?;
         if agent.model.trim().is_empty() { return Err("recipient has no model set".into()); }
-        // STREAMING (Mason 08-06): stream token-by-token so AYGENT Remote shows
-        // partial text as it arrives (was a single delta on completion — the
-        // whole reply popped in at once over the tunnel). Emits real TextDelta
-        // events on the stream channel, exactly like the Anthropic headless path.
+        // TOOL LOOP (Mason 09-04): this branch used to be a single no-tools text
+        // turn, so a task_continue wake-up on Muse/OpenAI could only TALK — it could
+        // not shell_poll, read files or call task_continue again. Now it runs the
+        // same bounded tool loop as the Anthropic headless path, streaming live.
         let _ = app.emit(&stream_channel, &provider::StreamEvent::Info { text: "thinking…".into() });
-        let msgs = serde_json::json!([{ "role": "user", "content": framed }]);
-        let no_tools = serde_json::json!([]);
-        let hl_stream = if provider_kind == "meta" {
-            meta_provider::meta_stream_turn(&key, &agent.model, &system, &msgs, &no_tools, Some(&hl_cancel_flag),
-                |ev| {
-                    if let provider::StreamEvent::TextDelta { text } = &ev { reply_text.push_str(text); }
-                    let _ = app.emit(&stream_channel, &ev);
-                }).await
-        } else {
-        openai_provider::openai_stream_turn(
-            &provider_kind, &key, &agent.model, &system, &msgs, &no_tools, Some(&hl_cancel_flag),
-            |ev| {
-                // Accumulate the assistant text AND forward the live event so the
-                // remote/inbox pane streams it.
-                if let provider::StreamEvent::TextDelta { text } = &ev { reply_text.push_str(text); }
-                let _ = app.emit(&stream_channel, &ev);
-            },
-        ).await
-        };
-        match hl_stream {
-            Ok((assistant, _stop)) => {
-                // If the stream produced no TextDelta (some models only fill the
-                // final message content), fall back to the assembled content.
-                if reply_text.trim().is_empty() {
-                    if let Some(c) = assistant.get("content").and_then(|c| c.as_str()) {
-                        reply_text = c.to_string();
-                        let _ = app.emit(&stream_channel, &provider::StreamEvent::TextDelta { text: reply_text.clone() });
-                    }
-                }
+        let mut sent_in_turn: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        for _ in 0..12 {
+            let model_msgs = with_prior(&messages);
+            let mut round_text = String::new();
+            let hl_stream = if provider_kind == "meta" {
+                meta_provider::meta_stream_turn(&key, &agent.model, &system, &model_msgs, &tools, Some(&hl_cancel_flag),
+                    |ev| { if let provider::StreamEvent::TextDelta { text } = &ev { round_text.push_str(text); } let _ = app.emit(&stream_channel, &ev); }).await
+            } else {
+                openai_provider::openai_stream_turn(&provider_kind, &key, &agent.model, &system, &model_msgs, &tools, Some(&hl_cancel_flag),
+                    |ev| { if let provider::StreamEvent::TextDelta { text } = &ev { round_text.push_str(text); } let _ = app.emit(&stream_channel, &ev); }).await
+            };
+            let (assistant, stop) = match hl_stream {
+                Ok(v) => v,
+                Err(e) => { reply_text = format!("(couldn't complete the reply: {e})"); break; }
+            };
+            // Text the stream didn't deliver as deltas (some models only fill content).
+            if round_text.trim().is_empty() {
+                if let Some(c) = assistant.get("content").and_then(|c| c.as_str()) { if !c.trim().is_empty() { round_text = c.to_string(); let _ = app.emit(&stream_channel, &provider::StreamEvent::TextDelta { text: c.to_string() }); } }
             }
-            Err(e) => { reply_text = format!("(couldn't complete the reply: {e})"); }
+            if !round_text.trim().is_empty() { reply_text.push_str(round_text.trim()); reply_text.push('\n'); }
+            messages.as_array_mut().unwrap().push(assistant.clone());
+            let calls = assistant.get("tool_calls").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+            if calls.is_empty() || stop != "tool_use" { break; }
+            let mut tool_results = Vec::new();
+            for c in &calls {
+                let id = c.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                let name = c.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string();
+                let input: serde_json::Value = c.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str())
+                    .and_then(|a| serde_json::from_str(a).ok()).unwrap_or(serde_json::json!({}));
+                let (result_text, is_err) = if name == "whoami" {
+                    (introspect::build_whoami(app, db, agent_id, Some(&agent.folder_path)), false)
+                } else if name == "task_continue" {
+                    let delay = input.get("delay_secs").and_then(|d| d.as_u64()).unwrap_or(60).clamp(5, 3600);
+                    let note = input.get("note").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
+                    if note.is_empty() { ("task_continue refused: a non-empty note is required".to_string(), true) }
+                    else {
+                        match mailbox::enqueue_continue(db, agent_id, &format!("conv:{}\n{}", continue_conv.clone().unwrap_or_default(), note), delay) {
+                            Ok(_) => (format!("wake-up scheduled in {delay}s — end your turn now; you'll be woken with your note"), false),
+                            Err(e) => (format!("task_continue failed: {e}"), true),
+                        }
+                    }
+                } else if name == "send_message" {
+                    let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
+                    let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                    if !sent_in_turn.insert((to.to_string(), body.to_string())) { (format!("already delivered to {to} in this turn"), false) }
+                    else {
+                        match mailbox::send(db, agent_id, to, body, msg.id) {
+                            Ok(mailbox::SendResult::Queued { .. }) => { app.state::<drainer::DrainSignal>().nudge(); (format!("message delivered to {to}"), false) }
+                            Ok(mailbox::SendResult::Refused { reason }) => (format!("not sent: {reason}"), true),
+                            Err(e) => (format!("send failed: {e}"), true),
+                        }
+                    }
+                } else if connectors::is_connector_tool(&name) {
+                    connector_exec::exec(db, agent_id, &name, &input).await
+                } else if mcp::is_mcp_tool(&name) {
+                    mcp::exec(&name, &input)
+                } else if video_tools::is_video_tool(&name) {
+                    video_tools::exec(broker, agent_id, &name, &input)
+                } else if dashboard::is_dashboard_tool(&name) {
+                    dashboard::exec_dashboard_tool(db, agent_id, &name, &input)
+                } else {
+                    exec_tool_cfg(broker, agent_id, &name, &input, &pdf_cfg)
+                };
+                let _ = app.emit(&stream_channel, &serde_json::json!({ "kind": "ToolResult", "id": id, "name": name, "path": input.get("path").and_then(|p| p.as_str()).unwrap_or(""), "ok": !is_err, "detail": if is_err { result_text.clone() } else { result_text.chars().take(2000).collect::<String>() } }));
+                tool_results.push(serde_json::json!({ "type": "tool_result", "tool_use_id": id, "content": result_text, "is_error": is_err }));
+            }
+            messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": tool_results }));
         }
     } else {
         reply_text = format!("({} runs a local model — headless inter-agent turns use a cloud provider for now.)", agent.name);

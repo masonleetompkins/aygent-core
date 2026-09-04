@@ -13,7 +13,7 @@
 // the timeline one by one while the agent works.
 // AUTO-COMPACT: when the model's context input passes 50 % of its window, the
 // history is summarized (history_compact) before the next send.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Send, Square, Trash2, Bot, ClipboardList, Check } from "lucide-react";
 import { Markdown } from "../../components/Markdown";
@@ -41,6 +41,18 @@ export function AgentDock({ agentName }: { agentName?: string }) {
   const [text, setText] = useState("");
   const [compacting, setCompacting] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
+  const taH = useRef(68);
+  // Auto-grow the composer (68–200px) and shift the chat up by exactly the delta
+  // so new lines never cover the latest message (same approach as Chat.tsx).
+  useLayoutEffect(() => {
+    const ta = taRef.current; if (!ta) return;
+    ta.style.height = "auto";
+    const next = Math.max(68, Math.min(ta.scrollHeight, 200));
+    ta.style.height = next + "px";
+    const prev = taH.current; if (next === prev) return; taH.current = next;
+    const el = scrollRef.current; if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 160 + Math.max(0, next - prev)) el.scrollTop += next - prev;
+  }, [text]);
   const channelRef = useRef<string | null>(null);
   const seenToolsRef = useRef(0);
 
@@ -150,7 +162,7 @@ export function AgentDock({ agentName }: { agentName?: string }) {
         <div className="ve-quick">{QUICK.map((q) => <button key={q.l} disabled={disabled || running} onClick={() => void send(q.p)}>{q.l}</button>)}</div>
       )}
       <div className="ve-compose">
-        <textarea value={text} placeholder={disabled ? "Open a project to chat with your agent" : awaitingApproval ? "Revision notes… (⏎ to send)" : "Tell the agent what to do to this edit… (⏎ to send, ⇧⏎ newline)"} disabled={disabled}
+        <textarea ref={taRef} rows={1} value={text} placeholder={disabled ? "Open a project to chat with your agent" : awaitingApproval ? "Revision notes… (⏎ to send)" : "Tell the agent what to do to this edit… (⏎ to send, ⇧⏎ newline)"} disabled={disabled}
           onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); } }} />
         <div className="row">
           <button className="ve-icon-btn" title="Clear conversation" disabled={!msgs.length || running} onClick={() => { if (confirm("Clear this project's conversation?")) chatClear(); }}><Trash2 size={14} /></button>

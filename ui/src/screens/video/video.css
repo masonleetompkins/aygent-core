@@ -209,7 +209,7 @@
 .ve-quick.approve .go { display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 12px; border-radius: 999px; font-size: 12px; font-weight: 700; background: var(--accent); color: var(--bg); border: 1px solid var(--accent); box-shadow: 0 0 12px rgba(var(--accent-rgb), .4); }
 .ve-quick.approve .go:hover:not(:disabled) { filter: brightness(1.08); }
 .ve-compose { border-top: 1px solid rgba(var(--accent-rgb), .1); padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 8px; }
-.ve-compose textarea { resize: none; min-height: 68px; max-height: 200px; line-height: 1.4; padding: 9px 10px; border-radius: 10px; }
+.ve-compose textarea { resize: none; height: 68px; min-height: 68px; max-height: 200px; overflow-y: auto; line-height: 1.4; padding: 9px 10px; border-radius: 10px; }
 .ve-compose .row { display: flex; align-items: center; gap: 8px; }
 .ve-compose .row .spacer { flex: 1; }
 .ve-empty-chat { margin: auto; text-align: center; color: var(--text-faint); font-size: 12.5px; line-height: 1.5; padding: 24px; }
