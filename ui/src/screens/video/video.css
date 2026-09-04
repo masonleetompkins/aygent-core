@@ -36,7 +36,7 @@
 .ve-btn.primary:hover:not(:disabled) { filter: brightness(1.08); }
 .ve-btn.sm { height: 26px; padding: 0 9px; font-size: 12px; }
 .ve-seg { display: inline-flex; border: 1px solid rgba(var(--accent-rgb), .18); border-radius: 7px; overflow: hidden; height: 28px; }
-.ve-seg button { padding: 0 10px; font-size: 12px; font-weight: 600; color: var(--text-muted); border-right: 1px solid rgba(var(--accent-rgb), .12); }
+.ve-seg button { display: inline-flex; align-items: center; justify-content: center; padding: 0 10px; font-size: 12px; font-weight: 600; color: var(--text-muted); border-right: 1px solid rgba(var(--accent-rgb), .12); line-height: 1; }
 .ve-seg button:last-child { border-right: 0; }
 .ve-seg button.on { background: var(--accent); color: var(--bg); }
 .ve-pill { display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600; border: 1px solid rgba(var(--accent-rgb), .22); color: var(--text-muted); }
@@ -132,7 +132,7 @@
 .ve-scene-pop { position: absolute; right: 12px; bottom: 46px; z-index: 30; width: 300px; padding: 12px; border-radius: 12px; background: var(--surface); border: 1px solid rgba(var(--accent-rgb), .2); box-shadow: var(--elevation); display: flex; flex-direction: column; gap: 10px; }
 .ve-scene-pop h4 { margin: 0; font-size: 11px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center; }
 .ve-scene-pop .presets { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-.ve-scene-pop .presets button { height: 28px; border-radius: 7px; border: 1px solid rgba(var(--accent-rgb), .18); font-size: 11.5px; font-weight: 600; color: var(--text-muted); display: flex; justify-content: space-between; padding: 0 9px; }
+.ve-scene-pop .presets button { height: 28px; border-radius: 7px; border: 1px solid rgba(var(--accent-rgb), .18); font-size: 11.5px; font-weight: 600; color: var(--text-muted); display: flex; align-items: center; justify-content: space-between; padding: 0 9px; line-height: 1; }
 .ve-scene-pop .presets button span { font-weight: 500; color: var(--text-faint); font-variant-numeric: tabular-nums; }
 .ve-scene-pop .presets button:hover { border-color: rgba(var(--accent-rgb), .45); color: var(--text); }
 .ve-scene-pop .presets button.on { border-color: var(--accent); color: var(--text); background: rgba(var(--accent-rgb), .1); }
@@ -188,7 +188,7 @@
 .ve-msg pre { max-width: 100%; overflow-x: auto; }
 .ve-dock.closed { display: none; }
 .ve-dock-tabs { display: flex; height: 40px; border-bottom: 1px solid rgba(var(--accent-rgb), .1); padding: 0 6px; align-items: stretch; }
-.ve-dock-tabs button { padding: 0 12px; font-size: 12px; font-weight: 700; color: var(--text-muted); letter-spacing: .04em; border-bottom: 2px solid transparent; text-transform: uppercase; }
+.ve-dock-tabs button { display: inline-flex; align-items: center; padding: 0 12px; font-size: 12px; font-weight: 700; color: var(--text-muted); letter-spacing: .04em; border-bottom: 2px solid transparent; text-transform: uppercase; }
 .ve-dock-tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
 .ve-dock-tabs .spacer { flex: 1; }
 .ve-dock-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
@@ -209,7 +209,7 @@
 .ve-thinking i { width: 6px; height: 6px; border-radius: 50%; background: var(--text-faint); animation: ve-pulse 1.2s infinite; }
 .ve-thinking i:nth-child(2) { animation-delay: .2s; } .ve-thinking i:nth-child(3) { animation-delay: .4s; }
 .ve-quick { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 8px; }
-.ve-quick button { font-size: 11.5px; font-weight: 600; padding: 4px 9px; border-radius: 999px; border: 1px solid rgba(var(--accent-rgb), .2); color: var(--text-muted); }
+.ve-quick button { display: inline-flex; align-items: center; font-size: 11.5px; font-weight: 600; padding: 4px 9px; border-radius: 999px; border: 1px solid rgba(var(--accent-rgb), .2); color: var(--text-muted); line-height: 1.3; }
 .ve-quick button:hover { border-color: var(--accent); color: var(--text); }
 .ve-quick.approve { align-items: center; padding: 8px 12px; border-top: 1px solid rgba(var(--accent-rgb), .1); background: rgba(var(--accent-rgb), .05); }
 .ve-quick.approve .go { display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 12px; border-radius: 999px; font-size: 12px; font-weight: 700; background: var(--accent); color: var(--bg); border: 1px solid var(--accent); box-shadow: 0 0 12px rgba(var(--accent-rgb), .4); }
@@ -240,6 +240,6 @@
 .ve-welcome .card { width: 460px; border: 1px solid rgba(var(--accent-rgb), .15); border-radius: 16px; padding: 28px; background: var(--surface); box-shadow: var(--elevation); display: flex; flex-direction: column; gap: 14px; }
 .ve-welcome h2 { margin: 0; font-size: 20px; font-weight: 800; }
 .ve-welcome .recent { display: flex; flex-direction: column; gap: 4px; }
-.ve-welcome .recent button { text-align: left; padding: 8px 10px; border-radius: 8px; display: flex; justify-content: space-between; font-weight: 600; }
+.ve-welcome .recent button { text-align: left; padding: 8px 10px; border-radius: 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: 600; line-height: 1.3; }
 .ve-welcome .recent button:hover { background: rgba(var(--accent-rgb), .08); }
 .ve-welcome .recent span { color: var(--text-faint); font-weight: 500; font-size: 12px; }

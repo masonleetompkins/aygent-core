@@ -115,11 +115,17 @@ fn caption_lines(words: &[Word], key_words: &[String]) -> Vec<CapLine> {
         cur.push(w.clone());
     }
     if !cur.is_empty() { lines.push(cur); }
-    lines.iter().map(|l| {
+    lines.iter().enumerate().map(|(idx, l)| {
         let s = l[0].s;
+        let raw_e = l.last().map(|x| x.e).unwrap_or(s) + 0.6;
+        // Consecutive captions share one screen slot: an end past the next
+        // start co-shows two lines. Clamp to the next start (the floor keeps
+        // the 0.5s word stagger readable on dense lines).
+        let next_s = lines.get(idx + 1).map(|n| n[0].s).unwrap_or(f64::INFINITY);
+        let e = raw_e.min(next_s - 0.04).max(s + 0.35);
         let stagger = if l.len() > 1 { 0.5 / (l.len() - 1) as f64 } else { 0.0 };
         CapLine {
-            s, e: l.last().map(|x| x.e).unwrap_or(s) + 0.6,
+            s, e,
             words: l.iter().enumerate().map(|(i, w)| {
                 let clean: String = w.w.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
                 CapWord { w: w.w.clone(), key: key_words.iter().any(|k| k == &clean), t: (i as f64 * stagger * 1000.0).round() / 1000.0, i }
