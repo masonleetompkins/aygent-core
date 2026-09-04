@@ -72,6 +72,7 @@ mod video; // VIDEO v0.3: project store + hardlink import + probe/thumbs (Video/
 mod video_render; // VIDEO v0.3: composition.json -> ffmpeg filter graph -> MP4/frame.
 mod video_media; // VIDEO v0.3: aygent-media:// jailed range-capable media serving for the editor.
 mod video_tools; // VIDEO v0.3: video_* agent tools (frame-accurate edit helpers).
+mod video_hyperframes; // VIDEO: Hyperframes transparent overlays — graphics + captions (T1/V3 clips).
 
 use std::sync::Arc;
 use rand::Rng;
@@ -3996,6 +3997,7 @@ fn agent_tools_for_full(
         // VIDEO v0.3: frame-accurate edit helpers (jailed; provisioned ffmpeg only).
         for schema in video_tools::tool_schemas() { tools.push(schema); }
         extra_instructions.push_str(video_tools::INSTRUCTIONS);
+        extra_instructions.push_str(video_hyperframes::HYPERFRAMES_INSTRUCTIONS);
         tools.push(spark_preview_tool());
         // WHOAMI is already in the base tool list (added unconditionally above).
         // Here we only add the instruction that tells the model it exists.
@@ -6026,7 +6028,8 @@ pub fn run() {
             video::video_chat_save, video::video_pick_media, video::video_import_paths, video::video_remove_asset, video::video_relink_asset,
             video::video_refresh_thumbs, video::video_list_luts, video::video_pick_lut, video::video_reveal,
             video_render::video_render, video_render::video_render_cancel, video_render::video_frame,
-            video_render::video_validate, video_render::video_list_renders, video_render::video_caption_lines,
+            video_render::video_validate, video_render::video_list_renders,
+            video_hyperframes::video_build_captions, video_hyperframes::video_render_overlay_cmd, video_hyperframes::video_pick_style_guide, video_hyperframes::video_caption_timing,
             video_tools::video_tool, video_tools::video_set_auphonic,
             dashboard::dashboard_load, dashboard::dashboard_upsert_module,
             dashboard::dashboard_remove_module, dashboard::dashboard_arrange,

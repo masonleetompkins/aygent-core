@@ -15,16 +15,16 @@ export type AudioFx = { fadeIn: number; fadeOut: number; keyframes: Keyframe[] }
 export type Transition = { kind: string; duration: number };
 
 export type Clip = {
-  id: string; track: TrackId; type: ClipKind; asset: string; audioAsset: string; name: string;
+  id: string; track: TrackId; type: ClipKind; asset: string; audioAsset: string; link: string; name: string;
   start: number; end: number; in: number; out: number; speed: number;
   volume: number; muted: boolean; hidden: boolean; fit: "cover" | "contain" | "none";
   transform: Transform; text: TextStyle; color: ColorGrade; audio: AudioFx;
   behindSubject: boolean; transitionIn: Transition; transitionOut: Transition;
 };
 
+export type GraphicsStyle = { instructions: string; styleGuide: string; styleGuideName: string };
 export type Captions = {
-  enabled: boolean; preset: "pop" | "karaoke" | "plain"; font: string; weight: number; size: number; color: string; keyColor: string;
-  y: number; wordsPerLine: number; maxChars: number; uppercase: boolean; behindSubject: boolean; sourceAsset: string; keyWords: string[]; shadow: boolean;
+  enabled: boolean; sourceAsset: string; keyWords: string[]; y: number;
 };
 export type Duck = { enabled: boolean; musicDb: number; duckedDb: number; attack: number; release: number };
 export type AudioMix = { duck: Duck; enhance: string; masterDb: number; loudnorm: boolean };
@@ -35,6 +35,7 @@ export type Composition = {
   version: 3;
   scene: { width: number; height: number; fps: number; background: string };
   clips: Clip[];
+  graphics: GraphicsStyle;
   captions: Captions;
   audio: AudioMix;
   color: ColorGrade;
@@ -56,7 +57,7 @@ export type Transcript = { asset: string; language: string; text: string; words:
 
 export const TRACK_ORDER: TrackId[] = ["T1", "V3", "V2", "V1", "A1", "A2"]; // top = composited on top: titles over graphics over B-roll over A-roll
 export const TRACK_KIND = (t: TrackId): "video" | "text" | "audio" => t.startsWith("T") ? "text" : t.startsWith("A") ? "audio" : "video";
-export const TRACK_LABEL: Record<string, string> = { V3: "Graphics", V2: "B-roll", V1: "A-roll", T1: "Titles", A1: "Voice", A2: "Music" };
+export const TRACK_LABEL: Record<string, string> = { V3: "Graphics", V2: "B-roll", V1: "A-roll", T1: "Overlays", A1: "Voice", A2: "Music" };
 
 export const uid = (p = "c") => `${p}${Date.now().toString(36)}${Math.floor(Math.random() * 1296).toString(36)}`;
 
@@ -71,7 +72,8 @@ export function blankComposition(): Composition {
     version: 3,
     scene: { width: 1920, height: 1080, fps: 30, background: "#000000" },
     clips: [],
-    captions: { enabled: false, preset: "pop", font: "SF Pro Display", weight: 600, size: 64, color: "#ffffff", keyColor: "#00e6ff", y: 0.78, wordsPerLine: 4, maxChars: 24, uppercase: false, behindSubject: false, sourceAsset: "", keyWords: [], shadow: true },
+    graphics: { instructions: "", styleGuide: "", styleGuideName: "" },
+    captions: { enabled: false, sourceAsset: "", keyWords: [], y: 0.78 },
     audio: { duck: { enabled: true, musicDb: -18, duckedDb: -30, attack: 0.02, release: 0.4 }, enhance: "auphonic", masterDb: 0, loudnorm: false },
     color: { ...defaultGrade(), sCurve: 0.35 },
     adjustmentLayer: true,
@@ -85,7 +87,7 @@ export function blankComposition(): Composition {
 
 export function newClip(partial: Partial<Clip> & { track: TrackId; type: ClipKind }): Clip {
   return {
-    id: uid(), asset: "", audioAsset: "", name: "", start: 0, end: 4, in: 0, out: 4, speed: 1, volume: 0, muted: false, hidden: false, fit: "cover",
+    id: uid(), asset: "", audioAsset: "", link: "", name: "", start: 0, end: 4, in: 0, out: 4, speed: 1, volume: 0, muted: false, hidden: false, fit: "cover",
     transform: defaultTransform(), text: defaultText(), color: defaultGrade(), audio: { fadeIn: 0, fadeOut: 0, keyframes: [] },
     behindSubject: false, transitionIn: { kind: "", duration: 0 }, transitionOut: { kind: "", duration: 0 },
     ...partial,
@@ -118,7 +120,7 @@ export function normalize(raw: unknown, assets: Asset[] = []): Composition {
     return {
       ...base,
       id: str(c.id, "") || `clip-${i}`,
-      asset: str(c.asset, ""), audioAsset: str(c.audioAsset, ""), name: str(c.name, ""),
+      asset: str(c.asset, ""), audioAsset: str(c.audioAsset, ""), link: str(c.link, ""), name: str(c.name, ""),
       start, end, in: inn, out: Math.max(inn + 0.04, num(c.out, inn + (end - start))), speed: num(c.speed, 1) || 1,
       volume: num(c.volume, 0), muted: bool(c.muted, false), hidden: bool(c.hidden, false), fit: (["cover", "contain", "none"].includes(c.fit) ? c.fit : "cover"),
       transform: { ...base.transform, ...(c.transform ?? {}) },
@@ -134,6 +136,7 @@ export function normalize(raw: unknown, assets: Asset[] = []): Composition {
     version: 3,
     scene: { width: num(r.scene?.width, 1920), height: num(r.scene?.height, 1080), fps: num(r.scene?.fps, 30) || 30, background: str(r.scene?.background, "#000000") },
     clips,
+    graphics: { instructions: str(r.graphics?.instructions, ""), styleGuide: str(r.graphics?.styleGuide, ""), styleGuideName: str(r.graphics?.styleGuideName, "") },
     captions: { ...b.captions, ...(r.captions ?? {}), keyWords: Array.isArray(r.captions?.keyWords) ? r.captions.keyWords : [] },
     audio: { ...b.audio, ...(r.audio ?? {}), duck: { ...b.audio.duck, ...(r.audio?.duck ?? {}) } },
     color: { ...b.color, ...(r.color ?? {}) },

@@ -7,10 +7,12 @@
 // ffmpeg (provision.rs) with a filter script written into Video/<p>/.cache/, so
 // no shell quoting and nothing the agent names gets executed.
 //
-// Visual stacking (bottom → top): V1 < V2 < V3 … < T1 < captions, then the global
-// grade (LUT + S-curve = "adjustment layer") on the composite. If a matte is
-// enabled, layers flagged behindSubject are composited BETWEEN the a-roll and
-// its alpha-merged foreground so text sits behind Mason.
+// Visual stacking (bottom → top): V1 < V2 < V3 … < T1 (caption overlays play only
+// when captions.enabled), then the global grade (LUT + S-curve = "adjustment layer")
+// on the composite. Captions + graphics are Hyperframes transparent-overlay video
+// clips — there is no ASS/drawtext caption pipeline anymore. If a matte is enabled,
+// layers flagged behindSubject are composited BETWEEN the a-roll and its
+// alpha-merged foreground so overlays sit behind Mason.
 
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -97,6 +99,7 @@ pub struct Clip {
     #[serde(rename = "type")] pub kind: String, // video | audio | image | text
     pub asset: String,             // asset id
     pub audio_asset: String,       // optional replacement audio (Auphonic result)
+    pub link: String,              // links a V picture clip to its A1 waveform partner ("" = unlinked)
     pub name: String,
     pub start: f64,
     pub end: f64,
@@ -116,7 +119,7 @@ pub struct Clip {
     pub transition_out: Transition,
 }
 impl Default for Clip {
-    fn default() -> Self { Self { id: String::new(), track: "V1".into(), kind: "video".into(), asset: String::new(), audio_asset: String::new(), name: String::new(), start: 0.0, end: 0.0, in_: 0.0, out: 0.0, speed: 1.0, volume: 0.0, muted: false, hidden: false, fit: "cover".into(), transform: Transform::default(), text: TextStyle::default(), color: ColorGrade::default(), audio: AudioFx::default(), behind_subject: false, transition_in: Transition::default(), transition_out: Transition::default() } }
+    fn default() -> Self { Self { id: String::new(), track: "V1".into(), kind: "video".into(), asset: String::new(), audio_asset: String::new(), link: String::new(), name: String::new(), start: 0.0, end: 0.0, in_: 0.0, out: 0.0, speed: 1.0, volume: 0.0, muted: false, hidden: false, fit: "cover".into(), transform: Transform::default(), text: TextStyle::default(), color: ColorGrade::default(), audio: AudioFx::default(), behind_subject: false, transition_in: Transition::default(), transition_out: Transition::default() } }
 }
 impl Clip {
     pub fn dur(&self) -> f64 { (self.end - self.start).max(0.0) }
@@ -124,27 +127,24 @@ impl Clip {
     fn has_audio_role(&self) -> bool { matches!(self.kind.as_str(), "video" | "audio") && !self.muted }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GraphicsStyle {
+    pub instructions: String,      // plain-text style directions for Hyperframes overlays
+    pub style_guide: String,       // extracted text of the uploaded style guide (.md/.txt/.rtf/.pdf/.docx)
+    pub style_guide_name: String,  // original file name of the guide
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Captions {
-    pub enabled: bool,
-    pub preset: String,            // pop | karaoke | plain
-    pub font: String,
-    pub weight: u32,
-    pub size: f64,                 // px at scene size
-    pub color: String,
-    pub key_color: String,
-    pub y: f64,                    // 0..1 center from top
-    pub words_per_line: u32,
-    pub max_chars: u32,
-    pub uppercase: bool,
-    pub behind_subject: bool,
+    pub enabled: bool,             // the T1 caption overlay clip plays
     pub source_asset: String,      // transcript's asset id ("" = first a-roll)
     pub key_words: Vec<String>,    // words to highlight (case-insensitive)
-    pub shadow: bool,
+    pub y: f64,                    // 0..1 center from top (passed to the Hyperframes build)
 }
 impl Default for Captions {
-    fn default() -> Self { Self { enabled: false, preset: "pop".into(), font: "SF Pro Display".into(), weight: 600, size: 64.0, color: "#ffffff".into(), key_color: "#00e6ff".into(), y: 0.78, words_per_line: 4, max_chars: 24, uppercase: false, behind_subject: false, source_asset: String::new(), key_words: vec![], shadow: true } }
+    fn default() -> Self { Self { enabled: false, source_asset: String::new(), key_words: vec![], y: 0.78 } }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -172,6 +172,7 @@ pub struct Composition {
     pub version: u32,
     pub scene: Scene,
     pub clips: Vec<Clip>,
+    pub graphics: GraphicsStyle,   // Hyperframes overlay style (instructions + guide)
     pub captions: Captions,
     pub audio: AudioMix,
     pub color: ColorGrade,         // the adjustment layer (on the composite)
@@ -181,7 +182,7 @@ pub struct Composition {
 }
 impl Default for Composition {
     fn default() -> Self {
-        Self { version: 3, scene: Scene::default(), clips: vec![], captions: Captions::default(), audio: AudioMix::default(), color: ColorGrade { s_curve: 0.35, ..Default::default() }, adjustment_layer: true, matte: Matte::default(),
+        Self { version: 3, scene: Scene::default(), clips: vec![], graphics: GraphicsStyle::default(), captions: Captions::default(), audio: AudioMix::default(), color: ColorGrade { s_curve: 0.35, ..Default::default() }, adjustment_layer: true, matte: Matte::default(),
             exports: vec![ExportPreset::default(), ExportPreset { name: "vertical".into(), width: 1080, height: 1920, bitrate: "10M".into(), ..Default::default() }] }
     }
 }
@@ -451,24 +452,15 @@ fn wrap_text(s: &str, max_chars: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Captions → ASS (Hyperframes "pop" look)
-// ---------------------------------------------------------------------------
-
-fn ass_color(hex: &str, fb: &str) -> String {
-    let h = hex_color(hex, fb);
-    let r = &h[1..3]; let g = &h[3..5]; let b = &h[5..7];
-    format!("&H00{}{}{}&", b.to_uppercase(), g.to_uppercase(), r.to_uppercase())
-}
-fn ass_bgr(hex: &str, fb: &str) -> String { let c = ass_color(hex, fb); c.replacen("&H00", "&H", 1) }
-fn ass_time(t: f64) -> String {
-    let t = t.max(0.0);
-    let h = (t / 3600.0).floor(); let m = ((t - h * 3600.0) / 60.0).floor(); let s = t - h * 3600.0 - m * 60.0;
-    format!("{}:{:02}:{:05.2}", h as u32, m as u32, s)
-}
+// Caption TIMING (shared with video_hyperframes)
+//
+// The old ASS/drawtext caption renderer is gone. This section keeps only the
+// transcript→timeline word mapper, which video_hyperframes uses to time the
+// transparent Hyperframes caption overlay. `timeline_words` is pub for that.
 
 /// Map transcript words (asset source time) onto the timeline through the clips
 /// that play that asset. Returns timeline-time words.
-fn timeline_words(comp: &Composition, tr: &Transcript) -> Vec<Word> {
+pub fn timeline_words(comp: &Composition, tr: &Transcript) -> Vec<Word> {
     let mut out = vec![];
     for c in comp.clips.iter().filter(|c| c.kind == "video" && !c.hidden && c.asset == tr.asset) {
         let src_end = c.in_ + c.dur() * c.speed;
@@ -484,75 +476,6 @@ fn timeline_words(comp: &Composition, tr: &Transcript) -> Vec<Word> {
     out
 }
 
-fn group_lines(words: &[Word], per_line: u32, max_chars: u32) -> Vec<Vec<Word>> {
-    let mut lines: Vec<Vec<Word>> = vec![];
-    let mut cur: Vec<Word> = vec![];
-    let mut chars = 0usize;
-    for w in words {
-        let gap = cur.last().map(|l| w.s - l.e).unwrap_or(0.0);
-        let ends = cur.last().map(|l| l.w.ends_with(['.', '?', '!'])).unwrap_or(false);
-        if !cur.is_empty() && (cur.len() as u32 >= per_line.max(1) || chars + w.w.len() + 1 > max_chars.max(6) as usize || gap > 0.7 || ends) {
-            lines.push(std::mem::take(&mut cur)); chars = 0;
-        }
-        chars += w.w.len() + 1;
-        cur.push(w.clone());
-    }
-    if !cur.is_empty() { lines.push(cur); }
-    lines
-}
-
-pub fn build_ass(comp: &Composition, tr: &Transcript, w: u32, h: u32) -> String {
-    let cap = &comp.captions;
-    let words = timeline_words(comp, tr);
-    let lines = group_lines(&words, cap.words_per_line, cap.max_chars);
-    let size = cap.size.max(8.0) * (h as f64 / comp.scene.height.max(1) as f64);
-    let primary = ass_color(&cap.color, "#ffffff");
-    let bold = if cap.weight >= 600 { -1 } else { 0 };
-    let shadow = if cap.shadow { 3 } else { 0 };
-    let mut s = String::new();
-    s.push_str(&format!("[Script Info]\nScriptType: v4.00+\nPlayResX: {w}\nPlayResY: {h}\nWrapStyle: 2\nScaledBorderAndShadow: yes\nYCbCr Matrix: TV.709\n\n"));
-    s.push_str("[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n");
-    s.push_str(&format!("Style: Cap,{},{:.0},{primary},{primary},&H00000000&,&H80000000&,{bold},0,0,0,100,100,0,0,1,0,{shadow},5,40,40,40,1\n\n", cap.font, size));
-    s.push_str("[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n");
-    let cx = w as f64 / 2.0; let cy = h as f64 * cap.y.clamp(0.02, 0.98);
-    let key: Vec<String> = cap.key_words.iter().map(|k| k.to_lowercase()).collect();
-    let key_bgr = ass_bgr(&cap.key_color, "#00e6ff");
-    for (li, line) in lines.iter().enumerate() {
-        let ls = line[0].s;
-        let last_e = line.last().map(|x| x.e).unwrap_or(ls);
-        let next_s = lines.get(li + 1).map(|n| n[0].s).unwrap_or(f64::MAX);
-        let le = (last_e + 0.6).min(next_s - 0.02).max(ls + 0.3);
-        let mut text = format!("{{\\an5\\pos({cx:.0},{cy:.0})\\fad(0,90)}}");
-        for (wi, wd) in line.iter().enumerate() {
-            let mut word = wd.w.clone();
-            if cap.uppercase { word = word.to_uppercase(); }
-            let clean: String = word.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
-            let is_key = key.iter().any(|k| k == &clean);
-            let off = ((wd.s - ls) * 1000.0).max(0.0) as i64;
-            let pop = 170i64;
-            let mut tags = String::new();
-            match cap.preset.as_str() {
-                "plain" => {}
-                "karaoke" => {
-                    // white → key color as each word lands
-                    tags.push_str(&format!("{{\\t({off},{},\\c{key_bgr})}}", off + 40));
-                }
-                _ => {
-                    // pop: appear per word with a small scale-up (Hyperframes look)
-                    tags.push_str(&format!("{{\\alpha&HFF&\\fscx86\\fscy86\\t({off},{},\\alpha&H00&\\fscx100\\fscy100)}}", off + pop));
-                }
-            }
-            if is_key && cap.preset != "karaoke" { tags.push_str(&format!("{{\\c{key_bgr}\\blur4\\bord1\\3c{key_bgr}}}")); }
-            if wi > 0 { text.push(' '); }
-            text.push_str(&tags);
-            text.push_str(&word.replace('{', "(").replace('}', ")"));
-            if is_key && cap.preset != "karaoke" { text.push_str(&format!("{{\\c{primary}\\blur0\\bord0}}")); }
-        }
-        s.push_str(&format!("Dialogue: 0,{},{},Cap,,0,0,0,,{}\n", ass_time(ls), ass_time(le), text));
-    }
-    s
-}
-
 // ---------------------------------------------------------------------------
 // Whole-graph build
 // ---------------------------------------------------------------------------
@@ -563,11 +486,6 @@ pub struct Plan {
 }
 
 pub struct Target { pub w: u32, pub h: u32, pub fps: f64 }
-
-fn load_transcript(proj: &Path) -> Option<Transcript> {
-    let t = std::fs::read_to_string(proj.join("transcript.json")).ok()?;
-    serde_json::from_str(&t).ok()
-}
 
 pub fn build_plan(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, comp: &Composition, target: &Target, script_name: &str) -> Result<Plan, String> {
     let proj = video::project_dir(broker, agent_id, project)?;
@@ -602,16 +520,20 @@ pub fn build_plan(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, proje
     visuals.sort_by_key(|c| (rank(&c.track), (c.start * 1000.0) as i64));
 
     let matte_on = comp.matte.enabled && !comp.matte.alpha_asset.is_empty() && abs.contains_key(&comp.matte.alpha_asset)
-        && (comp.captions.behind_subject || visuals.iter().any(|c| c.behind_subject));
+        && visuals.iter().any(|c| c.behind_subject);
 
     let mut missing: Vec<String> = vec![];
     let mut tn = 0usize;
+    let captions_on = comp.captions.enabled;
     let mut compose = |ctx: &mut Ctx, g: &mut Graph, cur: &mut String, c: &Clip, missing: &mut Vec<String>| {
         if c.kind == "text" {
             tn += 1;
             *cur = text_overlay(ctx, g, cur.clone(), c, tn);
             return;
         }
+        // T1 holds Hyperframes caption overlays: silent while captions are off.
+        // (Legacy T1 text clips have no asset and always play — see above.)
+        if c.track == "T1" && !c.asset.is_empty() && !captions_on { return; }
         if !ctx.abs.contains_key(&c.asset) { missing.push(format!("{} ({})", c.name, c.asset)); return; }
         if let Some(s) = visual_stream(ctx, c, g, None) { *cur = overlay(ctx, g, cur.clone(), s, c); }
     };
@@ -621,7 +543,6 @@ pub fn build_plan(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, proje
         for c in visuals.iter().filter(|c| !c.behind_subject && rank(&c.track) <= 1) { compose(&mut ctx, &mut g, &mut cur, c, &mut missing); }
         // 2) behind-subject layers
         for c in visuals.iter().filter(|c| c.behind_subject) { compose(&mut ctx, &mut g, &mut cur, c, &mut missing); }
-        if comp.captions.enabled && comp.captions.behind_subject { cur = captions_layer(&mut ctx, &mut g, cur, comp, &proj, w, h)?; }
         // 3) foreground = a-roll clips of the matte source with alpha merged
         let src = if comp.matte.source_asset.is_empty() { scaled.iter().find(|c| c.track == "V1" && c.kind == "video").map(|c| c.asset.clone()).unwrap_or_default() } else { comp.matte.source_asset.clone() };
         for c in scaled.iter().filter(|c| c.kind == "video" && !c.hidden && c.asset == src) {
@@ -638,10 +559,8 @@ pub fn build_plan(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, proje
         }
         // 4) front layers
         for c in visuals.iter().filter(|c| !c.behind_subject && rank(&c.track) > 1) { compose(&mut ctx, &mut g, &mut cur, c, &mut missing); }
-        if comp.captions.enabled && !comp.captions.behind_subject { cur = captions_layer(&mut ctx, &mut g, cur, comp, &proj, w, h)?; }
     } else {
         for c in visuals.iter() { compose(&mut ctx, &mut g, &mut cur, c, &mut missing); }
-        if comp.captions.enabled { cur = captions_layer(&mut ctx, &mut g, cur, comp, &proj, w, h)?; }
     }
     if !missing.is_empty() { return Err(format!("clips reference missing media: {}", missing.join(", "))); }
 
@@ -651,9 +570,13 @@ pub fn build_plan(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, proje
     g.push(format!("[{cur}]format=yuv420p[{vout}]"));
 
     // ---- audio ----
+    // Linked V+A pairs share one voice: the picture clip's audio already plays,
+    // so a linked waveform partner with a video mate is skipped (no doubling).
+    let video_links: std::collections::HashSet<&str> = scaled.iter().filter(|c| c.kind == "video" && !c.link.is_empty()).map(|c| c.link.as_str()).collect();
     let mut voice: Vec<String> = vec![];
     let mut music: Vec<String> = vec![];
     for c in scaled.iter().filter(|c| c.has_audio_role() && !c.hidden || (c.kind == "audio" && !c.muted)) {
+        if c.kind == "audio" && !c.link.is_empty() && video_links.contains(c.link.as_str()) { continue; }
         let asset_id = if !c.audio_asset.is_empty() && abs.contains_key(&c.audio_asset) { c.audio_asset.as_str() } else { c.asset.as_str() };
         let Some(a) = assets.get(asset_id) else { continue };
         if !a.has_audio { continue; }
@@ -747,19 +670,6 @@ fn filter_file_args(app: &tauri::AppHandle, script: &Path) -> Vec<String> {
         major >= 8 || (major == 7 && !text.contains("7.0"))
     });
     if modern { vec!["-/filter_complex".into(), script.to_string_lossy().to_string()] } else { vec!["-filter_complex_script".into(), script.to_string_lossy().to_string()] }
-}
-
-fn captions_layer(ctx: &mut Ctx, g: &mut Graph, cur: String, comp: &Composition, proj: &Path, w: u32, h: u32) -> Result<String, String> {
-    let Some(mut tr) = load_transcript(proj) else { return Ok(cur) }; // no transcript yet → no captions, not an error
-    if !comp.captions.source_asset.is_empty() { tr.asset = comp.captions.source_asset.clone(); }
-    if tr.asset.is_empty() { if let Some(c) = comp.clips.iter().find(|c| c.track == "V1" && c.kind == "video") { tr.asset = c.asset.clone(); } }
-    let ass = build_ass(comp, &tr, w, h);
-    let p = proj.join(".cache").join("captions.ass");
-    std::fs::write(&p, ass).map_err(|e| format!("write captions.ass: {e}"))?;
-    let out = g.label("cap");
-    g.push(format!("[{cur}]ass=filename='{}'[{out}]", fesc(&p.to_string_lossy())));
-    let _ = ctx;
-    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -967,24 +877,6 @@ pub fn video_list_renders(broker: tauri::State<Arc<Broker>>, agent_id: String, p
     Ok(out)
 }
 
-pub fn write_captions_preview(broker: &Broker, agent_id: &str, project: &str, comp: &Composition) -> Result<serde_json::Value, String> {
-    let proj = video::project_dir(broker, agent_id, project)?;
-    let Some(mut tr) = load_transcript(&proj) else { return Ok(serde_json::json!({ "lines": [] })) };
-    if tr.asset.is_empty() { if let Some(c) = comp.clips.iter().find(|c| c.track == "V1" && c.kind == "video") { tr.asset = c.asset.clone(); } }
-    let words = timeline_words(comp, &tr);
-    let lines = group_lines(&words, comp.captions.words_per_line, comp.captions.max_chars);
-    let out: Vec<serde_json::Value> = lines.iter().map(|l| serde_json::json!({ "s": l[0].s, "e": l.last().map(|x| x.e).unwrap_or(0.0), "words": l })).collect();
-    Ok(serde_json::json!({ "lines": out }))
-}
-
-/// Caption lines mapped to the timeline — the UI canvas draws these live.
-#[tauri::command]
-pub fn video_caption_lines(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String, composition: serde_json::Value) -> Result<serde_json::Value, String> {
-    let assets = video::load_manifest(&broker, &agent_id, &project).assets;
-    let comp = parse_composition(&composition, &assets)?;
-    write_captions_preview(&broker, &agent_id, &project, &comp)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -999,15 +891,13 @@ mod tests {
         assert!((c.duration() - 5.0).abs() < 1e-9);
     }
     #[test]
-    fn ass_groups_and_maps_through_cuts() {
+    fn words_map_through_cuts() {
         let mut comp = Composition::default();
         comp.clips.push(Clip { id: "c1".into(), track: "V1".into(), kind: "video".into(), asset: "a".into(), start: 0.0, end: 2.0, in_: 10.0, out: 12.0, ..Default::default() });
         let tr = Transcript { asset: "a".into(), words: vec![Word { w: "hello".into(), s: 10.2, e: 10.5 }, Word { w: "world".into(), s: 10.6, e: 10.9 }, Word { w: "skipped".into(), s: 13.0, e: 13.4 }], ..Default::default() };
         let words = timeline_words(&comp, &tr);
         assert_eq!(words.len(), 2);
         assert!((words[0].s - 0.2).abs() < 1e-9);
-        let ass = build_ass(&comp, &tr, 1920, 1080);
-        assert!(ass.contains("Dialogue:")); assert!(ass.contains("hello")); assert!(!ass.contains("skipped"));
     }
     #[test]
     fn fesc_escapes_filter_chars() { assert_eq!(fesc("a:b,c'd"), "a\\:b\\,c\\'d"); }

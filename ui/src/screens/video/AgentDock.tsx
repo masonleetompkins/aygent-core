@@ -24,8 +24,8 @@ import { fmtTime } from "./model";
 const QUICK: { l: string; p: string }[] = [
   { l: "Rough cut", p: "Run video_auto_cut on the A-roll: drop silences and dead air, keep the LAST take when I repeat a line. Then tell me what you removed." },
   { l: "Transcribe", p: "Transcribe the A-roll (video_transcribe) and give me a 5-bullet summary of what I say with timestamps." },
-  { l: "Captions", p: "Turn on animated captions with the pop preset, 4 words per line, and pick 6 key words to highlight from the transcript." },
-  { l: "Graphics plan", p: "Read the transcript and write a PLAN for on-screen graphics (title cards / callouts) where extra explanation helps: numbered list, one per line with timecode range, exact on-screen text, placement, and why. Do NOT add anything yet — wait for my approval or revision notes." },
+  { l: "Captions", p: "Transcribe the A-roll if needed, then build the Hyperframes caption overlay (video_build_captions) with 6 key words to highlight. Style comes from my Graphics panel." },
+  { l: "Graphics plan", p: "Read the transcript and my Graphics panel style, then write a PLAN for Hyperframes overlay graphics (title cards / callouts) where extra explanation helps: numbered list, one per line with timecode range, exact on-screen text, placement, and why. Do NOT build anything yet — wait for my approval or revision notes, then build with video_render_overlay." },
   { l: "Grade", p: "Apply my LUT (pick the .cube in luts/) on the adjustment layer with a 35% S-curve." },
   { l: "Duck music", p: "Make sure anything on A2 ducks under my voice: music -18 dB, ducked -30 dB." },
   { l: "9:16 version", p: "Add a vertical export preset (1080x1920) and tell me which clips would need reframing (x offsets) to keep me centered." },
@@ -102,7 +102,7 @@ export function AgentDock({ agentName }: { agentName?: string }) {
     const ctx = [
       `[Video editor context — project "${project}" · Video/${project}/ · scene ${comp.scene.width}x${comp.scene.height}@${comp.scene.fps} · ${comp.clips.length} clips · playhead ${fmtTime(playhead, comp.scene.fps)} (${playhead.toFixed(3)}s)` +
       (selection.length ? ` · selected clip ids: ${selection.join(", ")}` : "") + `]`,
-      `Use the video_* tools (start with video_project if you need the current state). Keep the reply short: what changed, clip ids, times. Graphics/titles: PLAN first, build only after approval, one video_edit per graphic.`,
+      `Use the video_* tools (start with video_project if you need the current state). Keep the reply short: what changed, clip ids, times. Captions/graphics are Hyperframes transparent overlays (video_build_captions / video_render_overlay), styled by the Graphics panel — never drawtext/ASS. Overlays: PLAN first, build only after approval, one tool call per overlay in timeline order.`,
     ].join("\n");
     chatPush({ role: "user", text: p, at: Date.now() });
     chatPush({ role: "assistant", text: "", at: Date.now() });
@@ -155,7 +155,7 @@ export function AgentDock({ agentName }: { agentName?: string }) {
       {awaitingApproval ? (
         <div className="ve-quick approve">
           <span className="ve-faint" style={{ fontSize: 11.5, display: "inline-flex", alignItems: "center", gap: 5 }}><ClipboardList size={13} /> Plan ready</span>
-          <button className="go" disabled={disabled} onClick={() => void send("Approved — build it. One video_edit per graphic, in timeline order.")}><Check size={12} /> Approve &amp; build</button>
+          <button className="go" disabled={disabled} onClick={() => void send("Approved — build it. One overlay tool call per graphic, in timeline order.")}><Check size={12} /> Approve &amp; build</button>
           <span className="ve-faint" style={{ fontSize: 11.5 }}>or type revision notes below</span>
         </div>
       ) : (

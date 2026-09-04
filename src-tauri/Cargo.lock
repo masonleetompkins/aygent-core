@@ -191,6 +191,7 @@ dependencies = [
  "keyring",
  "libc",
  "llama-cpp-2",
+ "miniz_oxide",
  "num_cpus",
  "objc2",
  "objc2-app-kit",

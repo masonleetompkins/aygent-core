@@ -1,10 +1,12 @@
-// AYGENT — VIDEO v0.3 side panels: Media · Text · Captions · Color · Audio · Export.
+// AYGENT — VIDEO v0.3 side panels: Media · Graphics · Captions (Hyperframes) · Color · Audio · Export.
 // Each panel edits the composition through the store (autosaved) or triggers a
 // video_* tool — the SAME core the agent uses, so button == prompt.
+// Graphics + captions are built with Hyperframes (transparent overlays); the old
+// ASS/DOM caption pipeline is gone.
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Upload, Plus, X, Type, Wand2, FolderOpen, Download, Square, Sparkles, Music, Film, Image as ImageIcon, Mic2, RefreshCw, Link2, Layers, Unplug } from "lucide-react";
-import { useVideo, mutate, importPick, removeAsset, relinkAsset, reload, addAssetToTimeline, addTitle, runTool, pickLut, startRender, cancelRender, reveal, toast, set, refreshRenders, refreshThumbs } from "./store";
+import { Upload, Plus, X, Wand2, FolderOpen, Download, Square, Sparkles, Music, Film, Image as ImageIcon, Mic2, RefreshCw, Link2, Layers, Unplug, FileText } from "lucide-react";
+import { useVideo, mutate, importPick, removeAsset, relinkAsset, reload, addAssetToTimeline, runTool, pickLut, startRender, cancelRender, reveal, toast, set, refreshRenders, refreshThumbs } from "./store";
 import { type Asset, type Composition, fmtDur, fmtBytes, mediaUrl } from "./model";
 
 // ---- small field kit ------------------------------------------------------
@@ -38,8 +40,8 @@ const setPath = (path: string, value: unknown) => mutate((c) => { const parts = 
 export function MediaPanel() {
   const s = useVideo();
   const [sel, setSel] = useState<string | null>(null);
-  const files = s.assets.filter((a) => !a.name.includes("(alpha)") && !a.name.includes("(enhanced)"));
-  const generated = s.assets.filter((a) => a.name.includes("(alpha)") || a.name.includes("(enhanced)"));
+  const files = s.assets.filter((a) => !a.name.includes("(alpha)") && !a.name.includes("(enhanced)") && !a.name.includes("(HF)") && !a.name.includes("(overlay)"));
+  const generated = s.assets.filter((a) => a.name.includes("(alpha)") || a.name.includes("(enhanced)") || a.name.includes("(HF)") || a.name.includes("(overlay)"));
   const offline = s.assets.filter((a) => a.online === false);
   return (
     <>
@@ -98,71 +100,93 @@ function AssetGrid({ assets, sel, setSel }: { assets: Asset[]; sel: string | nul
   );
 }
 
-// ---- TEXT -----------------------------------------------------------------
-const TITLE_PRESETS = [
-  { l: "Big centered", t: { size: 120, weight: 800, y: 0.5, align: "center", bg: "", shadow: true } },
-  { l: "Lower third", t: { size: 56, weight: 700, y: 0.82, x: 0.5, align: "center", bg: "#000000", bgOpacity: 0.55, padding: 20 } },
-  { l: "Top label", t: { size: 44, weight: 700, y: 0.12, align: "center", bg: "", shadow: true } },
-  { l: "Kicker (left)", t: { size: 48, weight: 800, y: 0.85, x: 0.08, align: "left", bg: "#ffffff", bgOpacity: 0.92, padding: 18 } },
-];
-export function TextPanel() {
+// ---- GRAPHICS (Hyperframes) -------------------------------------------------
+// The look of every Hyperframes overlay (graphics + captions) is driven here:
+// plain-text instructions plus an optional style-guide file. The agent reads
+// both when it builds overlays with video_render_overlay.
+const GUIDE_EXTS = [".md", ".txt", ".rtf", ".pdf", ".docx"];
+export function GraphicsPanel() {
   const s = useVideo();
+  const g = s.comp.graphics;
+  const [instructions, setInstructions] = useState(g.instructions);
+  useEffect(() => setInstructions(g.instructions), [g.instructions]);
+  const commitInstructions = () => { if (instructions !== g.instructions) setPath("graphics.instructions", instructions); };
+
+  async function pickGuide() {
+    const { agentId, project } = s;
+    if (!agentId || !project) { toast("open a project first"); return; }
+    try {
+      const r = await invoke<{ name: string; chars: number }>("video_pick_style_guide", { agentId, project });
+      toast(`style guide: ${r.name} (${r.chars} chars)`, "ok");
+      await reload();
+    } catch (e) { toast(String(e), "err"); }
+  }
+  function clearGuide() {
+    mutate((c) => { c.graphics.styleGuide = ""; c.graphics.styleGuideName = ""; });
+  }
+
   return (
     <>
-      <div className="ve-panel-head">Text<span className="spacer" /><button className="ve-btn sm primary" onClick={() => addTitle()}><Plus size={13} /> Title at playhead</button></div>
+      <div className="ve-panel-head">Graphics<span className="spacer" /><span className="ve-pill">Hyperframes</span></div>
       <div className="ve-panel-body">
-        <Section title="Presets">
-          {TITLE_PRESETS.map((p) => <button key={p.l} className="ve-btn" style={{ justifyContent: "flex-start" }} onClick={() => { const c = addTitle(s.playhead, p.l === "Lower third" ? "Name\nWhat they do" : "Your title"); mutate((k) => { const x = k.clips.find((z) => z.id === c.id)!; Object.assign(x.text, p.t); }); }}><Type size={13} /> {p.l}</button>)}
+        <Section title="Style instructions">
+          <textarea rows={6} value={instructions} placeholder={"e.g. Bold kinetic type, SF Pro Heavy, cyan (#00e6ff) glows on dark grid panels, mono kickers, generous spacing. Lower-thirds slide in from the left."} onChange={(e) => setInstructions(e.target.value)} onBlur={commitInstructions} />
+          <p className="ve-hint">Plain text. The agent follows this every time it builds a graphic or caption overlay.</p>
         </Section>
-        <Section title="Graphics">
-          <p className="ve-hint">Overlay images/videos go on <b>V2</b> (B-roll) or <b>V3</b> (Graphics). Import them in Media and drag onto a lane, or ask the agent: <i>"add a lower-third at 12s saying…"</i>.</p>
-          <p className="ve-hint">Text uses <b>drawtext</b> on export; the preview font is the same family, so what you see is what renders.</p>
+        <Section title="Style guide" right={g.styleGuideName ? <button className="ve-icon-btn" style={{ width: 22, height: 22 }} title="Remove style guide" onClick={clearGuide}><X size={12} /></button> : null}>
+          {g.styleGuideName ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <FileText size={15} style={{ flexShrink: 0, color: "var(--text-muted)" }} />
+              <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600, fontSize: 12.5 }} title={g.styleGuideName}>{g.styleGuideName}</span>
+              <span className="ve-pill ok">{g.styleGuide.length} chars</span>
+            </div>
+          ) : (
+            <p className="ve-hint">No guide yet — instructions above are the whole style.</p>
+          )}
+          <button className="ve-btn" onClick={() => void pickGuide()}><Upload size={13} /> Upload guide</button>
+          <p className="ve-hint">{GUIDE_EXTS.join(" · ")} — text is extracted and saved into the project, so the agent always sees it.</p>
+        </Section>
+        <Section title="Overlays">
+          <p className="ve-hint">Graphics land as overlay clips on <b>V3</b> (graphics) and <b>T1</b> (captions) — transparent Hyperframes renders, composited on export. Ask the agent: <i>"plan graphics for this video"</i> — it plans first, then builds one overlay per approval.</p>
         </Section>
       </div>
     </>
   );
 }
 
-// ---- CAPTIONS -------------------------------------------------------------
+// ---- CAPTIONS (Hyperframes) -------------------------------------------------
+// No styling controls here anymore: the look comes from the Graphics panel.
+// This panel owns the transcript → a transparent caption overlay on T1.
 export function CaptionsPanel() {
   const s = useVideo(); const cap = s.comp.captions;
   const [kw, setKw] = useState(cap.keyWords.join(", "));
   useEffect(() => setKw(cap.keyWords.join(", ")), [cap.keyWords]);
   const hasTx = !!s.transcript;
+  const hfOk = !!s.status?.hyperframes;
+  const building = !!s.toolProgress;
+
+  async function build() {
+    const keyWords = kw.split(",").map((x) => x.trim()).filter(Boolean);
+    if (JSON.stringify(keyWords) !== JSON.stringify(cap.keyWords)) setPath("captions.keyWords", keyWords);
+    await runTool("video_build_captions", { keyWords }, "building captions…");
+  }
+
   return (
     <>
-      <div className="ve-panel-head">Captions<span className="spacer" /><Check label="On" checked={cap.enabled} onChange={(v) => setPath("captions.enabled", v)} /></div>
+      <div className="ve-panel-head">Captions<span className="spacer" /><Check label="On" checked={cap.enabled} onChange={(v) => setPath("captions.enabled", v)} /><span className="ve-pill">Hyperframes</span></div>
       <div className="ve-panel-body">
         <Section title="Transcript" right={hasTx ? <span className="ve-pill ok">{s.transcript!.words.length} words</span> : <span className="ve-pill">none</span>}>
-          <button className="ve-btn primary" disabled={!s.assets.some((a) => a.hasAudio) || !!s.toolProgress} onClick={() => void runTool("video_transcribe", {}, "transcribing…")}><Mic2 size={13} /> {hasTx ? "Re-transcribe A-roll" : "Transcribe A-roll"}</button>
+          <button className="ve-btn primary" disabled={!s.assets.some((a) => a.hasAudio) || building} onClick={() => void runTool("video_transcribe", {}, "transcribing…")}><Mic2 size={13} /> {hasTx ? "Re-transcribe A-roll" : "Transcribe A-roll"}</button>
           {!s.status?.whisper && <p className="ve-hint" style={{ color: "var(--warn)" }}>Needs an OpenAI key (Settings) — Whisper word timestamps.</p>}
           {hasTx && <p className="ve-hint" style={{ maxHeight: 90, overflow: "auto", userSelect: "text" }}>{s.transcript!.text}</p>}
         </Section>
-        <Section title="Style">
-          <Seg value={cap.preset} options={[{ v: "pop", l: "Pop (Hyperframes)" }, { v: "karaoke", l: "Karaoke" }, { v: "plain", l: "Plain" }]} onChange={(v) => setPath("captions.preset", v)} />
-          <div className="ve-row2">
-            <Field label="Font"><input value={cap.font} onChange={(e) => setPath("captions.font", e.target.value)} /></Field>
-            <Num label="Weight" value={cap.weight} step={100} min={100} max={900} onChange={(v) => setPath("captions.weight", v)} />
-          </div>
-          <Slider label="Size" value={cap.size} min={24} max={160} step={1} fmt={(v) => `${v}px`} onChange={(v) => setPath("captions.size", v)} />
-          <Slider label="Vertical position" value={cap.y} min={0.05} max={0.95} fmt={(v) => `${Math.round(v * 100)}%`} onChange={(v) => setPath("captions.y", v)} />
-          <div className="ve-row2">
-            <Field label="Color"><div style={{ display: "flex", gap: 6, alignItems: "center" }}><input type="color" value={cap.color} onChange={(e) => setPath("captions.color", e.target.value)} /><input value={cap.color} onChange={(e) => setPath("captions.color", e.target.value)} /></div></Field>
-            <Field label="Key color"><div style={{ display: "flex", gap: 6, alignItems: "center" }}><input type="color" value={cap.keyColor} onChange={(e) => setPath("captions.keyColor", e.target.value)} /><input value={cap.keyColor} onChange={(e) => setPath("captions.keyColor", e.target.value)} /></div></Field>
-          </div>
-          <div className="ve-row2">
-            <Num label="Words / line" value={cap.wordsPerLine} min={1} max={10} onChange={(v) => setPath("captions.wordsPerLine", v)} />
-            <Num label="Max chars" value={cap.maxChars} min={6} max={60} onChange={(v) => setPath("captions.maxChars", v)} />
-          </div>
+        <Section title="Build">
           <Field label="Key words (highlighted)"><input value={kw} placeholder="agent, AYGENT, free" onChange={(e) => setKw(e.target.value)} onBlur={() => setPath("captions.keyWords", kw.split(",").map((x) => x.trim()).filter(Boolean))} /></Field>
-          <div style={{ display: "flex", gap: 14 }}>
-            <Check label="Uppercase" checked={cap.uppercase} onChange={(v) => setPath("captions.uppercase", v)} />
-            <Check label="Shadow" checked={cap.shadow} onChange={(v) => setPath("captions.shadow", v)} />
-            <Check label="Behind subject" checked={cap.behindSubject} onChange={(v) => setPath("captions.behindSubject", v)} />
-          </div>
-          {cap.behindSubject && !s.comp.matte.enabled && <p className="ve-hint" style={{ color: "var(--warn)" }}>Needs a matte — Color → Subject matte.</p>}
+          <Slider label="Vertical position" value={cap.y} min={0.05} max={0.95} fmt={(v) => `${Math.round(v * 100)}%`} onChange={(v) => setPath("captions.y", v)} />
+          <button className="ve-btn primary" disabled={!hasTx || !hfOk || building} onClick={() => void build()}><Sparkles size={13} /> {building ? "Building…" : "Build caption overlay"}</button>
+          {!hfOk && <p className="ve-hint" style={{ color: "var(--warn)" }}>Enable Hyperframes in Tools to build captions.</p>}
+          <p className="ve-hint">Renders a transparent overlay clip on <b>T1</b> from the transcript, timed through your cuts. Style comes from the Graphics panel. Rebuild after re-cutting.</p>
         </Section>
-        <p className="ve-hint">Captions follow the A-roll cuts automatically (word times are remapped through each clip's in/out). Export renders them with libass; the preview shows the same timing.</p>
       </div>
     </>
   );
@@ -202,7 +226,7 @@ export function ColorPanel() {
           </Section>
         )}
         <Section title="Subject matte (experimental)" right={s.comp.matte.enabled ? <span className="ve-pill ok">on</span> : null}>
-          <p className="ve-hint">RobustVideoMatting separates you from the background so captions/graphics flagged <b>behind subject</b> render behind you. First run downloads PyTorch via uv (slow).</p>
+          <p className="ve-hint">RobustVideoMatting separates you from the background so overlay clips flagged <b>behind subject</b> render behind you. First run downloads PyTorch via uv (slow).</p>
           <button className="ve-btn" disabled={!s.status?.uv || !!s.toolProgress || !s.assets.some((a) => a.kind === "video")} onClick={() => { const a = s.comp.clips.find((c) => c.track === "V1" && c.type === "video")?.asset ?? s.assets.find((x) => x.kind === "video")?.id; if (a) void runTool("video_matte", { asset: a }, "matting (RVM)…"); }}><Layers size={13} /> Generate matte for A-roll</button>
           {!s.status?.uv && <p className="ve-hint" style={{ color: "var(--warn)" }}>uv isn't provisioned yet — enable any Python MCP server once (MCP Connections) to install it.</p>}
           {s.comp.matte.enabled && <><Slider label="Edge feather" value={s.comp.matte.feather} min={0} max={12} step={0.5} fmt={(v) => `${v}px`} onChange={(v) => setPath("matte.feather", v)} /><Check label="Matte enabled" checked={s.comp.matte.enabled} onChange={(v) => setPath("matte.enabled", v)} /></>}

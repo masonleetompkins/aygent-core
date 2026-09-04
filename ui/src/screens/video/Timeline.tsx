@@ -4,7 +4,7 @@
 // or K splits, marquee-select on empty lane, drag an asset from Media to place.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Scissors, MousePointer2, Magnet, ZoomIn, ZoomOut, Trash2, Copy, AlignHorizontalSpaceAround, Eye, EyeOff, Volume2, VolumeX, Lock, Unlock, Undo2, Redo2 } from "lucide-react";
-import { useVideo, useVideoSel, usePlayhead, set, get, seek, patchClips, beginGesture, splitAt, deleteSelected, duplicateSelected, closeGaps, addAssetToTimeline, undo, redo, canUndo, canRedo, mutate } from "./store";
+import { useVideo, useVideoSel, usePlayhead, set, get, seek, patchClips, beginGesture, splitAt, deleteSelected, duplicateSelected, closeGaps, addAssetToTimeline, undo, redo, canUndo, canRedo, mutate, withLinked } from "./store";
 import { type Clip, TRACK_ORDER, TRACK_KIND, TRACK_LABEL, duration as durOf, fmtTime, mediaUrl, clipDur } from "./model";
 
 const LANE_H: Record<string, number> = { video: 56, text: 34, audio: 44 };
@@ -69,7 +69,7 @@ export function Timeline() {
     window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
   }
 
-  // ---- clip drag: move / trim ----
+  // ---- clip drag: move / trim (linked V+A pairs stay together) ----
   function onClipDown(e: React.MouseEvent, clip: Clip, mode: "move" | "l" | "r") {
     e.stopPropagation(); e.preventDefault();
     if (locked[clip.track]) return;
@@ -77,6 +77,7 @@ export function Timeline() {
     const multi = e.shiftKey || e.metaKey;
     let sel = selection.includes(clip.id) ? selection : multi ? [...selection, clip.id] : [clip.id];
     if (multi && selection.includes(clip.id) && mode === "move") { sel = selection.filter((i) => i !== clip.id); set({ selection: sel }); return; }
+    sel = withLinked(sel);
     set({ selection: sel, dockTab: s.dockTab === "inspector" || sel.length ? s.dockTab : "inspector" });
     const startX = e.clientX, startY = e.clientY;
     const orig = new Map(get().comp.clips.filter((c) => sel.includes(c.id)).map((c) => [c.id, { ...c }]));
@@ -107,7 +108,7 @@ export function Timeline() {
         const sn = snap(ns, excl); if (sn.hit !== null) ns = Math.max(minStart, Math.min(o.end - 1 / fps, sn.t)); setSnapLine(sn.hit);
         ns = frameQ(ns);
         const delta = ns - o.start;
-        patchClips([clip.id], () => ({ start: ns, in: o.type === "text" ? 0 : o.in + delta * o.speed }), { undo: false });
+        patchClips(withLinked([clip.id]), () => ({ start: ns, in: o.type === "text" ? 0 : o.in + delta * o.speed }), { undo: false });
       } else {
         const o = anchor;
         const asset = get().assets.find((a) => a.id === o.asset);
@@ -116,7 +117,7 @@ export function Timeline() {
         const sn = snap(ne, excl); if (sn.hit !== null) ne = Math.min(maxEnd, Math.max(o.start + 1 / fps, sn.t)); setSnapLine(sn.hit);
         ne = frameQ(ne);
         const delta = ne - o.end;
-        patchClips([clip.id], () => ({ end: ne, out: o.type === "text" ? ne - o.start : o.out + delta * o.speed }), { undo: false });
+        patchClips(withLinked([clip.id]), () => ({ end: ne, out: o.type === "text" ? ne - o.start : o.out + delta * o.speed }), { undo: false });
       }
     };
     const up = () => { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); setSnapLine(null); };
@@ -309,10 +310,10 @@ function ClipView({ clip: c, zoom, sel, agentId, project, bust, onDown }: { clip
     wave = { backgroundImage: `url(${mediaUrl(agentId, project, "cache", th.wave, bust)})`, backgroundSize: `${totalW}px 100%`, backgroundPosition: `${-(c.in / c.speed) * zoom}px 0` };
   }
   return (
-    <div className={`ve-clip ${c.type} ${sel ? "sel" : ""} ${c.hidden ? "hidden" : ""}`} style={{ left: c.start * zoom, width: w }} onMouseDown={(e) => onDown(e, c, "move")} title={`${c.name || c.text?.content || c.asset}
-${fmtTime(c.start)} → ${fmtTime(c.end)}  ·  src ${c.in.toFixed(2)}–${c.out.toFixed(2)}${c.speed !== 1 ? ` · ${c.speed}×` : ""}`}>
+    <div className={`ve-clip ${c.type} ${sel ? "sel" : ""} ${c.hidden ? "hidden" : ""}`} style={{ left: c.start * zoom, width: w }} onMouseDown={(e) => onDown(e, c, "move")} title={`${c.name || (c.text ? c.text.content : "") || c.asset}
+${fmtTime(c.start)} → ${fmtTime(c.end)}  ·  src ${c.in.toFixed(2)}–${c.out.toFixed(2)}${c.speed !== 1 ? ` · ${c.speed}×` : ""}${c.link ? " · linked" : ""}`}>
       {wave && <div className="wave" style={wave} />}
-      <div className="lbl">{c.muted ? "🔇 " : ""}{c.type === "text" ? c.text.content || "Title" : c.name || asset?.name || "clip"}{c.behindSubject ? " · behind" : ""}</div>
+      <div className="lbl">{c.link ? "🔗 " : ""}{c.muted ? "🔇 " : ""}{c.type === "text" ? c.text.content || "Title" : c.name || asset?.name || "clip"}{c.behindSubject ? " · behind" : ""}</div>
       {c.transitionIn.duration > 0 && <div className="fade" style={{ left: 0, borderRight: `${c.transitionIn.duration * zoom}px solid transparent` }} />}
       {c.transitionOut.duration > 0 && <div className="fade" style={{ right: 0, borderLeft: `${c.transitionOut.duration * zoom}px solid transparent` }} />}
       <div className="h l" onMouseDown={(e) => onDown(e, c, "l")} />

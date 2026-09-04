@@ -60,6 +60,9 @@ export function Inspector() {
           {kind !== "audio" && <Check label="Behind subject" checked={c.behindSubject} onChange={(v) => p({ behindSubject: v })} />}
         </div>
         {asset && !multi && <p className="ve-hint">{asset.name} · {asset.width}×{asset.height} · {asset.fps ? `${Math.round(asset.fps)}fps · ` : ""}{fmtTime(asset.duration, fps)} · source {c.in.toFixed(2)}–{c.out.toFixed(2)}s</p>}
+        {c.link && !multi && (() => { const partners = s.comp.clips.filter((k) => k.link === c.link && k.id !== c.id); return (
+          <p className="ve-hint">🔗 Linked with {partners.length ? partners.map((k) => `${k.track} · ${k.name || k.id}`).join(", ") : "(missing partner)"}. <button className="ve-btn sm" onClick={() => mutate((comp) => { for (const k of comp.clips) if (k.link === c.link) k.link = ""; })}>Unlink</button></p>
+        ); })()}
       </Section>
 
       {c.type === "text" && !multi && (

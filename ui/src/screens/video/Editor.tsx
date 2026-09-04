@@ -6,7 +6,7 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { Film, Type, Captions, Palette, AudioLines, Download, PanelLeftClose, PanelLeft, PanelRightClose, PanelRight, Plus, FolderOpen, Save } from "lucide-react";
+import { Film, Shapes, Captions, Palette, AudioLines, Download, PanelLeftClose, PanelLeft, PanelRightClose, PanelRight, Plus, FolderOpen, Save } from "lucide-react";
 import "./video.css";
 import { useVideo, init, open, create, save, set, get, togglePlay, seek, stepFrames, splitAt, deleteSelected, duplicateSelected, undo, redo, importPaths, reload, refreshProjects, reveal, type Panel } from "./store";
 import { duration as durOf } from "./model";
@@ -14,10 +14,10 @@ import { Player } from "./Player";
 import { Timeline } from "./Timeline";
 import { Inspector } from "./Inspector";
 import { AgentDock } from "./AgentDock";
-import { MediaPanel, TextPanel, CaptionsPanel, ColorPanel, AudioPanel, ExportPanel } from "./Panels";
+import { MediaPanel, GraphicsPanel, CaptionsPanel, ColorPanel, AudioPanel, ExportPanel } from "./Panels";
 
 const RAIL: { id: Panel; l: string; I: typeof Film }[] = [
-  { id: "media", l: "Media", I: Film }, { id: "text", l: "Text", I: Type }, { id: "captions", l: "Caps", I: Captions },
+  { id: "media", l: "Media", I: Film }, { id: "graphics", l: "Graph", I: Shapes }, { id: "captions", l: "Caps", I: Captions },
   { id: "color", l: "Color", I: Palette }, { id: "audio", l: "Audio", I: AudioLines }, { id: "export", l: "Export", I: Download },
 ];
 
@@ -115,7 +115,7 @@ export function Editor({ agentId, agentName, folder }: { agentId: string | null;
     window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
   }
 
-  const PanelBody = { media: MediaPanel, text: TextPanel, captions: CaptionsPanel, color: ColorPanel, audio: AudioPanel, export: ExportPanel }[s.panel];
+  const PanelBody = { media: MediaPanel, graphics: GraphicsPanel, captions: CaptionsPanel, color: ColorPanel, audio: AudioPanel, export: ExportPanel }[s.panel];
   const noProject = !s.project;
 
   return (

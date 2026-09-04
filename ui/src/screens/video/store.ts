@@ -10,7 +10,7 @@ import { type Asset, type Clip, type Composition, type Transcript, blankComposit
 
 export type Status = { ffmpeg: string | null; hyperframes: boolean; whisper: boolean; uv: boolean; proMode: boolean };
 export type Project = { name: string; modified: number; assets: number };
-export type Panel = "media" | "text" | "captions" | "color" | "audio" | "export";
+export type Panel = "media" | "graphics" | "captions" | "color" | "audio" | "export";
 
 export type State = {
   agentId: string | null;
@@ -252,8 +252,8 @@ export async function refreshRenders() {
   try { set({ renders: await invoke<State["renders"]>("video_list_renders", { agentId, project }) }); } catch { /* ignore */ }
 }
 export async function refreshCaptionLines() {
-  const { agentId, project, comp, transcript } = state; if (!agentId || !project || !transcript) { set({ captionLines: [] }); return; }
-  try { const r = await invoke<{ lines: State["captionLines"] }>("video_caption_lines", { agentId, project, composition: comp }); set({ captionLines: r.lines ?? [] }); } catch { /* ignore */ }
+  // Removed: the old ASS/DOM caption pipeline is gone. Hyperframes renders all captions + graphics.
+  if (state.captionLines.length) set({ captionLines: [] });
 }
 
 /** Run a video_* tool from the UI (same core as the agent). */
@@ -298,35 +298,47 @@ export function addAssetToTimeline(a: Asset, at?: number, track?: string) {
   const start = at ?? duration(state.comp);
   const d = a.kind === "image" ? 5 : Math.max(0.04, a.duration);
   const clip: Clip = { ...(newClipFor(a)), track: t, start, end: start + d, in: 0, out: d };
-  mutate((c) => { c.clips.push(clip); });
-  set({ selection: [clip.id] });
+  const extra: Clip[] = [];
+  // Video with an audio stream lays a LINKED audio clip on A1 so the timeline
+  // shows the waveform under the picture (same asset, same timing, link id shared).
+  if (a.kind === "video" && a.hasAudio && (t === "V1" || t === "V2")) {
+    const link = uid("l");
+    clip.link = link;
+    const ac: Clip = { ...(newClipFor(a)), type: "audio", track: "A1", name: `${a.name} · audio`, start, end: start + d, in: 0, out: d, link };
+    extra.push(ac);
+  }
+  mutate((c) => { c.clips.push(clip); for (const x of extra) c.clips.push(x); });
+  set({ selection: [clip.id, ...extra.map((x) => x.id)] });
   return clip;
 }
 function newClipFor(a: Asset): Clip {
   const base = normalize({ clips: [{ id: uid(), track: "V1", type: a.kind, asset: a.id, name: a.name }] }).clips[0];
   return base;
 }
-export function addTitle(at = state.playhead, content = "Title") {
-  const clip = normalize({ clips: [{ id: uid(), track: "T1", type: "text", name: content, start: at, end: at + 3, in: 0, out: 3, text: { content } }] }).clips[0];
-  mutate((c) => { c.clips.push(clip); });
-  set({ selection: [clip.id], dockTab: "inspector", dockOpen: true });
-  return clip;
+/** Expand ids to include linked partners (V+A pairs move/split/delete as one). */
+export function withLinked(ids: string[]): string[] {
+  const links = new Set(state.comp.clips.filter((c) => ids.includes(c.id) && c.link).map((c) => c.link));
+  if (!links.size) return ids;
+  const out = new Set(ids);
+  for (const c of state.comp.clips) if (c.link && links.has(c.link)) out.add(c.id);
+  return [...out];
 }
 export function splitAt(time: number, ids?: string[]) {
-  const targets = ids ?? (state.selection.length ? state.selection : state.comp.clips.filter((c) => time > c.start + 0.02 && time < c.end - 0.02).map((c) => c.id));
+  const targets = withLinked(ids ?? (state.selection.length ? state.selection : state.comp.clips.filter((c) => time > c.start + 0.02 && time < c.end - 0.02).map((c) => c.id)));
   mutate((c) => {
     const out: Clip[] = [];
     for (const k of c.clips) {
       if (!targets.includes(k.id) || time <= k.start + 0.02 || time >= k.end - 0.02) { out.push(k); continue; }
       const srcAt = k.in + (time - k.start) * k.speed;
-      out.push({ ...k, end: time, out: srcAt, transitionOut: { kind: "", duration: 0 } });
-      out.push({ ...k, id: uid(), start: time, in: srcAt, transitionIn: { kind: "", duration: 0 } });
+      const nl = k.link ? uid("l") : "";
+      out.push({ ...k, end: time, out: srcAt, transitionOut: { kind: "", duration: 0 }, link: nl });
+      out.push({ ...k, id: uid(), start: time, in: srcAt, transitionIn: { kind: "", duration: 0 }, link: nl });
     }
     c.clips = out;
   });
 }
 export function deleteSelected(ripple = false) {
-  const ids = state.selection; if (!ids.length) return;
+  const ids = withLinked(state.selection); if (!ids.length) return;
   mutate((c) => {
     const removed = c.clips.filter((k) => ids.includes(k.id));
     c.clips = c.clips.filter((k) => !ids.includes(k.id));
@@ -338,7 +350,7 @@ export function deleteSelected(ripple = false) {
   set({ selection: [] });
 }
 export function duplicateSelected() {
-  const ids = state.selection; if (!ids.length) return;
+  const ids = withLinked(state.selection); if (!ids.length) return;
   const made: string[] = [];
   mutate((c) => {
     for (const k of c.clips.filter((x) => ids.includes(x.id))) { const d = clipDur(k); const n = { ...k, id: uid(), start: k.end, end: k.end + d }; c.clips.push(n); made.push(n.id); }

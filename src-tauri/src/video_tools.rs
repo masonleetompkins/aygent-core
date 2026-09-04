@@ -14,12 +14,14 @@
 //   video_silences       silent ranges of an asset (ffmpeg silencedetect)
 //   video_takes          repeated-take groups from the transcript (keep last/longest)
 //   video_auto_cut       silences + takes → tight V1 selects in one call
-//   video_frame          render one composite frame (grade + captions) for QA
+//   video_frame          render one composite frame (grade + overlays) for QA
 //   video_render         export with a preset (progress streams to the UI)
 //   video_audio_enhance  Auphonic round-trip (or local ffmpeg chain) → enhanced audio asset
 //   video_matte          RobustVideoMatting alpha (uv + torch) → matte asset (experimental)
+//   video_build_captions Hyperframes caption overlay → transparent T1 clip
+//   video_render_overlay one approved Hyperframes graphic → transparent V3 clip
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
@@ -33,37 +35,41 @@ use crate::video_render::{self as vr, Clip, Composition, Segment, Transcript, Wo
 static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
 pub fn install_app(app: tauri::AppHandle) { let _ = APP.set(app); }
 fn app() -> Result<tauri::AppHandle, String> { APP.get().cloned().ok_or_else(|| "video tools not initialized".to_string()) }
+/// AppHandle for the Hyperframes overlay module (same install_app source).
+pub fn app_handle() -> Option<tauri::AppHandle> { APP.get().cloned() }
 
-const NAMES: &[&str] = &["video_project", "video_edit", "video_transcribe", "video_silences", "video_takes", "video_auto_cut", "video_frame", "video_render", "video_audio_enhance", "video_matte"];
-pub fn is_video_tool(name: &str) -> bool { NAMES.contains(&name) }
+const NAMES: &[&str] = &["video_project", "video_edit", "video_transcribe", "video_silences", "video_takes", "video_auto_cut", "video_frame", "video_render", "video_audio_enhance", "video_matte", "video_build_captions", "video_render_overlay"];
+pub fn is_video_tool(name: &str) -> bool { NAMES.contains(&name) || crate::video_hyperframes::is_hyperframes_tool(name) }
 
 pub fn tool_schemas() -> Vec<Value> {
     let proj = json!({ "type": "string", "description": "project name (folder under Video/)" });
-    vec![
-        json!({ "name": "video_project", "description": "Overview of a video project: scene, duration, clips per track, assets (ids, durations, fps, audio), transcript/captions/LUT state, renders. Omit project to list all projects. Call this FIRST before editing.",
+    let mut v = vec![
+        json!({ "name": "video_project", "description": "Overview of a video project: scene, duration, clips per track, assets (ids, durations, fps, audio), transcript/captions/graphics-style/LUT state, renders. Omit project to list all projects. Call this FIRST before editing.",
             "input_schema": { "type": "object", "properties": { "project": proj } } }),
-        json!({ "name": "video_edit", "description": "Apply precise edits to Video/<project>/composition.json and save. ops run in order. Ops: {op:'set', path:'captions.enabled', value:true} (dot path into the composition, e.g. scene.width, color.lut, color.sCurve, audio.duck.enabled, captions.preset, captions.keyWords, matte.enabled) · {op:'add_clip', clip:{track,type:'video'|'audio'|'image'|'text',asset,start,end,in,out,name,text:{content,size,y,...},transform:{x,y,scale,opacity},fit,behindSubject,volume}} · {op:'update_clip', id, patch:{...}} · {op:'remove_clip', id, ripple?:true} · {op:'split', id, at:<timeline seconds>} · {op:'move', id, start} · {op:'cutlist', asset, keep:[{in,out}], track?:'V1', pad?:0.03} (replaces that asset's clips on the track with contiguous selects). Times are seconds; start/end = timeline placement, in/out = source range. Returns the saved summary.",
+        json!({ "name": "video_edit", "description": "Apply precise edits to Video/<project>/composition.json and save. ops run in order. Ops: {op:'set', path:'captions.enabled', value:true} (dot path into the composition, e.g. scene.width, color.lut, color.sCurve, audio.duck.enabled, captions.keyWords, graphics.instructions) · {op:'add_clip', clip:{track,type:'video'|'audio'|'image'|'text',asset,start,end,in,out,name,text:{content,size,y,...},transform:{x,y,scale,opacity},fit,behindSubject,volume}} (video with audio on V1/V2 auto-lays a linked A1 waveform partner) · {op:'update_clip', id, patch:{...}} · {op:'remove_clip', id, ripple?:true} (linked partners go together) · {op:'split', id, at:<timeline seconds>} (linked partners split together) · {op:'move', id, start} · {op:'cutlist', asset, keep:[{in,out}], track?:'V1', pad?:0.03} (replaces that asset's clips on the track with contiguous selects + linked A1 partners). Times are seconds; start/end = timeline placement, in/out = source range. Returns the saved summary.",
             "input_schema": { "type": "object", "properties": { "project": proj, "ops": { "type": "array", "items": { "type": "object" } } }, "required": ["project", "ops"] } }),
-        json!({ "name": "video_transcribe", "description": "Word-level transcript of an asset (OpenAI Whisper; audio is extracted + chunked automatically, any length). Saves Video/<project>/transcript.json used by captions, takes and auto_cut. Returns the segments with timestamps.", 
+        json!({ "name": "video_transcribe", "description": "Word-level transcript of an asset (OpenAI Whisper; audio is extracted + chunked automatically, any length). Saves Video/<project>/transcript.json used by captions, takes and auto_cut. Returns the segments with timestamps.",
             "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string", "description": "asset id (default: the first V1 video clip's asset, else the first video asset)" }, "language": { "type": "string", "description": "ISO code hint, e.g. en" } }, "required": ["project"] } }),
         json!({ "name": "video_silences", "description": "Detect silent ranges in an asset's audio (source time, seconds).",
             "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "threshold_db": { "type": "number", "description": "default -35" }, "min_duration": { "type": "number", "description": "seconds, default 0.5" } }, "required": ["project", "asset"] } }),
         json!({ "name": "video_takes", "description": "Find repeated takes in the transcript (the speaker re-saying a line). Returns groups of similar segments with the recommended keep (last take by default, or the longest coherent one). Requires video_transcribe first.",
             "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "keep": { "type": "string", "enum": ["last", "longest"] }, "similarity": { "type": "number", "description": "0..1, default 0.6" } }, "required": ["project"] } }),
-        json!({ "name": "video_auto_cut", "description": "One shot rough cut: drop silences/dead air and duplicate takes from an A-roll asset, then lay the kept ranges as tight contiguous V1 selects. Transcribes first if needed. Returns the cutlist + what was dropped so the user can review.",
+        json!({ "name": "video_auto_cut", "description": "One shot rough cut: drop silences/dead air and duplicate takes from an A-roll asset, then lay the kept ranges as tight contiguous V1 selects (+ linked A1 waveform partners). Transcribes first if needed. Returns the cutlist + what was dropped so the user can review.",
             "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "threshold_db": { "type": "number", "description": "default -35" }, "min_silence": { "type": "number", "description": "seconds, default 0.6" }, "pad": { "type": "number", "description": "seconds kept around speech, default 0.08" }, "keep": { "type": "string", "enum": ["last", "longest"] }, "drop_takes": { "type": "boolean", "description": "default true" } }, "required": ["project"] } }),
-        json!({ "name": "video_frame", "description": "Render ONE composite frame (grade + captions + overlays) at a timeline time to .cache/. Use to sanity-check a moment; the user sees it in the Video tab preview.",
+        json!({ "name": "video_frame", "description": "Render ONE composite frame (grade + overlays) at a timeline time to .cache/. Use to sanity-check a moment; the user sees it in the Video tab preview.",
             "input_schema": { "type": "object", "properties": { "project": proj, "time": { "type": "number" } }, "required": ["project", "time"] } }),
         json!({ "name": "video_render", "description": "Export the project with a preset from composition.exports (by name) or an explicit {width,height,bitrate,codec:'h264'|'hevc'|'prores'}. Blocking; progress streams to the UI. Output lands in Video/<project>/renders/.",
             "input_schema": { "type": "object", "properties": { "project": proj, "preset": { "type": "string", "description": "preset name, e.g. landscape | vertical" }, "width": { "type": "integer" }, "height": { "type": "integer" }, "bitrate": { "type": "string" }, "codec": { "type": "string" }, "name": { "type": "string", "description": "output file stem" } }, "required": ["project"] } }),
         json!({ "name": "video_audio_enhance", "description": "Enhance an asset's dialogue audio: engine 'auphonic' (needs Auphonic credentials in Settings → Video) or 'local' (ffmpeg denoise + leveler + loudnorm). Produces a new audio asset and points the source clips' audioAsset at it, so the enhanced track plays in place of the original.",
             "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "engine": { "type": "string", "enum": ["auphonic", "local"] }, "preset": { "type": "string", "description": "Auphonic preset uuid (optional)" } }, "required": ["project", "asset"] } }),
-        json!({ "name": "video_matte", "description": "EXPERIMENTAL: generate a subject alpha matte for an asset with RobustVideoMatting (downloads torch via uv on first run; slow). Registers the matte asset and enables composition.matte so behindSubject layers/captions render behind the person.",
-            "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" } }, "required": ["project", "asset"] } }),
-    ]
+        json!({ "name": "video_matte", "description": "EXPERIMENTAL: generate a subject alpha matte for an asset with RobustVideoMatting (downloads torch via uv on first run; slow). Registers the matte asset and enables composition.matte so behindSubject overlay layers render behind the person.",
+            "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "engine": { "type": "string", "enum": ["auphonic", "local"] }, "preset": { "type": "string", "description": "Auphonic preset uuid (optional)" } }, "required": ["project", "asset"] } }),
+    ];
+    v.extend(crate::video_hyperframes::tool_schemas());
+    v
 }
 
-pub const INSTRUCTIONS: &str = "\n\nVIDEO EDITOR: the Video tab is an agentic NLE. A project is Video/<name>/ with composition.json (the edit), assets.json (imported media — HARDLINKS, never copy media), transcript.json, chat.json. Use the video_* tools for every edit (frame-accurate numbers, validated + saved); never hand-write composition.json unless a tool cannot express the change. Workflow the user follows: video_project → video_auto_cut (silences + keep the LAST take) → review → video_transcribe (if not done) → titles/graphics via video_edit add_clip (type text on T1, image/video on V2) → captions via video_edit set captions.enabled true (preset pop = Hyperframes look; captions.keyWords highlight) → color via set color.lut 'luts/<file>.cube' + color.sCurve → video_audio_enhance → set audio.duck → video_render {preset:'landscape'|'vertical'}. Report clip ids + times in one line; the UI refreshes automatically after each tool.\n\nGRAPHICS / TITLES PROTOCOL (mandatory): when asked for graphics, titles, callouts or overlays, FIRST reply with a PLAN and NO tool calls that add clips: a numbered list, one line per graphic — timecode range, the on-screen text (exact wording), style/placement, and why it helps. End with \"Approve, or give revision notes.\" Only after the user approves (\"approve\", \"go\", \"yes\", \"do it\") do you build — ONE video_edit call PER graphic, in timeline order, so each one appears on the timeline as it lands. Revision notes → revise the plan and ask again. Never batch 20 ops into one call and never skip the plan.";
+pub const INSTRUCTIONS: &str = "\n\nVIDEO EDITOR: the Video tab is an agentic NLE. A project is Video/<name>/ with composition.json (the edit), assets.json (imported media — HARDLINKS, never copy media), transcript.json, chat.json. Use the video_* tools for every edit (frame-accurate numbers, validated + saved); never hand-write composition.json unless a tool cannot express the change. Workflow the user follows: video_project → video_auto_cut (silences + keep the LAST take; lays linked V1+A1 pairs) → review → video_transcribe (if not done) → graphics/captions as Hyperframes overlays (see below) → color via set color.lut 'luts/<file>.cube' + color.sCurve → video_audio_enhance → set audio.duck → video_render {preset:'landscape'|'vertical'}. Report clip ids + times in one line; the UI refreshes automatically after each tool. Video clips with audio carry a LINKED A1 waveform partner (clip.link shared) — split/move/remove keep pairs together, and the mix plays the pair once (no double audio).";
 
 // ---------------------------------------------------------------------------
 // Entry points
@@ -102,6 +108,11 @@ pub fn run(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, name: &str, 
     let s = |k: &str| input.get(k).and_then(|v| v.as_str()).map(|x| x.trim().to_string()).filter(|x| !x.is_empty());
     let f = |k: &str, d: f64| input.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
     let project = s("project");
+    // Hyperframes overlay tools live in video_hyperframes (same jail, same emit).
+    if crate::video_hyperframes::is_hyperframes_tool(name) {
+        let out = crate::video_hyperframes::exec(broker, agent_id, name, input)?;
+        return Ok(out);
+    }
     let out = match name {
         "video_project" => match project { Some(p) => overview(broker, agent_id, &p)?, None => list_projects(broker, agent_id)? },
         "video_edit" => {
@@ -211,10 +222,11 @@ fn overview(broker: &Broker, agent_id: &str, project: &str) -> Result<Value, Str
     let tr = load_transcript(&proj);
     let mut tracks: HashMap<String, Vec<Value>> = HashMap::new();
     for c in &comp.clips {
-        tracks.entry(c.track.clone()).or_default().push(json!({ "id": c.id, "type": c.kind, "asset": c.asset, "name": c.name, "start": round3(c.start), "end": round3(c.end), "in": round3(c.in_), "out": round3(c.out), "hidden": c.hidden, "muted": c.muted, "text": if c.kind == "text" { Some(&c.text.content) } else { None }, "behindSubject": c.behind_subject }));
+        tracks.entry(c.track.clone()).or_default().push(json!({ "id": c.id, "type": c.kind, "asset": c.asset, "name": c.name, "start": round3(c.start), "end": round3(c.end), "in": round3(c.in_), "out": round3(c.out), "hidden": c.hidden, "muted": c.muted, "link": c.link, "text": if c.kind == "text" { Some(&c.text.content) } else { None }, "behindSubject": c.behind_subject }));
     }
     let luts: Vec<String> = std::fs::read_dir(proj.join("luts")).map(|rd| rd.flatten().map(|e| format!("luts/{}", e.file_name().to_string_lossy())).collect()).unwrap_or_default();
     let renders: Vec<String> = std::fs::read_dir(proj.join("renders")).map(|rd| rd.flatten().map(|e| format!("renders/{}", e.file_name().to_string_lossy())).collect()).unwrap_or_default();
+    let overlays: Vec<String> = assets.iter().filter(|a| a.name.contains("(overlay HF)") || a.name.contains("(captions HF)")).map(|a| format!("{} ({})", a.id, a.name)).collect();
     let offline: Vec<Value> = assets.iter().filter(|a| !video::asset_abs(broker, agent_id, project, a).map(|p| p.is_file()).unwrap_or(false)).map(|a| json!({ "id": a.id, "name": a.name, "path": a.path })).collect();
     Ok(json!({
         "project": project,
@@ -226,6 +238,8 @@ fn overview(broker: &Broker, agent_id: &str, project: &str) -> Result<Value, Str
         "assets": assets.iter().map(|a| json!({ "id": a.id, "name": a.name, "kind": a.kind, "duration": round2(a.duration), "fps": round2(a.fps), "size": format!("{}x{}", a.width, a.height), "hasAudio": a.has_audio, "linked": a.linked, "online": video::asset_abs(broker, agent_id, project, a).map(|p| p.is_file()).unwrap_or(false), "path": a.path })).collect::<Vec<_>>(),
         "transcript": tr.as_ref().map(|t| json!({ "asset": t.asset, "words": t.words.len(), "segments": t.segments.len() })),
         "captions": comp.captions,
+        "graphics": comp.graphics,
+        "overlays": overlays,
         "color": comp.color,
         "audio": comp.audio,
         "matte": comp.matte,
@@ -236,7 +250,7 @@ fn overview(broker: &Broker, agent_id: &str, project: &str) -> Result<Value, Str
 }
 
 // ---------------------------------------------------------------------------
-// video_edit
+// video_edit — linked V+A pairs stay together through every op
 // ---------------------------------------------------------------------------
 
 fn set_path(v: &mut Value, path: &str, val: Value) -> Result<(), String> {
@@ -262,6 +276,23 @@ fn merge(dst: &mut Value, patch: &Value) {
         (Value::Object(d), Value::Object(p)) => { for (k, v) in p { if v.is_object() && d.get(k).map(|x| x.is_object()).unwrap_or(false) { merge(d.get_mut(k).unwrap(), v); } else { d.insert(k.clone(), v.clone()); } } }
         (d, p) => *d = p.clone(),
     }
+}
+
+/// Ids of clips sharing a link with any of `ids` (V+A pairs act as one).
+fn linked_ids(arr: &[Value], ids: &HashSet<String>) -> HashSet<String> {
+    let mut links: HashSet<String> = HashSet::new();
+    for c in arr {
+        if c.get("id").and_then(|x| x.as_str()).map(|x| ids.contains(x)).unwrap_or(false) {
+            if let Some(l) = c.get("link").and_then(|x| x.as_str()).filter(|x| !x.is_empty()) { links.insert(l.to_string()); }
+        }
+    }
+    if links.is_empty() { return ids.clone(); }
+    let mut out = ids.clone();
+    for c in arr {
+        let same = c.get("link").and_then(|x| x.as_str()).map(|x| links.contains(x)).unwrap_or(false);
+        if same { if let Some(id) = c.get("id").and_then(|x| x.as_str()) { out.insert(id.to_string()); } }
+    }
+    out
 }
 
 pub fn edit(broker: &Broker, agent_id: &str, project: &str, ops: &[Value]) -> Result<Value, String> {
@@ -296,14 +327,33 @@ pub fn edit(broker: &Broker, agent_id: &str, project: &str, ops: &[Value]) -> Re
                     c["in"] = json!(in_); c["out"] = json!(out); c["start"] = json!(start);
                     if c.get("end").is_none() { c["end"] = json!(start + (out - in_).max(0.04)); }
                     if c.get("track").is_none() { c["track"] = json!(if a.kind == "audio" { "A1" } else { "V1" }); }
+                    let track = c.get("track").and_then(|x| x.as_str()).unwrap_or("V1").to_string();
+                    let arr = v["clips"].as_array_mut().ok_or("clips")?;
+                    arr.push(c);
+                    // Video with audio on a picture track lays a linked A1
+                    // waveform partner (same timing, shared link id).
+                    if a.has_audio && (track == "V1" || track == "V2") {
+                        let link = video::new_id("l");
+                        if let Some(last) = arr.last_mut() { last["link"] = json!(link); }
+                        let vc = arr.last().cloned().unwrap_or(json!({}));
+                        let mut ac = vc.clone();
+                        ac["id"] = json!(video::new_id("c"));
+                        ac["track"] = json!("A1"); ac["type"] = json!("audio");
+                        ac["name"] = json!(format!("{} · audio", a.name));
+                        ac["link"] = json!(link);
+                        arr.push(ac);
+                        log.push(format!("add_clip {cid} + linked A1 partner"));
+                    } else {
+                        log.push(format!("add_clip {cid}"));
+                    }
                 } else {
                     if c.get("track").is_none() { c["track"] = json!("T1"); }
                     let start = c.get("start").and_then(|x| x.as_f64()).unwrap_or(0.0);
                     if c.get("end").is_none() { c["end"] = json!(start + 3.0); }
                     if c.get("name").is_none() { c["name"] = json!(c.get("text").and_then(|t| t.get("content")).and_then(|x| x.as_str()).unwrap_or("Title")); }
+                    v["clips"].as_array_mut().ok_or("clips")?.push(c);
+                    log.push(format!("add_clip {cid}"));
                 }
-                v["clips"].as_array_mut().ok_or("clips")?.push(c);
-                log.push(format!("add_clip {cid}"));
             }
             "update_clip" => {
                 let patch = op.get("patch").cloned().ok_or("update_clip needs patch")?;
@@ -316,13 +366,23 @@ pub fn edit(broker: &Broker, agent_id: &str, project: &str, ops: &[Value]) -> Re
             "remove_clip" => {
                 let ripple = op.get("ripple").and_then(|r| r.as_bool()).unwrap_or(false);
                 let arr = v["clips"].as_array_mut().ok_or("clips")?;
-                let idx = arr.iter().position(|c| c["id"] == id).ok_or_else(|| format!("remove_clip: no clip {id}"))?;
-                let removed = arr.remove(idx);
+                let targets = linked_ids(arr, &HashSet::from([id.clone()]));
+                let mut removed: Vec<Value> = vec![];
+                arr.retain(|c| {
+                    let hit = c.get("id").and_then(|x| x.as_str()).map(|x| targets.contains(x)).unwrap_or(false);
+                    if hit { removed.push(c.clone()); }
+                    !hit
+                });
+                if removed.is_empty() { return Err(format!("remove_clip: no clip {id}")); }
                 if ripple {
-                    let (s, e, tr) = (removed["start"].as_f64().unwrap_or(0.0), removed["end"].as_f64().unwrap_or(0.0), removed["track"].as_str().unwrap_or("").to_string());
-                    let d = e - s;
-                    for c in arr.iter_mut().filter(|c| c["track"] == tr && c["start"].as_f64().unwrap_or(0.0) >= e - 1e-6) {
-                        c["start"] = json!(c["start"].as_f64().unwrap_or(0.0) - d); c["end"] = json!(c["end"].as_f64().unwrap_or(0.0) - d);
+                    let mut removed = removed;
+                    removed.sort_by(|a, b| b["start"].as_f64().unwrap_or(0.0).partial_cmp(&a["start"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+                    for r in removed.iter() {
+                        let (s, e, tr) = (r["start"].as_f64().unwrap_or(0.0), r["end"].as_f64().unwrap_or(0.0), r["track"].as_str().unwrap_or("").to_string());
+                        let d = e - s;
+                        for c in arr.iter_mut().filter(|c| c["track"] == tr && c["start"].as_f64().unwrap_or(0.0) >= e - 1e-6) {
+                            c["start"] = json!(c["start"].as_f64().unwrap_or(0.0) - d); c["end"] = json!(c["end"].as_f64().unwrap_or(0.0) - d);
+                        }
                     }
                 }
                 log.push(format!("remove_clip {id}{}", if ripple { " (ripple)" } else { "" }));
@@ -330,25 +390,62 @@ pub fn edit(broker: &Broker, agent_id: &str, project: &str, ops: &[Value]) -> Re
             "move" => {
                 let start = op.get("start").and_then(|x| x.as_f64()).ok_or("move needs start")?;
                 let arr = v["clips"].as_array_mut().ok_or("clips")?;
-                let c = arr.iter_mut().find(|c| c["id"] == id).ok_or_else(|| format!("move: no clip {id}"))?;
-                let d = c["end"].as_f64().unwrap_or(0.0) - c["start"].as_f64().unwrap_or(0.0);
-                c["start"] = json!(start.max(0.0)); c["end"] = json!(start.max(0.0) + d);
-                if let Some(t) = op.get("track").and_then(|t| t.as_str()) { c["track"] = json!(t); }
+                let idx = arr.iter().position(|c| c["id"] == id).ok_or_else(|| format!("move: no clip {id}"))?;
+                let old_start = arr[idx]["start"].as_f64().unwrap_or(0.0);
+                let delta = start.max(0.0) - old_start;
+                let targets = linked_ids(arr, &HashSet::from([id.clone()]));
+                for c in arr.iter_mut().filter(|c| c.get("id").and_then(|x| x.as_str()).map(|x| targets.contains(x)).unwrap_or(false)) {
+                    let d = c["end"].as_f64().unwrap_or(0.0) - c["start"].as_f64().unwrap_or(0.0);
+                    let ns = (c["start"].as_f64().unwrap_or(0.0) + delta).max(0.0);
+                    c["start"] = json!(ns); c["end"] = json!(ns + d);
+                }
+                if let Some(t) = op.get("track").and_then(|t| t.as_str()) {
+                    if let Some(c) = arr.iter_mut().find(|c| c["id"] == id) { c["track"] = json!(t); }
+                }
                 log.push(format!("move {id} → {start:.3}"));
             }
             "split" => {
                 let at = op.get("at").and_then(|x| x.as_f64()).ok_or("split needs at")?;
                 let arr = v["clips"].as_array_mut().ok_or("clips")?;
-                let idx = arr.iter().position(|c| c["id"] == id).ok_or_else(|| format!("split: no clip {id}"))?;
-                let c: Clip = serde_json::from_value(arr[idx].clone()).map_err(|e| e.to_string())?;
-                if at <= c.start + 0.02 || at >= c.end - 0.02 { return Err(format!("split: {at} is not inside clip {id} ({}..{})", c.start, c.end)); }
-                let src_at = c.in_ + (at - c.start) * c.speed;
-                let mut a = c.clone(); a.end = at; a.out = src_at;
-                let mut b = c.clone(); b.id = video::new_id("c"); b.start = at; b.in_ = src_at;
-                a.transition_out = Default::default(); b.transition_in = Default::default();
-                arr[idx] = serde_json::to_value(&a).map_err(|e| e.to_string())?;
-                arr.insert(idx + 1, serde_json::to_value(&b).map_err(|e| e.to_string())?);
-                log.push(format!("split {id} at {at:.3} → {}", b.id));
+                if !arr.iter().any(|c| c["id"] == id) { return Err(format!("split: no clip {id}")); }
+                // Split the target AND its linked partners at the same timeline
+                // time; left halves share one fresh link, right halves another.
+                // (Two passes: collect first, mutate second — one borrow at a time.)
+                let targets = linked_ids(arr, &HashSet::from([id.clone()]));
+                let mut fresh: HashMap<String, String> = HashMap::new();
+                let mut made: Vec<String> = vec![];
+                let mut jobs: Vec<(usize, Clip, f64, String)> = vec![];
+                for (idx, c) in arr.iter().enumerate() {
+                    let cid = c.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    if !targets.contains(&cid) { continue; }
+                    let (cs, ce) = (c["start"].as_f64().unwrap_or(0.0), c["end"].as_f64().unwrap_or(0.0));
+                    if at <= cs + 0.02 || at >= ce - 0.02 { continue; }
+                    let cc: Clip = serde_json::from_value(c.clone()).map_err(|e| e.to_string())?;
+                    let src_at = cc.in_ + (at - cc.start) * cc.speed;
+                    let key = if cc.link.is_empty() { format!("solo:{cid}") } else { cc.link.clone() };
+                    let nl = fresh.entry(key).or_insert_with(|| video::new_id("l")).clone();
+                    jobs.push((idx, cc, src_at, nl));
+                }
+                let mut inserts: Vec<(usize, Value)> = vec![];
+                for (idx, cc, src_at, nl) in jobs {
+                    let mut b = cc.clone(); b.id = video::new_id("c"); b.start = at; b.in_ = src_at; b.link = nl.clone();
+                    b.transition_in = Default::default();
+                    made.push(b.id.clone());
+                    inserts.push((idx, serde_json::to_value(&b).map_err(|e| e.to_string())?));
+                    // shrink the left half in place
+                    if let Some(a) = arr.get_mut(idx) {
+                        a["end"] = json!(at); a["out"] = json!(src_at);
+                        a["transitionOut"] = json!({});
+                        if !cc.link.is_empty() { a["link"] = json!(nl); }
+                    }
+                }
+                if made.is_empty() {
+                    let c = arr.iter().find(|c| c["id"] == id).cloned().unwrap_or(json!({}));
+                    return Err(format!("split: {at} is not inside clip {id} ({}..{})", c["start"].as_f64().unwrap_or(0.0), c["end"].as_f64().unwrap_or(0.0)));
+                }
+                inserts.sort_by_key(|(idx, _)| *idx);
+                for (n, (idx, b)) in inserts.into_iter().enumerate() { arr.insert(idx + 1 + n, b); }
+                log.push(format!("split {id} at {at:.3} → {}", made.join(", ")));
             }
             "cutlist" => {
                 let aid = op.get("asset").and_then(|x| x.as_str()).unwrap_or("");
@@ -370,6 +467,8 @@ pub fn edit(broker: &Broker, agent_id: &str, project: &str, ops: &[Value]) -> Re
 }
 
 /// Replace `asset`'s clips on `track` with contiguous selects for `keep` (source ranges).
+/// Video assets with audio also lay matching linked A1 partners (the timeline's
+/// picture+waveform pairs) sharing a fresh link id per select.
 fn apply_cutlist(v: &mut Value, a: &Asset, track: &str, keep: &[(f64, f64)]) -> Result<usize, String> {
     let arr = v["clips"].as_array_mut().ok_or("clips")?;
     // where the existing selects started on the timeline (keep that origin)
@@ -377,6 +476,8 @@ fn apply_cutlist(v: &mut Value, a: &Asset, track: &str, keep: &[(f64, f64)]) -> 
     let origin = if origin == f64::MAX { 0.0 } else { origin };
     let template = arr.iter().find(|c| c["track"] == track && c["asset"] == a.id.as_str()).cloned();
     arr.retain(|c| !(c["track"] == track && c["asset"] == a.id.as_str()));
+    // linked A1 partners of the old selects go too (they're rebuilt below)
+    arr.retain(|c| !(c["track"] == "A1" && c["asset"] == a.id.as_str() && c.get("link").and_then(|x| x.as_str()).map(|x| !x.is_empty()).unwrap_or(false) && (track == "V1" || track == "V2")));
     let mut t = origin;
     let mut sorted = keep.to_vec();
     sorted.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -388,7 +489,19 @@ fn apply_cutlist(v: &mut Value, a: &Asset, track: &str, keep: &[(f64, f64)]) -> 
         c["name"] = json!(format!("{} · {}", a.name, i + 1));
         c["start"] = json!(round3(t)); c["end"] = json!(round3(t + d)); c["in"] = json!(round3(*in_)); c["out"] = json!(round3(*out));
         c["transitionIn"] = json!({}); c["transitionOut"] = json!({});
-        arr.push(c);
+        if a.has_audio && (track == "V1" || track == "V2") {
+            let link = video::new_id("l");
+            c["link"] = json!(link);
+            let mut ac = c.clone();
+            ac["id"] = json!(video::new_id("c"));
+            ac["track"] = json!("A1"); ac["type"] = json!("audio");
+            ac["name"] = json!(format!("{} · audio {}", a.name, i + 1));
+            ac["link"] = json!(link);
+            arr.push(c);
+            arr.push(ac);
+        } else {
+            arr.push(c);
+        }
         t += d; n += 1;
     }
     Ok(n)
@@ -574,7 +687,7 @@ pub fn auto_cut(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project
     let ops = vec![json!({ "op": "cutlist", "asset": a.id, "track": "V1", "keep": merged.iter().map(|(s, e)| json!({ "in": round3(*s), "out": round3(*e) })).collect::<Vec<_>>() })];
     let r = edit(broker, agent_id, project, &ops)?;
     let kept: f64 = merged.iter().map(|(s, e)| e - s).sum();
-    Ok(json!({ "asset": a.id, "source_duration": round2(dur), "kept_duration": round2(kept), "removed_silence": round2(dropped_sil), "clips": r["clips"], "keep": merged.iter().map(|(s, e)| json!({ "in": round2(*s), "out": round2(*e) })).collect::<Vec<_>>(), "dropped_takes": dropped_takes, "take_groups": groups.len(), "note": "review the V1 selects; use video_edit update_clip/split to fine-tune, or re-run with a different threshold" }))
+    Ok(json!({ "asset": a.id, "source_duration": round2(dur), "kept_duration": round2(kept), "removed_silence": round2(dropped_sil), "clips": r["clips"], "keep": merged.iter().map(|(s, e)| json!({ "in": round2(*s), "out": round2(*e) })).collect::<Vec<_>>(), "dropped_takes": dropped_takes, "take_groups": groups.len(), "note": "review the V1+A1 selects; use video_edit update_clip/split to fine-tune, or re-run with a different threshold" }))
 }
 
 // ---------------------------------------------------------------------------
@@ -729,6 +842,5 @@ pub fn matte(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &
     let mut comp = load_comp(broker, agent_id, project)?;
     comp.matte.enabled = true; comp.matte.source_asset = a.id.clone(); comp.matte.alpha_asset = na.id.clone();
     save_comp(broker, agent_id, project, &comp)?;
-    Ok(json!({ "ok": true, "alphaAsset": na.id, "file": na.rel, "note": "matte.enabled = true; set behindSubject on clips or captions.behindSubject to place them behind the person" }))
+    Ok(json!({ "ok": true, "alphaAsset": na.id, "file": na.rel, "note": "matte.enabled = true; set behindSubject on overlay clips to place them behind the person" }))
 }
-

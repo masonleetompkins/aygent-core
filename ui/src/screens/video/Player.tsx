@@ -18,8 +18,9 @@
 //  · The transport tick publishes on the store's narrow playhead channel
 //    (tickPlayhead/usePlayhead); only the stage, timecode and playhead lines
 //    re-render per frame — the timeline/inspector/dock stay idle.
-// Text clips and captions are drawn live as DOM; "Render frame" shows the exact
-// ffmpeg composite (grade + LUT + ASS captions) as an overlay badge.
+// Text clips are drawn live as DOM; captions + graphics are Hyperframes overlay
+// clips on T1/V3 (transparent video) and play through the normal slot path.
+// "Render frame" shows the exact ffmpeg composite (grade + LUT + overlays).
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Play, Pause, SkipBack, SkipForward, ChevronLeft, ChevronRight, Repeat, Camera, Maximize2, Volume2, VolumeX, Proportions, X } from "lucide-react";
 import { useVideo, usePlayhead, tickPlayhead, seek, togglePlay, stepFrames, set, get, renderFrame, mutate } from "./store";
@@ -50,7 +51,10 @@ type Slot = { id: string; asset: string; kind: "video" | "audio" };
 function assignSlots(comp: Composition, assetKind: (id: string) => "video" | "audio" | "image" | undefined): { slots: Slot[]; slotOf: Map<string, string> } {
   const slots: Slot[] = []; const slotOf = new Map<string, string>();
   const lastEnd = new Map<string, number>();
-  const media = comp.clips.filter((c) => (c.type === "video" || c.type === "audio") && !c.hidden && c.asset).sort((a, b) => a.start - b.start);
+  // Linked V+A pairs share one voice: the video element carries the sound, so
+  // the linked audio clip needs no slot of its own (it would double-play).
+  const videoLinks = new Set(comp.clips.filter((c) => c.type === "video" && c.link).map((c) => c.link));
+  const media = comp.clips.filter((c) => (c.type === "video" || c.type === "audio") && !c.hidden && c.asset && !(c.type === "audio" && c.link && videoLinks.has(c.link))).sort((a, b) => a.start - b.start);
   for (const c of media) {
     const k = assetKind(c.asset); if (!k || k === "image") continue;
     const mine = slots.filter((s) => s.asset === c.asset);
@@ -181,7 +185,6 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
 
   const images = active.filter((c) => c.type === "image" && TRACK_KIND(c.track) !== "audio");
   const texts = active.filter((c) => c.type === "text");
-  const caption = comp.captions.enabled ? s.captionLines.find((l) => playhead >= l.s && playhead < l.e) : undefined;
   const showFrame = s.frame && Math.abs(s.frame.time - playhead) < 0.02;
   const anyVisual = active.some((c) => c.type !== "audio" && TRACK_KIND(c.track) !== "audio");
   // media under the playhead whose file isn't readable right now (drive unplugged / moved)
@@ -214,17 +217,7 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
           opacity: fadeAlpha(c, playhead), outline: s.selection.includes(c.id) ? "1.5px solid var(--accent)" : undefined,
         }}>{c.text.content}</div>
       ))}
-      {caption && (
-        <div className="cap" style={{ top: `${comp.captions.y * 100}%`, zIndex: 200, fontFamily: `"${comp.captions.font}", -apple-system, system-ui, sans-serif`, fontSize: comp.captions.size * scale, fontWeight: comp.captions.weight, color: comp.captions.color, textShadow: comp.captions.shadow ? `0 ${3 * scale}px ${16 * scale}px rgba(0,0,0,.65)` : undefined }}>
-          {caption.words.map((w, i) => {
-            const on = playhead >= w.s - 0.01;
-            const key = comp.captions.keyWords.some((k) => k.toLowerCase() === w.w.toLowerCase().replace(/[^\p{L}\p{N}']/gu, ""));
-            const pop = comp.captions.preset === "pop";
-            return <span key={i} className="w" style={{ opacity: pop ? (on ? 1 : 0) : 1, transform: pop ? (on ? "none" : "translateY(8px) scale(.86)") : undefined, transition: "opacity 120ms, transform 160ms cubic-bezier(.2,1.6,.4,1)", color: key || (comp.captions.preset === "karaoke" && on) ? comp.captions.keyColor : undefined, textShadow: key ? `0 0 ${20 * scale}px ${comp.captions.keyColor}` : undefined }}>{comp.captions.uppercase ? w.w.toUpperCase() : w.w}</span>;
-          })}
-        </div>
-      )}
-      {showFrame && s.frame && agentId && project && <img className="layer" src={mediaUrl(agentId, project, "cache", s.frame.path, s.frame.at)} style={{ width: "100%", height: "100%", objectFit: "contain", zIndex: 300 }} alt="" />}
+            {showFrame && s.frame && agentId && project && <img className="layer" src={mediaUrl(agentId, project, "cache", s.frame.path, s.frame.at)} style={{ width: "100%", height: "100%", objectFit: "contain", zIndex: 300 }} alt="" />}
       {showFrame && <div className="frame-badge" style={{ zIndex: 301 }}>FFMPEG FRAME</div>}
       {safe && <div className="safe" style={{ zIndex: 302 }} />}
       {offlineHere.length > 0 && !showFrame && (
@@ -276,7 +269,7 @@ export function Player() {
         <span className="spacer" />
         <button className={`ve-icon-btn ${muted ? "on" : ""}`} title="Mute preview" onClick={() => setMuted(!muted)}>{muted ? <VolumeX size={15} /> : <Volume2 size={15} />}</button>
         <button className={`ve-icon-btn ${safe ? "on" : ""}`} title="Safe margins" onClick={() => setSafe(!safe)}><Maximize2 size={15} /></button>
-        <button className="ve-btn sm" title="Render this frame with the real ffmpeg pipeline (grade, LUT, captions)" onClick={() => void renderFrame()}><Camera size={13} /> Render frame</button>
+        <button className="ve-btn sm" title="Render this frame with the real ffmpeg pipeline (grade, LUT, overlays)" onClick={() => void renderFrame()}><Camera size={13} /> Render frame</button>
         <button className={`scene-btn ve-mono ${sceneOpen ? "on" : ""}`} title="Canvas size · frame rate" onMouseDown={(e) => e.stopPropagation()} onClick={() => setSceneOpen(!sceneOpen)}><Proportions size={13} />{sceneW}×{sceneH} · {fps}fps</button>
       </div>
       {sceneOpen && <ScenePopover onClose={() => setSceneOpen(false)} />}
