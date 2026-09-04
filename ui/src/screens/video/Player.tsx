@@ -8,10 +8,13 @@
 //    before the cut, already decoding in motion. The cut is a visibility swap +
 //    unmute — no mount, no load, no seek, no decoder spin-up (that spin-up was
 //    the black flash in v0.3 and the ~1 s freeze after the first fix).
-//  · The WALL CLOCK is the master while playing (like an NLE): the playhead never
-//    waits on a decoder. Every element chases the playhead with a small
-//    playbackRate nudge (±6 %); a hard seek only on real drift (>250 ms visible,
-//    >60 ms while still hidden in pre-roll where a seek costs nothing).
+//  · The VISIBLE A-roll <video> is the master clock while playing and its
+//    playbackRate is never touched (each rate change makes AVPlayer re-sync →
+//    stutter). The playhead is derived from its currentTime; the wall clock only
+//    fills in when no video is on screen or the master stalls. Followers (audio
+//    beds, B-roll) are corrected by a hard seek on real drift (>200 ms), never by
+//    rate nudging. Pre-roll elements get ONE alignment seek (hidden seeks are
+//    free) so the handoff at the cut is within a frame or two.
 //  · The transport tick publishes on the store's narrow playhead channel
 //    (tickPlayhead/usePlayhead); only the stage, timecode and playhead lines
 //    re-render per frame — the timeline/inspector/dock stay idle.
@@ -43,7 +46,6 @@ function useStageSize(ref: React.RefObject<HTMLDivElement>) {
 // been free the longest; if that slot freed up less than LEAD s before the clip
 // starts (no room to pre-roll) and we have < 3 slots for this asset, open another.
 const LEAD = 1.0;        // s of hidden pre-roll before a cut
-const NUDGE_MAX = 0.06;  // max playbackRate deviation used to chase the clock
 type Slot = { id: string; asset: string; kind: "video" | "audio" };
 function assignSlots(comp: Composition, assetKind: (id: string) => "video" | "audio" | "image" | undefined): { slots: Slot[]; slotOf: Map<string, string> } {
   const slots: Slot[] = []; const slotOf = new Map<string, string>();
@@ -97,10 +99,13 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
 
   const active = useMemo(() => comp.clips.filter((c) => !c.hidden && playhead >= c.start && playhead < c.end).sort((a, b) => rank(a.track) - rank(b.track)), [comp.clips, playhead]);
 
-  // imperative sync after every render (runs per playhead tick; cheap)
+  // imperative sync after every render (runs per playhead tick; only writes on change)
   const lastSeek = useRef(new Map<string, number>());
+  const masterRef = useRef<string | null>(null);   // slot id driving the clock
   const setRate = (el: HTMLMediaElement, r: number) => { if (Math.abs(el.playbackRate - r) > 0.004) el.playbackRate = r; };
   const seekTo = (slotId: string, el: HTMLMediaElement, t: number) => { lastSeek.current.set(slotId, performance.now()); el.currentTime = Math.max(0, t); };
+  const masterClip = active.find((c) => c.type === "video" && TRACK_KIND(c.track) === "video" && slotOf.has(c.id) && s.assets.find((a) => a.id === c.asset)?.online !== false);
+  masterRef.current = masterClip ? slotOf.get(masterClip.id)! : null;
   useLayoutEffect(() => {
     const now = performance.now();
     for (const slot of slots) {
@@ -113,53 +118,66 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
       if (el.muted !== wantMuted) el.muted = wantMuted;
       const vol = Math.max(0, Math.min(1, Math.pow(10, c.volume / 20)));
       if (Math.abs(el.volume - vol) > 0.005) el.volume = vol;
+      setRate(el, c.speed);
 
       if (!playing) {
         // paused / scrubbing: frame-accurate park (active → exact frame, upcoming → its first frame)
         if (!el.paused) el.pause();
-        setRate(el, c.speed);
         const park = isActive ? srcT : c.in;
         if (!el.seeking && Math.abs(el.currentTime - park) > 0.5 / fps) seekTo(slot.id, el, park);
         continue;
       }
-      const preroll = !isActive && c.start - playhead <= LEAD && srcT >= 0;
+      const toCut = c.start - playhead;
+      const preroll = !isActive && toCut <= LEAD && srcT >= 0;
       if (!isActive && !preroll) {
-        // upcoming but not yet in the pre-roll window: park where the pre-roll will begin
+        // upcoming, not yet in the pre-roll window: park where the pre-roll will begin
         if (!el.paused) el.pause();
-        setRate(el, c.speed);
-        if (prepared.current.get(slot.id) !== c.id) { prepared.current.set(slot.id, c.id); const park = Math.max(0, c.in - LEAD * c.speed); if (Math.abs(el.currentTime - park) > 0.02) seekTo(slot.id, el, park); }
+        if (prepared.current.get(slot.id) !== c.id) { prepared.current.set(slot.id, c.id); lastSeek.current.delete(slot.id); const park = Math.max(0, c.in - LEAD * c.speed); if (Math.abs(el.currentTime - park) > 0.02) seekTo(slot.id, el, park); }
         continue;
       }
-      // playing (visible) or pre-rolling (hidden): chase the wall clock
       prepared.current.set(slot.id, c.id);
       if (el.paused) void el.play().catch(() => {});
       if (el.seeking) continue;
-      const drift = srcT - el.currentTime;                // > 0: element is behind the playhead
-      const toCut = c.start - playhead;
-      const hard = isActive ? 0.25 : toCut > 0.2 ? 0.06 : 0.25;   // hidden seeks are free, so be strict early in pre-roll
-      if (Math.abs(drift) > hard && now - (lastSeek.current.get(slot.id) ?? 0) > 400) { seekTo(slot.id, el, srcT); setRate(el, c.speed); }
-      else if (Math.abs(drift) < 0.5 / fps) setRate(el, c.speed);
-      else setRate(el, c.speed * (1 + Math.max(-NUDGE_MAX, Math.min(NUDGE_MAX, drift * 0.6))));
+      if (slot.id === masterRef.current) continue;              // master drives the clock; never correct it
+      const drift = srcT - el.currentTime;                     // > 0: element is behind the playhead
+      const since = now - (lastSeek.current.get(slot.id) ?? 0);
+      if (preroll) {
+        // one alignment seek early in the pre-roll (hidden → free), then hands off as-is
+        if (toCut > 0.35 && Math.abs(drift) > 0.04 && since > 600) seekTo(slot.id, el, srcT + 0.02);
+      } else if (Math.abs(drift) > 0.2 && since > 1000) {
+        seekTo(slot.id, el, srcT);                              // follower (audio bed / B-roll): rare hard correction only
+      }
     }
   });
   useEffect(() => () => { els.current.forEach((el) => el.pause()); }, []);
 
-  // transport clock — wall clock is the master; media elements chase it (above)
+  // transport clock — master <video> clock when one is on screen, else wall clock
   const total = durOf(comp);
   useEffect(() => {
     if (!playing) return;
     let raf = 0; let last = performance.now();
     const tick = (now: number) => {
-      const dt = Math.min(0.1, (now - last) / 1000); last = now;   // clamp: a hidden tab shouldn't leap
+      const dt = Math.min(0.1, (now - last) / 1000); last = now;
       const st = get(); if (!st.playing) return;
-      const t = st.playhead + dt;
+      const wall = st.playhead + dt;
+      let t = wall;
+      const mid = masterRef.current;
+      if (mid) {
+        const el = els.current.get(mid);
+        const mc = st.comp.clips.find((c) => slotOf.get(c.id) === mid && st.playhead >= c.start && st.playhead < c.end);
+        if (el && mc && !el.paused && !el.seeking && el.readyState >= 3) {
+          const mt = mc.start + (el.currentTime - mc.in) / mc.speed;
+          // trust the picture unless it has clearly stalled (then coast on the wall clock)
+          if (mt > st.playhead - 0.15 && mt < wall + 0.25) t = Math.max(mt, st.playhead); // monotonic: never step the timeline backwards
+        }
+      }
       if (t >= Math.max(total, 0.01)) { if (st.loop) seek(0); else { set({ playing: false }); seek(total); return; } }
       else tickPlayhead(t);
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [playing, total]);
+  }, [playing, total, slotOf]);
 
   const images = active.filter((c) => c.type === "image" && TRACK_KIND(c.track) !== "audio");
   const texts = active.filter((c) => c.type === "text");
