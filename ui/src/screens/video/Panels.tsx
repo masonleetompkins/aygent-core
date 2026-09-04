@@ -7,7 +7,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Upload, Plus, X, Wand2, FolderOpen, Download, Square, Sparkles, Music, Film, Image as ImageIcon, Mic2, RefreshCw, Link2, Layers, Unplug, FileText } from "lucide-react";
 import { useVideo, mutate, importPick, removeAsset, relinkAsset, reload, addAssetToTimeline, runTool, pickLut, startRender, cancelRender, reveal, toast, set, refreshRenders, refreshThumbs } from "./store";
-import { type Asset, type Composition, fmtDur, fmtBytes, mediaUrl } from "./model";
+import { type Asset, type Composition, fmtDur, fmtBytes, mediaUrl, stockBrightHud, eli5DarkPack } from "./model";
 
 // ---- small field kit ------------------------------------------------------
 export function Field({ label, val, children }: { label: string; val?: string | number; children: React.ReactNode }) {
@@ -125,10 +125,67 @@ export function GraphicsPanel() {
     mutate((c) => { c.graphics.styleGuide = ""; c.graphics.styleGuideName = ""; });
   }
 
+  const setG = (patch: Partial<Composition["graphics"]>) => mutate((c) => { Object.assign(c.graphics, patch); });
+  const swatch = (label: string, key: "accent" | "accentInk" | "panel" | "ink" | "inkSoft" | "muted" | "positive" | "negative" | "amber", val: string) => (
+    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+      <input type="color" value={/^#[0-9a-fA-F]{6}$/.test(val) ? val : "#000000"} title={label} onChange={(e) => setG({ [key]: e.target.value } as any)} />
+      <input value={val} title={label} aria-label={label} onChange={(e) => setG({ [key]: e.target.value } as any)} style={{ flex: 1 }} />
+    </div>
+  );
+
   return (
     <>
       <div className="ve-panel-head">Graphics<span className="spacer" /><span className="ve-pill">Hyperframes</span></div>
       <div className="ve-panel-body">
+        <Section title="Brand style" right={g.theme === "bright-hud" ? <span className="ve-pill ok">stock</span> : <span className="ve-pill">custom</span>}>
+          <Seg value={g.theme} options={[{ v: "bright-hud", l: "Bright HUD" }, { v: "eli5-dark", l: "ELI5 dark" }]} onChange={(v) => mutate((c) => { c.graphics = v === "eli5-dark" ? { ...eli5DarkPack(), instructions: c.graphics.instructions, styleGuide: c.graphics.styleGuide, styleGuideName: c.graphics.styleGuideName } : { ...stockBrightHud(), instructions: c.graphics.instructions, styleGuide: c.graphics.styleGuide, styleGuideName: c.graphics.styleGuideName }; })} />
+          <p className="ve-hint">Stock = your Bright HUD brand (white panels, black ink, cyan #00cafc). ELI5 dark = the picture-locked dark system (#0a0e15 / #00e6ff). Switching keeps your instructions + guide.</p>
+          <div className="ve-row2">
+            <Field label="Accent">{swatch("Accent", "accent", g.accent)}</Field>
+            <Field label="Accent ink">{swatch("Accent ink", "accentInk", g.accentInk)}</Field>
+          </div>
+          <div className="ve-row2">
+            <Field label="Panel">{swatch("Panel", "panel", g.panel)}</Field>
+            <Field label="Headline ink">{swatch("Headline ink", "ink", g.ink)}</Field>
+          </div>
+          <div className="ve-row2">
+            <Field label="Body ink">{swatch("Body ink", "inkSoft", g.inkSoft)}</Field>
+            <Field label="Muted">{swatch("Muted", "muted", g.muted)}</Field>
+          </div>
+          <div className="ve-row3">
+            <Field label="Up">{swatch("Up metrics", "positive", g.positive)}</Field>
+            <Field label="Down">{swatch("Down / gap", "negative", g.negative)}</Field>
+            <Field label="Ask">{swatch("Question", "amber", g.amber)}</Field>
+          </div>
+        </Section>
+        <Section title="Type">
+          <div className="ve-row2">
+            <Field label="Display font"><input value={g.fontDisplay} onChange={(e) => setG({ fontDisplay: e.target.value })} /></Field>
+            <Field label="Mono font"><input value={g.fontMono} onChange={(e) => setG({ fontMono: e.target.value })} /></Field>
+          </div>
+          <div className="ve-row2">
+            <Num label="Headline weight" value={g.headlineWeight} step={100} min={100} max={900} onChange={(v) => setG({ headlineWeight: v })} />
+            <Num label="Caption size (px)" value={g.captionSize} step={1} min={16} max={200} onChange={(v) => setG({ captionSize: v })} />
+          </div>
+          <div className="ve-row3">
+            <Num label="Caption wt" value={g.captionWeight} step={100} min={100} max={900} onChange={(v) => setG({ captionWeight: v })} />
+            <Num label="Max words" value={g.captionMaxWords} step={1} min={1} max={8} onChange={(v) => setG({ captionMaxWords: v })} />
+            <Num label="Max lines" value={g.maxLines} step={1} min={1} max={4} onChange={(v) => setG({ maxLines: v })} />
+          </div>
+        </Section>
+        <Section title="Layout + motion">
+          <div className="ve-row3">
+            <Field label="Align"><select value={g.align} onChange={(e) => setG({ align: e.target.value })}><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></Field>
+            <Num label="Max styles" value={g.maxVariations} step={1} min={1} max={4} onChange={(v) => setG({ maxVariations: v })} />
+            <Num label="Width cap %" value={g.widthCapPct} step={1} min={40} max={100} onChange={(v) => setG({ widthCapPct: v })} />
+          </div>
+          <div className="ve-row3">
+            <Field label="Placement"><select value={g.placement} onChange={(e) => setG({ placement: e.target.value })}><option value="upper-right">Upper right</option><option value="upper-third">Upper third</option><option value="center">Center</option></select></Field>
+            <Field label="Motion"><select value={g.motion} onChange={(e) => setG({ motion: e.target.value })}><option value="subtle">Subtle</option><option value="kinetic">Kinetic</option></select></Field>
+            <Field label="Ease"><select value={g.ease} onChange={(e) => setG({ ease: e.target.value })}><option value="cubic-bezier(0.16,1,0.3,1)">Bright HUD</option><option value="power3.out">power3.out</option><option value="back.out(1.8)">back.out</option></select></Field>
+          </div>
+          <p className="ve-hint">Constraints from your feedback: {g.maxLines} lines max, left axis, {g.maxVariations} text styles per graphic, {g.motion} motion.</p>
+        </Section>
         <Section title="Style instructions">
           <textarea rows={6} value={instructions} placeholder={"e.g. Bold kinetic type, SF Pro Heavy, cyan (#00e6ff) glows on dark grid panels, mono kickers, generous spacing. Lower-thirds slide in from the left."} onChange={(e) => setInstructions(e.target.value)} onBlur={commitInstructions} />
           <p className="ve-hint">Plain text. The agent follows this every time it builds a graphic or caption overlay.</p>

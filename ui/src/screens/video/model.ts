@@ -22,7 +22,35 @@ export type Clip = {
   behindSubject: boolean; transitionIn: Transition; transitionOut: Transition;
 };
 
-export type GraphicsStyle = { instructions: string; styleGuide: string; styleGuideName: string };
+export type GraphicsTheme = "bright-hud" | "eli5-dark";
+export type GraphicsStyle = {
+  instructions: string; styleGuide: string; styleGuideName: string;
+  // structured brand style (stock = Mason Bright HUD)
+  theme: GraphicsTheme; accent: string; accentInk: string; panel: string;
+  ink: string; inkSoft: string; muted: string;
+  positive: string; negative: string; amber: string;
+  fontDisplay: string; fontMono: string;
+  headlineWeight: number; captionSize: number; captionWeight: number; captionMaxWords: number;
+  maxLines: number; align: string; maxVariations: number;
+  motion: string; ease: string; placement: string; widthCapPct: number;
+};
+export function stockBrightHud(): GraphicsStyle {
+  return {
+    instructions: "", styleGuide: "", styleGuideName: "",
+    theme: "bright-hud", accent: "#00cafc", accentInk: "#0090b4",
+    panel: "#ffffff", ink: "#000000", inkSoft: "#3a3a3a", muted: "#6b6b6b",
+    positive: "#3ddc84", negative: "#ff5470", amber: "#ffb020",
+    fontDisplay: "SF Pro Display", fontMono: "SF Mono",
+    headlineWeight: 800, captionSize: 58, captionWeight: 600, captionMaxWords: 3,
+    maxLines: 2, align: "left", maxVariations: 2,
+    motion: "subtle", ease: "cubic-bezier(0.16,1,0.3,1)",
+    placement: "upper-right", widthCapPct: 80,
+  };
+}
+/** ELI5 dark pack: the picture-locked dark system (one tap). */
+export function eli5DarkPack(): GraphicsStyle {
+  return { ...stockBrightHud(), theme: "eli5-dark", accent: "#00e6ff", accentInk: "#00b8d9", panel: "#0a0e15", ink: "#f2f8fb", inkSoft: "#eaf2f7", muted: "#7f93a3", headlineWeight: 900, ease: "power3.out", placement: "upper-third" };
+}
 export type Captions = {
   enabled: boolean; sourceAsset: string; keyWords: string[]; y: number;
 };
@@ -72,7 +100,7 @@ export function blankComposition(): Composition {
     version: 3,
     scene: { width: 1920, height: 1080, fps: 30, background: "#000000" },
     clips: [],
-    graphics: { instructions: "", styleGuide: "", styleGuideName: "" },
+    graphics: stockBrightHud(),
     captions: { enabled: false, sourceAsset: "", keyWords: [], y: 0.78 },
     audio: { duck: { enabled: true, musicDb: -18, duckedDb: -30, attack: 0.02, release: 0.4 }, enhance: "auphonic", masterDb: 0, loudnorm: false },
     color: { ...defaultGrade(), sCurve: 0.35 },
@@ -136,7 +164,7 @@ export function normalize(raw: unknown, assets: Asset[] = []): Composition {
     version: 3,
     scene: { width: num(r.scene?.width, 1920), height: num(r.scene?.height, 1080), fps: num(r.scene?.fps, 30) || 30, background: str(r.scene?.background, "#000000") },
     clips,
-    graphics: { instructions: str(r.graphics?.instructions, ""), styleGuide: str(r.graphics?.styleGuide, ""), styleGuideName: str(r.graphics?.styleGuideName, "") },
+    graphics: { ...stockBrightHud(), ...(r.graphics ?? {}) },
     captions: { ...b.captions, ...(r.captions ?? {}), keyWords: Array.isArray(r.captions?.keyWords) ? r.captions.keyWords : [] },
     audio: { ...b.audio, ...(r.audio ?? {}), duck: { ...b.audio.duck, ...(r.audio?.duck ?? {}) } },
     color: { ...b.color, ...(r.color ?? {}) },

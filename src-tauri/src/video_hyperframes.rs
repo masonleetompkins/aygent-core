@@ -133,16 +133,24 @@ fn caption_lines(words: &[Word], key_words: &[String]) -> Vec<CapLine> {
         }
     }).collect()
 }
-
+/// Style block the agent reads before authoring: structured brand fields first
+/// (stock Bright HUD unless the panel says otherwise), then free-text notes.
 fn style_note(comp: &Composition) -> String {
-    let mut parts: Vec<String> = vec![];
-    if !comp.graphics.instructions.trim().is_empty() { parts.push(comp.graphics.instructions.trim().to_string()); }
-    if !comp.graphics.style_guide.trim().is_empty() {
-        let name = if comp.graphics.style_guide_name.is_empty() { "style guide".to_string() } else { comp.graphics.style_guide_name.clone() };
-        parts.push(format!("[{name}]\n{}", comp.graphics.style_guide.trim()));
+    let g = &comp.graphics;
+    let mut parts: Vec<String> = vec![format!(
+        "BRAND: theme={} accent={} accentInk={} panel={} ink={} inkSoft={} muted={} up={} down={} ask={} | fonts display='{}' mono='{}' headlineW={} | captions {}px w{} single-line, max {} words/line, hold-till-next, accent keywords only | graphics: <= {} lines, align {}, <= {} text styles, {} motion ({}), place {}, content within {}% width",
+        g.theme, g.accent, g.accent_ink, g.panel, g.ink, g.ink_soft, g.muted,
+        g.positive, g.negative, g.amber, g.font_display, g.font_mono,
+        g.headline_weight, g.caption_size, g.caption_weight,
+        g.caption_max_words, g.max_lines, g.align, g.max_variations,
+        g.motion, g.ease, g.placement, g.width_cap_pct.round() as u32)];
+    if !g.instructions.trim().is_empty() { parts.push(g.instructions.trim().to_string()); }
+    if !g.style_guide.trim().is_empty() {
+        let name = if g.style_guide_name.is_empty() { "style guide".to_string() } else { g.style_guide_name.clone() };
+        parts.push(format!("[{name}]\n{}", g.style_guide.trim()));
     }
     // One line, safe inside an HTML comment.
-    parts.join(" / ").replace("--", "—").chars().take(500).collect()
+    parts.join(" / ").chars().take(1200).collect()
 }
 
 /// Stage one overlay as its own Hyperframes project dir (index.html + a minimal
@@ -221,7 +229,10 @@ pub fn build_captions(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, p
     let dir = proj.join(".cache").join("hf");
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir hf cache: {e}"))?;
     let cid = format!("caps-{}", slug(project));
-    let font_px = ((h as f64 * 0.030).round() as u32).clamp(24, 96);
+    let g = &comp.graphics;
+    // Stock caption look: semibold (never heavy), panel-relative size.
+    let base_px = if g.caption_size >= 16 { g.caption_size as f64 } else { 58.0 };
+    let font_px = (base_px * h as f64 / 1920.0).round().clamp(24.0, 160.0) as u32;
     let html = HYP_COMP
         .replace("{{CID}}", &cid)
         .replace("{{DUR}}", &format!("{dur:.3}"))
@@ -230,6 +241,9 @@ pub fn build_captions(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, p
         .replace("{{FPS}}", &format!("{fps:.0}"))
         .replace("{{Y_PX}}", &((h as f64 * comp.captions.y.clamp(0.02, 0.98)).round().to_string()))
         .replace("{{FONT_PX}}", &font_px.to_string())
+        .replace("{{CAP_WEIGHT}}", &g.caption_weight.clamp(100, 900).to_string())
+        .replace("{{ACCENT}}", &g.accent)
+        .replace("{{MAXW_PCT}}", &format!("{:.2}", g.width_cap_pct.clamp(40.0, 100.0) / 100.0))
         .replace("{{LINES_JSON}}", &serde_json::to_string(&lines).map_err(|e| e.to_string())?)
         .replace("{{STYLE_NOTE}}", &style_note(&comp));
     let cap_dir = stage_comp(&dir, "captions", &html)?;

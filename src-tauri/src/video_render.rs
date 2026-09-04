@@ -127,12 +127,61 @@ impl Clip {
     fn has_audio_role(&self) -> bool { matches!(self.kind.as_str(), "video" | "audio") && !self.muted }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GraphicsStyle {
     pub instructions: String,      // plain-text style directions for Hyperframes overlays
     pub style_guide: String,       // extracted text of the uploaded style guide (.md/.txt/.rtf/.pdf/.docx)
     pub style_guide_name: String,  // original file name of the guide
+    // ---- structured brand style (stock = Mason Bright HUD; ELI5 dark = one tap) ----
+    pub theme: String,             // "bright-hud" | "eli5-dark"
+    pub accent: String,            // brand accent (#00cafc Bright HUD, #00e6ff ELI5 dark)
+    pub accent_ink: String,        // readable accent on light (#0090b4) / deep (#00b8d9)
+    pub panel: String,             // panel surface (#ffffff / #0a0e15)
+    pub ink: String,               // headline ink (#000000 / #f2f8fb)
+    pub ink_soft: String,          // body ink (#3a3a3a / #eaf2f7)
+    pub muted: String,             // secondary (#6b6b6b / #7f93a3)
+    pub positive: String,          // up metrics (#3ddc84)
+    pub negative: String,          // errors / "the gap" (#ff5470)
+    pub amber: String,             // question prompts (#ffb020)
+    pub font_display: String,      // "SF Pro Display"
+    pub font_mono: String,         // "SF Mono"
+    pub headline_weight: u32,      // 800 Bright HUD / 900 ELI5
+    pub caption_size: u32,         // px at 1080x1920 reference (58)
+    pub caption_weight: u32,       // 600 semibold — never heavy
+    pub caption_max_words: u32,    // max 3, always one line
+    pub max_lines: u32,            // 2 lines max per graphic
+    pub align: String,             // "left" — same left axis, no centered mixes
+    pub max_variations: u32,       // max 2 text styles per graphic
+    pub motion: String,            // "subtle" (stock) | "kinetic"
+    pub ease: String,              // cubic-bezier(0.16,1,0.3,1) / power3.out
+    pub placement: String,         // "upper-right" | "upper-third" | "center"
+    pub width_cap_pct: f64,        // content within 80% of frame width
+}
+impl Default for GraphicsStyle {
+    fn default() -> Self { stock_bright_hud() }
+}
+fn stock_bright_hud() -> GraphicsStyle {
+    GraphicsStyle {
+        instructions: String::new(), style_guide: String::new(), style_guide_name: String::new(),
+        theme: "bright-hud".into(), accent: "#00cafc".into(), accent_ink: "#0090b4".into(),
+        panel: "#ffffff".into(), ink: "#000000".into(), ink_soft: "#3a3a3a".into(), muted: "#6b6b6b".into(),
+        positive: "#3ddc84".into(), negative: "#ff5470".into(), amber: "#ffb020".into(),
+        font_display: "SF Pro Display".into(), font_mono: "SF Mono".into(),
+        headline_weight: 800, caption_size: 58, caption_weight: 600, caption_max_words: 3,
+        max_lines: 2, align: "left".into(), max_variations: 2,
+        motion: "subtle".into(), ease: "cubic-bezier(0.16,1,0.3,1)".into(),
+        placement: "upper-right".into(), width_cap_pct: 80.0,
+    }
+}
+/// ELI5 dark pack (one tap in the Graphics panel): the picture-locked dark system.
+pub fn eli5_dark_pack() -> GraphicsStyle {
+    GraphicsStyle {
+        theme: "eli5-dark".into(), accent: "#00e6ff".into(), accent_ink: "#00b8d9".into(),
+        panel: "#0a0e15".into(), ink: "#f2f8fb".into(), ink_soft: "#eaf2f7".into(), muted: "#7f93a3".into(),
+        headline_weight: 900, ease: "power3.out".into(), placement: "upper-third".into(),
+        ..stock_bright_hud()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
