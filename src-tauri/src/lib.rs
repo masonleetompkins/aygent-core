@@ -1637,11 +1637,27 @@ async fn conv_compact(
 ) -> Result<serde_json::Value, String> {
     let conv = repo::load_conversation(&db, &id)?;
     let history = conv.history.as_array().cloned().unwrap_or_default();
+    compact_history(&db, &conv.agent_id, history).await
+}
+
+/// VIDEO DOCK COMPACT: the editor's per-project conversation is NOT a repo
+/// conversation (it lives in Video/<project>/chat.json), so the UI hands us the
+/// provider-format history directly. Same summarizer, same seed shape.
+#[tauri::command]
+async fn history_compact(
+    db: tauri::State<'_, writer::Db>,
+    agent_id: String,
+    history: Vec<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    compact_history(&db, &agent_id, history).await
+}
+
+async fn compact_history(db: &writer::Db, agent_id: &str, history: Vec<serde_json::Value>) -> Result<serde_json::Value, String> {
     if history.len() < 4 {
         return Err("not enough conversation to compact yet".into());
     }
     // Resolve the agent own provider/model (fallback: anthropic auto/haiku).
-    let agent = repo::get_agent(&db, &conv.agent_id)?.ok_or("agent not found")?;
+    let agent = repo::get_agent(db, agent_id)?.ok_or("agent not found")?;
     let provider = if agent.provider.is_empty() { "anthropic".to_string() } else { agent.provider.clone() };
 
     // Flatten the history into a readable transcript for the summarizer. We keep
@@ -5953,7 +5969,7 @@ pub fn run() {
             savepoint_undo, savepoint_redo,
             savepoint_get_retention, savepoint_set_retention, savepoint_purge,
             conv_list, conv_load, conv_save, conv_rename, conv_delete, conv_reorder,
-            conv_compact, chat_model_info,
+            conv_compact, history_compact, chat_model_info,
             agents_list, agents_create, agents_update, agents_reorder, agents_delete,
             agents_set_active, agents_get_active, agents_sharing_folder,
             agent_mounts_list, agent_mount_add, agent_mount_remove,

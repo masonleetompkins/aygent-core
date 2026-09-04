@@ -52,7 +52,9 @@
 .ve-rail { grid-area: rail; display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 10px 0; border-right: 1px solid rgba(var(--accent-rgb), .12); background: var(--surface); }
 .ve-rail button { width: 40px; height: 40px; border-radius: 9px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; color: var(--text-muted); font-size: 9.5px; font-weight: 700; letter-spacing: .02em; }
 .ve-rail button:hover { background: rgba(var(--accent-rgb), .08); color: var(--text); }
-.ve-rail button.on { background: rgba(var(--accent-rgb), .12); color: var(--text); box-shadow: inset 3px 0 0 var(--accent); }
+.ve-rail button.on { background: rgba(var(--accent-rgb), .16); color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(var(--accent-rgb), .45), 0 0 14px rgba(var(--accent-rgb), .45), 0 0 28px rgba(var(--accent-rgb), .2); }
+.ve-rail button.on svg { filter: drop-shadow(0 0 5px rgba(var(--accent-rgb), .75)); }
 .ve-rail .grow { flex: 1; }
 
 /* ---- side panel ---- */
@@ -203,6 +205,9 @@
 .ve-quick { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 8px; }
 .ve-quick button { font-size: 11.5px; font-weight: 600; padding: 4px 9px; border-radius: 999px; border: 1px solid rgba(var(--accent-rgb), .2); color: var(--text-muted); }
 .ve-quick button:hover { border-color: var(--accent); color: var(--text); }
+.ve-quick.approve { align-items: center; padding: 8px 12px; border-top: 1px solid rgba(var(--accent-rgb), .1); background: rgba(var(--accent-rgb), .05); }
+.ve-quick.approve .go { display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 12px; border-radius: 999px; font-size: 12px; font-weight: 700; background: var(--accent); color: var(--bg); border: 1px solid var(--accent); box-shadow: 0 0 12px rgba(var(--accent-rgb), .4); }
+.ve-quick.approve .go:hover:not(:disabled) { filter: brightness(1.08); }
 .ve-compose { border-top: 1px solid rgba(var(--accent-rgb), .1); padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 8px; }
 .ve-compose textarea { resize: none; min-height: 68px; max-height: 200px; line-height: 1.4; padding: 9px 10px; border-radius: 10px; }
 .ve-compose .row { display: flex; align-items: center; gap: 8px; }

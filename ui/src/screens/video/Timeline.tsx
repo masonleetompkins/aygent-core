@@ -27,7 +27,9 @@ export function Timeline() {
   const tracks = useMemo(() => {
     const used = new Set(comp.clips.map((c) => c.track));
     const extra = [...used].filter((t) => !TRACK_ORDER.includes(t)).sort();
-    return [...extra.filter((t) => t.startsWith("V")).reverse(), ...TRACK_ORDER, ...extra.filter((t) => !t.startsWith("V"))];
+    // extra V tracks (V4+) slot in just under T1 so text always stays on top
+    const extraV = extra.filter((t) => t.startsWith("V")).reverse();
+    return ["T1", ...extraV, ...TRACK_ORDER.filter((t) => t !== "T1"), ...extra.filter((t) => !t.startsWith("V"))];
   }, [comp.clips]);
   const contentW = Math.max(laneWidth, (total + 10) * zoom + 200);
 

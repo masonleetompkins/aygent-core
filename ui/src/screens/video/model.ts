@@ -54,7 +54,7 @@ export type Asset = {
 export type Word = { w: string; s: number; e: number };
 export type Transcript = { asset: string; language: string; text: string; words: Word[]; segments: { text: string; s: number; e: number }[]; created: number };
 
-export const TRACK_ORDER: TrackId[] = ["V3", "V2", "V1", "T1", "A1", "A2"];
+export const TRACK_ORDER: TrackId[] = ["T1", "V3", "V2", "V1", "A1", "A2"]; // top = composited on top: titles over graphics over B-roll over A-roll
 export const TRACK_KIND = (t: TrackId): "video" | "text" | "audio" => t.startsWith("T") ? "text" : t.startsWith("A") ? "audio" : "video";
 export const TRACK_LABEL: Record<string, string> = { V3: "Graphics", V2: "B-roll", V1: "A-roll", T1: "Titles", A1: "Voice", A2: "Music" };
 

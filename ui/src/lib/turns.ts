@@ -310,6 +310,12 @@ export function useAgentTurn(agentId: string | null): TurnState {
   );
 }
 
+// SCOPED SLOTS: a surface that runs its own conversation with an agent (the
+// Video editor dock) passes `slot: \`${agentId}::video\`` so its live stream and
+// history live in a separate slot. The Chat screen (keyed by bare agentId) never
+// sees it, and vice-versa. The backend still serializes per sessionId.
+export const turnSlotKey = (agentId: string, scope: string) => `${agentId}::${scope}`;
+
 /** The running history for an agent (used to seed a follow-up turn). */
 export function getHistory(agentId: string): unknown[] {
   return slot(agentId).history;
@@ -411,6 +417,7 @@ export type RunArgs = {
   folder: string | null;
   sessionId: string;
   attachments?: string[];  // jail-relative paths from chat_attach_file
+  slot?: string;           // store slot key (default agentId) — see turnSlotKey
 };
 
 /**
@@ -432,7 +439,8 @@ export async function stopTurn(channel: string): Promise<boolean> {
  * with the final provider-format history (also written into the store).
  */
 export async function runTurn(a: RunArgs): Promise<unknown[]> {
-  const s = slot(a.agentId);
+  const key = a.slot ?? a.agentId;
+  const s = slot(key);
   // Reset this agent's live turn.
   s.turn = { status: "running", liveText: "", liveTools: [], timeline: [] };
   emit();
@@ -441,7 +449,7 @@ export async function runTurn(a: RunArgs): Promise<unknown[]> {
   if (s.unlisten) { try { s.unlisten(); } catch { /* ignore */ } s.unlisten = undefined; }
   const un = await listen<any>(a.channel, (ev) => {
     const m = ev.payload;
-    const cur = slot(a.agentId);
+    const cur = slot(key);
     if (!m) return;
     // Anthropic-style: {TextDelta:{text}} or {kind:"TextDelta"} — accept both.
     const kind = m.kind || (m.TextDelta ? "TextDelta" : m.Info ? "Info" : m.ToolUseStart ? "ToolUseStart" : m.ToolUseDelta ? "ToolUseDelta" : m.ToolUse ? "ToolUse" : m.ToolResult ? "ToolResult" : m.Usage ? "Usage" : m.Done ? "Done" : null);
@@ -469,10 +477,10 @@ export async function runTurn(a: RunArgs): Promise<unknown[]> {
       agentId: a.agentId, sessionId: a.sessionId,
       attachments: a.attachments ?? [],
     });
-    slot(a.agentId).history = Array.isArray(updated) ? updated : s.history;
-    return slot(a.agentId).history;
+    slot(key).history = Array.isArray(updated) ? updated : s.history;
+    return slot(key).history;
   } finally {
-    const cur = slot(a.agentId);
+    const cur = slot(key);
     if (cur.unlisten) { try { cur.unlisten(); } catch { /* ignore */ } cur.unlisten = undefined; }
     cur.turn = { ...cur.turn, status: "idle" };
     emit();
