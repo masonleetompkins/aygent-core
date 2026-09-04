@@ -3,8 +3,8 @@
 // video_* tool — the SAME core the agent uses, so button == prompt.
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Upload, Plus, X, Type, Wand2, FolderOpen, Download, Square, Sparkles, Music, Film, Image as ImageIcon, Mic2, RefreshCw, Link2, Layers } from "lucide-react";
-import { useVideo, mutate, importPick, removeAsset, addAssetToTimeline, addTitle, runTool, pickLut, startRender, cancelRender, reveal, toast, set, refreshRenders, refreshThumbs } from "./store";
+import { Upload, Plus, X, Type, Wand2, FolderOpen, Download, Square, Sparkles, Music, Film, Image as ImageIcon, Mic2, RefreshCw, Link2, Layers, Unplug } from "lucide-react";
+import { useVideo, mutate, importPick, removeAsset, relinkAsset, reload, addAssetToTimeline, addTitle, runTool, pickLut, startRender, cancelRender, reveal, toast, set, refreshRenders, refreshThumbs } from "./store";
 import { type Asset, type Composition, fmtDur, fmtBytes, mediaUrl } from "./model";
 
 // ---- small field kit ------------------------------------------------------
@@ -30,6 +30,8 @@ export function Seg<T extends string>({ value, options, onChange }: { value: T; 
 export function Section({ title, right, children }: { title: string; right?: React.ReactNode; children: React.ReactNode }) {
   return <div className="ve-section"><h4>{title}{right}</h4>{children}</div>;
 }
+/** "/Volumes/Mason_2022/…" → "Mason_2022"; internal disk → "Macintosh HD". */
+export const volumeOf = (p: string) => { const m = /^\/Volumes\/([^/]+)/.exec(p); return m ? m[1] : "Macintosh HD"; };
 const setPath = (path: string, value: unknown) => mutate((c) => { const parts = path.split("."); let cur: any = c; for (let i = 0; i < parts.length - 1; i++) cur = cur[parts[i]]; cur[parts[parts.length - 1]] = value; });
 
 // ---- MEDIA ----------------------------------------------------------------
@@ -38,6 +40,7 @@ export function MediaPanel() {
   const [sel, setSel] = useState<string | null>(null);
   const files = s.assets.filter((a) => !a.name.includes("(alpha)") && !a.name.includes("(enhanced)"));
   const generated = s.assets.filter((a) => a.name.includes("(alpha)") || a.name.includes("(enhanced)"));
+  const offline = s.assets.filter((a) => a.online === false);
   return (
     <>
       <div className="ve-panel-head">Media<span className="spacer" /><button className="ve-icon-btn" title="Rebuild thumbnails" onClick={() => void refreshThumbs()}><RefreshCw size={14} /></button><button className="ve-btn sm primary" onClick={() => void importPick()}><Upload size={13} /> Import</button></div>
@@ -47,6 +50,22 @@ export function MediaPanel() {
           <div><b>Drop footage here</b> or click to pick</div>
           <div className="ve-faint" style={{ fontSize: 11 }}>Files are <b>hardlinked</b>, never copied. Same-volume only; others link by reference.</div>
         </div>
+        {offline.length > 0 && (
+          <div className="ve-offline">
+            <div className="hd"><Unplug size={14} /> {offline.length === 1 ? "1 file is offline" : `${offline.length} files are offline`}</div>
+            {offline.map((a) => (
+              <div key={a.id} className="row">
+                <div className="nm">{a.name}</div>
+                <div className="pth" title={a.path}>{a.path}</div>
+                <div className="acts">
+                  <span className="ve-faint">{a.linked ? "hardlink missing" : `plug in ${volumeOf(a.path)}`}</span>
+                  <button className="ve-btn sm" onClick={() => void relinkAsset(a.id)}><Link2 size={12} /> Relink…</button>
+                </div>
+              </div>
+            ))}
+            <button className="ve-btn sm" style={{ alignSelf: "flex-start" }} onClick={() => void reload()}><RefreshCw size={12} /> Check again</button>
+          </div>
+        )}
         {files.length > 0 && <AssetGrid assets={files} sel={sel} setSel={setSel} />}
         {generated.length > 0 && <Section title="Generated"><AssetGrid assets={generated} sel={sel} setSel={setSel} /></Section>}
         <p className="ve-hint">Drag a clip onto a lane, or double-click to append at the end. <kbd className="ve-kbd">⌫</kbd> on a card unlinks it.</p>
@@ -62,13 +81,14 @@ function AssetGrid({ assets, sel, setSel }: { assets: Asset[]; sel: string | nul
         const thumb = a.thumbs?.strip && s.agentId && s.project ? mediaUrl(s.agentId, s.project, "cache", a.thumbs.strip, s.cacheBust) : null;
         const fw = a.thumbs?.frameW ?? 114, fh = a.thumbs?.frameH ?? 64;
         return (
-          <div key={a.id} className={`item ${sel === a.id ? "sel" : ""}`} draggable onDragStart={(e) => { e.dataTransfer.setData("application/aygent-asset", a.id); e.dataTransfer.effectAllowed = "copy"; }}
+          <div key={a.id} className={`item ${sel === a.id ? "sel" : ""} ${a.online === false ? "offline" : ""}`} draggable onDragStart={(e) => { e.dataTransfer.setData("application/aygent-asset", a.id); e.dataTransfer.effectAllowed = "copy"; }}
             onClick={() => setSel(a.id)} onDoubleClick={() => addAssetToTimeline(a)} tabIndex={0}
             onKeyDown={(e) => { if ((e.key === "Backspace" || e.key === "Delete") && sel === a.id) { e.preventDefault(); if (confirm(`Unlink ${a.name}? Clips using it are removed.`)) void removeAsset(a.id); } }}>
             <div className={`thumb ${a.kind}`} style={thumb && a.kind !== "audio" ? { backgroundImage: `url(${thumb})`, backgroundSize: `${(fw / fh) * 100 * (a.thumbs?.stripFrames ?? 1)}% 100%`, backgroundPosition: "left center" } : undefined}>
               {a.kind === "audio" ? <Music size={22} /> : !thumb ? (a.kind === "image" ? <ImageIcon size={22} /> : <Film size={22} />) : null}
             </div>
             <span className="badge">{a.kind === "video" ? `${a.height}p` : a.kind.toUpperCase()}{!a.linked ? " · REF" : ""}</span>
+              {a.online === false && <span className="badge off" title={a.path}>OFFLINE</span>}
             <button className="x" title="Unlink" onClick={(e) => { e.stopPropagation(); if (confirm(`Unlink ${a.name}? Clips using it are removed.`)) void removeAsset(a.id); }}><X size={12} /></button>
             <div className="meta"><div className="n" title={a.path}>{a.name}</div><div className="d"><span>{a.kind === "image" ? `${a.width}×${a.height}` : fmtDur(a.duration)}</span><span>{a.fps ? `${Math.round(a.fps)}fps` : fmtBytes(a.size)}</span></div></div>
           </div>

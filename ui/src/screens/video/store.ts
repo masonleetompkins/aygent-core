@@ -224,6 +224,13 @@ export async function refreshThumbs() {
   const { agentId, project } = state; if (!agentId || !project) return;
   try { const assets = await invoke<Asset[]>("video_refresh_thumbs", { agentId, project }); set({ assets, cacheBust: Date.now() }); } catch { /* ignore */ }
 }
+export async function relinkAsset(id: string) {
+  const { agentId, project } = state; if (!agentId || !project) return;
+  try {
+    const r = await invoke<{ relinked: boolean; linked?: boolean }>("video_relink_asset", { agentId, project, assetId: id });
+    if (r.relinked) { toast(r.linked ? "relinked (hardlinked)" : "relinked (reference)", "ok"); await reload(); }
+  } catch (e) { toast(String(e), "err"); }
+}
 export async function removeAsset(id: string) {
   const { agentId, project } = state; if (!agentId || !project) return;
   try {

@@ -417,7 +417,7 @@ pub fn video_load(broker: tauri::State<Arc<Broker>>, agent_id: String, project: 
     if !slug_ok(&project) { return Err("invalid project name".into()); }
     let composition = read_json(&broker, &agent_id, &rel(&project, "composition.json"))
         .ok_or_else(|| format!("no such project: {project}"))?;
-    let assets = serde_json::to_value(load_manifest(&broker, &agent_id, &project).assets).unwrap_or_default();
+    let assets = assets_with_status(&broker, &agent_id, &project);
     let transcript = read_json(&broker, &agent_id, &rel(&project, "transcript.json")).unwrap_or(serde_json::Value::Null);
     let chat = read_json(&broker, &agent_id, &rel(&project, "chat.json")).unwrap_or(serde_json::Value::Null);
     Ok(serde_json::json!({ "project": project, "composition": composition, "assets": assets, "transcript": transcript, "chat": chat }))
@@ -503,6 +503,51 @@ pub fn import_lut(broker: &Broker, agent_id: &str, project: &str, src: &Path) ->
         }
     }
     Ok(format!("luts/{name}"))
+}
+
+/// Manifest rows + a computed `online` flag (is the media readable right now?).
+/// A cross-volume reference goes offline whenever its drive is unmounted; the
+/// UI shows the stored `path` so the user knows which drive to plug in.
+pub fn assets_with_status(broker: &Broker, agent_id: &str, project: &str) -> serde_json::Value {
+    let m = load_manifest(broker, agent_id, project);
+    serde_json::Value::Array(m.assets.iter().map(|a| {
+        let mut v = serde_json::to_value(a).unwrap_or_default();
+        let online = asset_abs(broker, agent_id, project, a).map(|p| p.is_file()).unwrap_or(false);
+        if let Some(o) = v.as_object_mut() { o.insert("online".into(), serde_json::Value::Bool(online)); }
+        v
+    }).collect())
+}
+
+/// Relink an (offline) asset to a file the user picks. Same volume → hardlink into
+/// media/ (linked=true); other volume → reference (linked=false). Asset id, clips
+/// and cached thumbs are untouched, so the edit keeps working.
+#[tauri::command]
+pub async fn video_relink_asset(app: tauri::AppHandle, broker: tauri::State<'_, Arc<Broker>>, agent_id: String, project: String, asset_id: String) -> Result<serde_json::Value, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let proj = project_dir(&broker, &agent_id, &project)?;
+    let mut m = load_manifest(&broker, &agent_id, &project);
+    let Some(i) = m.assets.iter().position(|a| a.id == asset_id) else { return Err("no such asset".into()) };
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<tauri_plugin_dialog::FilePath>>();
+    app.dialog().file().set_title(format!("Relink {}", m.assets[i].name)).pick_file(move |chosen| { let _ = tx.send(chosen); });
+    let Some(chosen) = rx.await.map_err(|_| "picker closed".to_string())? else { return Ok(serde_json::json!({ "relinked": false })) };
+    let src = chosen.into_path().map_err(|e| e.to_string())?;
+    if !src.is_file() { return Err("not a file".into()); }
+    let a = &mut m.assets[i];
+    // drop the old hardlink (if any) before linking the new file under the same media/ name
+    if a.linked && !a.rel.is_empty() { if let Ok(p) = broker.resolve(&agent_id, &rel(&project, &a.rel), broker::Mode::Read) { let _ = std::fs::remove_file(p); } }
+    let media = proj.join("media"); std::fs::create_dir_all(&media).map_err(|e| format!("mkdir media: {e}"))?;
+    let fname = format!("{}-{}", a.id, src.file_name().and_then(|n| n.to_str()).unwrap_or("media"));
+    let dst = media.join(&fname);
+    let _ = std::fs::remove_file(&dst);
+    let linked = match std::fs::hard_link(&src, &dst) { Ok(()) => true, Err(e) if e.raw_os_error() == Some(libc::EXDEV) => false, Err(e) => return Err(format!("hardlink failed: {e}")) };
+    a.path = src.to_string_lossy().to_string();
+    a.linked = linked;
+    a.rel = if linked { format!("media/{fname}") } else { String::new() };
+    a.name = src.file_name().and_then(|n| n.to_str()).unwrap_or(&a.name).to_string();
+    a.size = std::fs::metadata(&src).map(|md| md.len()).unwrap_or(a.size);
+    save_manifest(&broker, &agent_id, &project, &m)?;
+    let _ = app.emit("video-assets-changed", serde_json::json!({ "project": project }));
+    Ok(serde_json::json!({ "relinked": true, "linked": linked, "path": src.to_string_lossy() }))
 }
 
 /// Remove an asset from the manifest (+ its hardlink and cache). Clips that

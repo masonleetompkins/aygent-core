@@ -18,7 +18,8 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Play, Pause, SkipBack, SkipForward, ChevronLeft, ChevronRight, Repeat, Camera, Maximize2, Volume2, VolumeX, Proportions, X } from "lucide-react";
 import { useVideo, usePlayhead, tickPlayhead, seek, togglePlay, stepFrames, set, get, renderFrame, mutate } from "./store";
-import { Num } from "./Panels";
+import { Num, volumeOf } from "./Panels";
+import { Unplug } from "lucide-react";
 import { duration as durOf } from "./model";
 import { type Clip, type Composition, TRACK_KIND, fmtTime, mediaUrl } from "./model";
 
@@ -155,6 +156,8 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
   const caption = comp.captions.enabled ? s.captionLines.find((l) => playhead >= l.s && playhead < l.e) : undefined;
   const showFrame = s.frame && Math.abs(s.frame.time - playhead) < 0.02;
   const anyVisual = active.some((c) => c.type !== "audio" && TRACK_KIND(c.track) !== "audio");
+  // media under the playhead whose file isn't readable right now (drive unplugged / moved)
+  const offlineHere = active.map((c) => s.assets.find((a) => a.id === c.asset)).filter((a): a is NonNullable<typeof a> => !!a && a.online === false);
 
   const layerStyle = (c: Clip, visible: boolean): React.CSSProperties => ({
     width: sceneW * scale, height: sceneH * scale, objectFit: (c.fit === "contain" ? "contain" : c.fit === "none" ? "none" : "cover") as any,
@@ -196,7 +199,15 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
       {showFrame && s.frame && agentId && project && <img className="layer" src={mediaUrl(agentId, project, "cache", s.frame.path, s.frame.at)} style={{ width: "100%", height: "100%", objectFit: "contain", zIndex: 300 }} alt="" />}
       {showFrame && <div className="frame-badge" style={{ zIndex: 301 }}>FFMPEG FRAME</div>}
       {safe && <div className="safe" style={{ zIndex: 302 }} />}
-      {!anyVisual && !showFrame && <div className="empty">{comp.clips.length ? `nothing at ${fmtTime(playhead, fps)}` : "drop footage into the timeline"}</div>}
+      {offlineHere.length > 0 && !showFrame && (
+        <div className="offline" style={{ zIndex: 250 }}>
+          <Unplug size={22} />
+          <b>Media offline</b>
+          {offlineHere.slice(0, 2).map((a) => <div key={a.id} className="f"><span>{a.name}</span><code title={a.path}>{a.path}</code><em>{a.linked ? "hardlink missing — use Relink in Media" : `plug in “${volumeOf(a.path)}”, or Relink in Media`}</em></div>)}
+          {offlineHere.length > 2 && <em>+{offlineHere.length - 2} more in the Media panel</em>}
+        </div>
+      )}
+      {!anyVisual && !showFrame && offlineHere.length === 0 && <div className="empty">{comp.clips.length ? `nothing at ${fmtTime(playhead, fps)}` : "drop footage into the timeline"}</div>}
     </div>
   );
 }

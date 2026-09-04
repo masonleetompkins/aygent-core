@@ -48,6 +48,7 @@ export type Asset = {
   id: string; name: string; kind: "video" | "audio" | "image"; rel: string; path: string; linked: boolean; size: number;
   duration: number; width: number; height: number; fps: number; hasVideo: boolean; hasAudio: boolean; audioChannels: number; codec: string;
   thumbs: Thumbs | null; imported: number;
+  online?: boolean;        // computed by video_load: media readable right now (false = drive unplugged / moved)
 };
 
 export type Word = { w: string; s: number; e: number };

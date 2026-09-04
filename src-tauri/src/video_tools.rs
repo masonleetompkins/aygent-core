@@ -215,12 +215,15 @@ fn overview(broker: &Broker, agent_id: &str, project: &str) -> Result<Value, Str
     }
     let luts: Vec<String> = std::fs::read_dir(proj.join("luts")).map(|rd| rd.flatten().map(|e| format!("luts/{}", e.file_name().to_string_lossy())).collect()).unwrap_or_default();
     let renders: Vec<String> = std::fs::read_dir(proj.join("renders")).map(|rd| rd.flatten().map(|e| format!("renders/{}", e.file_name().to_string_lossy())).collect()).unwrap_or_default();
+    let offline: Vec<Value> = assets.iter().filter(|a| !video::asset_abs(broker, agent_id, project, a).map(|p| p.is_file()).unwrap_or(false)).map(|a| json!({ "id": a.id, "name": a.name, "path": a.path })).collect();
     Ok(json!({
         "project": project,
+        "offlineMedia": offline,
+        "warning": if offline.is_empty() { Value::Null } else { json!("Some media is OFFLINE (drive unplugged or file moved) — tell the user which files/paths and don't run transcribe/cut/render on them until relinked.") },
         "scene": comp.scene,
         "duration": round3(comp.duration()),
         "tracks": tracks,
-        "assets": assets.iter().map(|a| json!({ "id": a.id, "name": a.name, "kind": a.kind, "duration": round2(a.duration), "fps": round2(a.fps), "size": format!("{}x{}", a.width, a.height), "hasAudio": a.has_audio, "linked": a.linked })).collect::<Vec<_>>(),
+        "assets": assets.iter().map(|a| json!({ "id": a.id, "name": a.name, "kind": a.kind, "duration": round2(a.duration), "fps": round2(a.fps), "size": format!("{}x{}", a.width, a.height), "hasAudio": a.has_audio, "linked": a.linked, "online": video::asset_abs(broker, agent_id, project, a).map(|p| p.is_file()).unwrap_or(false), "path": a.path })).collect::<Vec<_>>(),
         "transcript": tr.as_ref().map(|t| json!({ "asset": t.asset, "words": t.words.len(), "segments": t.segments.len() })),
         "captions": comp.captions,
         "color": comp.color,
