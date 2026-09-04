@@ -138,17 +138,18 @@
 .ve-lane { position: relative; border-bottom: 1px solid rgba(var(--accent-rgb), .08); }
 .ve-lane.over { background: rgba(var(--accent-rgb), .06); }
 .ve-lane.text { background: rgba(var(--accent-rgb), .015); }
-.ve-clip { position: absolute; top: 4px; bottom: 4px; border-radius: 6px; overflow: hidden; cursor: grab; border: 1px solid rgba(255,255,255,.14); background: #3a3f4a; color: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.3); }
-.ve-clip.video { background: #2d3a4f; } .ve-clip.image { background: #3f3556; } .ve-clip.text { background: #5a4520; } .ve-clip.audio { background: #1f4d36; }
+.ve-clip { position: absolute; top: 4px; bottom: 4px; border-radius: 6px; overflow: hidden; cursor: grab; border: 1px solid rgba(var(--accent-rgb), .55); background: rgba(var(--accent-rgb), .82); color: var(--bg); box-shadow: 0 1px 2px rgba(0,0,0,.25); }
+.ve-clip.image { background: rgba(var(--accent-rgb), .62); }
+.ve-clip.text { background: rgba(var(--accent-rgb), .42); color: var(--text); }
+.ve-clip.audio { background: rgba(var(--accent-rgb), .28); color: var(--text); }
 .ve-clip.hidden { opacity: .4; }
-.ve-clip.sel { border-color: var(--accent); box-shadow: 0 0 0 1.5px var(--accent), 0 1px 2px rgba(0,0,0,.3); }
-.ve-clip .strip { position: absolute; inset: 0; background-repeat: repeat-x; background-position: left center; opacity: .85; }
-.ve-clip .wave { position: absolute; left: 0; right: 0; bottom: 0; height: 100%; background-repeat: no-repeat; background-size: 100% 100%; opacity: .7; mix-blend-mode: screen; }
-.ve-clip .lbl { position: absolute; left: 8px; top: 3px; right: 8px; font-size: 11px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-shadow: 0 1px 2px rgba(0,0,0,.7); }
-.ve-clip .h { position: absolute; top: 0; bottom: 0; width: 7px; cursor: ew-resize; opacity: 0; background: rgba(255,255,255,.35); }
+.ve-clip.sel { border-color: var(--text); box-shadow: 0 0 0 1.5px var(--text), 0 1px 2px rgba(0,0,0,.3); }
+.ve-clip .wave { position: absolute; inset: 0; background-repeat: no-repeat; opacity: .55; }
+.ve-clip .lbl { position: absolute; left: 8px; top: 3px; right: 8px; font-size: 11px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ve-clip .h { position: absolute; top: 0; bottom: 0; width: 7px; cursor: ew-resize; opacity: 0; background: rgba(255,255,255,.4); mix-blend-mode: overlay; }
 .ve-clip:hover .h, .ve-clip.sel .h { opacity: 1; }
 .ve-clip .h.l { left: 0; border-radius: 6px 0 0 6px; } .ve-clip .h.r { right: 0; border-radius: 0 6px 6px 0; }
-.ve-clip .fade { position: absolute; top: 0; bottom: 0; width: 0; border-top: 14px solid rgba(255,255,255,.25); pointer-events: none; }
+.ve-clip .fade { position: absolute; top: 0; bottom: 0; width: 0; border-top: 14px solid rgba(0,0,0,.22); pointer-events: none; }
 .ve-playhead { position: absolute; top: 0; bottom: 0; width: 0; border-left: 1.5px solid var(--danger); pointer-events: none; z-index: 4; }
 .ve-ruler .ph { position: absolute; top: 0; width: 0; height: 100%; border-left: 1.5px solid var(--danger); pointer-events: none; }
 .ve-ruler .ph::before { content: ""; position: absolute; left: -6px; top: 0; border: 6px solid transparent; border-top: 8px solid var(--danger); border-bottom: 0; }

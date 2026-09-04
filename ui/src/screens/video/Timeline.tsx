@@ -1,10 +1,10 @@
-// AYGENT — VIDEO v0.3 timeline. Multi-track, zoomable, snapping. Filmstrips and
-// waveforms come from the .cache thumbs the import built; drag body = move (with
+// AYGENT — VIDEO v0.3 timeline. Multi-track, zoomable, snapping. Clip bars are
+// flat accent blocks (audio shows its cached waveform); drag body = move (with
 // track change), drag edges = trim (source in/out follow, rate-aware), razor tool
 // or K splits, marquee-select on empty lane, drag an asset from Media to place.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Scissors, MousePointer2, Magnet, ZoomIn, ZoomOut, Trash2, Copy, AlignHorizontalSpaceAround, Eye, EyeOff, Volume2, VolumeX, Lock, Unlock, Undo2, Redo2 } from "lucide-react";
-import { useVideo, useVideoSel, set, get, seek, patchClips, beginGesture, splitAt, deleteSelected, duplicateSelected, closeGaps, addAssetToTimeline, undo, redo, canUndo, canRedo, mutate } from "./store";
+import { useVideo, useVideoSel, usePlayhead, set, get, seek, patchClips, beginGesture, splitAt, deleteSelected, duplicateSelected, closeGaps, addAssetToTimeline, undo, redo, canUndo, canRedo, mutate } from "./store";
 import { type Clip, TRACK_ORDER, TRACK_KIND, TRACK_LABEL, duration as durOf, fmtTime, mediaUrl, clipDur } from "./model";
 
 const LANE_H: Record<string, number> = { video: 56, text: 34, audio: 44 };
@@ -39,13 +39,6 @@ export function Timeline() {
     el.addEventListener("scroll", onScroll);
     return () => { ro.disconnect(); el.removeEventListener("scroll", onScroll); };
   }, []);
-
-  // keep playhead visible while playing
-  useEffect(() => {
-    const el = lanesRef.current; if (!el || !s.playing) return;
-    const x = playhead * zoom;
-    if (x < el.scrollLeft || x > el.scrollLeft + el.clientWidth - 40) el.scrollLeft = Math.max(0, x - 80);
-  }, [playhead, s.playing, zoom]);
 
   const snapPoints = useMemo(() => {
     const pts = new Set<number>([0, playhead]);
@@ -246,7 +239,7 @@ export function Timeline() {
       <div className="ve-ruler" ref={rulerRef} onMouseDown={onRulerDown}>
         <div style={{ position: "relative", width: contentW, height: "100%" }}>
           {ticks.map((k) => <div key={k.t} className={`tick ${k.major ? "" : "minor"}`} style={{ left: k.t * zoom }}>{k.major && <span>{fmtTime(k.t, fps).replace(/^00:/, "")}</span>}</div>)}
-          <div className="ph" style={{ left: playhead * zoom }} />
+          <RulerPlayhead zoom={zoom} />
         </div>
       </div>
 
@@ -272,12 +265,12 @@ export function Timeline() {
               const kind = TRACK_KIND(t);
               return (
                 <div key={t} data-track={t} className={`ve-lane ${kind} ${overLane === t ? "over" : ""}`} style={{ height: LANE_H[kind], opacity: locked[t] ? 0.6 : 1 }} onMouseDown={onLaneDown}>
-                  {comp.clips.filter((c) => c.track === t).map((c) => <ClipView key={c.id} clip={c} zoom={zoom} sel={selection.includes(c.id)} agentId={s.agentId} project={s.project} bust={s.cacheBust} onDown={onClipDown} laneH={LANE_H[kind]} />)}
+                  {comp.clips.filter((c) => c.track === t).map((c) => <ClipView key={c.id} clip={c} zoom={zoom} sel={selection.includes(c.id)} agentId={s.agentId} project={s.project} bust={s.cacheBust} onDown={onClipDown} />)}
                 </div>
               );
             })}
             <div style={{ height: 30 }} />
-            <div className="ve-playhead" style={{ left: playhead * zoom }} />
+            <LanePlayhead zoom={zoom} lanesRef={lanesRef} />
             {snapLine !== null && <div className="ve-snapline" style={{ left: snapLine * zoom }} />}
             {marquee && <div className="ve-marquee" style={{ left: Math.min(marquee.x0, marquee.x1), top: Math.min(marquee.y0, marquee.y1), width: Math.abs(marquee.x1 - marquee.x0), height: Math.abs(marquee.y1 - marquee.y0) }} />}
           </div>
@@ -287,26 +280,35 @@ export function Timeline() {
   );
 }
 
-function ClipView({ clip: c, zoom, sel, agentId, project, bust, onDown, laneH }: { clip: Clip; zoom: number; sel: boolean; agentId: string | null; project: string | null; bust: number; onDown: (e: React.MouseEvent, c: Clip, m: "move" | "l" | "r") => void; laneH: number }) {
+// Playhead lines subscribe to the narrow playhead channel so a 60 Hz transport
+// tick moves only these two nodes (+ auto-scroll), not the whole timeline.
+function RulerPlayhead({ zoom }: { zoom: number }) {
+  const playhead = usePlayhead();
+  return <div className="ph" style={{ left: playhead * zoom }} />;
+}
+function LanePlayhead({ zoom, lanesRef }: { zoom: number; lanesRef: React.RefObject<HTMLDivElement> }) {
+  const playhead = usePlayhead();
+  const playing = useVideoSel((st) => st.playing);
+  useEffect(() => {
+    const el = lanesRef.current; if (!el || !playing) return;
+    const x = playhead * zoom;
+    if (x < el.scrollLeft || x > el.scrollLeft + el.clientWidth - 40) el.scrollLeft = Math.max(0, x - 80);
+  }, [playhead, playing, zoom, lanesRef]);
+  return <div className="ve-playhead" style={{ left: playhead * zoom }} />;
+}
+
+function ClipView({ clip: c, zoom, sel, agentId, project, bust, onDown }: { clip: Clip; zoom: number; sel: boolean; agentId: string | null; project: string | null; bust: number; onDown: (e: React.MouseEvent, c: Clip, m: "move" | "l" | "r") => void }) {
   const asset = useVideoSel((st) => st.assets.find((a) => a.id === c.asset));
   const w = Math.max(4, clipDur(c) * zoom);
   const th = asset?.thumbs;
-  let strip: React.CSSProperties | undefined;
-  if (th && th.strip && agentId && project && c.type !== "audio") {
-    const fh = laneH - 10;
-    const framePx = (th.stripStep / c.speed) * zoom;               // px one filmstrip frame spans on the timeline
-    const bgW = th.stripFrames * framePx;                          // whole strip, stretched to timeline scale
-    const offset = -(c.in / th.stripStep) * framePx;               // shift so source `in` lands at the clip's left edge
-    strip = { backgroundImage: `url(${mediaUrl(agentId, project, "cache", th.strip, bust)})`, backgroundSize: `${bgW}px ${fh}px`, backgroundPosition: `${offset}px center`, backgroundRepeat: "no-repeat" };
-  }
   let wave: React.CSSProperties | undefined;
-  if (th && th.wave && agentId && project && asset && (c.type === "audio" || c.type === "video")) {
+  if (th && th.wave && agentId && project && asset && c.type === "audio") {
     const totalW = (asset.duration / c.speed) * zoom;
-    wave = { backgroundImage: `url(${mediaUrl(agentId, project, "cache", th.wave, bust)})`, backgroundSize: `${totalW}px 100%`, backgroundPosition: `${-(c.in / c.speed) * zoom}px 0`, height: c.type === "video" ? "40%" : "100%" };
+    wave = { backgroundImage: `url(${mediaUrl(agentId, project, "cache", th.wave, bust)})`, backgroundSize: `${totalW}px 100%`, backgroundPosition: `${-(c.in / c.speed) * zoom}px 0` };
   }
   return (
-    <div className={`ve-clip ${c.type} ${sel ? "sel" : ""} ${c.hidden ? "hidden" : ""}`} style={{ left: c.start * zoom, width: w }} onMouseDown={(e) => onDown(e, c, "move")} title={`${c.name || c.text?.content || c.asset}\n${fmtTime(c.start)} → ${fmtTime(c.end)}  ·  src ${c.in.toFixed(2)}–${c.out.toFixed(2)}${c.speed !== 1 ? ` · ${c.speed}×` : ""}`}>
-      {strip && <div className="strip" style={strip} />}
+    <div className={`ve-clip ${c.type} ${sel ? "sel" : ""} ${c.hidden ? "hidden" : ""}`} style={{ left: c.start * zoom, width: w }} onMouseDown={(e) => onDown(e, c, "move")} title={`${c.name || c.text?.content || c.asset}
+${fmtTime(c.start)} → ${fmtTime(c.end)}  ·  src ${c.in.toFixed(2)}–${c.out.toFixed(2)}${c.speed !== 1 ? ` · ${c.speed}×` : ""}`}>
       {wave && <div className="wave" style={wave} />}
       <div className="lbl">{c.muted ? "🔇 " : ""}{c.type === "text" ? c.text.content || "Title" : c.name || asset?.name || "clip"}{c.behindSubject ? " · behind" : ""}</div>
       {c.transitionIn.duration > 0 && <div className="fade" style={{ left: 0, borderRight: `${c.transitionIn.duration * zoom}px solid transparent` }} />}

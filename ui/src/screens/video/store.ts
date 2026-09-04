@@ -62,7 +62,20 @@ export function set(patch: Partial<State> | ((s: State) => Partial<State>)) {
   const p = typeof patch === "function" ? patch(state) : patch;
   state = { ...state, ...p };
   emit();
+  if ("playhead" in p) emitPh();
 }
+
+// ---- playhead channel ------------------------------------------------------
+// Playback advances the playhead ~60×/s. Waking every store subscriber at that
+// rate (timeline, inspector, dock…) is what made playback stutter, so the
+// transport tick publishes on this narrow channel instead; only the canvas,
+// timecode and playhead lines subscribe. Seeks/pauses still go through set()
+// so the rest of the UI catches up at interaction boundaries.
+const phListeners = new Set<() => void>();
+function emitPh() { phListeners.forEach((l) => l()); }
+function subscribePh(l: () => void) { phListeners.add(l); return () => { phListeners.delete(l); }; }
+export function usePlayhead(): number { return useSyncExternalStore(subscribePh, () => state.playhead); }
+export function tickPlayhead(t: number) { state = { ...state, playhead: t }; emitPh(); }
 
 // ---- undo/redo ------------------------------------------------------------
 const past: Composition[] = [];

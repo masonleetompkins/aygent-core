@@ -1,15 +1,26 @@
 // AYGENT — VIDEO v0.3 player. Real footage plays through the jailed
-// aygent-media:// scheme: one <video>/<audio> element per active clip, kept in
-// sync with the playhead (seek on scrub, play/pause on transport). Text clips
-// and captions are drawn live as DOM so the look updates as you type; the
-// exact ffmpeg composite (grade + LUT + ASS captions) is one click away via
-// "Render frame" and shows as an overlay badge.
-import { useEffect, useMemo, useRef, useState } from "react";
+// aygent-media:// scheme.
+//
+// Smooth, gapless playback design:
+//  · Media elements are PERSISTENT and double-buffered per asset: every clip is
+//    assigned a slot (≥2 <video>/<audio> per asset) so the next clip's element is
+//    already loaded and pre-seeked to its in-point while the current one plays.
+//    A cut is a visibility swap + play(), not a mount + load + seek (which was
+//    the black flash).
+//  · The active V1 video is the MASTER CLOCK while playing: the playhead is
+//    derived from its currentTime, so picture, sound and timecode can't drift.
+//    Other elements are only corrected when they drift > 250 ms (no seek-thrash).
+//  · The transport tick publishes on the store's narrow playhead channel
+//    (tickPlayhead/usePlayhead); only the stage, timecode and playhead lines
+//    re-render per frame — the timeline/inspector/dock stay idle.
+// Text clips and captions are drawn live as DOM; "Render frame" shows the exact
+// ffmpeg composite (grade + LUT + ASS captions) as an overlay badge.
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Play, Pause, SkipBack, SkipForward, ChevronLeft, ChevronRight, Repeat, Camera, Maximize2, Volume2, VolumeX, Proportions, X } from "lucide-react";
-import { useVideo, seek, togglePlay, stepFrames, set, get, renderFrame, mutate } from "./store";
+import { useVideo, usePlayhead, tickPlayhead, seek, togglePlay, stepFrames, set, get, renderFrame, mutate } from "./store";
 import { Num } from "./Panels";
 import { duration as durOf } from "./model";
-import { type Clip, TRACK_KIND, fmtTime, mediaUrl } from "./model";
+import { type Clip, type Composition, TRACK_KIND, fmtTime, mediaUrl } from "./model";
 
 const rank = (t: string) => (t.startsWith("V") ? Number(t.slice(1)) : t.startsWith("T") ? 100 + Number(t.slice(1)) : 50);
 
@@ -24,34 +35,24 @@ function useStageSize(ref: React.RefObject<HTMLDivElement>) {
   return sz;
 }
 
-function MediaLayer({ clip, agentId, project, playhead, playing, sceneW, sceneH, scale, muted, selected }: {
-  clip: Clip; agentId: string; project: string; playhead: number; playing: boolean; sceneW: number; sceneH: number; scale: number; muted: boolean; selected: boolean;
-}) {
-  const ref = useRef<HTMLVideoElement>(null);
-  const url = useMemo(() => mediaUrl(agentId, project, "asset", clip.asset), [agentId, project, clip.asset]);
-  const srcTime = clip.in + (playhead - clip.start) * clip.speed;
-  // sync: when paused or after a seek, set currentTime; when playing, keep drift < 80ms
-  useEffect(() => {
-    const v = ref.current; if (!v) return;
-    v.playbackRate = clip.speed;
-    v.muted = muted || clip.muted;
-    v.volume = Math.min(1, Math.pow(10, clip.volume / 20));
-    if (!playing) { v.pause(); if (Math.abs(v.currentTime - srcTime) > 0.04) v.currentTime = srcTime; return; }
-    if (Math.abs(v.currentTime - srcTime) > 0.12) v.currentTime = srcTime;
-    if (v.paused) void v.play().catch(() => {});
-  }, [playing, srcTime, clip.speed, clip.volume, clip.muted, muted]);
-  useEffect(() => () => { ref.current?.pause(); }, []);
-  const isImg = clip.type === "image";
-  const fit = clip.fit === "contain" ? "contain" : clip.fit === "none" ? "none" : "cover";
-  const style: React.CSSProperties = {
-    width: sceneW * scale, height: sceneH * scale, objectFit: fit as any,
-    transform: `translate(-50%,-50%) translate(${clip.transform.x * scale}px, ${clip.transform.y * scale}px) scale(${clip.transform.scale}) rotate(${clip.transform.rotation}deg)`,
-    opacity: clip.transform.opacity, filter: gradeFilter(clip.color),
-    outline: selected ? "1.5px solid var(--accent)" : undefined,
-  };
-  if (isImg) return <img className="layer" src={url} style={style} draggable={false} alt="" />;
-  if (clip.type === "audio") return <audio ref={ref as any} src={url} preload="auto" />;
-  return <video ref={ref} src={url} style={style} preload="auto" playsInline />;
+// ---- slot assignment --------------------------------------------------------
+// Greedy: clips sorted by start; each takes the slot of its asset that has been
+// free the longest (so sequential clips alternate A/B and the idle slot has the
+// whole previous clip's duration to pre-seek). Overlaps open a third slot.
+type Slot = { id: string; asset: string; kind: "video" | "audio" };
+function assignSlots(comp: Composition, assetKind: (id: string) => "video" | "audio" | "image" | undefined): { slots: Slot[]; slotOf: Map<string, string> } {
+  const slots: Slot[] = []; const slotOf = new Map<string, string>();
+  const lastEnd = new Map<string, number>();
+  const media = comp.clips.filter((c) => (c.type === "video" || c.type === "audio") && !c.hidden && c.asset).sort((a, b) => a.start - b.start);
+  for (const c of media) {
+    const k = assetKind(c.asset); if (!k || k === "image") continue;
+    const mine = slots.filter((s) => s.asset === c.asset);
+    let pick: Slot | undefined; let best = Infinity;
+    for (const s of mine) { const le = lastEnd.get(s.id) ?? -Infinity; if (le <= c.start + 1e-6 && le < best) { best = le; pick = s; } }
+    if (!pick || mine.length < 2) { pick = { id: `${c.asset}#${mine.length}`, asset: c.asset, kind: k === "audio" ? "audio" : "video" }; slots.push(pick); }
+    slotOf.set(c.id, pick.id); lastEnd.set(pick.id, c.end);
+  }
+  return { slots, slotOf };
 }
 
 function gradeFilter(g: Clip["color"]): string | undefined {
@@ -63,6 +64,148 @@ function gradeFilter(g: Clip["color"]): string | undefined {
   return f.length ? f.join(" ") : undefined;
 }
 
+// ---- stage (re-renders per frame via usePlayhead; small tree) ----------------
+function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: boolean }) {
+  const s = useVideo();
+  const playhead = usePlayhead();
+  const { comp, playing, agentId, project } = s;
+  const sceneW = comp.scene.width, sceneH = comp.scene.height;
+  const fps = comp.scene.fps || 30;
+  const assetKind = (id: string) => s.assets.find((a) => a.id === id)?.kind;
+  const { slots, slotOf } = useMemo(() => assignSlots(comp, assetKind), [comp.clips, s.assets]);
+  const els = useRef(new Map<string, HTMLMediaElement>());
+  const prepared = useRef(new Map<string, string>()); // slot → clip id pre-seeked
+
+  // per slot: the active clip, else the next upcoming clip (to pre-seek)
+  const assigned = useMemo(() => {
+    const m = new Map<string, Clip>();
+    const next = new Map<string, Clip>();
+    for (const c of comp.clips) {
+      const sid = slotOf.get(c.id); if (!sid) continue;
+      if (playhead >= c.start && playhead < c.end) m.set(sid, c);
+      else if (c.start >= playhead) { const n = next.get(sid); if (!n || c.start < n.start) next.set(sid, c); }
+    }
+    for (const [sid, c] of next) if (!m.has(sid)) m.set(sid, c);
+    return m;
+  }, [comp.clips, slotOf, playhead]);
+
+  const active = useMemo(() => comp.clips.filter((c) => !c.hidden && playhead >= c.start && playhead < c.end).sort((a, b) => rank(a.track) - rank(b.track)), [comp.clips, playhead]);
+  const masterClip = active.find((c) => c.type === "video" && TRACK_KIND(c.track) === "video" && slotOf.has(c.id));
+
+  // imperative sync after every render
+  useLayoutEffect(() => {
+    for (const slot of slots) {
+      const el = els.current.get(slot.id); if (!el) continue;
+      const c = assigned.get(slot.id);
+      if (!c) { if (!el.paused) el.pause(); continue; }
+      const isActive = playhead >= c.start && playhead < c.end;
+      const srcT = c.in + (playhead - c.start) * c.speed;
+      if (el.playbackRate !== c.speed) el.playbackRate = c.speed;
+      const wantMuted = muted || c.muted || !isActive;
+      if (el.muted !== wantMuted) el.muted = wantMuted;
+      const vol = Math.max(0, Math.min(1, Math.pow(10, c.volume / 20)));
+      if (Math.abs(el.volume - vol) > 0.005) el.volume = vol;
+      if (!isActive) {
+        // upcoming: park exactly on its in-point so the cut is instant
+        if (!el.paused) el.pause();
+        if (prepared.current.get(slot.id) !== c.id) { prepared.current.set(slot.id, c.id); if (Math.abs(el.currentTime - c.in) > 0.02) el.currentTime = c.in; }
+        continue;
+      }
+      prepared.current.set(slot.id, c.id);
+      if (!playing) {
+        if (!el.paused) el.pause();
+        if (!el.seeking && Math.abs(el.currentTime - srcT) > 0.5 / fps) el.currentTime = srcT; // scrub: frame-accurate
+        continue;
+      }
+      const isMaster = masterClip && masterClip.id === c.id;
+      if (!isMaster && !el.seeking && Math.abs(el.currentTime - srcT) > 0.25) el.currentTime = srcT; // followers: correct only on real drift
+      if (el.paused) void el.play().catch(() => {});
+    }
+  });
+  useEffect(() => () => { els.current.forEach((el) => el.pause()); }, []);
+
+  // transport clock — master = active V1 video element when it's actually advancing
+  const total = durOf(comp);
+  useEffect(() => {
+    if (!playing) return;
+    let raf = 0; let last = performance.now();
+    const tick = (now: number) => {
+      const dt = (now - last) / 1000; last = now;
+      const st = get(); if (!st.playing) return;
+      const wall = st.playhead + dt;
+      let t = wall;
+      const mc = st.comp.clips.find((c) => c.type === "video" && !c.hidden && TRACK_KIND(c.track) === "video" && st.playhead >= c.start && st.playhead < c.end && slotOf.has(c.id));
+      if (mc) {
+        const el = els.current.get(slotOf.get(mc.id)!);
+        if (el && !el.paused && el.readyState >= 2) {
+          const mt = mc.start + (el.currentTime - mc.in) / mc.speed;
+          if (Math.abs(mt - wall) < 0.5) t = mt; // trust the picture; fall back to wall clock if it stalls > 0.5s
+        }
+      }
+      if (t >= Math.max(total, 0.01)) { if (st.loop) seek(0); else { set({ playing: false }); seek(total); return; } }
+      else tickPlayhead(t);
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [playing, total, slotOf]);
+
+  const images = active.filter((c) => c.type === "image" && TRACK_KIND(c.track) !== "audio");
+  const texts = active.filter((c) => c.type === "text");
+  const caption = comp.captions.enabled ? s.captionLines.find((l) => playhead >= l.s && playhead < l.e) : undefined;
+  const showFrame = s.frame && Math.abs(s.frame.time - playhead) < 0.02;
+  const anyVisual = active.some((c) => c.type !== "audio" && TRACK_KIND(c.track) !== "audio");
+
+  const layerStyle = (c: Clip, visible: boolean): React.CSSProperties => ({
+    width: sceneW * scale, height: sceneH * scale, objectFit: (c.fit === "contain" ? "contain" : c.fit === "none" ? "none" : "cover") as any,
+    transform: `translate(-50%,-50%) translate(${c.transform.x * scale}px, ${c.transform.y * scale}px) scale(${c.transform.scale}) rotate(${c.transform.rotation}deg)`,
+    opacity: visible ? c.transform.opacity : 0, visibility: visible ? "visible" : "hidden", zIndex: rank(c.track), filter: gradeFilter(c.color),
+    outline: visible && s.selection.includes(c.id) ? "1.5px solid var(--accent)" : undefined,
+  });
+
+  return (
+    <div className="ve-canvas" style={{ width: sceneW * scale, height: sceneH * scale, background: comp.scene.background }} onClick={(e) => e.stopPropagation()}>
+      {agentId && project && slots.map((slot) => {
+        const c = assigned.get(slot.id);
+        const url = mediaUrl(agentId, project, "asset", slot.asset);
+        const visible = !!c && c.type === "video" && TRACK_KIND(c.track) !== "audio" && playhead >= c.start && playhead < c.end;
+        const setRef = (el: HTMLMediaElement | null) => { if (el) els.current.set(slot.id, el); else els.current.delete(slot.id); };
+        if (slot.kind === "audio") return <audio key={slot.id} ref={setRef} src={url} preload="auto" />;
+        return <video key={slot.id} ref={setRef} src={url} preload="auto" playsInline disablePictureInPicture style={c ? layerStyle(c, visible) : { visibility: "hidden" }} />;
+      })}
+      {agentId && project && images.map((c) => <img key={c.asset} className="layer" src={mediaUrl(agentId, project, "asset", c.asset)} style={layerStyle(c, true)} draggable={false} alt="" />)}
+      {texts.map((c) => (
+        <div key={c.id} className="txt" style={{
+          left: `${c.text.x * 100}%`, top: `${c.text.y * 100}%`, maxWidth: c.text.maxWidth > 0 ? `${c.text.maxWidth * 100}%` : undefined, zIndex: rank(c.track),
+          fontFamily: `"${c.text.font}", -apple-system, system-ui, sans-serif`, fontSize: c.text.size * scale, fontWeight: c.text.weight, color: c.text.color,
+          textAlign: c.text.align, textShadow: c.text.bg ? undefined : c.text.shadow ? `0 ${c.text.size * scale * 0.04}px ${c.text.size * scale * 0.12}px rgba(0,0,0,.6)` : undefined,
+          background: c.text.bg ? hexA(c.text.bg, c.text.bgOpacity) : undefined, padding: c.text.bg ? c.text.padding * scale : 0, borderRadius: c.text.bg ? 8 * scale : 0,
+          opacity: fadeAlpha(c, playhead), outline: s.selection.includes(c.id) ? "1.5px solid var(--accent)" : undefined,
+        }}>{c.text.content}</div>
+      ))}
+      {caption && (
+        <div className="cap" style={{ top: `${comp.captions.y * 100}%`, zIndex: 200, fontFamily: `"${comp.captions.font}", -apple-system, system-ui, sans-serif`, fontSize: comp.captions.size * scale, fontWeight: comp.captions.weight, color: comp.captions.color, textShadow: comp.captions.shadow ? `0 ${3 * scale}px ${16 * scale}px rgba(0,0,0,.65)` : undefined }}>
+          {caption.words.map((w, i) => {
+            const on = playhead >= w.s - 0.01;
+            const key = comp.captions.keyWords.some((k) => k.toLowerCase() === w.w.toLowerCase().replace(/[^\p{L}\p{N}']/gu, ""));
+            const pop = comp.captions.preset === "pop";
+            return <span key={i} className="w" style={{ opacity: pop ? (on ? 1 : 0) : 1, transform: pop ? (on ? "none" : "translateY(8px) scale(.86)") : undefined, transition: "opacity 120ms, transform 160ms cubic-bezier(.2,1.6,.4,1)", color: key || (comp.captions.preset === "karaoke" && on) ? comp.captions.keyColor : undefined, textShadow: key ? `0 0 ${20 * scale}px ${comp.captions.keyColor}` : undefined }}>{comp.captions.uppercase ? w.w.toUpperCase() : w.w}</span>;
+          })}
+        </div>
+      )}
+      {showFrame && s.frame && agentId && project && <img className="layer" src={mediaUrl(agentId, project, "cache", s.frame.path, s.frame.at)} style={{ width: "100%", height: "100%", objectFit: "contain", zIndex: 300 }} alt="" />}
+      {showFrame && <div className="frame-badge" style={{ zIndex: 301 }}>FFMPEG FRAME</div>}
+      {safe && <div className="safe" style={{ zIndex: 302 }} />}
+      {!anyVisual && !showFrame && <div className="empty">{comp.clips.length ? `nothing at ${fmtTime(playhead, fps)}` : "drop footage into the timeline"}</div>}
+    </div>
+  );
+}
+
+function Timecode({ total, fps }: { total: number; fps: number }) {
+  const playhead = usePlayhead();
+  return <span className="tc ve-mono">{fmtTime(playhead, fps)} <span className="dim">/ {fmtTime(total, fps)}</span></span>;
+}
+
 export function Player() {
   const s = useVideo();
   const stageRef = useRef<HTMLDivElement>(null);
@@ -70,71 +213,20 @@ export function Player() {
   const [muted, setMuted] = useState(false);
   const [safe, setSafe] = useState(false);
   const [sceneOpen, setSceneOpen] = useState(false);
-  const { comp, playhead, playing, agentId, project } = s;
+  const { comp, playing } = s;
   const total = durOf(comp);
   const sceneW = comp.scene.width, sceneH = comp.scene.height;
-  const fitScale = Math.min((size.w - 8) / sceneW, (size.h - 8) / sceneH, 1.6);
-  const scale = Math.max(0.05, fitScale);
-
-  // transport clock
-  const raf = useRef<number | null>(null);
-  useEffect(() => {
-    if (!playing) { if (raf.current) cancelAnimationFrame(raf.current); raf.current = null; return; }
-    let last = performance.now();
-    const tick = (t: number) => {
-      const dt = (t - last) / 1000; last = t;
-      const st = get();
-      const nxt = st.playhead + dt;
-      if (nxt >= Math.max(total, 0.01)) { if (st.loop) seek(0); else { set({ playing: false }); seek(total); return; } }
-      else set({ playhead: nxt });
-      raf.current = requestAnimationFrame(tick);
-    };
-    raf.current = requestAnimationFrame(tick);
-    return () => { if (raf.current) cancelAnimationFrame(raf.current); };
-  }, [playing, total]);
-
-  const active = useMemo(() => comp.clips.filter((c) => !c.hidden && playhead >= c.start && playhead < c.end).sort((a, b) => rank(a.track) - rank(b.track)), [comp.clips, playhead]);
-  const visual = active.filter((c) => TRACK_KIND(c.track) !== "audio" && c.type !== "audio");
-  const audioOnly = active.filter((c) => c.type === "audio" && !c.muted);
-  const caption = s.comp.captions.enabled ? s.captionLines.find((l) => playhead >= l.s && playhead < l.e) : undefined;
-  const showFrame = s.frame && Math.abs(s.frame.time - playhead) < 0.02;
+  const scale = Math.max(0.05, Math.min((size.w - 8) / sceneW, (size.h - 8) / sceneH, 1.6));
   const fps = comp.scene.fps || 30;
 
   return (
     <div className="ve-player">
       <div className="ve-stage" ref={stageRef} onClick={() => set({ selection: [] })}>
-        <div className="ve-canvas" style={{ width: sceneW * scale, height: sceneH * scale, background: comp.scene.background }} onClick={(e) => e.stopPropagation()}>
-          {agentId && project && visual.map((c) => c.type === "text" ? (
-            <div key={c.id} className="txt" style={{
-              left: `${c.text.x * 100}%`, top: `${c.text.y * 100}%`, maxWidth: c.text.maxWidth > 0 ? `${c.text.maxWidth * 100}%` : undefined,
-              fontFamily: `"${c.text.font}", -apple-system, system-ui, sans-serif`, fontSize: c.text.size * scale, fontWeight: c.text.weight, color: c.text.color,
-              textAlign: c.text.align, textShadow: c.text.bg ? undefined : c.text.shadow ? `0 ${c.text.size * scale * 0.04}px ${c.text.size * scale * 0.12}px rgba(0,0,0,.6)` : undefined,
-              background: c.text.bg ? hexA(c.text.bg, c.text.bgOpacity) : undefined, padding: c.text.bg ? c.text.padding * scale : 0, borderRadius: c.text.bg ? 8 * scale : 0,
-              opacity: fadeAlpha(c, playhead), outline: s.selection.includes(c.id) ? "1.5px solid var(--accent)" : undefined,
-            }}>{c.text.content}</div>
-          ) : (
-            <MediaLayer key={c.id} clip={c} agentId={agentId} project={project} playhead={playhead} playing={playing} sceneW={sceneW} sceneH={sceneH} scale={scale} muted={muted} selected={s.selection.includes(c.id)} />
-          ))}
-          {agentId && project && audioOnly.map((c) => <MediaLayer key={c.id} clip={c} agentId={agentId} project={project} playhead={playhead} playing={playing} sceneW={0} sceneH={0} scale={1} muted={muted} selected={false} />)}
-          {caption && (
-            <div className="cap" style={{ top: `${comp.captions.y * 100}%`, fontFamily: `"${comp.captions.font}", -apple-system, system-ui, sans-serif`, fontSize: comp.captions.size * scale, fontWeight: comp.captions.weight, color: comp.captions.color, textShadow: comp.captions.shadow ? `0 ${3 * scale}px ${16 * scale}px rgba(0,0,0,.65)` : undefined }}>
-              {caption.words.map((w, i) => {
-                const on = playhead >= w.s - 0.01;
-                const key = comp.captions.keyWords.some((k) => k.toLowerCase() === w.w.toLowerCase().replace(/[^\p{L}\p{N}']/gu, ""));
-                const pop = comp.captions.preset === "pop";
-                return <span key={i} className="w" style={{ opacity: pop ? (on ? 1 : 0) : 1, transform: pop ? (on ? "none" : "translateY(8px) scale(.86)") : undefined, transition: "opacity 120ms, transform 160ms cubic-bezier(.2,1.6,.4,1)", color: key || (comp.captions.preset === "karaoke" && on) ? comp.captions.keyColor : undefined, textShadow: key ? `0 0 ${20 * scale}px ${comp.captions.keyColor}` : undefined }}>{comp.captions.uppercase ? w.w.toUpperCase() : w.w}</span>;
-              })}
-            </div>
-          )}
-          {showFrame && s.frame && agentId && project && <img className="layer" src={mediaUrl(agentId, project, "cache", s.frame.path, s.frame.at)} style={{ width: "100%", height: "100%", objectFit: "contain" }} alt="" />}
-          {showFrame && <div className="frame-badge">FFMPEG FRAME</div>}
-          {safe && <div className="safe" />}
-          {visual.length === 0 && !showFrame && <div className="empty">{comp.clips.length ? `nothing at ${fmtTime(playhead, fps)}` : "drop footage into the timeline"}</div>}
-        </div>
+        <Stage scale={scale} muted={muted} safe={safe} />
         {s.toolProgress && <div className="ve-pill" style={{ position: "absolute", top: 20, left: "50%", transform: "translateX(-50%)", background: "var(--surface)" }}><span className="ve-spinner" />{s.toolProgress}</div>}
       </div>
       <div className="ve-transport">
-        <span className="tc ve-mono">{fmtTime(playhead, fps)} <span className="dim">/ {fmtTime(total, fps)}</span></span>
+        <Timecode total={total} fps={fps} />
         <span className="spacer" />
         <button className="ve-icon-btn" title="Start (Home)" onClick={() => seek(0)}><SkipBack size={16} /></button>
         <button className="ve-icon-btn" title="Back 1 frame (←)" onClick={() => stepFrames(-1)}><ChevronLeft size={16} /></button>
