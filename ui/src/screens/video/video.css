@@ -243,3 +243,15 @@
 .ve-welcome .recent button { text-align: left; padding: 8px 10px; border-radius: 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: 600; line-height: 1.3; }
 .ve-welcome .recent button:hover { background: rgba(var(--accent-rgb), .08); }
 .ve-welcome .recent span { color: var(--text-faint); font-weight: 500; font-size: 12px; }
+
+/* ---- sidebar overflow fixes: fields must shrink inside the 300px panel ---- */
+.ve-panel-body { overflow-x: clip; }
+.ve-row2 > *, .ve-row3 > * { min-width: 0; }
+.ve-field > * { min-width: 0; max-width: 100%; }
+.ve-panel-body input:not([type=checkbox]):not([type=color]):not([type=range]),
+.ve-panel-body select, .ve-panel-body textarea,
+.ve-insp input:not([type=checkbox]):not([type=color]):not([type=range]),
+.ve-insp select, .ve-insp textarea { width: 100%; min-width: 0; max-width: 100%; }
+.ve-panel-body select, .ve-insp select { text-overflow: ellipsis; overflow: hidden; }
+.ve-seg { display: flex; width: 100%; }
+.ve-seg button { flex: 1 1 0; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

@@ -128,9 +128,9 @@ export function GraphicsPanel() {
 
   const setG = (patch: Partial<Composition["graphics"]>) => mutate((c) => { Object.assign(c.graphics, patch); });
   const swatch = (label: string, key: "accent" | "accentInk" | "panel" | "ink" | "inkSoft" | "muted" | "positive" | "negative" | "amber", val: string) => (
-    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
       <input type="color" value={/^#[0-9a-fA-F]{6}$/.test(val) ? val : "#000000"} title={label} onChange={(e) => setG({ [key]: e.target.value } as any)} />
-      <input value={val} title={label} aria-label={label} onChange={(e) => setG({ [key]: e.target.value } as any)} style={{ flex: 1 }} />
+      <input value={val} title={label} aria-label={label} onChange={(e) => setG({ [key]: e.target.value } as any)} style={{ flex: "1 1 0", minWidth: 0 }} />
     </div>
   );
 
