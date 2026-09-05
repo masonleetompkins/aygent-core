@@ -26,7 +26,7 @@ use tauri::Emitter;
 
 use crate::broker::Broker;
 use crate::video::{self, Asset};
-use crate::video_render::{timeline_words, Clip as RClip, Composition, Transcript, Word};
+use crate::video_render::{timeline_words, CaptionLineEdit, Clip as RClip, Composition, Transcript, Word};
 
 const HYP_COMP: &str = include_str!("../templates/hyperframes/captions.html");
 
@@ -97,41 +97,96 @@ fn slug(s: &str) -> String {
 #[derive(Serialize, Deserialize, Clone)]
 struct CapLine { s: f64, e: f64, words: Vec<CapWord> }
 #[derive(Serialize, Deserialize, Clone)]
-struct CapWord { w: String, key: bool, t: f64, i: usize }
+struct CapWord { w: String, key: bool, t: f64, i: usize, s: f64, e: f64 }
 
 /// 4 words/line, ≤ 24 chars; sentence/pause breaks. Same grouping the old ASS
 /// path used — the look changed, the timing logic didn't.
-fn caption_lines(words: &[Word], key_words: &[String]) -> Vec<CapLine> {
+/// Auto-group timeline words into lines (max_words/line, char cap,
+/// sentence/pause breaks). Same grouping the old ASS path used.
+fn auto_groups(words: &[Word], max_words: usize) -> Vec<Vec<Word>> {
     let mut lines: Vec<Vec<Word>> = vec![];
     let mut cur: Vec<Word> = vec![];
     let mut chars = 0usize;
     for w in words {
         let gap = cur.last().map(|l| w.s - l.e).unwrap_or(0.0);
         let ends = cur.last().map(|l| l.w.ends_with(['.', '?', '!'])).unwrap_or(false);
-        if !cur.is_empty() && (cur.len() >= 4 || chars + w.w.len() + 1 > 24 || gap > 0.7 || ends) {
+        if !cur.is_empty() && (cur.len() >= max_words.max(1) || chars + w.w.len() + 1 > 24 || gap > 0.7 || ends) {
             lines.push(std::mem::take(&mut cur)); chars = 0;
         }
         chars += w.w.len() + 1;
         cur.push(w.clone());
     }
     if !cur.is_empty() { lines.push(cur); }
-    lines.iter().enumerate().map(|(idx, l)| {
+    lines
+}
+
+/// User-arranged sections (captions.lines, timeline time) partition the words:
+/// each section becomes exactly one line (words appear at once). Words outside
+/// every section fall back to auto-grouping in place.
+fn user_groups(words: &[Word], sections: &[CaptionLineEdit], max_words: usize) -> Vec<Vec<Word>> {
+    let mut secs = sections.to_vec();
+    secs.sort_by(|a, b| a.s.partial_cmp(&b.s).unwrap_or(std::cmp::Ordering::Equal));
+    let containing = |t: f64| secs.iter().position(|l| t >= l.s - 1e-6 && t <= l.e + 0.35);
+    let mut out: Vec<Vec<Word>> = vec![];
+    let mut cur: Vec<Word> = vec![];
+    let mut cur_li: Option<Option<usize>> = None; // None = cur empty
+    let mut chars = 0usize;
+    for w in words {
+        let li = containing(w.s);
+        let break_here = match cur_li {
+            None => false,
+            Some(prev) => {
+                if prev != li { true } else if li.is_none() {
+                    let gap = cur.last().map(|l| w.s - l.e).unwrap_or(0.0);
+                    let ends = cur.last().map(|l| l.w.ends_with(['.', '?', '!'])).unwrap_or(false);
+                    cur.len() >= max_words.max(1) || chars + w.w.len() + 1 > 24 || gap > 0.7 || ends
+                } else { false }
+            }
+        };
+        if break_here { out.push(std::mem::take(&mut cur)); chars = 0; }
+        chars += w.w.len() + 1;
+        cur.push(w.clone());
+        cur_li = Some(li);
+    }
+    if !cur.is_empty() { out.push(cur); }
+    out
+}
+
+/// Groups become render lines: end-clamp (no co-showing), word stagger,
+/// keyword flags. Words keep their absolute timeline times (s/e) for the UI.
+fn groups_to_lines(groups: Vec<Vec<Word>>, key_words: &[String]) -> Vec<CapLine> {
+    groups.iter().enumerate().map(|(idx, l)| {
         let s = l[0].s;
         let raw_e = l.last().map(|x| x.e).unwrap_or(s) + 0.6;
         // Consecutive captions share one screen slot: an end past the next
         // start co-shows two lines. Clamp to the next start (the floor keeps
         // the 0.5s word stagger readable on dense lines).
-        let next_s = lines.get(idx + 1).map(|n| n[0].s).unwrap_or(f64::INFINITY);
+        let next_s = groups.get(idx + 1).map(|n| n[0].s).unwrap_or(f64::INFINITY);
         let e = raw_e.min(next_s - 0.04).max(s + 0.35);
         let stagger = if l.len() > 1 { 0.5 / (l.len() - 1) as f64 } else { 0.0 };
         CapLine {
             s, e,
             words: l.iter().enumerate().map(|(i, w)| {
                 let clean: String = w.w.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
-                CapWord { w: w.w.clone(), key: key_words.iter().any(|k| k == &clean), t: (i as f64 * stagger * 1000.0).round() / 1000.0, i }
+                CapWord { w: w.w.clone(), key: key_words.iter().any(|k| k == &clean), t: (i as f64 * stagger * 1000.0).round() / 1000.0, i, s: w.s, e: w.e }
             }).collect(),
         }
     }).collect()
+}
+
+/// Resolve the caption lines for a build or preview: user sections win
+/// (composition.captions.lines from the Captions panel), else auto-group.
+fn resolve_lines(comp: &Composition, tr: &Transcript, key_words: &[String]) -> Vec<CapLine> {
+    let words = timeline_words(comp, tr);
+    if words.is_empty() { return vec![]; }
+    let mw = comp.graphics.caption_max_words;
+    let max_words = if mw == 0 { 3 } else { mw.clamp(1, 8) as usize };
+    let groups = if comp.captions.lines.is_empty() {
+        auto_groups(&words, max_words)
+    } else {
+        user_groups(&words, &comp.captions.lines, max_words)
+    };
+    groups_to_lines(groups, key_words)
 }
 /// Style block the agent reads before authoring: structured brand fields first
 /// (stock Bright HUD unless the panel says otherwise), then free-text notes.
@@ -221,7 +276,7 @@ pub fn build_captions(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, p
 
     let words = timeline_words(&comp, &tr);
     if words.is_empty() { return Err("no transcript words land on the timeline — check the A-roll selects cover the transcribed asset".into()); }
-    let lines = caption_lines(&words, &key_words);
+    let lines = resolve_lines(&comp, &tr, &key_words);
     let dur = comp.duration().max(lines.last().map(|l| l.e).unwrap_or(0.0) + 0.5);
     let (w, h) = (comp.scene.width.max(16) & !1, comp.scene.height.max(16) & !1);
     let fps = if comp.scene.fps > 0.0 { comp.scene.fps } else { 30.0 };
@@ -517,10 +572,9 @@ pub fn caption_timing(broker: &Broker, agent_id: &str, project: &str, comp: &Com
     let proj = video::project_dir(broker, agent_id, project)?;
     let Some(mut tr) = load_transcript(&proj) else { return Ok(json!({ "lines": [] })) };
     if tr.asset.is_empty() { if let Some(c) = comp.clips.iter().find(|c| c.track == "V1" && c.kind == "video") { tr.asset = c.asset.clone(); } }
-    let words = timeline_words(comp, &tr);
-    let lines = caption_lines(&words, &comp.captions.key_words);
-    let out: Vec<Value> = lines.iter().map(|l| json!({ "s": l.s, "e": l.e, "words": l.words.iter().map(|w| json!({ "w": w.w, "s": l.s, "e": l.e })).collect::<Vec<_>>() })).collect();
-    Ok(json!({ "lines": out }))
+    let lines = resolve_lines(comp, &tr, &comp.captions.key_words);
+    let out: Vec<Value> = lines.iter().map(|l| json!({ "s": l.s, "e": l.e, "words": l.words.iter().map(|w| json!({ "w": w.w, "s": w.s, "e": w.e })).collect::<Vec<_>>() })).collect();
+    Ok(json!({ "lines": out, "custom": !comp.captions.lines.is_empty() }))
 }
 
 #[tauri::command]
@@ -531,6 +585,52 @@ pub async fn video_caption_timing(broker: tauri::State<'_, Arc<Broker>>, agent_i
         let comp = crate::video_render::parse_composition(&composition, &assets)?;
         caption_timing(&broker, &agent_id, &project, &comp)
     }).await.map_err(|e| format!("caption timing task: {e}"))?
+}
+
+/// Save an edited transcript (from the Captions panel editor): validates +
+/// renormalizes (sort, clamp, rebuild text/segments from the words — one source
+/// of truth). Takes + auto-cut read these words; caption builds map them
+/// through the A-roll cuts and respect the user's arranged sections.
+#[tauri::command]
+pub fn video_save_transcript(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String, transcript: Value) -> Result<Value, String> {
+    let proj = video::project_dir(&broker, &agent_id, &project)?;
+    let raw = video::read_json(&broker, &agent_id, &video::rel(&project, "transcript.json"));
+    let mut tr: Transcript = raw.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    let asset = transcript.get("asset").and_then(|v| v.as_str()).unwrap_or("");
+    if !asset.is_empty() { tr.asset = asset.to_string(); }
+    let lang = transcript.get("language").and_then(|v| v.as_str()).unwrap_or("");
+    if !lang.is_empty() { tr.language = lang.to_string(); }
+    let mut words: Vec<Word> = transcript.get("words").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|w| {
+        let t = w.get("w").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+        if t.is_empty() { return None; }
+        let (mut s, mut e) = (w.get("s").and_then(|x| x.as_f64()).unwrap_or(0.0), w.get("e").and_then(|x| x.as_f64()).unwrap_or(0.0));
+        if !(s.is_finite() && e.is_finite()) { return None; }
+        s = s.max(0.0);
+        if e <= s { e = s + 0.12; }
+        Some(Word { w: t, s: (s * 1000.0).round() / 1000.0, e: (e * 1000.0).round() / 1000.0 })
+    }).collect()).unwrap_or_default();
+    if words.is_empty() { return Err("transcript needs at least one word".into()); }
+    words.sort_by(|a, b| a.s.partial_cmp(&b.s).unwrap_or(std::cmp::Ordering::Equal));
+    tr.words = words;
+    tr.text = tr.words.iter().map(|w| w.w.as_str()).collect::<Vec<_>>().join(" ");
+    tr.segments = sentences_from_words(&tr.words);
+    video::write_json(&broker, &agent_id, &video::rel(&project, "transcript.json"), &serde_json::to_value(&tr).map_err(|e| e.to_string())?)?;
+    let _ = proj;
+    Ok(json!({ "ok": true, "words": tr.words.len(), "segments": tr.segments.len() }))
+}
+
+fn sentences_from_words(words: &[Word]) -> Vec<crate::video_render::Segment> {
+    let mut out: Vec<crate::video_render::Segment> = vec![];
+    let mut cur: Vec<&Word> = vec![];
+    for w in words {
+        cur.push(w);
+        if w.w.ends_with(['.', '?', '!']) || cur.len() >= 18 {
+            out.push(crate::video_render::Segment { text: cur.iter().map(|x| x.w.as_str()).collect::<Vec<_>>().join(" "), s: cur[0].s, e: w.e });
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() { out.push(crate::video_render::Segment { text: cur.iter().map(|x| x.w.as_str()).collect::<Vec<_>>().join(" "), s: cur[0].s, e: cur.last().unwrap().e }); }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -546,7 +646,7 @@ pub fn tool_schemas() -> Vec<Value> {
     ]
 }
 
-pub const HYPERFRAMES_INSTRUCTIONS: &str = "\n\nHYPERFRAMES GRAPHICS + CAPTIONS: every graphic and caption is a transparent Hyperframes overlay clip (captions on T1, graphics on V3), composited by ffmpeg on export — there is no ASS/drawtext caption path.\n- Read composition.graphics (instructions + styleGuide) BEFORE authoring anything and match that style.\n- Captions: video_build_captions {project, keyWords} builds the whole T1 overlay from the transcript. Transcribe first if needed.\n- Graphics: video_render_overlay {project, name, start, end, comp_html, behindSubject?} renders ONE overlay per call. comp_html is a COMPLETE Hyperframes composition: #stage with data-composition-id/data-width/data-height, class=\"clip\" elements with data-start/data-duration/data-track-index, a paused GSAP timeline on window.__timelines.<id> (or CSS/WAAPI seekable animation). Keep it deterministic (no Date.now/random/network). The overlay is transparent — no opaque backgrounds unless the design calls for a panel.\n\nGRAPHICS PROTOCOL (mandatory): when asked for graphics, titles, callouts or overlays, FIRST reply with a PLAN and NO tool calls that build: a numbered list, one line per graphic — timecode range, the on-screen text (exact wording), style/placement, and why it helps. End with \"Approve, or give revision notes.\" Only after the user approves (\"approve\", \"go\", \"yes\", \"do it\") do you build — ONE overlay tool call PER graphic, in timeline order, so each one appears on the timeline as it lands. Revision notes → revise the plan and ask again. Never batch overlays into one call and never skip the plan.";
+pub const HYPERFRAMES_INSTRUCTIONS: &str = "\n\nHYPERFRAMES GRAPHICS + CAPTIONS: every graphic and caption is a transparent Hyperframes overlay clip (captions on T1, graphics on V3), composited by ffmpeg on export — there is no ASS/drawtext caption path.\n- Read composition.graphics (instructions + styleGuide) BEFORE authoring anything and match that style.\n- Captions: video_build_captions {project, keyWords} builds the whole T1 overlay from the transcript. Transcribe first if needed. The user may arrange caption sections in the Captions panel (composition.captions.lines) — the build respects them; never clear or rewrite captions.lines yourself.\n- Graphics: video_render_overlay {project, name, start, end, comp_html, behindSubject?} renders ONE overlay per call. comp_html is a COMPLETE Hyperframes composition: #stage with data-composition-id/data-width/data-height, class=\"clip\" elements with data-start/data-duration/data-track-index, a paused GSAP timeline on window.__timelines.<id> (or CSS/WAAPI seekable animation). Keep it deterministic (no Date.now/random/network). The overlay is transparent — no opaque backgrounds unless the design calls for a panel.\n\nGRAPHICS PROTOCOL (mandatory): when asked for graphics, titles, callouts or overlays, FIRST reply with a PLAN and NO tool calls that build: a numbered list, one line per graphic — timecode range, the on-screen text (exact wording), style/placement, and why it helps. End with \"Approve, or give revision notes.\" Only after the user approves (\"approve\", \"go\", \"yes\", \"do it\") do you build — ONE overlay tool call PER graphic, in timeline order, so each one appears on the timeline as it lands. Revision notes → revise the plan and ask again. Never batch overlays into one call and never skip the plan.";
 
 pub fn is_hyperframes_tool(name: &str) -> bool { name == "video_build_captions" || name == "video_render_overlay" }
 

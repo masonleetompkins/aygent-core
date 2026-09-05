@@ -51,8 +51,11 @@ export function stockBrightHud(): GraphicsStyle {
 export function eli5DarkPack(): GraphicsStyle {
   return { ...stockBrightHud(), theme: "eli5-dark", accent: "#00e6ff", accentInk: "#00b8d9", panel: "#0a0e15", ink: "#f2f8fb", inkSoft: "#eaf2f7", muted: "#7f93a3", headlineWeight: 900, ease: "power3.out", placement: "upper-third" };
 }
+export type CaptionWordEdit = { w: string; s: number; e: number };
+export type CaptionLineEdit = { s: number; e: number; words: CaptionWordEdit[] };
 export type Captions = {
   enabled: boolean; sourceAsset: string; keyWords: string[]; y: number;
+  lines: CaptionLineEdit[]; // user-edited sections (timeline time; empty = auto-group)
 };
 export type Duck = { enabled: boolean; musicDb: number; duckedDb: number; attack: number; release: number };
 export type AudioMix = { duck: Duck; enhance: string; masterDb: number; loudnorm: boolean };
@@ -101,7 +104,7 @@ export function blankComposition(): Composition {
     scene: { width: 1920, height: 1080, fps: 30, background: "#000000" },
     clips: [],
     graphics: stockBrightHud(),
-    captions: { enabled: false, sourceAsset: "", keyWords: [], y: 0.78 },
+    captions: { enabled: false, sourceAsset: "", keyWords: [], y: 0.78, lines: [] },
     audio: { duck: { enabled: true, musicDb: -18, duckedDb: -30, attack: 0.02, release: 0.4 }, enhance: "auphonic", masterDb: 0, loudnorm: false },
     color: { ...defaultGrade(), sCurve: 0.35 },
     adjustmentLayer: true,

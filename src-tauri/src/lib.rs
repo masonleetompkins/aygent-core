@@ -6029,7 +6029,7 @@ pub fn run() {
             video::video_refresh_thumbs, video::video_list_luts, video::video_pick_lut, video::video_reveal,
             video_render::video_render, video_render::video_render_cancel, video_render::video_frame,
             video_render::video_validate, video_render::video_list_renders,
-            video_hyperframes::video_build_captions, video_hyperframes::video_render_overlay_cmd, video_hyperframes::video_pick_style_guide, video_hyperframes::video_caption_timing,
+            video_hyperframes::video_build_captions, video_hyperframes::video_render_overlay_cmd, video_hyperframes::video_pick_style_guide, video_hyperframes::video_caption_timing, video_hyperframes::video_save_transcript,
             video_tools::video_tool, video_tools::video_set_auphonic,
             dashboard::dashboard_load, dashboard::dashboard_upsert_module,
             dashboard::dashboard_remove_module, dashboard::dashboard_arrange,

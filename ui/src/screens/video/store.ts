@@ -256,6 +256,17 @@ export async function refreshCaptionLines() {
   if (state.captionLines.length) set({ captionLines: [] });
 }
 
+/** Persist an edited transcript (words with per-word timecodes) to transcript.json. */
+export async function saveTranscript(tx: { asset?: string; language?: string; words: { w: string; s: number; e: number }[] }): Promise<boolean> {
+  const { agentId, project } = state; if (!agentId || !project) { toast("open a project first"); return false; }
+  try {
+    const r = await invoke<{ words: number; segments: number }>("video_save_transcript", { agentId, project, transcript: tx });
+    toast(`transcript saved — ${r.words} words`, "ok");
+    await reload();
+    return true;
+  } catch (e) { toast(String(e), "err"); return false; }
+}
+
 /** Run a video_* tool from the UI (same core as the agent). */
 export async function runTool<T = any>(name: string, input: Record<string, unknown>, label?: string): Promise<T | null> {
   const { agentId, project } = state; if (!agentId || !project) { toast("open a project first"); return null; }

@@ -8,6 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Upload, Plus, X, Wand2, FolderOpen, Download, Square, Sparkles, Music, Film, Image as ImageIcon, Mic2, RefreshCw, Link2, Layers, Unplug, FileText } from "lucide-react";
 import { useVideo, mutate, importPick, removeAsset, relinkAsset, reload, addAssetToTimeline, runTool, pickLut, startRender, cancelRender, reveal, toast, set, refreshRenders, refreshThumbs } from "./store";
 import { type Asset, type Composition, fmtDur, fmtBytes, mediaUrl, stockBrightHud, eli5DarkPack } from "./model";
+import { TranscriptEditor } from "./TranscriptEditor";
 
 // ---- small field kit ------------------------------------------------------
 export function Field({ label, val, children }: { label: string; val?: string | number; children: React.ReactNode }) {
@@ -235,8 +236,8 @@ export function CaptionsPanel() {
         <Section title="Transcript" right={hasTx ? <span className="ve-pill ok">{s.transcript!.words.length} words</span> : <span className="ve-pill">none</span>}>
           <button className="ve-btn primary" disabled={!s.assets.some((a) => a.hasAudio) || building} onClick={() => void runTool("video_transcribe", {}, "transcribing…")}><Mic2 size={13} /> {hasTx ? "Re-transcribe A-roll" : "Transcribe A-roll"}</button>
           {!s.status?.whisper && <p className="ve-hint" style={{ color: "var(--warn)" }}>Needs an OpenAI key (Settings) — Whisper word timestamps.</p>}
-          {hasTx && <p className="ve-hint" style={{ maxHeight: 90, overflow: "auto", userSelect: "text" }}>{s.transcript!.text}</p>}
         </Section>
+        {hasTx && <TranscriptEditor />}
         <Section title="Build">
           <Field label="Key words (highlighted)"><input value={kw} placeholder="agent, AYGENT, free" onChange={(e) => setKw(e.target.value)} onBlur={() => setPath("captions.keyWords", kw.split(",").map((x) => x.trim()).filter(Boolean))} /></Field>
           <Slider label="Vertical position" value={cap.y} min={0.05} max={0.95} fmt={(v) => `${Math.round(v * 100)}%`} onChange={(v) => setPath("captions.y", v)} />

@@ -184,6 +184,15 @@ pub fn eli5_dark_pack() -> GraphicsStyle {
     }
 }
 
+/// One user-edited caption line (timeline time): each word carries its own
+/// timecode + editable text. Empty `lines` = auto-group from the transcript.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CaptionWordEdit { pub w: String, pub s: f64, pub e: f64 }
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CaptionLineEdit { pub s: f64, pub e: f64, pub words: Vec<CaptionWordEdit> }
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Captions {
@@ -191,9 +200,10 @@ pub struct Captions {
     pub source_asset: String,      // transcript's asset id ("" = first a-roll)
     pub key_words: Vec<String>,    // words to highlight (case-insensitive)
     pub y: f64,                    // 0..1 center from top (passed to the Hyperframes build)
+    pub lines: Vec<CaptionLineEdit>, // user-edited caption sections (timeline time; empty = auto)
 }
 impl Default for Captions {
-    fn default() -> Self { Self { enabled: false, source_asset: String::new(), key_words: vec![], y: 0.78 } }
+    fn default() -> Self { Self { enabled: false, source_asset: String::new(), key_words: vec![], y: 0.78, lines: vec![] } }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
