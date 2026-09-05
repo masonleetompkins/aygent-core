@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 /// Current schema version. Bump when adding a migration step below.
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// The DB file name under <app_data>.
 pub const DB_FILE: &str = "aygent.db";
@@ -282,6 +282,18 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         v = 14;
     }
 
+    if v < 15 {
+        // MODEL VARIANT (Mason 09-05): per-agent reasoning knob for Spark-style
+        // models (Muse Spark: minimal|low|medium|high|xhigh|max). The model id
+        // stays the selector; the variant rides as the per-request reasoning
+        // effort. Empty = provider default. ALTER ADD so existing rows keep it.
+        conn.execute_batch(
+            "ALTER TABLE agent ADD COLUMN model_variant TEXT NOT NULL DEFAULT '';"
+        ).map_err(|e| format!("migrate v15 (model_variant): {e}"))?;
+        set_version(conn, 15)?;
+        v = 15;
+    }
+
     debug_assert_eq!(v, SCHEMA_VERSION, "migrate() must end at SCHEMA_VERSION — add the missing step or bump the constant");
     let _ = v;
     Ok(())
@@ -306,6 +318,7 @@ CREATE TABLE IF NOT EXISTS agent (
   folder_path   TEXT NOT NULL DEFAULT '',
   model         TEXT NOT NULL DEFAULT '',
   provider      TEXT NOT NULL DEFAULT '',
+  model_variant TEXT NOT NULL DEFAULT '',  -- reasoning knob (Muse/OpenAI effort); '' = provider default
   context_mode  TEXT NOT NULL DEFAULT 'isolated',  -- 'isolated' | 'shared:<poolId>'
   system_prompt TEXT NOT NULL DEFAULT '',
   created_at    INTEGER NOT NULL DEFAULT 0,

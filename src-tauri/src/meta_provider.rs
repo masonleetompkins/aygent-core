@@ -271,7 +271,7 @@ pub async fn complete(api_key: &str, model: &str, user_msg: &str) -> Result<Stri
     let no_tools = json!([]);
     let mut text = String::new();
     let (assistant, _stop) = meta_stream_turn(
-        api_key, model, "", &messages, &no_tools, None,
+        api_key, model, None, "", &messages, &no_tools, None,
         |ev| { if let StreamEvent::TextDelta { text: t } = &ev { text.push_str(t); } },
     ).await?;
     if !text.trim().is_empty() { return Ok(text); }
@@ -292,6 +292,7 @@ pub async fn complete(api_key: &str, model: &str, user_msg: &str) -> Result<Stri
 pub async fn meta_stream_turn<F: FnMut(StreamEvent)>(
     api_key: &str,
     model: &str,
+    variant: Option<&str>,
     system: &str,
     messages: &serde_json::Value,
     tools: &serde_json::Value,
@@ -305,6 +306,14 @@ pub async fn meta_stream_turn<F: FnMut(StreamEvent)>(
         "max_output_tokens": 32000,
         "stream": true,
     });
+    // MODEL VARIANT (Mason 09-05): per-agent reasoning knob for Spark models
+    // (minimal|low|medium|high|xhigh|max). Same model id, more/less thinking.
+    // "" / absent / unknown = provider default (omit the field entirely).
+    if let Some(v) = variant.map(str::trim).filter(|v| !v.is_empty()) {
+        if ["minimal", "low", "medium", "high", "xhigh", "max"].contains(&v) {
+            body["reasoning"] = json!({ "effort": v });
+        }
+    }
     if !tools_json.as_array().map(|a| a.is_empty()).unwrap_or(true) {
         body["tools"] = tools_json;
         body["tool_choice"] = json!("auto");

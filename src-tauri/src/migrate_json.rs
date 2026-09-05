@@ -73,6 +73,7 @@ struct LegacyAgent {
     #[serde(default)] folder_path: String,
     #[serde(default)] model: String,
     #[serde(default)] provider: String,
+    #[serde(default)] model_variant: String,
     #[serde(default)] context_mode: String,
     #[serde(default)] system_prompt: String,
     #[serde(default)] created_at: i64,
@@ -122,17 +123,17 @@ pub fn run(db: &Db, app_data: &Path) -> Result<(), String> {
         }
         let a_id = a.id.clone();
         let (name, icon, color) = (a.name.clone(), a.icon.clone(), a.color.clone());
-        let (fp, model, provider) = (a.folder_path.clone(), a.model.clone(), a.provider.clone());
+        let (fp, model, provider, mv) = (a.folder_path.clone(), a.model.clone(), a.provider.clone(), a.model_variant.clone());
         let (cm, sp) = (a.context_mode.clone(), a.system_prompt.clone());
         let (ca, ua, arch) = (a.created_at, a.updated_at, a.archived);
         db.write(move |c| {
             c.execute(
-                "INSERT OR IGNORE INTO agent (id,name,icon,color,folder_path,model,provider,context_mode,system_prompt,created_at,updated_at,archived)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                "INSERT OR IGNORE INTO agent (id,name,icon,color,folder_path,model,provider,model_variant,context_mode,system_prompt,created_at,updated_at,archived)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                 params![a_id, name,
                     if icon.is_empty() { "🤖".to_string() } else { icon },
                     if color.is_empty() { "#5b8cff".to_string() } else { color },
-                    fp, model, provider,
+                    fp, model, provider, mv,
                     if cm.is_empty() { "isolated".to_string() } else { cm },
                     sp, ca, ua, arch as i64],
             ).map_err(|e| format!("import agent: {e}"))?;

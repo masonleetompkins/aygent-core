@@ -302,7 +302,7 @@ pub async fn complete(provider: &str, api_key: &str, model: &str, user_msg: &str
     let no_tools = json!([]);
     let mut text = String::new();
     let (assistant, _stop) = openai_stream_turn(
-        provider, api_key, model, "", &messages, &no_tools, None,
+        provider, api_key, model, None, "", &messages, &no_tools, None,
         |ev| {
             if let StreamEvent::TextDelta { text: t } = &ev { text.push_str(t); }
         },
@@ -316,6 +316,7 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
     provider: &str,
     api_key: &str,
     model: &str,
+    variant: Option<&str>,
     system: &str,
     messages: &serde_json::Value,
     tools: &serde_json::Value,
@@ -347,6 +348,15 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
         // survives while tools still work (fixes GPT-5.6 Sol "reply but no screenshot").
         let built = build_openai_messages(system, messages);
         body["reasoning_effort"] = if messages_have_image(&built) { json!("low") } else { json!("none") };
+    }
+    // MODEL VARIANT (Mason 09-05): an explicit per-agent reasoning effort wins
+    // over the auto none/low above. Sent on OpenAI proper AND OpenRouter
+    // (passthrough) — if the upstream model rejects the value, its 400 surfaces
+    // honestly instead of silently running at the wrong effort.
+    if let Some(v) = variant.map(str::trim).filter(|v| !v.is_empty()) {
+        if ["minimal", "low", "medium", "high", "xhigh", "max"].contains(&v) {
+            body["reasoning_effort"] = json!(v);
+        }
     }
 
     // No-redirect client (see list_models): keeps the bearer token attached so

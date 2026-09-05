@@ -1532,15 +1532,16 @@ fn set_selected_model(db: tauri::State<writer::Db>, folder: String, model: Strin
 fn get_selection(db: tauri::State<writer::Db>, folder: String) -> Result<serde_json::Value, String> {
     let agent_id = agent_for_folder(&db, &folder)?;
     let a = repo::get_agent(&db, &agent_id)?.ok_or("agent not found")?;
-    Ok(serde_json::json!({ "provider": a.provider, "model": a.model }))
+    Ok(serde_json::json!({ "provider": a.provider, "model": a.model, "model_variant": a.model_variant }))
 }
 
 #[tauri::command]
-fn set_selection(db: tauri::State<writer::Db>, folder: String, provider: String, model: String) -> Result<(), String> {
+fn set_selection(db: tauri::State<writer::Db>, folder: String, provider: String, model: String, model_variant: Option<String>) -> Result<(), String> {
     let agent_id = agent_for_folder(&db, &folder)?;
     let mut a = repo::get_agent(&db, &agent_id)?.ok_or("agent not found")?;
     a.provider = provider;
     a.model = model;
+    if let Some(v) = model_variant { a.model_variant = v; }
     repo::update_agent(&db, a)
 }
 
@@ -1786,6 +1787,7 @@ fn agents_create(
     folder_path: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    model_variant: Option<String>,
     context_mode: Option<String>,
     system_prompt: Option<String>,
 ) -> Result<repo::AgentProfile, String> {
@@ -1796,6 +1798,7 @@ fn agents_create(
         &folder_path.unwrap_or_default(),
         &model.unwrap_or_default(),
         &provider.unwrap_or_default(),
+        &model_variant.unwrap_or_default(),
         &context_mode.unwrap_or_default(),
         &system_prompt.unwrap_or_default(),
     )?;
@@ -3054,7 +3057,7 @@ async fn agent_run(
         // Dispatch the turn to the agent's actual provider (Muse etc.), not always Anthropic.
         let resp: serde_json::Value = match provider {
             "openai" | "openrouter" => {
-                let (assistant, _stop) = openai_provider::openai_stream_turn(&provider.to_string(), &key, &model, &turn_system, &messages, &tools, None, |_| {}).await?;
+                let (assistant, _stop) = openai_provider::openai_stream_turn(&provider.to_string(), &key, &model, None, &turn_system, &messages, &tools, None, |_| {}).await?;
                 // Convert OpenAI assistant (tool_calls) -> Anthropic-like content for the loop below.
                 // For the browser loop we only need content as Anthropic blocks; synthesize them.
                 let mut blocks: Vec<serde_json::Value> = Vec::new();
@@ -3075,7 +3078,7 @@ async fn agent_run(
                 serde_json::json!({"content": blocks, "stop_reason": stop})
             },
             "meta" => {
-                let (assistant, _stop) = meta_provider::meta_stream_turn(&key, &model, &turn_system, &messages, &tools, None, |_| {}).await?;
+                let (assistant, _stop) = meta_provider::meta_stream_turn(&key, &model, None, &turn_system, &messages, &tools, None, |_| {}).await?;
                 let mut blocks: Vec<serde_json::Value> = Vec::new();
                 if let Some(txt) = assistant.get("content").and_then(|c| c.as_str()) {
                     if !txt.is_empty() { blocks.push(serde_json::json!({"type":"text","text": txt})); }
@@ -4845,6 +4848,12 @@ async fn agent_stream(
             .map_err(|_| format!("no {provider_kind} key set — add one in Settings"))?;
         let model = model.filter(|m| !m.trim().is_empty())
             .ok_or_else(|| format!("no {provider_kind} model selected — pick one in Settings"))?;
+        // MODEL VARIANT: the agent's reasoning knob (Muse Spark effort etc.).
+        // Resolved from the profile so every caller (chat, video dock) gets it
+        // without changing the turn args. Soul/compact/planner use complete()
+        // (default effort) deliberately — short utility calls, keep them cheap.
+        let variant: String = repo::get_agent(&db, &scope_id).ok().flatten().map(|a| a.model_variant).unwrap_or_default();
+        let variant_opt = if variant.trim().is_empty() { None } else { Some(variant.as_str()) };
 
         // Baseline SAVE POINT before the turn (rewind anchor), same as Anthropic.
         if let Ok(root) = broker.root_for(&scope_id) {
@@ -4872,7 +4881,7 @@ async fn agent_stream(
             content.extend(attachment_blocks_openai(&broker, &scope_id, &att));
             messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": content }));
         }
-        let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("model: {model}") });
+        let _ = app.emit(&channel, &provider::StreamEvent::Info { text: if variant.trim().is_empty() { format!("model: {model}") } else { format!("model: {model} · {variant}") } });
 
         // PRO MODE UNCAPPED (Mason 08-03): same policy as the Anthropic path —
         // no round cap in Pro Mode; the stall detector replaces it. Non-Pro
@@ -4904,12 +4913,12 @@ async fn agent_stream(
             let mut round_errs: usize = 0;
             let stream_result = if provider_kind == "meta" {
                 meta_provider::meta_stream_turn(
-                    &key, &model, &sys, &messages, &tools, Some(&cancel_flag),
+                    &key, &model, variant_opt, &sys, &messages, &tools, Some(&cancel_flag),
                     |ev| { let _ = app.emit(&channel, &ev); },
                 ).await
             } else {
                 openai_provider::openai_stream_turn(
-                    &provider_kind, &key, &model, &sys, &messages, &tools, Some(&cancel_flag),
+                    &provider_kind, &key, &model, variant_opt, &sys, &messages, &tools, Some(&cancel_flag),
                     |ev| { let _ = app.emit(&channel, &ev); },
                 ).await
             };
@@ -5772,15 +5781,18 @@ pub async fn run_headless_turn(
         // not shell_poll, read files or call task_continue again. Now it runs the
         // same bounded tool loop as the Anthropic headless path, streaming live.
         let _ = app.emit(&stream_channel, &provider::StreamEvent::Info { text: "thinking…".into() });
+        // Headless turns act AS the agent, so they carry its variant too.
+        let variant_hl: String = agent.model_variant.clone();
+        let variant_hl_opt = if variant_hl.trim().is_empty() { None } else { Some(variant_hl.as_str()) };
         let mut sent_in_turn: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
         for _ in 0..12 {
             let model_msgs = with_prior(&messages);
             let mut round_text = String::new();
             let hl_stream = if provider_kind == "meta" {
-                meta_provider::meta_stream_turn(&key, &agent.model, &system, &model_msgs, &tools, Some(&hl_cancel_flag),
+                meta_provider::meta_stream_turn(&key, &agent.model, variant_hl_opt, &system, &model_msgs, &tools, Some(&hl_cancel_flag),
                     |ev| { if let provider::StreamEvent::TextDelta { text } = &ev { round_text.push_str(text); } let _ = app.emit(&stream_channel, &ev); }).await
             } else {
-                openai_provider::openai_stream_turn(&provider_kind, &key, &agent.model, &system, &model_msgs, &tools, Some(&hl_cancel_flag),
+                openai_provider::openai_stream_turn(&provider_kind, &key, &agent.model, variant_hl_opt, &system, &model_msgs, &tools, Some(&hl_cancel_flag),
                     |ev| { if let provider::StreamEvent::TextDelta { text } = &ev { round_text.push_str(text); } let _ = app.emit(&stream_channel, &ev); }).await
             };
             let (assistant, stop) = match hl_stream {

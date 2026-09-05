@@ -42,6 +42,8 @@ pub struct AgentProfile {
     pub model: String,
     #[serde(default)]
     pub provider: String,
+    #[serde(default)]
+    pub model_variant: String, // reasoning knob, e.g. Muse: minimal|low|medium|high|xhigh|max ("" = provider default)
     #[serde(default = "default_context_mode")]
     pub context_mode: String,
     #[serde(default)]
@@ -103,6 +105,7 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
         folder_path: r.get("folder_path")?,
         model: r.get("model")?,
         provider: r.get("provider")?,
+        model_variant: r.get::<_, String>("model_variant").unwrap_or_default(),
         context_mode: r.get("context_mode")?,
         system_prompt: r.get("system_prompt")?,
         created_at: r.get("created_at")?,
@@ -179,7 +182,7 @@ pub fn get_active_agent(db: &Db) -> Result<Option<AgentProfile>, String> {
 pub fn create_agent(
     db: &Db,
     name: &str, icon: &str, color: &str, folder_path: &str,
-    model: &str, provider: &str, context_mode: &str, system_prompt: &str,
+    model: &str, provider: &str, model_variant: &str, context_mode: &str, system_prompt: &str,
 ) -> Result<AgentProfile, String> {
     let profile = AgentProfile {
         id: new_id(),
@@ -189,6 +192,7 @@ pub fn create_agent(
         folder_path: folder_path.to_string(),
         model: model.to_string(),
         provider: provider.to_string(),
+        model_variant: model_variant.to_string(),
         context_mode: if context_mode.is_empty() { default_context_mode() } else { context_mode.to_string() },
         system_prompt: system_prompt.to_string(),
         created_at: now(),
@@ -207,9 +211,9 @@ pub fn create_agent(
             "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM agent", [], |r| r.get(0),
         ).unwrap_or(1);
         tx.execute(
-            "INSERT INTO agent (id,name,icon,color,folder_path,model,provider,context_mode,system_prompt,created_at,updated_at,archived,sort_order)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12)",
-            params![p.id, p.name, p.icon, p.color, p.folder_path, p.model, p.provider, p.context_mode, p.system_prompt, p.created_at, p.updated_at, next_order],
+            "INSERT INTO agent (id,name,icon,color,folder_path,model,provider,model_variant,context_mode,system_prompt,created_at,updated_at,archived,sort_order)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0,?13)",
+            params![p.id, p.name, p.icon, p.color, p.folder_path, p.model, p.provider, p.model_variant, p.context_mode, p.system_prompt, p.created_at, p.updated_at, next_order],
         ).map_err(|e| format!("insert agent: {e}"))?;
         // First agent becomes active; also seed its settings row.
         tx.execute(
@@ -230,8 +234,8 @@ pub fn update_agent(db: &Db, mut profile: AgentProfile) -> Result<(), String> {
     profile.updated_at = now();
     db.write(move |c| {
         let n = c.execute(
-            "UPDATE agent SET name=?2,icon=?3,color=?4,folder_path=?5,model=?6,provider=?7,context_mode=?8,system_prompt=?9,updated_at=?10,archived=?11,telegram_enabled=?12,telegram_bot_username=?13,telegram_allowed_chats=?14 WHERE id=?1",
-            params![profile.id, profile.name, profile.icon, profile.color, profile.folder_path, profile.model, profile.provider, profile.context_mode, profile.system_prompt, profile.updated_at, profile.archived as i64, profile.telegram_enabled as i64, profile.telegram_bot_username, profile.telegram_allowed_chats],
+            "UPDATE agent SET name=?2,icon=?3,color=?4,folder_path=?5,model=?6,provider=?7,model_variant=?8,context_mode=?9,system_prompt=?10,updated_at=?11,archived=?12,telegram_enabled=?13,telegram_bot_username=?14,telegram_allowed_chats=?15 WHERE id=?1",
+            params![profile.id, profile.name, profile.icon, profile.color, profile.folder_path, profile.model, profile.provider, profile.model_variant, profile.context_mode, profile.system_prompt, profile.updated_at, profile.archived as i64, profile.telegram_enabled as i64, profile.telegram_bot_username, profile.telegram_allowed_chats],
         ).map_err(|e| format!("update agent: {e}"))?;
         if n == 0 { return Err("agent not found".into()); }
         Ok(())

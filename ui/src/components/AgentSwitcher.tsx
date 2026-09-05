@@ -14,6 +14,7 @@ export type AgentProfile = {
   folder_path: string;
   model: string;
   provider: string;
+  model_variant?: string;
   context_mode: string;
   system_prompt: string;
   created_at: number;
