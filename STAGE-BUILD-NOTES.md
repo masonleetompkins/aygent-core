@@ -1,3 +1,18 @@
+# Stage build — 2026-09-04 ~19:40 PDT — v1.0.14 (sidebar overflow fix)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `cbe89e6` — fix(video): sidebar overflow — fields shrink inside 300px panel; v1.0.14
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41,296,408 bytes), mtime **Sep 4 19:40**
+- dmg: `dmg/AYGENT_1.0.14_aarch64.dmg`, **17,952,514 bytes (~17.1 MB)**, mtime **Sep 4 19:40**
+
+**What changed:** Graphics-panel color rows, Type/Layout selects, and the Bright HUD/ELI5 seg buttons were spilling past the 300px sidebar. All inputs/selects/seg buttons now shrink + truncate (ellipsis) inside the panel; `\`ve-row2/3\`` children get `min-width: 0`; swatch hex inputs flex-shrink.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
 # Stage build — 2026-09-04 ~17:20 PDT — v1.0.13 (video editor round 2)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
