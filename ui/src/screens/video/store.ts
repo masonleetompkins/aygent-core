@@ -176,6 +176,25 @@ export async function create(name: string, size?: { w: number; h: number }) {
   } catch (e) { toast(String(e), "err"); }
 }
 
+/** Delete a whole project (Video/<name>/). Media inside is hardlinks + renders +
+ *  cache, so this frees project disk without touching the original footage. */
+export async function removeProject(name: string): Promise<boolean> {
+  const { agentId, project } = state; if (!agentId) return false;
+  try {
+    await invoke("video_delete_project", { agentId, project: name });
+    if (project === name) {
+      if (saveTimer) { window.clearTimeout(saveTimer); saveTimer = null; }
+      past.length = 0; future.length = 0;
+      chatClear();
+      set({ project: null, comp: blankComposition(), assets: [], transcript: null, dirty: false, saving: false, playhead: 0, playing: false, selection: [], render: null, frame: null, captionLines: [] });
+      localStorage.removeItem(`aygent.video.last.${agentId}`);
+    }
+    await refreshProjects();
+    toast(`deleted ${name}`, "ok");
+    return true;
+  } catch (e) { toast(String(e), "err"); return false; }
+}
+
 /** Reload from disk (after an agent tool ran) WITHOUT losing UI state. */
 export async function reload() {
   const { agentId, project } = state; if (!agentId || !project) return;

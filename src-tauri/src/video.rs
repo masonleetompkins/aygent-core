@@ -614,6 +614,20 @@ pub async fn video_pick_lut(app: tauri::AppHandle, broker: tauri::State<'_, Arc<
     import_lut(&broker, &agent_id, &project, &p).map(Some)
 }
 
+/// Delete a whole project (Video/<project>/). The media inside is hardlinks +
+/// renders + cache, so removing the folder frees project disk without touching
+/// the original footage. Refuses when the name is invalid or missing.
+#[tauri::command]
+pub fn video_delete_project(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String) -> Result<(), String> {
+    if agent_id.trim().is_empty() { return Err("select an agent first".into()); }
+    if !slug_ok(&project) { return Err("invalid project name".into()); }
+    let dir = project_dir(&broker, &agent_id, &project)?;
+    // Paranoia: only delete a real project dir (has composition.json).
+    if !dir.join("composition.json").is_file() { return Err(format!("not a video project: {project}")); }
+    std::fs::remove_dir_all(&dir).map_err(|e| format!("delete failed: {e}"))?;
+    Ok(())
+}
+
 /// Reveal a project file/folder in Finder (render outputs, the project dir).
 #[tauri::command]
 pub fn video_reveal(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String, tail: Option<String>) -> Result<(), String> {

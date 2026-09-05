@@ -6025,7 +6025,7 @@ pub fn run() {
             spark_save,
             spark_state_get, spark_state_set, spark_state_set_key,
             video::video_status, video::video_projects, video::video_load, video::video_save, video::video_create,
-            video::video_chat_save, video::video_pick_media, video::video_import_paths, video::video_remove_asset, video::video_relink_asset,
+            video::video_chat_save, video::video_pick_media, video::video_import_paths, video::video_delete_project, video::video_remove_asset, video::video_relink_asset,
             video::video_refresh_thumbs, video::video_list_luts, video::video_pick_lut, video::video_reveal,
             video_render::video_render, video_render::video_render_cancel, video_render::video_frame,
             video_render::video_validate, video_render::video_list_renders,
