@@ -1,3 +1,18 @@
+# Stage build — 2026-09-04 ~23:02 PDT — v1.0.15 (Spark variant knob)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `3767917` — feat(agents): per-agent model variant knob (Muse Spark reasoning effort); v1.0.15
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41,284,968 bytes), mtime **Sep 4 23:02**
+- dmg: `dmg/AYGENT_1.0.15_aarch64.dmg`, **17,966,773 bytes (~17.1 MB)**, mtime **Sep 4 23:02**
+
+**What changed:** Agent edit tab gets a second full-width Variant dropdown (Auto, minimal, low, medium, high, xhigh, max) shown when Provider is Muse Spark / OpenAI / OpenRouter. Stored per-agent, sent as `reasoning:{effort}` on `/responses`; chat model line shows `model: muse-spark-1.3 · high`. Other providers hide it.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
 # Stage build — 2026-09-04 ~19:40 PDT — v1.0.14 (sidebar overflow fix)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
