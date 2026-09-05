@@ -1,3 +1,42 @@
+# Stage build — 2026-09-04 ~17:20 PDT — v1.0.13 (video editor round 2)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `5c78c04` — fix(video): clamp caption line ends to next start (no co-showing); vertically center seg/dock-tab/scene-preset/quick/welcome buttons
+- `d15c856` — feat(video): structured brand style fields, stock Bright HUD prefill + ELI5 dark pack
+- `1bd8d39` — feat(video): transcript editor — full scrollable lines, per-word times, merge/split, editable words
+- `ad844a3` — feat(video): delete project from top bar; v1.0.13
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41,295,560 bytes), mtime **Sep 4 17:20**
+- dmg: `dmg/AYGENT_1.0.13_aarch64.dmg`, **17,950,575 bytes (~17.1 MB)**, mtime **Sep 4 17:20**
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## What this build adds (since v1.0.12)
+1. **Caption overlap fix** — line ends clamp to the next start; consecutive captions can't co-show.
+2. **Button alignment** — seg/dock-tab/scene-preset/quick/welcome buttons vertically centered.
+3. **Brand style fields** — Graphics panel: stock Bright HUD prefill (accent #00cafc, white panels, black ink), one-tap ELI5 dark pack (#0a0e15/#00e6ff), 9 color swatches, type/layout/motion fields. Agent reads a BRAND block; caption builds use panel size/weight/accent/width-cap.
+4. **Transcript editor** — Captions panel: full scrollable lines with timecodes, per-word editable text + times, merge lines, split at any word, add/delete words. Saves to transcript.json; sections to captions.lines (builds respect them).
+5. **Delete project** — trash button in the top bar next to the project picker (confirm dialog; removes Video/\<name>/, original footage untouched).
+
+## Smoke QA for this build (~12 min)
+1. **Delete** — open a scratch project, hit the trash icon in the top bar → confirm → project gone from the picker, welcome screen shows.
+2. **Transcript** — transcribe, open Captions → editor lists every line with timecodes → double-click a word, fix spelling, Save → rebuild captions → fixed word renders.
+3. **Merge/split** — checkbox 2 lines → Merge → one section; ✂ between words → two sections; rebuild → matches arrangement.
+4. **Brand** — Graphics panel shows Bright HUD stock values; switch to ELI5 dark → agent's next graphic uses dark tokens.
+5. **Captions** — rebuild overlay → consecutive lines never co-show; keyword accent follows the panel.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
 # Stage build — 2026-09-04 ~15:06 PDT — v1.0.12 (video Hyperframes rebuild)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
