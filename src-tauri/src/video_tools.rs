@@ -824,19 +824,25 @@ pub fn enhance(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project:
                 .output().map(|o| o.status.success() && mov.is_file()).unwrap_or(false)
         } else { false };
         let _ = std::fs::remove_file(&padded);
-        if mux_ok { (mov, "video") } else { (out.clone(), "audio") }
+        if mux_ok {
+            // intermediate wav is baked into the proxy; don't leave an orphan
+            let _ = std::fs::remove_file(&out);
+            (mov, "video")
+        } else { (out.clone(), "audio") }
     } else { (out.clone(), "audio") };
     let _ = std::fs::remove_file(&wav);
     // Drop superseded cleaned replacements for this source (wav<->mov on
     // re-clean) so Generated doesn't pile up stale files.
     {
         let cleaned_name = format!("{} (cleaned)", a.name);
+        let rep_rel = rep_path.strip_prefix(&proj).map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
         let mut m = video::load_manifest(broker, agent_id, project);
         let before = m.assets.len();
         let mut gone: Vec<String> = vec![];
         m.assets.retain(|x| {
             let hit = x.name == cleaned_name && x.id != a.id;
-            if hit { gone.push(x.rel.clone()); }
+            // never delete the file we just wrote (same rel on re-clean)
+            if hit && x.rel != rep_rel { gone.push(x.rel.clone()); }
             !hit
         });
         if m.assets.len() != before {
