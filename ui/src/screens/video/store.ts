@@ -29,6 +29,7 @@ export type State = {
   zoom: number;            // px per second
   scrollX: number;
   selection: string[];     // clip ids
+  kfTrack: string | null;    // track with the keyframe lane open (manual ducking)
   tool: "select" | "razor" | "review";
   snap: boolean;
   panel: Panel;
@@ -48,7 +49,7 @@ export type State = {
 
 let state: State = {
   agentId: null, folder: null, status: null, projects: [], project: null, comp: blankComposition(), assets: [], transcript: null,
-  dirty: false, saving: false, playhead: 0, playing: false, loop: false, zoom: 60, scrollX: 0, selection: [], tool: "select", snap: true,
+  dirty: false, saving: false, playhead: 0, playing: false, loop: false, zoom: 60, scrollX: 0, selection: [], kfTrack: null, tool: "select", snap: true,
   panel: "media", dockOpen: true, dockTab: "agent", panelOpen: true, dockW: Math.max(280, Math.min(640, Number(localStorage.getItem("aygent.video.dockW")) || 360)), toast: null, render: null, toolProgress: null, frame: null, captionLines: [], luts: [], renders: [], cacheBust: 0,
 };
 
@@ -405,7 +406,10 @@ export function togglePlay() { set((s) => ({ playing: !s.playing })); }
 export function stepFrames(n: number) { const fps = state.comp.scene.fps || 30; set({ playing: false }); seek(Math.round(state.playhead * fps + n) / fps); }
 
 // ---- agent dock chat (persisted in Video/<project>/chat.json) ---------------
-export type ChatMsg = { role: "user" | "assistant"; text: string; at: number; tools?: { name: string; summary?: string; ok?: boolean; detail?: string }[] };
+export type ChatTimelineItem =
+  | { kind: "text"; text: string }
+  | { kind: "tool"; tool: { name: string; summary?: string; ok?: boolean; detail?: string } };
+export type ChatMsg = { role: "user" | "assistant"; text: string; at: number; tools?: { name: string; summary?: string; ok?: boolean; detail?: string }[]; timeline?: ChatTimelineItem[] };
 let chat: ChatMsg[] = [];
 let chatHistory: unknown[] = [];
 const chatListeners = new Set<() => void>();

@@ -139,7 +139,7 @@ export function Inspector() {
       )}
 
       {(kind === "audio" || c.type === "video") && (
-        <Section title="Audio">
+        <Section title="Audio" right={!multi && <button className="ve-btn sm" onClick={() => set({ kfTrack: s.kfTrack === c.track ? null : c.track })}>Keyframes…</button>}>
           <Slider label="Gain" value={c.volume} min={-40} max={12} step={0.5} fmt={(v) => `${v} dB`} onChange={(v) => p({ volume: v })} />
           <div className="ve-row2">
             <Num label="Fade in" value={c.audio.fadeIn} step={0.1} min={0} max={10} suffix="s" onChange={(v) => pt((k) => { k.audio.fadeIn = v; })} />
@@ -153,7 +153,7 @@ export function Inspector() {
               </select>
             </Field>
           )}
-          {c.audio.keyframes.length > 0 && <p className="ve-hint">{c.audio.keyframes.length} volume keyframes (agent-set). <button className="ve-btn sm" onClick={() => pt((k) => { k.audio.keyframes = []; })}>Clear</button></p>}
+          {c.audio.keyframes.length > 0 && <p className="ve-hint">{c.audio.keyframes.length} volume keyframes (timeline seconds — drag them on the lane, or let the agent set them). <button className="ve-btn sm" onClick={() => pt((k) => { k.audio.keyframes = []; })}>Clear</button></p>}
         </Section>
       )}
 

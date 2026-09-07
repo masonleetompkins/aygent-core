@@ -27,7 +27,7 @@ const QUICK: { l: string; p: string }[] = [
   { l: "Captions", p: "Transcribe the A-roll if needed, then build the Hyperframes caption overlay (video_build_captions) with 6 key words to highlight. Style comes from my Graphics panel." },
   { l: "Graphics plan", p: "Read the transcript and my Graphics panel style, then write a PLAN for Hyperframes overlay graphics (title cards / callouts) where extra explanation helps: numbered list, one per line with timecode range, exact on-screen text, placement, and why. Do NOT build anything yet — wait for my approval or revision notes, then build with video_render_overlay." },
   { l: "Grade", p: "Apply my LUT (pick the .cube in luts/) on the adjustment layer with a 35% S-curve." },
-  { l: "Duck music", p: "Make sure anything on A2 ducks under my voice: music -18 dB, ducked -30 dB." },
+  { l: "Duck music", p: "Add manual volume-ducking keyframes on the music clips: for each section where I speak, ramp the music down ~12 dB (0.15s ramps) with keyframes at {t, db} timeline seconds via video_edit update_clip {audio:{keyframes:[...]}}. Then confirm the keyframe counts." },
   { l: "9:16 version", p: "Add a vertical export preset (1080x1920) and tell me which clips would need reframing (x offsets) to keep me centered." },
 ];
 const COMPACT_AT = 0.5; // fraction of the context window
@@ -85,7 +85,13 @@ export async function sendVideoPrompt(prompt: string): Promise<boolean> {
   } finally {
     videoChannel = null;
     const done = getAgentTurnSnapshot(slotKey);
-    const final: ChatMsg = { role: "assistant", text: done.liveText || (done.error ? `\u2717 ${done.error}` : "(no reply)"), at: Date.now(), tools: done.liveTools.map((t) => ({ name: t.name, summary: t.summary, ok: t.ok, detail: t.detail?.slice(0, 1200) })) };
+    // Keep the streamed layout: the ordered timeline (text + tool cards
+    // interleaved) is the message. tools[] stays as back-compat for anything
+    // reading the flat list.
+    const tl = (done.timeline ?? []).map((it) => it.kind === "text"
+      ? { kind: "text" as const, text: it.text }
+      : { kind: "tool" as const, tool: { name: it.tool.name, summary: it.tool.summary, ok: it.tool.ok, detail: it.tool.detail?.slice(0, 1200) } });
+    const final: ChatMsg = { role: "assistant", text: done.liveText || (done.error ? `\u2717 ${done.error}` : "(no reply)"), at: Date.now(), tools: done.liveTools.map((t) => ({ name: t.name, summary: t.summary, ok: t.ok, detail: t.detail?.slice(0, 1200) })), timeline: tl };
     chatReplaceLast(final);
     void chatPersist(out.length ? out : getHistory(slotKey));
     void reload();
@@ -132,7 +138,10 @@ export function AgentDock({ agentName }: { agentName?: string }) {
     if (!running) return;
     const last = msgs[msgs.length - 1];
     if (!last || last.role !== "assistant") return;
-    const draft: ChatMsg = { ...last, text: turn.liveText, tools: turn.liveTools.map((t) => ({ name: t.name, summary: t.summary, ok: t.ok, detail: t.detail?.slice(0, 1200) })) };
+    const tl = (turn.timeline ?? []).map((it) => it.kind === "text"
+      ? { kind: "text" as const, text: it.text }
+      : { kind: "tool" as const, tool: { name: it.tool.name, summary: it.tool.summary, ok: it.tool.ok, detail: it.tool.detail?.slice(0, 1200) } });
+    const draft: ChatMsg = { ...last, text: turn.liveText, tools: turn.liveTools.map((t) => ({ name: t.name, summary: t.summary, ok: t.ok, detail: t.detail?.slice(0, 1200) })), timeline: tl };
     chatReplaceLast(draft);
   }, [turn.liveTools.length, turn.liveText, running]);
 
@@ -161,6 +170,14 @@ export function AgentDock({ agentName }: { agentName?: string }) {
           const isLast = i === msgs.length - 1;
           if (m.role === "user") return <div key={i} className="ve-msg user">{m.text}</div>;
           if (isLast && running) return <LiveBubble key={i} timeline={turn.timeline ?? []} text={turn.liveText} info={turn.info} />;
+          if (m.timeline && m.timeline.length > 0) return (
+            <div key={i} className="ve-msg assistant">
+              {m.timeline.map((it, j) => it.kind === "text"
+                ? (it.text ? <Markdown key={j} text={it.text} /> : null)
+                : <div key={j} className="tools"><ToolCard name={it.tool.name} summary={it.tool.summary} ok={it.tool.ok} detail={it.tool.detail} /></div>)}
+              {!m.timeline.some((it) => it.kind === "text" && it.text) && !m.timeline.some((it) => it.kind === "tool") && <span className="ve-faint">(no reply)</span>}
+            </div>
+          );
           return (
             <div key={i} className="ve-msg assistant">
               {m.text ? <Markdown text={m.text} /> : <span className="ve-faint">(no reply)</span>}

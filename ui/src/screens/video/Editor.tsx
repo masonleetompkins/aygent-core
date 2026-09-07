@@ -161,9 +161,9 @@ export function Editor({ agentId, agentName, folder }: { agentId: string | null;
             <h2>{agentId ? "Start a video project" : "Pick an agent"}</h2>
             <p className="ve-hint" style={{ fontSize: 13 }}>A project is a folder under <b>Video/</b> in the agent's workspace: the edit (composition.json), hardlinked media, transcript, and the agent conversation. Your agent edits the same file you do.</p>
             {agentId && (
-              <form style={{ display: "flex", gap: 8 }} onSubmit={(e) => { e.preventDefault(); const n = newName.trim().replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 80); if (n) { void create(n); setNewName(""); } }}>
-                <input autoFocus value={newName} placeholder="project-name" onChange={(e) => setNewName(e.target.value)} style={{ flex: 1, height: 34 }} />
-                <button className="ve-btn primary" type="submit" style={{ height: 34 }}><Plus size={14} /> Create</button>
+              <form className="ve-create" onSubmit={(e) => { e.preventDefault(); const n = newName.trim().replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 80); if (n) { void create(n); setNewName(""); } }}>
+                <input autoFocus value={newName} placeholder="project-name" onChange={(e) => setNewName(e.target.value)} aria-label="New project name" />
+                <button className="ve-btn primary ve-create-btn" type="submit" disabled={!newName.trim()}><Plus size={14} /> Create</button>
               </form>
             )}
             {s.projects.length > 0 && <div className="recent">{s.projects.map((p) => <button key={p.name} onClick={() => void open(p.name)}>{p.name}<span>{p.assets} media · {new Date(p.modified * 1000).toLocaleDateString()}</span></button>)}</div>}

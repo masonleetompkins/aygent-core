@@ -16,7 +16,7 @@
 //   video_auto_cut       silences + takes → tight V1 selects in one call
 //   video_frame          render one composite frame (grade + overlays) for QA
 //   video_render         export with a preset (progress streams to the UI)
-//   video_audio_enhance  Auphonic round-trip (or local ffmpeg chain) → enhanced audio asset
+//   video_audio_enhance  local normalize + denoise → enhanced audio asset
 //   video_matte          RobustVideoMatting alpha (uv + torch) → matte asset (experimental)
 //   video_build_captions Hyperframes caption overlay → transparent T1 clip
 //   video_render_overlay one approved Hyperframes graphic → transparent V3 clip
@@ -38,7 +38,7 @@ fn app() -> Result<tauri::AppHandle, String> { APP.get().cloned().ok_or_else(|| 
 /// AppHandle for the Hyperframes overlay module (same install_app source).
 pub fn app_handle() -> Option<tauri::AppHandle> { APP.get().cloned() }
 
-const NAMES: &[&str] = &["video_project", "video_edit", "video_transcribe", "video_silences", "video_takes", "video_auto_cut", "video_frame", "video_look", "video_render", "video_audio_enhance", "video_matte", "video_build_captions", "video_render_overlay"];
+const NAMES: &[&str] = &["video_project", "video_edit", "video_transcribe", "video_silences", "video_takes", "video_auto_cut", "video_frame", "video_look", "video_render", "video_audio_enhance", "video_audio_audition", "video_matte", "video_build_captions", "video_render_overlay"];
 pub fn is_video_tool(name: &str) -> bool { NAMES.contains(&name) || crate::video_hyperframes::is_hyperframes_tool(name) }
 
 pub fn tool_schemas() -> Vec<Value> {
@@ -62,16 +62,18 @@ pub fn tool_schemas() -> Vec<Value> {
             "input_schema": { "type": "object", "properties": { "project": proj, "time": { "type": "number", "description": "timeline seconds to look at" }, "times": { "type": "array", "items": { "type": "number" }, "description": "up to 4 times to see side by side" } }, "required": ["project"] } }),
         json!({ "name": "video_render", "description": "Export the project with a preset from composition.exports (by name) or an explicit {width,height,bitrate,codec:'h264'|'hevc'|'prores'}. Blocking; progress streams to the UI. Output lands in Video/<project>/renders/.",
             "input_schema": { "type": "object", "properties": { "project": proj, "preset": { "type": "string", "description": "preset name, e.g. landscape | vertical" }, "width": { "type": "integer" }, "height": { "type": "integer" }, "bitrate": { "type": "string" }, "codec": { "type": "string" }, "name": { "type": "string", "description": "output file stem" } }, "required": ["project"] } }),
-        json!({ "name": "video_audio_enhance", "description": "Enhance an asset's dialogue audio: engine 'auphonic' (needs Auphonic credentials in Settings → Video) or 'local' (ffmpeg denoise + leveler + loudnorm). Produces a new audio asset and points the source clips' audioAsset at it, so the enhanced track plays in place of the original.",
-            "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "engine": { "type": "string", "enum": ["auphonic", "local"] }, "preset": { "type": "string", "description": "Auphonic preset uuid (optional)" } }, "required": ["project", "asset"] } }),
+        json!({ "name": "video_audio_enhance", "description": "LOCAL dialogue cleanup (ffmpeg only, nothing leaves the machine): normalize peaks to normalizeDb (default -3 dBFS) + background-noise reduction at denoise 0..1 (0 = off). Produces a new audio asset and points the source clips' audioAsset at it. (TEMPORARY compat: engine/preset args are ignored if passed.)",
+            "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "normalize_db": { "type": "number", "description": "peak target dBFS, default -3" }, "denoise": { "type": "number", "description": "0..1 noise-reduction strength, default 0" } }, "required": ["project", "asset"] } }),
+        json!({ "name": "video_audio_audition", "description": "Preview a denoise strength WITHOUT touching the timeline: renders a short sample (at/len seconds) with that denoise amount to .cache/ for listening in the Video tab.",
+            "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "denoise": { "type": "number", "description": "0..1 strength" }, "at": { "type": "number", "description": "sample start (source seconds, default 0)" }, "len": { "type": "number", "description": "sample length seconds, default 8" } }, "required": ["project", "asset", "denoise"] } }),
         json!({ "name": "video_matte", "description": "EXPERIMENTAL: generate a subject alpha matte for an asset with RobustVideoMatting (downloads torch via uv on first run; slow). Registers the matte asset and enables composition.matte so behindSubject overlay layers render behind the person.",
-            "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "engine": { "type": "string", "enum": ["auphonic", "local"] }, "preset": { "type": "string", "description": "Auphonic preset uuid (optional)" } }, "required": ["project", "asset"] } }),
+            "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "engine": { "type": "string", "description": "ignored (local only)" } }, "required": ["project", "asset"] } }),
     ];
     v.extend(crate::video_hyperframes::tool_schemas());
     v
 }
 
-pub const INSTRUCTIONS: &str = "\n\nVIDEO EDITOR: the Video tab is an agentic NLE. A project is Video/<name>/ with composition.json (the edit), assets.json (imported media — HARDLINKS, never copy media), transcript.json, chat.json. Use the video_* tools for every edit (frame-accurate numbers, validated + saved); never hand-write composition.json unless a tool cannot express the change. Workflow the user follows: video_project → video_auto_cut (silences + keep the LAST take; lays linked V1+A1 pairs) → review → video_transcribe (if not done) → graphics/captions as Hyperframes overlays (see below) → color via set color.lut 'luts/<file>.cube' + color.sCurve → video_audio_enhance → set audio.duck → video_render {preset:'landscape'|'vertical'}. Report clip ids + times in one line; the UI refreshes automatically after each tool. Video clips with audio carry a LINKED A1 waveform partner (clip.link shared) — split/move/remove keep pairs together, and the mix plays the pair once (no double audio). REVIEW: the user leaves timestamped feedback as review clips on R1 (video_project exposes reviewNotes/reviewNotesResolved) — read them first, act on each, mark done via update_clip {hidden:true}. VISION: video_look renders canvas frame(s) you SEE as images; delete spent frames with delete_file.";
+pub const INSTRUCTIONS: &str = "\n\nVIDEO EDITOR: the Video tab is an agentic NLE. A project is Video/<name>/ with composition.json (the edit), assets.json (imported media — HARDLINKS, never copy media), transcript.json, chat.json. Use the video_* tools for every edit (frame-accurate numbers, validated + saved); never hand-write composition.json unless a tool cannot express the change. Workflow the user follows: video_project → video_auto_cut (silences + keep the LAST take; lays linked V1+A1 pairs) → review → video_transcribe (if not done) → graphics/captions as Hyperframes overlays (see below) → audio via video_audio_enhance {normalizeDb, denoise} (local, peaks default -3 dBFS) + per-track audio.trackGain + manual ducking with clip volume keyframes {audio:{keyframes:[{t,db}]}} (video_audio_audition previews a denoise strength first); color via set color.lut 'luts/<file>.cube' + color.sCurve → video_audio_enhance → video_render {preset:'landscape'|'vertical'}. Report clip ids + times in one line; the UI refreshes automatically after each tool. Video clips with audio carry a LINKED A1 waveform partner (clip.link shared) — split/move/remove keep pairs together, and the mix plays the pair once (no double audio). REVIEW: the user leaves timestamped feedback as review clips on R1 (video_project exposes reviewNotes/reviewNotesResolved) — read them first, act on each, mark done via update_clip {hidden:true}. VISION: video_look renders canvas frame(s) you SEE as images; delete spent frames with delete_file.";
 
 // ---------------------------------------------------------------------------
 // Entry points
@@ -127,14 +129,6 @@ fn bounded(v: &Value) -> String {
 pub async fn video_tool(app: tauri::AppHandle, broker: tauri::State<'_, Arc<Broker>>, agent_id: String, name: String, input: Value) -> Result<Value, String> {
     let broker = broker.inner().clone();
     tokio::task::spawn_blocking(move || run(&app, &broker, &agent_id, &name, &input)).await.map_err(|e| format!("tool task: {e}"))?
-}
-
-/// Store Auphonic credentials ("user:password" or a bearer token) in the keychain.
-#[tauri::command]
-pub fn video_set_auphonic(credentials: String) -> Result<(), String> {
-    let c = credentials.trim();
-    if c.is_empty() { return crate::keychain::delete_key("auphonic"); }
-    crate::keychain::set_key("auphonic", c)
 }
 
 pub fn run(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, name: &str, input: &Value) -> Result<Value, String> {
@@ -218,7 +212,11 @@ pub fn run(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, name: &str, 
         }
         "video_audio_enhance" => {
             let p = project.ok_or("project is required")?;
-            enhance(app, broker, agent_id, &p, &s("asset").ok_or("asset is required")?, s("engine").as_deref().unwrap_or("auphonic"), s("preset").as_deref())?
+            enhance(app, broker, agent_id, &p, &s("asset").ok_or("asset is required")?, f("normalize_db", -3.0), f("denoise", 0.0))?
+        }
+        "video_audio_audition" => {
+            let p = project.ok_or("project is required")?;
+            audition(app, broker, agent_id, &p, &s("asset").ok_or("asset is required")?, f("denoise", 0.5), f("at", 0.0), f("len", 8.0))?
         }
         "video_matte" => {
             let p = project.ok_or("project is required")?;
@@ -783,7 +781,7 @@ fn register_generated(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, p
     Ok(a)
 }
 
-pub fn enhance(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, asset: &str, engine: &str, preset: Option<&str>) -> Result<Value, String> {
+pub fn enhance(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, asset: &str, normalize_db: f64, denoise: f64) -> Result<Value, String> {
     let proj = video::project_dir(broker, agent_id, project)?;
     let a = find_asset(broker, agent_id, project, Some(asset), true)?;
     if !a.has_audio { return Err("asset has no audio".into()); }
@@ -791,77 +789,64 @@ pub fn enhance(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project:
     let ff = video::ffmpeg(app)?;
     let media = proj.join("media"); std::fs::create_dir_all(&media).map_err(|e| e.to_string())?;
     let stem: String = Path::new(&a.name).file_stem().and_then(|s| s.to_str()).unwrap_or("audio").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
-    let out = media.join(format!("{stem}.enhanced.{}.wav", engine));
+    let out = media.join(format!("{stem}.cleaned.wav"));
     // 1) extract a clean WAV
     let wav = proj.join(".cache").join(format!("{}.src.wav", a.id));
     std::fs::create_dir_all(wav.parent().unwrap()).map_err(|e| e.to_string())?;
     let o = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&abs).args(["-vn", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&wav).output().map_err(|e| format!("ffmpeg: {e}"))?;
     if !o.status.success() { return Err(format!("extract failed: {}", String::from_utf8_lossy(&o.stderr).chars().take(300).collect::<String>())); }
-    let used_engine;
-    match engine {
-        "auphonic" => {
-            let creds = crate::keychain::get_key("auphonic").map_err(|_| "no Auphonic credentials — add them in the Video tab Audio panel (user:password or an API token), or use engine 'local'".to_string())?;
-            auphonic(app, &creds, &wav, &out, &a.name, preset, project)?;
-            used_engine = "auphonic";
-        }
-        _ => {
-            let af = "highpass=f=70,afftdn=nf=-28:nr=12:tn=1,acompressor=threshold=-20dB:ratio=2.5:attack=8:release=120:makeup=3,deesser=i=0.3,loudnorm=I=-16:TP=-1.5:LRA=9";
-            let o = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&wav).args(["-af", af, "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&out).output().map_err(|e| format!("ffmpeg: {e}"))?;
-            if !o.status.success() { return Err(format!("local enhance failed: {}", String::from_utf8_lossy(&o.stderr).chars().take(400).collect::<String>())); }
-            used_engine = "local";
-        }
-    }
+    // LOCAL ONLY: highpass -> afftdn (strength-mapped) -> gentle leveling.
+    // Peak normalize to normalizeDb + optional loudnorm stay in the TIMELINE
+    // mix (audio.normalizeDb on export), so this file is denoise + leveling only.
+    let dn = denoise.clamp(0.0, 1.0);
+    let nr = (dn * 24.0).round() as i64; // 0..24 dB reduction
+    let af = if dn <= 0.001 {
+        "highpass=f=70,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2".to_string()
+    } else {
+        format!("highpass=f=70,afftdn=nf=-{nr}:nr={nr}:tn=1,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2")
+    };
+    let o = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&wav).args(["-af", &af, "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&out).output().map_err(|e| format!("ffmpeg: {e}"))?;
+    if !o.status.success() { return Err(format!("local enhance failed: {}", String::from_utf8_lossy(&o.stderr).chars().take(400).collect::<String>())); }
     let _ = std::fs::remove_file(&wav);
-    let na = register_generated(app, broker, agent_id, project, &out, &format!("{} (enhanced)", a.name), "audio")?;
-    // point every clip of the source asset at the enhanced audio
+    let na = register_generated(app, broker, agent_id, project, &out, &format!("{} (cleaned)", a.name), "audio")?;
+    // point every clip of the source asset at the cleaned audio
     let mut comp = load_comp(broker, agent_id, project)?;
     let mut n = 0;
     for c in comp.clips.iter_mut().filter(|c| c.asset == a.id && c.kind == "video") { c.audio_asset = na.id.clone(); n += 1; }
-    comp.audio.enhance = used_engine.into();
+    comp.audio.enhance = "local".into();
+    comp.audio.normalize_db = normalize_db.clamp(-24.0, 0.0);
+    comp.audio.denoise = dn;
     save_comp(broker, agent_id, project, &comp)?;
-    Ok(json!({ "ok": true, "engine": used_engine, "asset": na.id, "file": na.rel, "clipsUpdated": n }))
+    Ok(json!({ "ok": true, "engine": "local", "asset": na.id, "file": na.rel, "clipsUpdated": n, "normalizeDb": comp.audio.normalize_db, "denoise": dn }))
 }
 
-fn auphonic(app: &tauri::AppHandle, creds: &str, wav: &Path, out: &Path, title: &str, preset: Option<&str>, project: &str) -> Result<(), String> {
-    let creds = creds.to_string(); let wav = wav.to_path_buf(); let out = out.to_path_buf(); let title = title.to_string(); let preset = preset.map(String::from);
-    let app = app.clone(); let project = project.to_string();
-    run_thread(async move {
-        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(600)).build().map_err(|e| e.to_string())?;
-        let auth = |r: reqwest::RequestBuilder| -> reqwest::RequestBuilder {
-            match creds.split_once(':') { Some((u, p)) => r.basic_auth(u, Some(p)), None => r.bearer_auth(&creds) }
-        };
-        let progress = |msg: &str| { let _ = tauri::Emitter::emit(&app, "video-tool-progress", json!({ "project": project, "tool": "video_audio_enhance", "msg": msg })); };
-        progress("creating Auphonic production");
-        let mut body = json!({ "metadata": { "title": title }, "output_files": [{ "format": "wav" }], "algorithms": { "denoise": true, "denoiseamount": 0, "leveler": true, "normloudness": true, "loudnesstarget": -16, "filtering": true } });
-        if let Some(p) = preset { body["preset"] = json!(p); }
-        let r = auth(client.post("https://auphonic.com/api/productions.json")).json(&body).send().await.map_err(|e| format!("auphonic: {e}"))?;
-        if !r.status().is_success() { return Err(format!("auphonic create {}: {}", r.status(), r.text().await.unwrap_or_default().chars().take(300).collect::<String>())); }
-        let v: Value = r.json().await.map_err(|e| e.to_string())?;
-        let uuid = v["data"]["uuid"].as_str().ok_or("auphonic: no uuid")?.to_string();
-        progress("uploading audio");
-        let bytes = tokio::fs::read(&wav).await.map_err(|e| e.to_string())?;
-        let form = reqwest::multipart::Form::new().part("input_file", reqwest::multipart::Part::bytes(bytes).file_name("input.wav").mime_str("audio/wav").map_err(|e| e.to_string())?);
-        let r = auth(client.post(format!("https://auphonic.com/api/production/{uuid}/upload.json"))).multipart(form).send().await.map_err(|e| format!("auphonic upload: {e}"))?;
-        if !r.status().is_success() { return Err(format!("auphonic upload {}", r.status())); }
-        let r = auth(client.post(format!("https://auphonic.com/api/production/{uuid}/start.json"))).send().await.map_err(|e| format!("auphonic start: {e}"))?;
-        if !r.status().is_success() { return Err(format!("auphonic start {}", r.status())); }
-        let mut url = String::new();
-        for _ in 0..360 { // ≤ 30 min
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let r = auth(client.get(format!("https://auphonic.com/api/production/{uuid}.json"))).send().await.map_err(|e| format!("auphonic poll: {e}"))?;
-            let v: Value = r.json().await.map_err(|e| e.to_string())?;
-            let st = v["data"]["status_string"].as_str().unwrap_or("").to_string();
-            progress(&format!("Auphonic: {st}"));
-            if st == "Done" { url = v["data"]["output_files"].as_array().and_then(|a| a.first()).and_then(|f| f["download_url"].as_str()).unwrap_or("").to_string(); break; }
-            if st == "Error" || st.contains("Incomplete") { return Err(format!("auphonic production failed: {}", v["data"]["error_message"].as_str().unwrap_or(&st))); }
-        }
-        if url.is_empty() { return Err("auphonic timed out".into()); }
-        progress("downloading enhanced audio");
-        let r = auth(client.get(&url)).send().await.map_err(|e| format!("auphonic download: {e}"))?;
-        let bytes = r.bytes().await.map_err(|e| e.to_string())?;
-        tokio::fs::write(&out, &bytes).await.map_err(|e| e.to_string())?;
-        Ok::<(), String>(())
-    })?
+/// Render a short denoise audition sample to .cache/ WITHOUT touching the
+/// timeline. Same chain as enhance (highpass + afftdn at strength + leveling),
+/// so what you hear is what the cleanup produces.
+pub fn audition(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, asset: &str, denoise: f64, at: f64, len: f64) -> Result<Value, String> {
+    let proj = video::project_dir(broker, agent_id, project)?;
+    let a = find_asset(broker, agent_id, project, Some(asset), true)?;
+    if !a.has_audio { return Err("asset has no audio".into()); }
+    let abs = video::asset_abs(broker, agent_id, project, &a)?;
+    let ff = video::ffmpeg(app)?;
+    let at = at.max(0.0).min(a.duration.max(0.0));
+    let len = len.clamp(1.0, 30.0).min((a.duration - at).max(1.0));
+    let dn = denoise.clamp(0.0, 1.0);
+    let nr = (dn * 24.0).round() as i64;
+    let af = if dn <= 0.001 {
+        "highpass=f=70,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2".to_string()
+    } else {
+        format!("highpass=f=70,afftdn=nf=-{nr}:nr={nr}:tn=1,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2")
+    };
+    let cache = proj.join(".cache");
+    std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+    let name = format!("audition-{}-dn{:02}.wav", a.id, (dn * 100.0).round() as i64);
+    let out = cache.join(&name);
+    let _ = tauri::Emitter::emit(app, "video-tool-progress", json!({ "project": project, "tool": "video_audio_audition", "msg": "rendering audition…" }));
+    let o = Command::new(&ff).args(["-v", "error", "-y", "-ss", &format!("{at:.3}"), "-t", &format!("{len:.3}"), "-i"]).arg(&abs)
+        .args(["-vn", "-af", &af, "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&out).output().map_err(|e| format!("ffmpeg: {e}"))?;
+    if !o.status.success() { return Err(format!("audition failed: {}", String::from_utf8_lossy(&o.stderr).chars().take(300).collect::<String>())); }
+    Ok(json!({ "ok": true, "sample": format!(".cache/{name}"), "denoise": dn, "at": at, "len": len, "note": "listen in the Video tab (Media > Generated, or the preview below), then run video_audio_enhance with the denoise you like" }))
 }
 
 // ---------------------------------------------------------------------------

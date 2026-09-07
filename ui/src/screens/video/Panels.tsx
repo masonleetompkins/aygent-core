@@ -5,7 +5,7 @@
 // ASS/DOM caption pipeline is gone.
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Upload, Plus, X, Wand2, FolderOpen, Download, Square, Sparkles, Music, Film, Image as ImageIcon, Mic2, RefreshCw, Link2, Layers, Unplug, FileText } from "lucide-react";
+import { Upload, Plus, X, FolderOpen, Download, Square, Sparkles, Music, Film, Image as ImageIcon, Mic2, RefreshCw, Link2, Layers, Unplug, FileText, Volume2, AudioLines, KeyRound, Play } from "lucide-react";
 import { useVideo, mutate, importPick, removeAsset, relinkAsset, reload, addAssetToTimeline, runTool, pickLut, startRender, cancelRender, reveal, toast, set, refreshRenders, refreshThumbs } from "./store";
 import { type Asset, type Composition, fmtDur, fmtBytes, mediaUrl, stockBrightHud, eli5DarkPack } from "./model";
 import { TranscriptEditor } from "./TranscriptEditor";
@@ -41,8 +41,8 @@ const setPath = (path: string, value: unknown) => mutate((c) => { const parts = 
 export function MediaPanel() {
   const s = useVideo();
   const [sel, setSel] = useState<string | null>(null);
-  const files = s.assets.filter((a) => !a.name.includes("(alpha)") && !a.name.includes("(enhanced)") && !a.name.includes("(HF)") && !a.name.includes("(overlay)"));
-  const generated = s.assets.filter((a) => a.name.includes("(alpha)") || a.name.includes("(enhanced)") || a.name.includes("(HF)") || a.name.includes("(overlay)"));
+  const files = s.assets.filter((a) => !a.name.includes("(alpha)") && !a.name.includes("(enhanced)") && !a.name.includes("(cleaned)") && !a.name.includes("(HF)") && !a.name.includes("(overlay)"));
+  const generated = s.assets.filter((a) => a.name.includes("(alpha)") || a.name.includes("(enhanced)") || a.name.includes("(cleaned)") || a.name.includes("(HF)") || a.name.includes("(overlay)"));
   const offline = s.assets.filter((a) => a.online === false);
   return (
     <>
@@ -294,32 +294,61 @@ export function ColorPanel() {
   );
 }
 
-// ---- AUDIO ----------------------------------------------------------------
+// ---- AUDIO (local only) -----------------------------------------------------
+// No cloud, no credentials: normalize peaks + denoise strength per asset,
+// per-track trims, master gain. Manual ducking = volume keyframes on the
+// timeline lane (Inspector > Audio > Keyframes), which the agent can also write.
 export function AudioPanel() {
   const s = useVideo(); const a = s.comp.audio;
-  const [creds, setCreds] = useState("");
+  const [auditioning, setAuditioning] = useState<string | null>(null);
+  const [auditionUrl, setAuditionUrl] = useState<string | null>(null);
   const aroll = s.comp.clips.find((c) => c.track === "V1" && c.type === "video");
-  const enhanced = aroll && s.assets.find((x) => x.id === aroll.audioAsset);
+  const cleaned = aroll && s.assets.find((x) => x.id === aroll.audioAsset);
+  const tracks = Array.from(new Set(s.comp.clips.filter((c) => (c.type === "audio" || c.type === "video") && !c.hidden).map((c) => c.track))).sort();
+
+  async function cleanup(assetId: string) {
+    const r = await runTool<{ asset: string }>("video_audio_enhance", { asset: assetId, normalize_db: a.normalizeDb, denoise: a.denoise }, "cleaning dialogue…");
+    if (r) toast("dialogue cleaned — clips now play the cleaned track", "ok");
+  }
+  async function audition(assetId: string) {
+    setAuditioning(assetId);
+    try {
+      const r = await runTool<{ sample: string }>("video_audio_audition", { asset: assetId, denoise: a.denoise, at: Math.max(0, s.playhead - 2), len: 8 }, "rendering preview…");
+      if (r?.sample && s.agentId && s.project) setAuditionUrl(mediaUrl(s.agentId, s.project, "cache", r.sample, Date.now()));
+      else setAuditionUrl(null);
+    } finally { setAuditioning(null); }
+  }
+
   return (
     <>
-      <div className="ve-panel-head">Audio</div>
+      <div className="ve-panel-head">Audio<span className="spacer" /><span className="ve-pill ok">local</span></div>
       <div className="ve-panel-body">
-        <Section title="Enhance dialogue" right={enhanced ? <span className="ve-pill ok">{a.enhance}</span> : null}>
-          <div className="ve-row2">
-            <button className="ve-btn primary" disabled={!aroll || !!s.toolProgress} onClick={() => aroll && void runTool("video_audio_enhance", { asset: aroll.asset, engine: "auphonic" }, "Auphonic…")}><Sparkles size={13} /> Auphonic</button>
-            <button className="ve-btn" disabled={!aroll || !!s.toolProgress} onClick={() => aroll && void runTool("video_audio_enhance", { asset: aroll.asset, engine: "local" }, "enhancing…")}><Wand2 size={13} /> Local (ffmpeg)</button>
+        <Section title="Dialogue cleanup" right={cleaned ? <span className="ve-pill ok">cleaned</span> : null}>
+          <Slider label="Normalize peaks to" value={a.normalizeDb} min={-24} max={0} step={0.5} fmt={(v) => `${v} dBFS`} onChange={(v) => setPath("audio.normalizeDb", v)} />
+          <Slider label="Noise reduction" value={a.denoise} min={0} max={1} step={0.01} fmt={(v) => (v <= 0.001 ? "off" : `${Math.round(v * 100)}%`)} onChange={(v) => setPath("audio.denoise", v)} />
+          <p className="ve-hint">Normalize + denoise apply to the <b>export mix</b> and to cleaned assets below. Preview a strength before committing.</p>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="ve-btn sm" disabled={!aroll || !!s.toolProgress} onClick={() => aroll && void audition(aroll.asset)}><Play size={12} /> {auditioning ? "Rendering…" : "Preview denoise"}</button>
+            <button className="ve-btn sm primary" disabled={!aroll || !!s.toolProgress} onClick={() => aroll && void cleanup(aroll.asset)}><Sparkles size={12} /> Clean A-roll</button>
           </div>
-          <Field label="Auphonic credentials (user:password or API token) — stored in Keychain"><div style={{ display: "flex", gap: 6 }}><input type="password" value={creds} placeholder="••••••" onChange={(e) => setCreds(e.target.value)} /><button className="ve-btn sm" onClick={() => { void invoke("video_set_auphonic", { credentials: creds }).then(() => { toast("Auphonic credentials saved", "ok"); setCreds(""); }).catch((e) => toast(String(e), "err")); }}>Save</button></div></Field>
-          {enhanced && <p className="ve-hint">A-roll clips now play <b>{enhanced.name}</b>. Clear via Inspector → Audio asset.</p>}
+          {auditionUrl && <audio controls src={auditionUrl} style={{ width: "100%" }} />}
+          {cleaned && <p className="ve-hint">A-roll clips now play <b>{cleaned.name}</b>. Clear via Inspector → Audio asset.</p>}
         </Section>
-        <Section title="Music ducking" right={<Check label="" checked={a.duck.enabled} onChange={(v) => setPath("audio.duck.enabled", v)} />}>
-          <p className="ve-hint">Anything on <b>A2</b> is treated as music and ducks under voice (sidechain).</p>
-          <Slider label="Music level" value={a.duck.musicDb} min={-40} max={0} step={0.5} fmt={(v) => `${v} dB`} onChange={(v) => setPath("audio.duck.musicDb", v)} />
-          <Slider label="Ducked level" value={a.duck.duckedDb} min={-50} max={-6} step={0.5} fmt={(v) => `${v} dB`} onChange={(v) => setPath("audio.duck.duckedDb", v)} />
-          <div className="ve-row2">
-            <Num label="Attack" value={a.duck.attack} step={0.01} min={0.001} max={1} suffix="s" onChange={(v) => setPath("audio.duck.attack", v)} />
-            <Num label="Release" value={a.duck.release} step={0.05} min={0.05} max={3} suffix="s" onChange={(v) => setPath("audio.duck.release", v)} />
-          </div>
+        <Section title="Tracks" right={<Volume2 size={13} style={{ color: "var(--text-faint)" }} />}>
+          {tracks.length === 0 && <p className="ve-hint">No audible tracks yet — import media first.</p>}
+          {tracks.map((t) => (
+            <div key={t} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span className="ve-pill" style={{ minWidth: 34, justifyContent: "center" }}>{t}</span>
+              <input type="range" min={-24} max={12} step={0.5} value={a.trackGain?.[t] ?? 0}
+                title={`${t} trim`} style={{ flex: 1 }}
+                onChange={(e) => mutate((c) => { c.audio.trackGain[t] = Number(e.target.value); })} />
+              <span className="ve-mono" style={{ fontSize: 11, minWidth: 52, textAlign: "right" }}>{(a.trackGain?.[t] ?? 0).toFixed(1)} dB</span>
+              <button className={`ve-icon-btn ${s.kfTrack === t ? "on" : ""}`} title={s.kfTrack === t ? "Hide keyframes" : "Edit keyframes (manual ducking)"}
+                onClick={() => set({ kfTrack: s.kfTrack === t ? null : t })}><KeyRound size={13} /></button>
+              {(a.trackGain?.[t] ?? 0) !== 0 && <button className="ve-icon-btn" title="Reset trim" onClick={() => mutate((c) => { delete c.audio.trackGain[t]; })}><X size={12} /></button>}
+            </div>
+          ))}
+          <p className="ve-hint"><AudioLines size={12} style={{ verticalAlign: -2 }} /> Keyframe toggle opens the dB lane under the track: click to add, drag to move (⇧ = fine), double-click to delete. The agent writes the same keyframes.</p>
         </Section>
         <Section title="Master">
           <Slider label="Master gain" value={a.masterDb} min={-12} max={12} step={0.5} fmt={(v) => `${v} dB`} onChange={(v) => setPath("audio.masterDb", v)} />

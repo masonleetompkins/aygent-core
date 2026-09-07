@@ -31,6 +31,7 @@ use crate::video::{self, Asset, Manifest};
 // ---------------------------------------------------------------------------
 
 fn d_one() -> f64 { 1.0 }
+fn d_neg3() -> f64 { -3.0 }
 fn d_true() -> bool { true }
 fn d_half() -> f64 { 0.5 }
 
@@ -209,12 +210,12 @@ impl Default for Captions {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Duck { pub enabled: bool, pub music_db: f64, pub ducked_db: f64, pub attack: f64, pub release: f64 }
-impl Default for Duck { fn default() -> Self { Self { enabled: true, music_db: -18.0, ducked_db: -30.0, attack: 0.02, release: 0.4 } } }
+impl Default for Duck { fn default() -> Self { Self { enabled: false, music_db: -18.0, ducked_db: -30.0, attack: 0.02, release: 0.4 } } }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
-pub struct AudioMix { pub duck: Duck, pub enhance: String, pub master_db: f64, pub loudnorm: bool }
-impl Default for AudioMix { fn default() -> Self { Self { duck: Duck::default(), enhance: "auphonic".into(), master_db: 0.0, loudnorm: false } } }
+pub struct AudioMix { pub duck: Duck, pub enhance: String, pub master_db: f64, pub loudnorm: bool, #[serde(default = "d_neg3")] pub normalize_db: f64, pub denoise: f64, #[serde(default)] pub track_gain: std::collections::HashMap<String, f64> }
+impl Default for AudioMix { fn default() -> Self { Self { duck: Duck::default(), enhance: "local".into(), master_db: 0.0, loudnorm: false, normalize_db: -3.0, denoise: 0.0, track_gain: Default::default() } } }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -647,9 +648,12 @@ pub fn build_plan(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, proje
         if (sp - 1.0).abs() > 0.001 { let mut r = sp; while r > 2.0 { f.push_str(",atempo=2.0"); r /= 2.0; } while r < 0.5 { f.push_str(",atempo=0.5"); r *= 2.0; } f.push_str(&format!(",atempo={r:.4}")); }
         f.push_str(",aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo");
         if c.volume != 0.0 { f.push_str(&format!(",volume={:.2}dB", c.volume)); }
+        let tg = comp.audio.track_gain.get(&c.track).copied().unwrap_or(0.0);
+        if tg != 0.0 { f.push_str(&format!(",volume={:.2}dB", tg)); }
         if !c.audio.keyframes.is_empty() {
-            // piecewise-linear dB envelope in CLIP-LOCAL time
-            let mut kf = c.audio.keyframes.clone();
+            // piecewise-linear dB envelope. Keyframes store TIMELINE seconds;
+            // the stream clock here is clip-local (asetpts ran above), so shift.
+            let mut kf: Vec<Keyframe> = c.audio.keyframes.iter().map(|k| Keyframe { t: k.t - c.start, db: k.db }).collect();
             kf.sort_by(|x, y| x.t.partial_cmp(&y.t).unwrap_or(std::cmp::Ordering::Equal));
             let mut expr = format!("{:.2}", kf[0].db);
             for k in 1..kf.len() {
@@ -676,35 +680,52 @@ pub fn build_plan(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, proje
     let master = if comp.audio.master_db != 0.0 { format!(",volume={:.2}dB", comp.audio.master_db) } else { String::new() };
     let norm = if comp.audio.loudnorm { ",loudnorm=I=-16:TP=-1.5:LRA=11".to_string() } else { String::new() };
     let tail = format!("apad=whole_dur={dur:.4},atrim=0:{dur:.4}{master}{norm}");
-    match (voice.is_empty(), music.is_empty()) {
-        (true, true) => g.push(format!("anullsrc=r=48000:cl=stereo,{tail}[{aout}]")),
-        (false, true) => { let v = mix(&mut g, &voice, "vm"); g.push(format!("[{v}]{tail}[{aout}]")); }
-        (true, false) => {
-            let m = mix(&mut g, &music, "mm");
-            g.push(format!("[{m}]volume={:.2}dB,{tail}[{aout}]", comp.audio.duck.music_db));
-        }
-        (false, false) => {
-            let v = mix(&mut g, &voice, "vm");
-            let m = mix(&mut g, &music, "mm");
-            let d = &comp.audio.duck;
-            if d.enabled {
-                let v1 = g.label("vs"); let v2 = g.label("vs"); let md = g.label("md");
-                g.push(format!("[{v}]asplit[{v1}][{v2}]"));
-                let ratio = ((d.music_db - d.ducked_db) / 2.5).clamp(2.0, 20.0);
-                g.push(format!("[{m}]volume={:.2}dB[{}]", d.music_db, format!("{md}pre")));
-                g.push(format!("[{md}pre][{v2}]sidechaincompress=threshold=0.015:ratio={ratio:.1}:attack={:.0}:release={:.0}:makeup=1:level_sc=1:mix=1[{md}]", (d.attack * 1000.0).max(1.0), (d.release * 1000.0).max(10.0)));
-                g.push(format!("[{v1}][{md}]amix=inputs=2:duration=longest:normalize=0,{tail}[{aout}]"));
-            } else {
-                let m2 = g.label("mv");
-                g.push(format!("[{m}]volume={:.2}dB[{m2}]", d.music_db));
-                g.push(format!("[{v}][{m2}]amix=inputs=2:duration=longest:normalize=0,{tail}[{aout}]"));
-            }
-        }
-    }
-
+    // No automatic ducking: every audible clip (voice AND music) mixes flat.
+    // Manual ducking = volume keyframes on a clip (UI keyframe lane or agent
+    // update_clip {audio:{keyframes:[{t,db}]}}); per-track trim = track_gain.
+    let mut all = voice;
+    all.extend(music);
     let cache = proj.join(".cache");
     std::fs::create_dir_all(&cache).map_err(|e| format!("mkdir .cache: {e}"))?;
     let script = cache.join(script_name);
+    // Two-pass peak normalize (skipped when loudnorm owns the master): measure
+    // the mix peak with volumedetect, then gain so peaks land on normalizeDb.
+    // Measurement failure can never fail the render — it just yields +0 dB.
+    let mut norm_fx = String::new();
+    if !comp.audio.loudnorm && !all.is_empty() {
+        let tgt = comp.audio.normalize_db.clamp(-24.0, 0.0);
+        let m = mix(&mut g, &all, "mx");
+        let pm = g.label("pm");
+        g.push(format!("[{m}]volumedetect[{pm}]"));
+        if std::fs::write(&script, g.lines.join(";\n")).is_ok() {
+            if let Ok(ff) = video::ffmpeg(app) {
+                let mut args: Vec<String> = vec!["-hide_banner".into(), "-nostdin".into()];
+                args.extend(ctx.inputs.clone());
+                args.extend(filter_file_args(app, &script));
+                args.extend(["-map".into(), format!("[{pm}]"), "-f".into(), "null".into(), "-".into()]);
+                if let Ok(o) = Command::new(&ff).args(&args).output() {
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    let peak = err.lines().filter_map(|l| l.find("max_volume:").and_then(|i| l[i + 12..].trim().split_whitespace().next()).and_then(|v| v.parse::<f64>().ok())).last();
+                    if let Some(pk) = peak.filter(|p| p.is_finite() && *p > -90.0) {
+                        let gain = (tgt - pk).clamp(-24.0, 24.0);
+                        if gain.abs() >= 0.05 { norm_fx.push_str(&format!(",volume={gain:.2}dB")); }
+                        let lin = 10f64.powf(tgt / 20.0).clamp(0.0625, 1.0);
+                        norm_fx.push_str(&format!(",alimiter=limit={lin:.4}:attack=7:release=100"));
+                    }
+                }
+            }
+        }
+        g.lines.pop(); // drop the measurement tail; the real tail follows
+    }
+    match all.len() {
+        0 => g.push(format!("anullsrc=r=48000:cl=stereo,{tail}[{aout}]")),
+        _ => {
+            let m = mix(&mut g, &all, "mx2");
+            let tail2 = format!("apad=whole_dur={dur:.4},atrim=0:{dur:.4}{norm_fx}{master}{norm}");
+            g.push(format!("[{m}]{tail2}[{aout}]"));
+        }
+    }
+
     std::fs::write(&script, g.lines.join(";\n")).map_err(|e| format!("write filter script: {e}"))?;
 
     let mut args: Vec<String> = vec!["-hide_banner".into(), "-nostdin".into()];

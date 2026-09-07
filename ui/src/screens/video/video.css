@@ -268,3 +268,18 @@
 .ve-apply { position: sticky; bottom: -12px; margin: 4px -12px -12px; padding: 12px; background: linear-gradient(transparent, var(--surface) 30%); display: flex; flex-direction: column; gap: 6px; }
 .ve-apply .ve-btn { width: 100%; justify-content: center; height: 34px; font-size: 13px; }
 .ve-apply .ve-hint { text-align: center; }
+
+/* ---- keyframe lane (manual ducking) ---- */
+.ve-lane.keyframes { background: rgba(var(--accent-rgb), .05); cursor: crosshair; border-bottom: 1px solid rgba(var(--accent-rgb), .2); }
+.ve-kf { position: absolute; width: 10px; height: 10px; transform: rotate(45deg); background: var(--surface); border: 1.5px solid var(--accent); border-radius: 2px; cursor: grab; z-index: 3; }
+.ve-kf:hover, .ve-kf.drag { background: var(--accent); }
+.ve-kf.sel { box-shadow: 0 0 0 1.5px var(--text); }
+.ve-kf-hint { position: absolute; right: 6px; top: 2px; font-size: 9.5px; font-weight: 700; color: var(--text-faint); pointer-events: none; letter-spacing: .04em; }
+.ve-track-hdr.ve-kf-hdr { border-bottom: 1px solid rgba(var(--accent-rgb), .2); }
+.ve-track-hdr.ve-kf-hdr .id { color: var(--accent); }
+
+/* ---- welcome create form ---- */
+.ve-create { display: flex; gap: 8px; align-items: stretch; }
+.ve-create input { flex: 1; min-width: 0; height: 38px; font-size: 13.5px; padding: 0 12px; border-radius: 10px; }
+.ve-create-btn { height: 38px; padding: 0 18px; font-size: 13.5px; border-radius: 10px; flex-shrink: 0; }
+.ve-create-btn:disabled { opacity: .45; cursor: default; }

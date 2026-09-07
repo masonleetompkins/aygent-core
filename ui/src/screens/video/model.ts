@@ -58,7 +58,7 @@ export type Captions = {
   lines: CaptionLineEdit[]; // user-edited sections (timeline time; empty = auto-group)
 };
 export type Duck = { enabled: boolean; musicDb: number; duckedDb: number; attack: number; release: number };
-export type AudioMix = { duck: Duck; enhance: string; masterDb: number; loudnorm: boolean };
+export type AudioMix = { duck: Duck; enhance: string; masterDb: number; loudnorm: boolean; normalizeDb: number; denoise: number; trackGain: Record<string, number> };
 export type Matte = { enabled: boolean; sourceAsset: string; alphaAsset: string; feather: number };
 export type ExportPreset = { name: string; width: number; height: number; bitrate: string; codec: "h264" | "hevc" | "prores"; fps: number };
 
@@ -105,7 +105,7 @@ export function blankComposition(): Composition {
     clips: [],
     graphics: stockBrightHud(),
     captions: { enabled: false, sourceAsset: "", keyWords: [], y: 0.78, lines: [] },
-    audio: { duck: { enabled: true, musicDb: -18, duckedDb: -30, attack: 0.02, release: 0.4 }, enhance: "auphonic", masterDb: 0, loudnorm: false },
+    audio: { duck: { enabled: false, musicDb: -18, duckedDb: -30, attack: 0.02, release: 0.4 }, enhance: "local", masterDb: 0, loudnorm: false, normalizeDb: -3, denoise: 0, trackGain: {} },
     color: { ...defaultGrade(), sCurve: 0.35 },
     adjustmentLayer: true,
     matte: { enabled: false, sourceAsset: "", alphaAsset: "", feather: 0 },
@@ -169,12 +169,30 @@ export function normalize(raw: unknown, assets: Asset[] = []): Composition {
     clips,
     graphics: { ...stockBrightHud(), ...(r.graphics ?? {}) },
     captions: { ...b.captions, ...(r.captions ?? {}), keyWords: Array.isArray(r.captions?.keyWords) ? r.captions.keyWords : [] },
-    audio: { ...b.audio, ...(r.audio ?? {}), duck: { ...b.audio.duck, ...(r.audio?.duck ?? {}) } },
+    audio: { ...b.audio, ...(r.audio ?? {}), duck: { ...b.audio.duck, ...(r.audio?.duck ?? {}) }, trackGain: (r.audio?.trackGain && typeof r.audio.trackGain === "object" ? r.audio.trackGain : {}), normalizeDb: num(r.audio?.normalizeDb, -3), denoise: num(r.audio?.denoise, 0) },
     color: { ...b.color, ...(r.color ?? {}) },
     adjustmentLayer: bool(r.adjustmentLayer, true),
     matte: { ...b.matte, ...(r.matte ?? {}) },
     exports: Array.isArray(r.exports) && r.exports.length ? r.exports.map((e: any) => ({ name: str(e.name, "export"), width: num(e.width, 1920), height: num(e.height, 1080), bitrate: str(e.bitrate, "12M"), codec: (["h264", "hevc", "prores"].includes(e.codec) ? e.codec : "h264"), fps: num(e.fps, 0) })) : b.exports,
   };
+}
+
+/** dB value of a clip's manual volume envelope at a TIMELINE time (seconds).
+ *  Keyframes store timeline seconds (UI lane + agent agree); the ffmpeg graph
+ *  shifts them to clip-local at render. Piecewise-linear, edge-pinned. */
+export function kfDbAt(keyframes: { t: number; db: number }[], t: number): number {
+  if (!keyframes.length) return 0;
+  const kf = [...keyframes].sort((a, b) => a.t - b.t);
+  if (t <= kf[0].t) return kf[0].db;
+  for (let i = 1; i < kf.length; i++) {
+    if (t <= kf[i].t) {
+      const a0 = kf[i - 1], a1 = kf[i];
+      const span = a1.t - a0.t;
+      if (span < 1e-6) return a1.db;
+      return a0.db + (a1.db - a0.db) * ((t - a0.t) / span);
+    }
+  }
+  return kf[kf.length - 1].db;
 }
 
 export const duration = (c: Composition) => c.clips.reduce((m, k) => (k.hidden || k.type === "review" ? m : Math.max(m, k.end)), 0);

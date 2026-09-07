@@ -2,12 +2,13 @@
 // flat accent blocks (audio shows its cached waveform); drag body = move (with
 // track change), drag edges = trim (source in/out follow, rate-aware), razor tool
 // or K splits, marquee-select on empty lane, drag an asset from Media to place.
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Scissors, MousePointer2, MessageSquare, Magnet, ZoomIn, ZoomOut, Trash2, Copy, AlignHorizontalSpaceAround, Eye, EyeOff, Volume2, VolumeX, Lock, Unlock, Undo2, Redo2 } from "lucide-react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Scissors, MousePointer2, MessageSquare, Magnet, ZoomIn, ZoomOut, Trash2, Copy, AlignHorizontalSpaceAround, Eye, EyeOff, Volume2, VolumeX, Lock, Unlock, Undo2, Redo2, X } from "lucide-react";
 import { useVideo, useVideoSel, usePlayhead, set, get, seek, patchClips, beginGesture, splitAt, deleteSelected, duplicateSelected, closeGaps, addAssetToTimeline, undo, redo, canUndo, canRedo, mutate, withLinked } from "./store";
-import { type Clip, TRACK_ORDER, TRACK_KIND, TRACK_LABEL, duration as durOf, fmtTime, mediaUrl, clipDur, newClip } from "./model";
+import { type Clip, TRACK_ORDER, TRACK_KIND, TRACK_LABEL, duration as durOf, fmtTime, mediaUrl, clipDur, newClip, kfDbAt } from "./model";
 
-const LANE_H: Record<string, number> = { video: 56, text: 34, audio: 44, review: 44 };
+const LANE_H: Record<string, number> = { video: 56, text: 34, audio: 44, review: 44, keyframes: 46 };
+const KF_TOP_DB = 6, KF_BOT_DB = -40; // keyframe lane range
 const MIN_ZOOM = 6, MAX_ZOOM = 600;
 
 export function Timeline() {
@@ -36,6 +37,7 @@ export function Timeline() {
     return showR1 ? ["R1", ...base.filter((t) => t !== "R1")] : base;
   }, [comp.clips, s.tool]);
   const contentW = Math.max(laneWidth, (total + 10) * zoom + 200);
+  const kfLaneShown = (t: string) => t === s.kfTrack && (TRACK_KIND(t) === "audio" || comp.clips.some((c) => c.track === t && c.type === "video"));
 
   useEffect(() => {
     const el = lanesRef.current; if (!el) return;
@@ -60,7 +62,13 @@ export function Timeline() {
   }
   const xToT = (clientX: number) => { const el = lanesRef.current!; const r = el.getBoundingClientRect(); return Math.max(0, (clientX - r.left + el.scrollLeft) / zoom); };
   const frameQ = (t: number) => Math.round(t * fps) / fps;
-  const laneTop = (track: string) => { let y = 0; for (const t of tracks) { if (t === track) return y; y += LANE_H[TRACK_KIND(t)] ?? 44; } return 0; };
+  // Y offset of a lane top; keyframe lanes render directly under their audio lane.
+  const laneTops = useMemo(() => {
+    const m = new Map<string, number>(); let y = 0;
+    for (const t of tracks) { m.set(t, y); y += LANE_H[TRACK_KIND(t)] ?? 44; if (t === s.kfTrack && kfLaneShown(t)) y += LANE_H.keyframes; }
+    return m;
+  }, [tracks, s.kfTrack, comp.clips]);
+  const laneTop = (track: string) => laneTops.get(track) ?? 0;
 
   // ---- ruler scrub ----
   function onRulerDown(e: React.MouseEvent) {
@@ -277,26 +285,37 @@ export function Timeline() {
           {tracks.map((t) => {
             const kind = TRACK_KIND(t);
             return (
-              <div key={t} className="ve-track-hdr" style={{ height: LANE_H[kind] ?? 44 }}>
+              <React.Fragment key={t}>
+              <div className="ve-track-hdr" style={{ height: LANE_H[kind] ?? 44 }}>
                 <span className="id">{t}</span>
                 <span className="nm">{TRACK_LABEL[t] ?? (kind === "video" ? "Video" : kind === "text" ? "Text" : kind === "review" ? "Review" : "Audio")}</span>
                 {kind !== "audio" && <button className={`t ${trackState(t, "hidden") ? "off" : ""}`} title={kind === "review" ? "Resolve / reopen all notes" : "Toggle visibility"} onClick={() => toggleTrack(t, "hidden")}>{trackState(t, "hidden") ? <EyeOff size={13} /> : <Eye size={13} />}</button>}
                 {kind !== "text" && kind !== "review" && <button className={`t ${trackState(t, "muted")} ? "off" : ""}`} title="Toggle mute" onClick={() => toggleTrack(t, "muted")}>{trackState(t, "muted") ? <VolumeX size={13} /> : <Volume2 size={13} />}</button>}
                 <button className={`t ${locked[t] ? "off" : ""}`} title="Lock track" onClick={() => setLocked({ ...locked, [t]: !locked[t] })}>{locked[t] ? <Lock size={12} /> : <Unlock size={12} />}</button>
               </div>
-            );
-          })}
+              {kfLaneShown(t) && (
+                <div key={`${t}-kfhdr`} className="ve-track-hdr ve-kf-hdr" style={{ height: LANE_H.keyframes }}>
+                  <span className="id">dB</span>
+                  <button className="t" title="Close keyframe lane" onClick={() => set({ kfTrack: null })}><X size={12} /></button>
+                </div>
+              )}
+            </React.Fragment>
+          );})}
           <div className="ve-track-hdr" style={{ height: 30 }}><span className="ve-faint" style={{ fontSize: 10.5 }}>inspector → track: V3, V4… adds lanes</span></div>
         </div>
         <div className="ve-lanes aygent-scroll" ref={lanesRef} onWheel={onWheel} onDragOver={onDragOver} onDragLeave={() => setOverLane(null)} onDrop={onDrop}>
           <div style={{ position: "relative", width: contentW, minHeight: "100%" }}>
-            {tracks.map((t) => {
+            {tracks.flatMap((t) => {
               const kind = TRACK_KIND(t);
-              return (
+              const lane = (
                 <div key={t} data-track={t} className={`ve-lane ${kind} ${overLane === t ? "over" : ""}`} style={{ height: LANE_H[kind] ?? 44, opacity: locked[t] ? 0.6 : 1 }} onMouseDown={onLaneDown}>
                   {comp.clips.filter((c) => c.track === t).map((c) => <ClipView key={c.id} clip={c} zoom={zoom} sel={selection.includes(c.id)} agentId={s.agentId} project={s.project} bust={s.cacheBust} onDown={onClipDown} />)}
                 </div>
               );
+              if (kfLaneShown(t)) {
+                return [lane, <KeyframeLane key={`${t}-kf`} track={t} zoom={zoom} xToT={xToT} frameQ={frameQ} contentW={contentW} />];
+              }
+              return [lane];
             })}
             <div style={{ height: 30 }} />
             {reviewDraft && tracks.includes("R1") && <div className="ve-review-ghost" style={{ top: laneTop("R1") + 4, left: reviewDraft.a * zoom, width: Math.max(4, (reviewDraft.b - reviewDraft.a) * zoom) }} />}
@@ -325,6 +344,115 @@ function LanePlayhead({ zoom, lanesRef }: { zoom: number; lanesRef: React.RefObj
     if (x < el.scrollLeft || x > el.scrollLeft + el.clientWidth - 40) el.scrollLeft = Math.max(0, x - 80);
   }, [playhead, playing, zoom, lanesRef]);
   return <div className="ve-playhead" style={{ left: playhead * zoom }} />;
+}
+
+// ---- manual-ducking keyframe lane -------------------------------------------
+// Drawn directly under its audio lane. Click empty space = add keyframe (at the
+// envelope value there, timeline seconds); drag a diamond = move it (shift =
+// fine); double-click a diamond = delete. Keyframes store TIMELINE seconds and
+// are evaluated against every clip the playhead sits inside, so the curve rides
+// across cuts instead of resetting per clip.
+function KeyframeLane({ track, zoom, xToT, frameQ, contentW }: { track: string; zoom: number; xToT: (x: number) => number; frameQ: (t: number) => number; contentW: number }) {
+  const st = useVideo();
+  const { comp, selection } = st;
+  const [drag, setDrag] = useState<{ idx: number; clipId: string } | null>(null);
+  const clips = comp.clips.filter((c) => c.track === track && (c.type === "audio" || c.type === "video") && !c.hidden);
+  const H = LANE_H.keyframes;
+  const yOf = (db: number) => H - 6 - ((Math.max(KF_BOT_DB, Math.min(KF_TOP_DB, db)) - KF_BOT_DB) / (KF_TOP_DB - KF_BOT_DB)) * (H - 12);
+  const dbOf = (y: number) => KF_BOT_DB + ((H - 6 - Math.max(6, Math.min(H - 6, y))) / (H - 12)) * (KF_TOP_DB - KF_BOT_DB);
+  // envelope path across the lane (timeline seconds)
+  const pts: string[] = [];
+  const total = durOf(comp);
+  const step = Math.max(0.05, 1 / zoom);
+  for (let t = 0; t <= total + 0.001; t += step) {
+    const c = clips.find((k) => t >= k.start && t < k.end);
+    const db = c && c.audio.keyframes.length ? kfDbAt(c.audio.keyframes, t) : 0;
+    pts.push(`${(t * zoom).toFixed(1)},${yOf(db).toFixed(1)}`);
+  }
+  const envAt = (clip: Clip, tl: number) => (clip.audio.keyframes.length ? kfDbAt(clip.audio.keyframes, tl) : 0);
+
+  function onDown(e: React.MouseEvent) {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    const tl = frameQ(Math.max(0, xToT(e.clientX)));
+    const clip = clips.find((k) => tl >= k.start && tl <= k.end + 0.001);
+    if (!clip) return;
+    const laneEl = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const y = e.clientY - laneEl.top;
+    const db = Math.round(dbOf(y) * 2) / 2;
+    beginGesture();
+    mutate((c) => {
+      const kfs = c.clips.find((k) => k.id === clip.id)!.audio.keyframes;
+      kfs.push({ t: tl, db });
+      kfs.sort((a, b) => a.t - b.t);
+    }, { undo: false });
+    const startX = e.clientX;
+    const mv = (ev: MouseEvent) => {
+      const fine = ev.shiftKey ? 0.2 : 1;
+      const ntl = frameQ(Math.max(clip.start, Math.min(clip.end, tl + ((ev.clientX - startX) / zoom) * fine)));
+      const lane = (document.querySelector(`[data-kflane="${track}"]`) as HTMLElement | null)?.getBoundingClientRect();
+      const ndb = lane ? Math.round(dbOf(ev.clientY - lane.top) * 2) / 2 : db;
+      setDrag({ idx: -1, clipId: clip.id });
+      mutate((c) => {
+        const kfs = c.clips.find((k) => k.id === clip.id)!.audio.keyframes;
+        // the keyframe we just placed is the one nearest (tl, db)
+        let best = 0, bd = Infinity;
+        kfs.forEach((k, i) => { const d = Math.abs(k.t - tl) + Math.abs(k.db - db) / 20; if (d < bd) { bd = d; best = i; } });
+        kfs[best] = { t: ntl, db: Math.max(KF_BOT_DB, Math.min(KF_TOP_DB, ndb)) };
+        kfs.sort((a, b) => a.t - b.t);
+      }, { undo: false });
+    };
+    const up = () => { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); setDrag(null); };
+    window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
+  }
+
+  function onKfDown(e: React.MouseEvent, clip: Clip, idx: number) {
+    e.stopPropagation(); e.preventDefault();
+    if (e.detail >= 2) { // double-click = delete
+      beginGesture();
+      mutate((c) => { c.clips.find((k) => k.id === clip.id)!.audio.keyframes.splice(idx, 1); });
+      return;
+    }
+    const kf = clip.audio.keyframes[idx];
+    beginGesture();
+    setDrag({ idx, clipId: clip.id });
+    const startX = (e as unknown as MouseEvent).clientX;
+    const mv = (ev: MouseEvent) => {
+      const fine = ev.shiftKey ? 0.2 : 1;
+      const ntl = frameQ(Math.max(clip.start, Math.min(clip.end, kf.t + ((ev.clientX - startX) / zoom) * fine)));
+      const lane = (document.querySelector(`[data-kflane="${track}"]`) as HTMLElement | null)?.getBoundingClientRect();
+      const ndb = lane ? Math.round(dbOf(ev.clientY - lane.top) * 2) / 2 : kf.db;
+      mutate((c) => {
+        const kfs = c.clips.find((k) => k.id === clip.id)!.audio.keyframes;
+        // idx may have shifted after a sort — find by identity window first
+        let at = kfs.findIndex((k) => Math.abs(k.t - kf.t) < 1e-9 && Math.abs(k.db - kf.db) < 1e-9);
+        if (at < 0) at = Math.max(0, Math.min(idx, kfs.length - 1));
+        kfs[at] = { t: ntl, db: Math.max(KF_BOT_DB, Math.min(KF_TOP_DB, ndb)) };
+        kfs.sort((a, b) => a.t - b.t);
+      }, { undo: false });
+    };
+    const up = () => { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); setDrag(null); };
+    window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
+  }
+
+  return (
+    <div data-kflane={track} className="ve-lane keyframes" style={{ height: LANE_H.keyframes, top: 0 }} onMouseDown={onDown} title="Click to add a volume keyframe · drag to move (shift = fine) · double-click to delete">
+      <svg style={{ position: "absolute", left: 0, top: 0, width: contentW, height: H, pointerEvents: "none" }}>
+        <line x1={0} x2={contentW} y1={yOf(0)} y2={yOf(0)} stroke="rgba(var(--accent-rgb),.25)" strokeDasharray="3 3" />
+        <polyline points={pts.join(" ")} fill="none" stroke="var(--accent)" strokeWidth={1.5} />
+      </svg>
+      {clips.map((c) => c.audio.keyframes.map((k, idx) => (
+        <div
+          key={`${c.id}-${idx}`}
+          className={`ve-kf ${drag?.clipId === c.id && drag?.idx === idx ? "drag" : ""} ${selection.includes(c.id) ? "sel" : ""}`}
+          style={{ left: k.t * zoom - 5, top: yOf(k.db) - 5 }}
+          title={`${k.t.toFixed(2)}s · ${k.db.toFixed(1)} dB — drag to move, double-click to delete`}
+          onMouseDown={(e) => onKfDown(e, c, idx)}
+        />
+      )))}
+      <span className="ve-kf-hint">{track} · dB</span>
+    </div>
+  );
 }
 
 function ClipView({ clip: c, zoom, sel, agentId, project, bust, onDown }: { clip: Clip; zoom: number; sel: boolean; agentId: string | null; project: string | null; bust: number; onDown: (e: React.MouseEvent, c: Clip, m: "move" | "l" | "r") => void }) {

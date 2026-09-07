@@ -31,7 +31,7 @@ import { useVideo, usePlayhead, tickPlayhead, seek, togglePlay, stepFrames, set,
 import { Num, volumeOf } from "./Panels";
 import { Unplug } from "lucide-react";
 import { duration as durOf } from "./model";
-import { type Clip, type Composition, TRACK_KIND, fmtTime, mediaUrl } from "./model";
+import { type Clip, type Composition, TRACK_KIND, fmtTime, mediaUrl, kfDbAt } from "./model";
 
 const rank = (t: string) => (t.startsWith("V") ? Number(t.slice(1)) : t.startsWith("T") ? 100 + Number(t.slice(1)) : 50);
 
@@ -165,7 +165,11 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
       if (!isActive && playhead < c.start && keepTail(slot.id, el)) continue;
       const wantMuted = muted || c.muted || !isActive;
       if (el.muted !== wantMuted) el.muted = wantMuted;
-      const vol = Math.max(0, Math.min(1, Math.pow(10, c.volume / 20)));
+      // Preview mix mirrors the export graph: clip gain + track trim + the
+      // manual keyframe envelope (evaluated at clip-local time, like ffmpeg).
+      const tg = comp.audio.trackGain?.[c.track] ?? 0;
+      const kdb = c.audio.keyframes.length ? kfDbAt(c.audio.keyframes, playhead) : 0;
+      const vol = Math.max(0, Math.min(1, Math.pow(10, (c.volume + tg + kdb) / 20)));
       if (Math.abs(el.volume - vol) > 0.005) el.volume = vol;
       setRate(el, c.speed);
 
