@@ -31,7 +31,7 @@ import { useVideo, usePlayhead, tickPlayhead, seek, togglePlay, stepFrames, set,
 import { Num, volumeOf } from "./Panels";
 import { Unplug } from "lucide-react";
 import { duration as durOf } from "./model";
-import { type Clip, type Composition, TRACK_KIND, fmtTime, mediaUrl, kfDbAt } from "./model";
+import { type Asset, type Clip, type Composition, TRACK_KIND, fmtTime, mediaUrl, kfDbAt } from "./model";
 
 const rank = (t: string) => (t.startsWith("V") ? Number(t.slice(1)) : t.startsWith("T") ? 100 + Number(t.slice(1)) : 50);
 
@@ -54,13 +54,30 @@ const LEAD = 1.0;        // s of hidden pre-roll before a cut
 const TAIL_MS = 350;       // gapless-audio tail: outgoing keeps playing this long past a cut
                          // until the incoming element is confirmed rolling
 type Slot = { id: string; asset: string; kind: "video" | "audio" };
-function assignSlots(comp: Composition, assetKind: (id: string) => "video" | "audio" | "image" | undefined): { slots: Slot[]; slotOf: Map<string, string> } {
+// Replacement-audio dubs: when cleanup is enabled, a video clip with audioAsset
+// plays picture muted while a pooled audio slot plays the cleaned file in sync
+// (same timing model as export). Bypassed/offline → no dub, original sound.
+function cleanDubs(comp: Composition, assets: Asset[]): Clip[] {
+  if (comp.audio.cleanEnabled === false) return [];
+  const byId = new Map(assets.map((a) => [a.id, a]));
+  const out: Clip[] = [];
+  for (const c of comp.clips) {
+    if (c.hidden || c.muted || c.type !== "video" || !c.audioAsset) continue;
+    const ra = byId.get(c.audioAsset);
+    if (!ra || ra.online === false) continue;
+    out.push({ ...c, id: `${c.id}#dub`, type: "audio", asset: c.audioAsset, link: "", name: `${c.name} \u00b7 cleaned` });
+  }
+  return out;
+}
+function assignSlots(comp: Composition, dubs: Clip[], assetKind: (id: string) => "video" | "audio" | "image" | undefined): { slots: Slot[]; slotOf: Map<string, string> } {
   const slots: Slot[] = []; const slotOf = new Map<string, string>();
   const lastEnd = new Map<string, number>();
   // Linked V+A pairs share one voice: the video element carries the sound, so
   // the linked audio clip needs no slot of its own (it would double-play).
+  // (A clip WITH an active cleaned dub is the exception: its picture plays
+  // muted and the dub pseudo below carries the sound.)
   const videoLinks = new Set(comp.clips.filter((c) => c.type === "video" && c.link).map((c) => c.link));
-  const media = comp.clips.filter((c) => (c.type === "video" || c.type === "audio") && !c.hidden && c.asset && !(c.type === "audio" && c.link && videoLinks.has(c.link))).sort((a, b) => a.start - b.start);
+  const media = comp.clips.filter((c) => (c.type === "video" || c.type === "audio") && !c.hidden && c.asset && !(c.type === "audio" && c.link && videoLinks.has(c.link))).concat(dubs).sort((a, b) => a.start - b.start);
   for (const c of media) {
     const k = assetKind(c.asset); if (!k || k === "image") continue;
     const mine = slots.filter((s) => s.asset === c.asset);
@@ -90,7 +107,9 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
   const sceneW = comp.scene.width, sceneH = comp.scene.height;
   const fps = comp.scene.fps || 30;
   const assetKind = (id: string) => s.assets.find((a) => a.id === id)?.kind;
-  const { slots, slotOf } = useMemo(() => assignSlots(comp, assetKind), [comp.clips, s.assets]);
+  const dubs = useMemo(() => cleanDubs(comp, s.assets), [comp, s.assets]);
+  const dubbed = useMemo(() => new Set(dubs.map((d) => d.id.replace(/#dub$/, ""))), [dubs]);
+  const { slots, slotOf } = useMemo(() => assignSlots(comp, dubs, assetKind), [comp, s.assets, dubs]);
   const els = useRef(new Map<string, HTMLMediaElement>());
   const prepared = useRef(new Map<string, string>()); // slot → clip id pre-seeked
   const retiring = useRef(new Map<string, number>()); // slot → tail deadline (performance.now ms)
@@ -100,14 +119,14 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
   const assigned = useMemo(() => {
     const m = new Map<string, Clip>();
     const next = new Map<string, Clip>();
-    for (const c of comp.clips) {
+    for (const c of [...comp.clips, ...dubs]) {
       const sid = slotOf.get(c.id); if (!sid) continue;
       if (playhead >= c.start && playhead < c.end) m.set(sid, c);
       else if (c.start >= playhead) { const n = next.get(sid); if (!n || c.start < n.start) next.set(sid, c); }
     }
     for (const [sid, c] of next) if (!m.has(sid)) m.set(sid, c);
     return m;
-  }, [comp.clips, slotOf, playhead]);
+  }, [comp.clips, dubs, slotOf, playhead]);
 
   const active = useMemo(() => comp.clips.filter((c) => !c.hidden && playhead >= c.start && playhead < c.end).sort((a, b) => rank(a.track) - rank(b.track)), [comp.clips, playhead]);
 
@@ -120,7 +139,7 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
   // rolling (unpaused, buffered, on-position) before a retiring tail may stop.
   // A clip with no slot (offline media) counts as vacuous — tails still end on time.
   const audibleOwnersRolling = () => {
-    const owners = comp.clips.filter((k) => !k.hidden && !k.muted && (k.type === "video" || k.type === "audio") && playhead >= k.start && playhead < k.end);
+    const owners = [...comp.clips, ...dubs].filter((k) => !k.hidden && !k.muted && (k.type === "video" || k.type === "audio") && playhead >= k.start && playhead < k.end);
     if (!owners.length) return true;
     return owners.every((k) => {
       const sid = slotOf.get(k.id); if (!sid) return true;
@@ -163,13 +182,14 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
       // Slot already assigned to a FUTURE clip but still sounding the just-ended
       // one: keep the tail (checked before wantMuted mutes it below).
       if (!isActive && playhead < c.start && keepTail(slot.id, el)) continue;
-      const wantMuted = muted || c.muted || !isActive;
+      const hasDub = c.type === "video" && dubbed.has(c.id);
+      const wantMuted = muted || c.muted || !isActive || hasDub;
       if (el.muted !== wantMuted) el.muted = wantMuted;
       // Preview mix mirrors the export graph: clip gain + track trim + the
       // manual keyframe envelope (evaluated at clip-local time, like ffmpeg).
       const tg = comp.audio.trackGain?.[c.track] ?? 0;
       const kdb = c.audio.keyframes.length ? kfDbAt(c.audio.keyframes, playhead) : 0;
-      const vol = Math.max(0, Math.min(1, Math.pow(10, (c.volume + tg + kdb) / 20)));
+      const vol = hasDub && slot.kind === "video" ? 0 : Math.max(0, Math.min(1, Math.pow(10, (c.volume + tg + kdb) / 20)));
       if (Math.abs(el.volume - vol) > 0.005) el.volume = vol;
       setRate(el, c.speed);
 

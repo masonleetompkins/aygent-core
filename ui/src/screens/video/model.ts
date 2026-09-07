@@ -58,7 +58,7 @@ export type Captions = {
   lines: CaptionLineEdit[]; // user-edited sections (timeline time; empty = auto-group)
 };
 export type Duck = { enabled: boolean; musicDb: number; duckedDb: number; attack: number; release: number };
-export type AudioMix = { duck: Duck; enhance: string; masterDb: number; loudnorm: boolean; normalizeDb: number; denoise: number; trackGain: Record<string, number> };
+export type AudioMix = { duck: Duck; enhance: string; masterDb: number; loudnorm: boolean; normalizeDb: number; denoise: number; trackGain: Record<string, number>; cleanEnabled: boolean };
 export type Matte = { enabled: boolean; sourceAsset: string; alphaAsset: string; feather: number };
 export type ExportPreset = { name: string; width: number; height: number; bitrate: string; codec: "h264" | "hevc" | "prores"; fps: number };
 
@@ -105,7 +105,7 @@ export function blankComposition(): Composition {
     clips: [],
     graphics: stockBrightHud(),
     captions: { enabled: false, sourceAsset: "", keyWords: [], y: 0.78, lines: [] },
-    audio: { duck: { enabled: false, musicDb: -18, duckedDb: -30, attack: 0.02, release: 0.4 }, enhance: "local", masterDb: 0, loudnorm: false, normalizeDb: -3, denoise: 0, trackGain: {} },
+    audio: { duck: { enabled: false, musicDb: -18, duckedDb: -30, attack: 0.02, release: 0.4 }, enhance: "local", masterDb: 0, loudnorm: false, normalizeDb: -3, denoise: 0, trackGain: {}, cleanEnabled: true },
     color: { ...defaultGrade(), sCurve: 0.35 },
     adjustmentLayer: true,
     matte: { enabled: false, sourceAsset: "", alphaAsset: "", feather: 0 },
@@ -169,7 +169,7 @@ export function normalize(raw: unknown, assets: Asset[] = []): Composition {
     clips,
     graphics: { ...stockBrightHud(), ...(r.graphics ?? {}) },
     captions: { ...b.captions, ...(r.captions ?? {}), keyWords: Array.isArray(r.captions?.keyWords) ? r.captions.keyWords : [] },
-    audio: { ...b.audio, ...(r.audio ?? {}), duck: { ...b.audio.duck, ...(r.audio?.duck ?? {}) }, trackGain: (r.audio?.trackGain && typeof r.audio.trackGain === "object" ? r.audio.trackGain : {}), normalizeDb: num(r.audio?.normalizeDb, -3), denoise: num(r.audio?.denoise, 0) },
+    audio: { ...b.audio, ...(r.audio ?? {}), duck: { ...b.audio.duck, ...(r.audio?.duck ?? {}) }, trackGain: (r.audio?.trackGain && typeof r.audio.trackGain === "object" ? r.audio.trackGain : {}), normalizeDb: num(r.audio?.normalizeDb, -3), denoise: num(r.audio?.denoise, 0), cleanEnabled: bool(r.audio?.cleanEnabled, true) },
     color: { ...b.color, ...(r.color ?? {}) },
     adjustmentLayer: bool(r.adjustmentLayer, true),
     matte: { ...b.matte, ...(r.matte ?? {}) },

@@ -214,8 +214,8 @@ impl Default for Duck { fn default() -> Self { Self { enabled: false, music_db: 
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
-pub struct AudioMix { pub duck: Duck, pub enhance: String, pub master_db: f64, pub loudnorm: bool, #[serde(default = "d_neg3")] pub normalize_db: f64, pub denoise: f64, #[serde(default)] pub track_gain: std::collections::HashMap<String, f64> }
-impl Default for AudioMix { fn default() -> Self { Self { duck: Duck::default(), enhance: "local".into(), master_db: 0.0, loudnorm: false, normalize_db: -3.0, denoise: 0.0, track_gain: Default::default() } } }
+pub struct AudioMix { pub duck: Duck, pub enhance: String, pub master_db: f64, pub loudnorm: bool, #[serde(default = "d_neg3")] pub normalize_db: f64, pub denoise: f64, #[serde(default)] pub track_gain: std::collections::HashMap<String, f64>, #[serde(default = "d_true")] pub clean_enabled: bool }
+impl Default for AudioMix { fn default() -> Self { Self { duck: Duck::default(), enhance: "local".into(), master_db: 0.0, loudnorm: false, normalize_db: -3.0, denoise: 0.0, track_gain: Default::default(), clean_enabled: true } } }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -637,7 +637,7 @@ pub fn build_plan(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, proje
     let mut music: Vec<String> = vec![];
     for c in scaled.iter().filter(|c| c.has_audio_role() && !c.hidden || (c.kind == "audio" && !c.muted)) {
         if c.kind == "audio" && !c.link.is_empty() && video_links.contains(c.link.as_str()) { continue; }
-        let asset_id = if !c.audio_asset.is_empty() && abs.contains_key(&c.audio_asset) { c.audio_asset.as_str() } else { c.asset.as_str() };
+        let asset_id = if comp.audio.clean_enabled && !c.audio_asset.is_empty() && abs.contains_key(&c.audio_asset) { c.audio_asset.as_str() } else { c.asset.as_str() };
         let Some(a) = assets.get(asset_id) else { continue };
         if !a.has_audio { continue; }
         let Some(i) = ctx.input_for(asset_id, None) else { continue };

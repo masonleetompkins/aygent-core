@@ -323,16 +323,17 @@ export function AudioPanel() {
     <>
       <div className="ve-panel-head">Audio<span className="spacer" /><span className="ve-pill ok">local</span></div>
       <div className="ve-panel-body">
-        <Section title="Dialogue cleanup" right={cleaned ? <span className="ve-pill ok">cleaned</span> : null}>
+        <Section title="Dialogue cleanup" right={cleaned ? (a.cleanEnabled !== false ? <span className="ve-pill ok">cleaned</span> : <span className="ve-pill">bypassed</span>) : null}>
           <Slider label="Normalize peaks to" value={a.normalizeDb} min={-24} max={0} step={0.5} fmt={(v) => `${v} dBFS`} onChange={(v) => setPath("audio.normalizeDb", v)} />
           <Slider label="Noise reduction" value={a.denoise} min={0} max={1} step={0.01} fmt={(v) => (v <= 0.001 ? "off" : `${Math.round(v * 100)}%`)} onChange={(v) => setPath("audio.denoise", v)} />
-          <p className="ve-hint">Normalize + denoise apply to the <b>export mix</b> and to cleaned assets below. Preview a strength before committing.</p>
+          <p className="ve-hint">Normalize + denoise bake into the cleaned file when you clean. Preview a strength, adjust % freely, Clean again to regenerate.</p>
           <div style={{ display: "flex", gap: 8 }}>
             <button className="ve-btn sm" disabled={!aroll || !!s.toolProgress} onClick={() => aroll && void audition(aroll.asset)}><Play size={12} /> {auditioning ? "Rendering…" : "Preview denoise"}</button>
-            <button className="ve-btn sm primary" disabled={!aroll || !!s.toolProgress} onClick={() => aroll && void cleanup(aroll.asset)}><Sparkles size={12} /> Clean A-roll</button>
+            <button className="ve-btn sm primary" disabled={!aroll || !!s.toolProgress} onClick={() => aroll && void cleanup(aroll.asset)}><Sparkles size={12} /> {cleaned ? "Re-clean A-roll" : "Clean A-roll"}</button>
           </div>
+          {cleaned && <Check label="Use cleaned audio" checked={a.cleanEnabled !== false} onChange={(v) => setPath("audio.cleanEnabled", v)} />}
           {auditionUrl && <audio controls src={auditionUrl} style={{ width: "100%" }} />}
-          {cleaned && <p className="ve-hint">A-roll clips now play <b>{cleaned.name}</b>. Clear via Inspector → Audio asset.</p>}
+          {cleaned && <p className="ve-hint">{a.cleanEnabled !== false ? <>A-roll plays <b>{cleaned.name}</b> (preview + export).</> : <>Bypassed — original audio (preview + export).</>} Toggle above to A/B. Clear via Inspector → Audio asset.</p>}
         </Section>
         <Section title="Tracks" right={<Volume2 size={13} style={{ color: "var(--text-faint)" }} />}>
           {tracks.length === 0 && <p className="ve-hint">No audible tracks yet — import media first.</p>}
