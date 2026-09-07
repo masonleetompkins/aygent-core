@@ -1,3 +1,39 @@
+# Stage build — 2026-09-07 ~06:17 PDT — v1.0.16 (review lane + agent vision)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `da012a7` — feat(video): review lane (R1 notes) + agent canvas vision (video_look)
+- `fa5ad78` — chore: bump version 1.0.15 → 1.0.16 (review lane + agent vision)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41,553,704 bytes), mtime **Sep 7 06:17**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **18,013,736 bytes (~17.2 MB)**, mtime **Sep 7 06:17**
+
+**What changed:**
+1. **Review mode** — third tool button (💬, `R`) next to Select/Razor. Entering Review reveals the **R1 lane** on top; it stays visible while notes exist. Click-drag on R1 drops a timestamped note (plain click = 2s note); Inspector's **Feedback for the agent** section edits text + resolved state. Notes never touch renders (excluded from duration, visuals, audio; razor/close-gaps skip them).
+2. **Agent vision** — new `video_look {project, time|times}` tool renders the real canvas (grade + LUT + overlays) at any timecode(s, max 4) and the model **sees the frames as images** in its next message — wired on Anthropic (merged into tool_result content), OpenAI/OpenRouter (image_url passthrough), and Meta (input_image translation) loops, interactive + headless. First frame also lands in the Video tab preview. Delete spent frames with `delete_file` on `Video/<project>/.cache/frame-*.jpg`.
+3. **Agent sees feedback three ways** — `video_project` exposes `reviewNotes`/`reviewNotesResolved`, every dock message carries open notes inline, and tool instructions say to read/act/resolve them (resolve = `video_edit update_clip {hidden:true}`).
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA for this build (~10 min)
+1. **Review** — open a project, hit `R`, drag on the R1 lane → note appears, type feedback in Inspector → agent dock message shows the note; ask agent to act → it resolves via `hidden:true`.
+2. **Vision** — ask agent "look at 12s and tell me what you see" → `video_look` runs, reply references the actual frame; first frame shows in Video tab preview.
+3. **Cleanup** — `delete_file` on a `frame-*.jpg` → gone; export unaffected.
+4. **No render pollution** — export with open notes → notes absent from output, duration unchanged.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
+---
+
 # Stage build — 2026-09-04 ~23:02 PDT — v1.0.15 (Spark variant knob)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
