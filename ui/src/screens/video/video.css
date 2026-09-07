@@ -281,5 +281,5 @@
 /* ---- welcome create form ---- */
 .ve-create { display: flex; gap: 8px; align-items: stretch; }
 .ve-create input { flex: 1; min-width: 0; height: 38px; font-size: 13.5px; padding: 0 12px; border-radius: 10px; }
-.ve-create-btn { height: 38px; padding: 0 18px; font-size: 13.5px; border-radius: 10px; flex-shrink: 0; }
+.ve-create-btn { height: 38px; padding: 0 20px; font-size: 13.5px; border-radius: 10px; flex: none; white-space: nowrap; }
 .ve-create-btn:disabled { opacity: .45; cursor: default; }
