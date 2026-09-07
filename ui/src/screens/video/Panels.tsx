@@ -327,7 +327,7 @@ export function AudioPanel() {
           <Slider label="Normalize peaks to" value={a.normalizeDb} min={-24} max={0} step={0.5} fmt={(v) => `${v} dBFS`} onChange={(v) => setPath("audio.normalizeDb", v)} />
           <Slider label="Noise reduction" value={a.denoise} min={0} max={1} step={0.01} fmt={(v) => (v <= 0.001 ? "off" : `${Math.round(v * 100)}%`)} onChange={(v) => setPath("audio.denoise", v)} />
           <p className="ve-hint">Normalize + denoise bake into the cleaned file when you clean. Preview a strength, adjust % freely, Clean again to regenerate.</p>
-          <div style={{ display: "flex", gap: 8 }}>
+          <div className="ve-btn-row">
             <button className="ve-btn sm" disabled={!aroll || !!s.toolProgress} onClick={() => aroll && void audition(aroll.asset)}><Play size={12} /> {auditioning ? "Rendering…" : "Preview denoise"}</button>
             <button className="ve-btn sm primary" disabled={!aroll || !!s.toolProgress} onClick={() => aroll && void cleanup(aroll.asset)}><Sparkles size={12} /> {cleaned ? "Re-clean A-roll" : "Clean A-roll"}</button>
           </div>

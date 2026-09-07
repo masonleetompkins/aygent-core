@@ -57,6 +57,9 @@ type Slot = { id: string; asset: string; kind: "video" | "audio" };
 // Replacement-audio dubs: when cleanup is enabled, a video clip with audioAsset
 // plays picture muted while a pooled audio slot plays the cleaned file in sync
 // (same timing model as export). Bypassed/offline → no dub, original sound.
+// Video-kind replacements (cleaned .mov proxies: picture stream-copied + cleaned
+// audio) play as ONE element via playClips below — no dub, so no dual-element
+// drift. Only audio-only replacements (legacy .wavs, audio sources) dub.
 function cleanDubs(comp: Composition, assets: Asset[]): Clip[] {
   if (comp.audio.cleanEnabled === false) return [];
   const byId = new Map(assets.map((a) => [a.id, a]));
@@ -64,10 +67,26 @@ function cleanDubs(comp: Composition, assets: Asset[]): Clip[] {
   for (const c of comp.clips) {
     if (c.hidden || c.muted || c.type !== "video" || !c.audioAsset) continue;
     const ra = byId.get(c.audioAsset);
-    if (!ra || ra.online === false) continue;
+    if (!ra || ra.online === false || ra.kind === "video") continue;
     out.push({ ...c, id: `${c.id}#dub`, type: "audio", asset: c.audioAsset, link: "", name: `${c.name} \u00b7 cleaned` });
   }
   return out;
+}
+// Single-element preview: a video clip whose replacement carries picture plays
+// the replacement file directly (same in/out — the proxy is full-length), so
+// picture + cleaned sound share one clock through cuts and on full tracks.
+function playClips(comp: Composition, assets: Asset[]): Clip[] {
+  if (comp.audio.cleanEnabled === false) return comp.clips;
+  const byId = new Map(assets.map((a) => [a.id, a]));
+  let swapped = false;
+  const out = comp.clips.map((c) => {
+    if (c.hidden || c.muted || c.type !== "video" || !c.audioAsset) return c;
+    const ra = byId.get(c.audioAsset);
+    if (!ra || ra.online === false || ra.kind !== "video") return c;
+    swapped = true;
+    return { ...c, asset: ra.id };
+  });
+  return swapped ? out : comp.clips;
 }
 function assignSlots(comp: Composition, dubs: Clip[], assetKind: (id: string) => "video" | "audio" | "image" | undefined): { slots: Slot[]; slotOf: Map<string, string> } {
   const slots: Slot[] = []; const slotOf = new Map<string, string>();
@@ -107,9 +126,10 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
   const sceneW = comp.scene.width, sceneH = comp.scene.height;
   const fps = comp.scene.fps || 30;
   const assetKind = (id: string) => s.assets.find((a) => a.id === id)?.kind;
-  const dubs = useMemo(() => cleanDubs(comp, s.assets), [comp, s.assets]);
+  const pcomp = useMemo(() => ({ ...comp, clips: playClips(comp, s.assets) }), [comp, s.assets]);
+  const dubs = useMemo(() => cleanDubs(pcomp, s.assets), [pcomp, s.assets]);
   const dubbed = useMemo(() => new Set(dubs.map((d) => d.id.replace(/#dub$/, ""))), [dubs]);
-  const { slots, slotOf } = useMemo(() => assignSlots(comp, dubs, assetKind), [comp, s.assets, dubs]);
+  const { slots, slotOf } = useMemo(() => assignSlots(pcomp, dubs, assetKind), [pcomp, s.assets, dubs]);
   const els = useRef(new Map<string, HTMLMediaElement>());
   const prepared = useRef(new Map<string, string>()); // slot → clip id pre-seeked
   const retiring = useRef(new Map<string, number>()); // slot → tail deadline (performance.now ms)
@@ -119,16 +139,16 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
   const assigned = useMemo(() => {
     const m = new Map<string, Clip>();
     const next = new Map<string, Clip>();
-    for (const c of [...comp.clips, ...dubs]) {
+    for (const c of [...pcomp.clips, ...dubs]) {
       const sid = slotOf.get(c.id); if (!sid) continue;
       if (playhead >= c.start && playhead < c.end) m.set(sid, c);
       else if (c.start >= playhead) { const n = next.get(sid); if (!n || c.start < n.start) next.set(sid, c); }
     }
     for (const [sid, c] of next) if (!m.has(sid)) m.set(sid, c);
     return m;
-  }, [comp.clips, dubs, slotOf, playhead]);
+  }, [pcomp, dubs, slotOf, playhead]);
 
-  const active = useMemo(() => comp.clips.filter((c) => !c.hidden && playhead >= c.start && playhead < c.end).sort((a, b) => rank(a.track) - rank(b.track)), [comp.clips, playhead]);
+  const active = useMemo(() => pcomp.clips.filter((c) => !c.hidden && playhead >= c.start && playhead < c.end).sort((a, b) => rank(a.track) - rank(b.track)), [pcomp, playhead]);
 
   // imperative sync after every render (runs per playhead tick; only writes on change)
   const lastSeek = useRef(new Map<string, number>());
@@ -139,7 +159,7 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
   // rolling (unpaused, buffered, on-position) before a retiring tail may stop.
   // A clip with no slot (offline media) counts as vacuous — tails still end on time.
   const audibleOwnersRolling = () => {
-    const owners = [...comp.clips, ...dubs].filter((k) => !k.hidden && !k.muted && (k.type === "video" || k.type === "audio") && playhead >= k.start && playhead < k.end);
+    const owners = [...pcomp.clips, ...dubs].filter((k) => !k.hidden && !k.muted && (k.type === "video" || k.type === "audio") && playhead >= k.start && playhead < k.end);
     if (!owners.length) return true;
     return owners.every((k) => {
       const sid = slotOf.get(k.id); if (!sid) return true;
@@ -255,7 +275,7 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
       const mid = masterRef.current;
       if (mid) {
         const el = els.current.get(mid);
-        const mc = st.comp.clips.find((c) => slotOf.get(c.id) === mid && st.playhead >= c.start && st.playhead < c.end);
+        const mc = pcomp.clips.find((c) => slotOf.get(c.id) === mid && st.playhead >= c.start && st.playhead < c.end);
         if (el && mc && !el.paused && !el.seeking && el.readyState >= 3) {
           const mt = mc.start + (el.currentTime - mc.in) / mc.speed;
           // trust the picture unless it has clearly stalled (then coast on the wall clock)
@@ -268,7 +288,7 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [playing, total, slotOf]);
+  }, [playing, total, slotOf, pcomp]);
 
   const images = active.filter((c) => c.type === "image" && TRACK_KIND(c.track) !== "audio");
   const texts = active.filter((c) => c.type === "text");

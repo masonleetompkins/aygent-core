@@ -283,3 +283,7 @@
 .ve-create input { flex: 1; min-width: 0; height: 38px; font-size: 13.5px; padding: 0 12px; border-radius: 10px; }
 .ve button.ve-create-btn { height: 38px; padding: 0 20px; font-size: 13.5px; border-radius: 10px; flex: none; white-space: nowrap; }
 .ve button.ve-create-btn:disabled { opacity: .45; cursor: default; }
+
+/* ---- audio cleanup buttons: wrap inside the 300px panel, never spill ---- */
+.ve-btn-row { display: flex; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.ve-btn-row > .ve-btn { flex: 1 1 120px; min-width: 0; justify-content: center; }

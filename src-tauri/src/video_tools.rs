@@ -62,7 +62,7 @@ pub fn tool_schemas() -> Vec<Value> {
             "input_schema": { "type": "object", "properties": { "project": proj, "time": { "type": "number", "description": "timeline seconds to look at" }, "times": { "type": "array", "items": { "type": "number" }, "description": "up to 4 times to see side by side" } }, "required": ["project"] } }),
         json!({ "name": "video_render", "description": "Export the project with a preset from composition.exports (by name) or an explicit {width,height,bitrate,codec:'h264'|'hevc'|'prores'}. Blocking; progress streams to the UI. Output lands in Video/<project>/renders/.",
             "input_schema": { "type": "object", "properties": { "project": proj, "preset": { "type": "string", "description": "preset name, e.g. landscape | vertical" }, "width": { "type": "integer" }, "height": { "type": "integer" }, "bitrate": { "type": "string" }, "codec": { "type": "string" }, "name": { "type": "string", "description": "output file stem" } }, "required": ["project"] } }),
-        json!({ "name": "video_audio_enhance", "description": "LOCAL dialogue cleanup (ffmpeg only, nothing leaves the machine): normalize peaks to normalizeDb (default -3 dBFS) + background-noise reduction at denoise 0..1 (0 = off). Produces a new audio asset and points the source clips' audioAsset at it, and sets audio.cleanEnabled=true (toggle it off to A/B the original). (TEMPORARY compat: engine/preset args are ignored if passed.)",
+        json!({ "name": "video_audio_enhance", "description": "LOCAL dialogue cleanup (ffmpeg only, nothing leaves the machine): normalize peaks to normalizeDb (default -3 dBFS) + background-noise reduction at denoise 0..1 (0 = off). Video sources produce a full-length .cleaned.mov proxy (picture stream-copied, cleaned audio padded to the video duration) so preview plays picture+sound as one element through cuts; audio-only sources produce a .cleaned.wav. Points the source clips' audioAsset at it, and sets audio.cleanEnabled=true (toggle it off to A/B the original). (TEMPORARY compat: engine/preset args are ignored if passed.)",
             "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "normalize_db": { "type": "number", "description": "peak target dBFS, default -3" }, "denoise": { "type": "number", "description": "0..1 noise-reduction strength, default 0" } }, "required": ["project", "asset"] } }),
         json!({ "name": "video_audio_audition", "description": "Preview a denoise strength WITHOUT touching the timeline: renders a short sample (at/len seconds) with that denoise amount to .cache/ for listening in the Video tab.",
             "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "denoise": { "type": "number", "description": "0..1 strength" }, "at": { "type": "number", "description": "sample start (source seconds, default 0)" }, "len": { "type": "number", "description": "sample length seconds, default 8" } }, "required": ["project", "asset", "denoise"] } }),
@@ -799,17 +799,57 @@ pub fn enhance(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project:
     // Peak normalize to normalizeDb + optional loudnorm stay in the TIMELINE
     // mix (audio.normalizeDb on export), so this file is denoise + leveling only.
     let dn = denoise.clamp(0.0, 1.0);
-    let nr = (dn * 24.0).round() as i64; // 0..24 dB reduction
+    let nr = (dn * 18.0).round() as i64; // 0..18 dB reduction (stable floor, no noise-tracking pump)
     let af = if dn <= 0.001 {
         "highpass=f=70,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2".to_string()
     } else {
-        format!("highpass=f=70,afftdn=nr={nr}:nf=-25:tn=1,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2")
+        format!("highpass=f=70,afftdn=nr={nr}:nf=-30,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2")
     };
     let o = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&wav).args(["-af", &af, "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&out).output().map_err(|e| format!("ffmpeg: {e}"))?;
     if !o.status.success() { return Err(format!("local enhance failed: {}", String::from_utf8_lossy(&o.stderr).chars().take(400).collect::<String>())); }
+    // Full-length proxy: video sources get a .cleaned.mov (picture stream-copied,
+    // cleaned audio padded to the full video duration + AAC for browser playback)
+    // so preview plays picture+sound as ONE element — no dual-element drift.
+    // Audio-only sources keep the cleaned .wav directly.
+    let dur_full = a.duration.max(0.04);
+    let (rep_path, rep_kind): (std::path::PathBuf, &str) = if a.has_video {
+        let padded = proj.join(".cache").join(format!("{}.pad.wav", a.id));
+        let apad = format!("apad=whole_dur={:.3}", dur_full);
+        let mov = media.join(format!("{stem}.cleaned.mov"));
+        let pad_ok = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&out).args(["-af", apad.as_str(), "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&padded).output().map(|o| o.status.success()).unwrap_or(false);
+        let mux_ok = if pad_ok {
+            Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&abs).args(["-i"]).arg(&padded)
+                .args(["-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+                       "-movflags", "+faststart", "-t", &format!("{:.3}", dur_full)]).arg(&mov)
+                .output().map(|o| o.status.success() && mov.is_file()).unwrap_or(false)
+        } else { false };
+        let _ = std::fs::remove_file(&padded);
+        if mux_ok { (mov, "video") } else { (out.clone(), "audio") }
+    } else { (out.clone(), "audio") };
     let _ = std::fs::remove_file(&wav);
-    let na = register_generated(app, broker, agent_id, project, &out, &format!("{} (cleaned)", a.name), "audio")?;
-    // point every clip of the source asset at the cleaned audio
+    // Drop superseded cleaned replacements for this source (wav<->mov on
+    // re-clean) so Generated doesn't pile up stale files.
+    {
+        let cleaned_name = format!("{} (cleaned)", a.name);
+        let mut m = video::load_manifest(broker, agent_id, project);
+        let before = m.assets.len();
+        let mut gone: Vec<String> = vec![];
+        m.assets.retain(|x| {
+            let hit = x.name == cleaned_name && x.id != a.id;
+            if hit { gone.push(x.rel.clone()); }
+            !hit
+        });
+        if m.assets.len() != before {
+            for rel in &gone {
+                if rel.starts_with("media/") || rel.starts_with(".cache/") {
+                    let _ = std::fs::remove_file(proj.join(rel));
+                }
+            }
+            video::save_manifest(broker, agent_id, project, &m)?;
+        }
+    }
+    let na = register_generated(app, broker, agent_id, project, &rep_path, &format!("{} (cleaned)", a.name), rep_kind)?;
+    // point every clip of the source asset at the cleaned replacement
     let mut comp = load_comp(broker, agent_id, project)?;
     let mut n = 0;
     for c in comp.clips.iter_mut().filter(|c| c.asset == a.id && c.kind == "video") { c.audio_asset = na.id.clone(); n += 1; }
@@ -833,11 +873,11 @@ pub fn audition(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project
     let at = at.max(0.0).min(a.duration.max(0.0));
     let len = len.clamp(1.0, 30.0).min((a.duration - at).max(1.0));
     let dn = denoise.clamp(0.0, 1.0);
-    let nr = (dn * 24.0).round() as i64;
+    let nr = (dn * 18.0).round() as i64; // 0..18 dB (matches enhance)
     let af = if dn <= 0.001 {
         "highpass=f=70,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2".to_string()
     } else {
-        format!("highpass=f=70,afftdn=nr={nr}:nf=-25:tn=1,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2")
+        format!("highpass=f=70,afftdn=nr={nr}:nf=-30,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2")
     };
     let cache = proj.join(".cache");
     std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
