@@ -1,3 +1,36 @@
+# Stage build — 2026-09-07 ~09:02 PDT — v1.0.16 (review feedback round 2)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `66b0031` — feat(video): review UX — static note header, Apply Feedback button, gapless audio handoff
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41553704 bytes), mtime **Sep 7 09:02**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **18013969 bytes (~17.2 MB)**, mtime **Sep 7 09:02**
+
+**What changed (feedback round):**
+1. **Inspector: Title unlinked** — review notes show a static "Review note · time range" header instead of the linked Title field. The Feedback textarea is the single editor (timeline labels + tooltips read from it).
+2. **Apply Feedback button** — sticky footer at the bottom of the Inspector (Scene view + any selection) while open R1 notes exist. One click flushes the save, sends the apply prompt with all open notes + timestamps through the shared agent path, and flips the dock to the Agent tab. Button shows the open-note count, disables with "Working…" mid-turn.
+3. **Agent send path shared** — new `sendVideoPrompt`/`stopVideoTurn` in AgentDock; dock composer + Stop delegate to it (same context, history, compact, live-timeline reload lifecycle). Dead code removed.
+4. **Gapless audio handoff** — outgoing audible elements keep a ≤350 ms tail past each cut until every audible owner under the playhead is confirmed rolling (unpaused, buffered, on-position); tail runs before mute is applied so cuts never mute the cover early. Pre-roll warms every incoming clip: exact-arrival play with room, seek-parked hold-at-head for clips near source 0.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA for this build (~8 min)
+1. **Note header** — select an R1 note → header reads "Review note · range", no Title input; editing Feedback updates the lane label.
+2. **Apply Feedback** — with 2+ open notes, Inspector footer shows "Apply Feedback (2)" → click → dock flips to Agent, turn runs, notes resolve to hidden.
+3. **Audio** — play across 3+ cuts → no ~1 s silence at clip starts; pause/resume still frame-accurate.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
 # Stage build — 2026-09-07 ~06:17 PDT — v1.0.16 (review lane + agent vision)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
