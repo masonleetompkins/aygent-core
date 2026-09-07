@@ -32,6 +32,68 @@ const QUICK: { l: string; p: string }[] = [
 ];
 const COMPACT_AT = 0.5; // fraction of the context window
 
+/** One-shot instruction behind Inspector's "Apply Feedback" button. */
+export const APPLY_FEEDBACK_PROMPT =
+  "Apply my open R1 review notes now: read each note with its timecode, make the requested change to the edit with the video_* tools, and mark every note you actioned resolved via video_edit update_clip {hidden:true}. Reply with one line per note: what you changed, clip ids, times.";
+
+// Live channel for the in-flight video turn (module-level so Inspector's
+// Apply Feedback button and the dock share one turn lifecycle).
+let videoChannel: string | null = null;
+
+/** Send a prompt to the video agent from anywhere (Inspector, Timeline…).
+ *  Same context/history lifecycle as the dock composer. Returns false when
+ *  there is nothing to send or a turn is already running. */
+export async function sendVideoPrompt(prompt: string): Promise<boolean> {
+  const p = prompt.trim();
+  const { agentId, project, folder, comp, selection, playhead } = get();
+  const slotKey = agentId ? turnSlotKey(agentId, "video") : null;
+  if (!p || !agentId || !project || !slotKey) return false;
+  if (isRunning(slotKey)) return false;
+  await flushSave();
+  const snap = getAgentTurnSnapshot(slotKey);
+  const pct = snap.usage?.contextWindow ? (snap.usage.contextInput || 0) / snap.usage.contextWindow : 0;
+  let history = chatGetHistory();
+  if (pct >= COMPACT_AT && history.length >= 4) {
+    try {
+      history = await invoke<unknown[]>("history_compact", { agentId, history });
+      await chatPersist(history);
+      chatPush({ role: "assistant", text: `\u{1F5DC}\uFE0F Context compacted at ${Math.round(pct * 100)}% — earlier turns summarized. The visible chat is unchanged.`, at: Date.now() });
+    } catch (e) { toast(`compact failed: ${String(e)}`, "err"); }
+  }
+  const notes = comp.clips.filter((c) => c.type === "review" && !c.hidden && c.text.content.trim());
+  const notesTxt = notes.length
+    ? `\nOPEN REVIEW NOTES from the user (R1 lane — read each, act on it, mark resolved via video_edit update_clip {hidden:true}):\n` +
+      notes.map((c) => `- [${fmtTime(c.start, comp.scene.fps)} \u2192 ${fmtTime(c.end, comp.scene.fps)}] ${c.text.content.trim()}`).join("\n")
+    : "";
+  const ctx = [
+    `[Video editor context — project "${project}" · Video/${project}/ · scene ${comp.scene.width}x${comp.scene.height}@${comp.scene.fps} · ${comp.clips.length} clips · playhead ${fmtTime(playhead, comp.scene.fps)} (${playhead.toFixed(3)}s)` +
+    (selection.length ? ` · selected clip ids: ${selection.join(", ")}` : "") + `]${notesTxt}`,
+    `Use the video_* tools (start with video_project if you need the current state). Keep the reply short: what changed, clip ids, times. Captions/graphics are Hyperframes transparent overlays (video_build_captions / video_render_overlay), styled by the Graphics panel — never drawtext/ASS. Overlays: PLAN first, build only after approval, one tool call per overlay in timeline order.`,
+  ].join("\n");
+  chatPush({ role: "user", text: p, at: Date.now() });
+  chatPush({ role: "assistant", text: "", at: Date.now() });
+  void chatPersist(history);
+  setHistory(slotKey, history);
+  const channel = `video-${project}-${Date.now()}`; videoChannel = channel;
+  let out: unknown[] = history;
+  try {
+    let model: string | null = null, provider: string | null = null;
+    if (folder) { try { const sel = await invoke<{ provider: string; model: string }>("get_selection", { folder }); model = sel.model || null; provider = sel.provider || null; } catch { /* default */ } }
+    out = await runTurn({ agentId, channel, prompt: `${ctx}\n\n${p}`, model, provider, folder, sessionId: `video-${agentId}-${project}`, attachments: [], slot: slotKey });
+  } catch (e) {
+    chatReplaceLast({ role: "assistant", text: `\u2717 ${String(e)}`, at: Date.now() });
+  } finally {
+    videoChannel = null;
+    const done = getAgentTurnSnapshot(slotKey);
+    const final: ChatMsg = { role: "assistant", text: done.liveText || (done.error ? `\u2717 ${done.error}` : "(no reply)"), at: Date.now(), tools: done.liveTools.map((t) => ({ name: t.name, summary: t.summary, ok: t.ok, detail: t.detail?.slice(0, 1200) })) };
+    chatReplaceLast(final);
+    void chatPersist(out.length ? out : getHistory(slotKey));
+    void reload();
+  }
+  return true;
+}
+export function stopVideoTurn() { if (videoChannel) void stopTurn(videoChannel); }
+
 export function AgentDock({ agentName }: { agentName?: string }) {
   const s = useVideo();
   const msgs = useChat();
@@ -39,7 +101,6 @@ export function AgentDock({ agentName }: { agentName?: string }) {
   const turn = useAgentTurn(slotKey);
   const running = turn.status === "running";
   const [text, setText] = useState("");
-  const [compacting, setCompacting] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const taH = useRef(68);
@@ -53,7 +114,6 @@ export function AgentDock({ agentName }: { agentName?: string }) {
     const prev = taH.current; if (next === prev) return; taH.current = next;
     const el = scrollRef.current; if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 160 + Math.max(0, next - prev)) el.scrollTop += next - prev;
   }, [text]);
-  const channelRef = useRef<string | null>(null);
   const seenToolsRef = useRef(0);
 
   useEffect(() => { const el = scrollRef.current; if (el) el.scrollTop = el.scrollHeight; }, [msgs, turn.liveText, turn.liveTools.length, turn.timeline?.length]);
@@ -78,57 +138,9 @@ export function AgentDock({ agentName }: { agentName?: string }) {
 
   const ctxPct = turn.usage?.contextWindow ? (turn.usage.contextInput || 0) / turn.usage.contextWindow : 0;
 
-  async function maybeCompact(agentId: string): Promise<unknown[]> {
-    const hist = chatGetHistory();
-    if (ctxPct < COMPACT_AT || hist.length < 4) return hist;
-    setCompacting(true);
-    try {
-      const seed = await invoke<unknown[]>("history_compact", { agentId, history: hist });
-      await chatPersist(seed);
-      chatPush({ role: "assistant", text: `🗜️ Context compacted at ${Math.round(ctxPct * 100)}% — earlier turns summarized. The visible chat is unchanged.`, at: Date.now() });
-      return seed;
-    } catch (e) { toast(`compact failed: ${String(e)}`, "err"); return hist; }
-    finally { setCompacting(false); }
-  }
-
   async function send(prompt?: string) {
-    const p = (prompt ?? text).trim();
-    const { agentId, project, folder, comp, selection, playhead } = get();
-    if (!p || !agentId || !project || !slotKey) return;
-    if (isRunning(slotKey)) return;
-    setText("");
-    await flushSave();
-    const history = await maybeCompact(agentId);
-    const notes = comp.clips.filter((c) => c.type === "review" && !c.hidden && c.text.content.trim());
-    const notesTxt = notes.length
-      ? `\nOPEN REVIEW NOTES from the user (R1 lane — read each, act on it, mark resolved via video_edit update_clip {hidden:true}):\n` +
-        notes.map((c) => `- [${fmtTime(c.start, comp.scene.fps)} → ${fmtTime(c.end, comp.scene.fps)}] ${c.text.content.trim()}`).join("\n")
-      : "";
-    const ctx = [
-      `[Video editor context — project "${project}" · Video/${project}/ · scene ${comp.scene.width}x${comp.scene.height}@${comp.scene.fps} · ${comp.clips.length} clips · playhead ${fmtTime(playhead, comp.scene.fps)} (${playhead.toFixed(3)}s)` +
-      (selection.length ? ` · selected clip ids: ${selection.join(", ")}` : "") + `]${notesTxt}`,
-      `Use the video_* tools (start with video_project if you need the current state). Keep the reply short: what changed, clip ids, times. Captions/graphics are Hyperframes transparent overlays (video_build_captions / video_render_overlay), styled by the Graphics panel — never drawtext/ASS. Overlays: PLAN first, build only after approval, one tool call per overlay in timeline order.`,
-    ].join("\n");
-    chatPush({ role: "user", text: p, at: Date.now() });
-    chatPush({ role: "assistant", text: "", at: Date.now() });
-    void chatPersist(history);
-    setHistory(slotKey, history);
-    const channel = `video-${project}-${Date.now()}`; channelRef.current = channel;
-    let out: unknown[] = history;
-    try {
-      let model: string | null = null, provider: string | null = null;
-      if (folder) { try { const sel = await invoke<{ provider: string; model: string }>("get_selection", { folder }); model = sel.model || null; provider = sel.provider || null; } catch { /* default */ } }
-      out = await runTurn({ agentId, channel, prompt: `${ctx}\n\n${p}`, model, provider, folder, sessionId: `video-${agentId}-${project}`, attachments: [], slot: slotKey });
-    } catch (e) {
-      chatReplaceLast({ role: "assistant", text: `✗ ${String(e)}`, at: Date.now() });
-    } finally {
-      channelRef.current = null;
-      const done = getAgentTurnSnapshot(slotKey);
-      const final: ChatMsg = { role: "assistant", text: done.liveText || (done.error ? `✗ ${done.error}` : "(no reply)"), at: Date.now(), tools: done.liveTools.map((t) => ({ name: t.name, summary: t.summary, ok: t.ok, detail: t.detail?.slice(0, 1200) })) };
-      chatReplaceLast(final);
-      void chatPersist(out.length ? out : getHistory(slotKey));
-      void reload();
-    }
+    const ok = await sendVideoPrompt(prompt ?? text);
+    if (ok) setText("");
   }
 
   const disabled = !s.agentId || !s.project;
@@ -174,11 +186,11 @@ export function AgentDock({ agentName }: { agentName?: string }) {
           <span className="ve-faint" style={{ fontSize: 11 }}>
             {agentName ? `as ${agentName}` : ""}
             {turn.usage?.contextWindow ? <span title="Context used · auto-compacts at 50%" style={{ marginLeft: 8, color: ctxPct >= COMPACT_AT ? "var(--warn)" : undefined }}>· ctx {Math.round(ctxPct * 100)}%</span> : null}
-            {compacting ? " · compacting…" : turn.info && running ? ` · ${turn.info}` : ""}
+            {turn.info && running ? ` · ${turn.info}` : ""}
           </span>
           <span className="spacer" />
-          {running ? <button className="ve-btn sm" onClick={() => channelRef.current && void stopTurn(channelRef.current)}><Square size={12} /> Stop</button>
-            : <button className="ve-btn sm primary" disabled={disabled || !text.trim() || compacting} onClick={() => void send()}><Send size={12} /> Send</button>}
+          {running ? <button className="ve-btn sm" onClick={() => stopVideoTurn()}><Square size={12} /> Stop</button>
+            : <button className="ve-btn sm primary" disabled={disabled || !text.trim()} onClick={() => void send()}><Send size={12} /> Send</button>}
         </div>
       </div>
     </div>

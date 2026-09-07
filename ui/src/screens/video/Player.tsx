@@ -8,6 +8,10 @@
 //    before the cut, already decoding in motion. The cut is a visibility swap +
 //    unmute — no mount, no load, no seek, no decoder spin-up (that spin-up was
 //    the black flash in v0.3 and the ~1 s freeze after the first fix).
+//  · Gapless audio: pre-roll warms every incoming element (exact-arrival play for
+//    clips with room, hold-at-head for clips near source 0), and the outgoing
+//    element keeps a ≤350 ms tail past each cut until the new owner is confirmed
+//    rolling — the tail covers any residual decoder spin-up, so no dropped audio.
 //  · The VISIBLE A-roll <video> is the master clock while playing and its
 //    playbackRate is never touched (each rate change makes AVPlayer re-sync →
 //    stutter). The playhead is derived from its currentTime; the wall clock only
@@ -47,6 +51,8 @@ function useStageSize(ref: React.RefObject<HTMLDivElement>) {
 // been free the longest; if that slot freed up less than LEAD s before the clip
 // starts (no room to pre-roll) and we have < 3 slots for this asset, open another.
 const LEAD = 1.0;        // s of hidden pre-roll before a cut
+const TAIL_MS = 350;       // gapless-audio tail: outgoing keeps playing this long past a cut
+                         // until the incoming element is confirmed rolling
 type Slot = { id: string; asset: string; kind: "video" | "audio" };
 function assignSlots(comp: Composition, assetKind: (id: string) => "video" | "audio" | "image" | undefined): { slots: Slot[]; slotOf: Map<string, string> } {
   const slots: Slot[] = []; const slotOf = new Map<string, string>();
@@ -87,6 +93,8 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
   const { slots, slotOf } = useMemo(() => assignSlots(comp, assetKind), [comp.clips, s.assets]);
   const els = useRef(new Map<string, HTMLMediaElement>());
   const prepared = useRef(new Map<string, string>()); // slot → clip id pre-seeked
+  const retiring = useRef(new Map<string, number>()); // slot → tail deadline (performance.now ms)
+  const headHeld = useRef(new Map<string, string>()); // slot → clip id seek-parked at head
 
   // per slot: the active clip, else the next upcoming clip (to pre-seek)
   const assigned = useMemo(() => {
@@ -108,16 +116,53 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
   const masterRef = useRef<string | null>(null);   // slot id driving the clock
   const setRate = (el: HTMLMediaElement, r: number) => { if (Math.abs(el.playbackRate - r) > 0.004) el.playbackRate = r; };
   const seekTo = (slotId: string, el: HTMLMediaElement, t: number) => { lastSeek.current.set(slotId, performance.now()); el.currentTime = Math.max(0, t); };
+  // Gapless-audio gate: every audible clip under the playhead must be confirmed
+  // rolling (unpaused, buffered, on-position) before a retiring tail may stop.
+  // A clip with no slot (offline media) counts as vacuous — tails still end on time.
+  const audibleOwnersRolling = () => {
+    const owners = comp.clips.filter((k) => !k.hidden && !k.muted && (k.type === "video" || k.type === "audio") && playhead >= k.start && playhead < k.end);
+    if (!owners.length) return true;
+    return owners.every((k) => {
+      const sid = slotOf.get(k.id); if (!sid) return true;
+      const oel = els.current.get(sid); if (!oel) return false;
+      if (oel.paused || oel.readyState < 3) return false;
+      const st = k.in + (playhead - k.start) * k.speed;
+      return Math.abs(oel.currentTime - st) < 0.5;
+    });
+  };
   const masterClip = active.find((c) => c.type === "video" && TRACK_KIND(c.track) === "video" && slotOf.has(c.id) && s.assets.find((a) => a.id === c.asset)?.online !== false);
   masterRef.current = masterClip ? slotOf.get(masterClip.id)! : null;
   useLayoutEffect(() => {
     const now = performance.now();
+    const ownersRolling = audibleOwnersRolling();
+    // Retiring tail: keep a just-ended audible element playing (unmuted) until
+    // the new owners roll or the cap hits. Shared by unassigned slots and slots
+    // already assigned to a future clip — both sound the previous clip.
+    const keepTail = (slotId: string, el: HTMLMediaElement) => {
+      if (!playing || muted || el.paused || el.muted) return false;
+      let until = retiring.current.get(slotId);
+      if (until === undefined) {
+        until = performance.now() + TAIL_MS;
+        if (retiring.current.size > 6) { const k = retiring.current.keys().next().value; if (k) retiring.current.delete(k); }
+        retiring.current.set(slotId, until);
+      }
+      if (performance.now() <= until && !ownersRolling) return true;
+      retiring.current.delete(slotId);
+      return false;
+    };
     for (const slot of slots) {
       const el = els.current.get(slot.id); if (!el) continue;
       const c = assigned.get(slot.id);
-      if (!c) { if (!el.paused) el.pause(); continue; }
+      if (!c) {
+        if (keepTail(slot.id, el)) continue;
+        if (!el.paused) el.pause(); continue;
+      }
       const isActive = playhead >= c.start && playhead < c.end;
       const srcT = c.in + (playhead - c.start) * c.speed;   // negative offset before the clip starts
+      if (isActive) retiring.current.delete(slot.id);
+      // Slot already assigned to a FUTURE clip but still sounding the just-ended
+      // one: keep the tail (checked before wantMuted mutes it below).
+      if (!isActive && playhead < c.start && keepTail(slot.id, el)) continue;
       const wantMuted = muted || c.muted || !isActive;
       if (el.muted !== wantMuted) el.muted = wantMuted;
       const vol = Math.max(0, Math.min(1, Math.pow(10, c.volume / 20)));
@@ -132,7 +177,9 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
         continue;
       }
       const toCut = c.start - playhead;
-      const preroll = !isActive && toCut <= LEAD && srcT >= 0;
+      // Pre-roll starts LEAD before the cut for every clip. Clips near source 0
+      // (srcT < 0) warm below via hold-at-head instead of early play (below).
+      const preroll = !isActive && toCut <= LEAD;
       if (!isActive && !preroll) {
         // upcoming, not yet in the pre-roll window: park where the pre-roll will begin
         if (!el.paused) el.pause();
@@ -140,6 +187,22 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
         continue;
       }
       prepared.current.set(slot.id, c.id);
+      if (isActive) headHeld.current.delete(slot.id);
+      if (!isActive && srcT < 0) {
+        // Hold-at-head warm-up: this clip starts near source 0, so there is no
+        // earlier media to pre-play. Seek straight to c.in (once), then keep the
+        // decoder warm and hold paused exactly at head — the cut starts
+        // instantly, no cold-start gap.
+        if (headHeld.current.get(slot.id) !== c.id) {
+          if (Math.abs(el.currentTime - c.in) > 0.05 && !el.seeking) seekTo(slot.id, el, c.in);
+          else headHeld.current.set(slot.id, c.id);
+        }
+        if (headHeld.current.get(slot.id) === c.id) {
+          if (el.paused && el.readyState >= 2) void el.play().catch(() => {});
+          else if (!el.paused && Math.abs(el.currentTime - c.in) <= 0.06) el.pause();
+        }
+        continue;
+      }
       if (el.paused) void el.play().catch(() => {});
       if (el.seeking) continue;
       if (slot.id === masterRef.current) continue;              // master drives the clock; never correct it

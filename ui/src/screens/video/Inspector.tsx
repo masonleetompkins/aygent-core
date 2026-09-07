@@ -1,11 +1,26 @@
 // AYGENT — VIDEO v0.3 inspector: the selected clip's numbers. Frame-accurate
 // fields; multi-select edits the shared props.
+import { Send } from "lucide-react";
 import { useVideo, patchClip, patchClips, mutate, set } from "./store";
+import { useAgentTurn, turnSlotKey } from "../../lib/turns";
+import { sendVideoPrompt, APPLY_FEEDBACK_PROMPT } from "./AgentDock";
 import { type Clip, TRACK_KIND, fmtTime, clipDur } from "./model";
 import { Field, Num, Slider, Check, Seg, Section } from "./Panels";
 
 export function Inspector() {
   const s = useVideo();
+  const slotKey = s.agentId ? turnSlotKey(s.agentId, "video") : null;
+  const turn = useAgentTurn(slotKey);
+  const running = turn.status === "running";
+  const openNotes = s.comp.clips.filter((k) => k.type === "review" && !k.hidden && k.text.content.trim());
+  const applyFooter = openNotes.length > 0 ? (
+    <div className="ve-apply">
+      <button className="ve-btn primary" disabled={running} onClick={() => { void sendVideoPrompt(APPLY_FEEDBACK_PROMPT); set({ dockTab: "agent", dockOpen: true }); }}>
+        <Send size={13} /> {running ? "Working…" : `Apply Feedback${openNotes.length > 1 ? ` (${openNotes.length})` : ""}`}
+      </button>
+      <p className="ve-hint">Sends your open R1 notes to the agent to action.</p>
+    </div>
+  ) : null;
   const sel = s.comp.clips.filter((c) => s.selection.includes(c.id));
   if (!sel.length) {
     return (
@@ -19,6 +34,7 @@ export function Inspector() {
           <Seg value={`${s.comp.scene.width}x${s.comp.scene.height}`} options={[{ v: "1920x1080", l: "16:9" }, { v: "1080x1920", l: "9:16" }, { v: "1080x1080", l: "1:1" }, { v: "1080x1350", l: "4:5" }]} onChange={(v) => { const [w, h] = v.split("x").map(Number); mutate((c) => { c.scene.width = w; c.scene.height = h; }); }} />
           <Field label="Background"><div style={{ display: "flex", gap: 6 }}><input type="color" value={s.comp.scene.background} onChange={(e) => mutate((c) => { c.scene.background = e.target.value; })} /><input value={s.comp.scene.background} onChange={(e) => mutate((c) => { c.scene.background = e.target.value; })} /></div></Field>
         </Section>
+        {applyFooter}
         <p className="ve-hint">Select a clip to edit its timing, transform, text and audio. <kbd className="ve-kbd">⇧</kbd>-click for multi-select, drag on an empty lane for marquee.</p>
       </div>
     );
@@ -36,7 +52,9 @@ export function Inspector() {
     <div className="ve-insp">
       <div className="title">
         <span className="ve-pill">{multi ? `${sel.length} clips` : c.type}</span>
-        {!multi && <input value={c.type === "review" ? (c.text.content.split("\n")[0] || "Review note") : c.type === "text" ? c.text.content.split("\n")[0] : c.name} onChange={(e) => (c.type === "review" || c.type === "text" ? pt((k) => { k.text.content = e.target.value; }) : p({ name: e.target.value }))} />}
+        {!multi && (c.type === "review"
+          ? <span className="ve-faint" style={{ fontWeight: 700 }}>Review note · {fmtTime(c.start, fps)} → {fmtTime(c.end, fps)}</span>
+          : <input value={c.type === "text" ? c.text.content.split("\n")[0] : c.name} onChange={(e) => (c.type === "text" ? pt((k) => { k.text.content = e.target.value; }) : p({ name: e.target.value }))} />)}
       </div>
 
       <Section title="Timing">
@@ -143,6 +161,7 @@ export function Inspector() {
         <button className="ve-btn sm" onClick={() => set({ panel: "color", panelOpen: true })}>Clip color…</button>
         <span className="ve-faint ve-mono" style={{ fontSize: 10.5, alignSelf: "center", marginLeft: "auto" }}>{multi ? ids.length + " ids" : c.id}</span>
       </div>
+      {applyFooter}
     </div>
   );
 }
