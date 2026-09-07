@@ -1,3 +1,41 @@
+# Stage build — 2026-09-07 v1.0.16 (local audio suite + chat timeline + create polish)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `761a6bc` — feat(video): local audio suite (normalize+denoise, track trims, keyframe ducking) + chat timeline layout + create button polish
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app`
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg` (~17.2 MB)
+
+**What changed:**
+1. **Create button** — welcome form restyled: 38px input + button, 10px radius, disabled until a name is typed.
+2. **Auphonic removed** — credential command, keychain path, UI, and engine enum all gone. Audio is local-only.
+3. **Normalize** — `audio.normalizeDb` (default -3 dBFS): two-pass peak measure + gain with limiter safety on export; Clean A-roll writes it into the composition.
+4. **Noise reduction** — `audio.denoise` 0..1 slider (afftdn, strength-mapped) with **Preview denoise** rendering an 8s audition sample to .cache for listening before Clean A-roll commits.
+5. **No auto-ducking** — sidechain graph deleted; Duck defaults off; all audible clips mix flat. Quick action rewritten to manual keyframes.
+6. **Track volumes** — per-track trim sliders in the Audio panel (`audio.trackGain`), applied in export graph + preview.
+7. **Keyframe toggle** — dB lane under any audio/video track: click to add, drag (shift = fine), double-click to delete. Timeline seconds, shared by UI + agent (`update_clip {audio:{keyframes:[{t,db}]}}`), rendered + previewed by one shared evaluator.
+8. **Chat layout** — finished turns now persist + render the ordered timeline (text and tool cards interleaved as streamed) instead of regrouping all cards at the bottom.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~10 min)
+1. **Audio** — move denoise slider, Preview denoise, listen; Clean A-roll; export and confirm peaks + cleanup.
+2. **Tracks** — trim A2, toggle keyframes, add/drag a diamond, export with the dip.
+3. **Chat** — long agent turn keeps streamed order after finishing.
+4. **Create** — welcome form: button disabled until typed, creates cleanly.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
 # Stage build — 2026-09-07 ~09:02 PDT — v1.0.16 (review feedback round 2)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
