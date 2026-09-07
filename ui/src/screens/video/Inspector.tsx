@@ -36,34 +36,45 @@ export function Inspector() {
     <div className="ve-insp">
       <div className="title">
         <span className="ve-pill">{multi ? `${sel.length} clips` : c.type}</span>
-        {!multi && <input value={c.type === "text" ? c.text.content.split("\n")[0] : c.name} onChange={(e) => (c.type === "text" ? pt((k) => { k.text.content = e.target.value; }) : p({ name: e.target.value }))} />}
+        {!multi && <input value={c.type === "review" ? (c.text.content.split("\n")[0] || "Review note") : c.type === "text" ? c.text.content.split("\n")[0] : c.name} onChange={(e) => (c.type === "review" || c.type === "text" ? pt((k) => { k.text.content = e.target.value; }) : p({ name: e.target.value }))} />}
       </div>
 
       <Section title="Timing">
         <div className="ve-row2">
           <Num label="Start" value={c.start} step={1 / fps} min={0} suffix="s" onChange={(v) => pt((k) => { const d = clipDur(k); k.start = v; k.end = v + d; })} />
-          <Num label="End" value={c.end} step={1 / fps} min={c.start + 1 / fps} suffix="s" onChange={(v) => pt((k) => { const dv = v - k.end; k.end = v; if (k.type !== "text") k.out += dv * k.speed; })} />
+          <Num label="End" value={c.end} step={1 / fps} min={c.start + 1 / fps} suffix="s" onChange={(v) => pt((k) => { const dv = v - k.end; k.end = v; if (k.type !== "text" && k.type !== "review") k.out += dv * k.speed; })} />
         </div>
-        {c.type !== "text" && (
+        {(c.type !== "text" && c.type !== "review") && (
           <div className="ve-row2">
-            <Num label="Source in" value={c.in} step={1 / fps} min={0} suffix="s" onChange={(v) => pt((k) => { k.in = v; k.out = v + clipDur(k) * k.speed; })} />
+            <Num label="Source in" value={c.in} step={1 / fps} min={0} suffix="s" onChange={(v) => pt((k) => { if (k.type === "review") { k.in = 0; k.out = clipDur(k); } else { k.in = v; k.out = v + clipDur(k) * k.speed; } })} />
             <Num label="Speed" value={c.speed} step={0.05} min={0.1} max={8} suffix="×" onChange={(v) => pt((k) => { k.speed = v; k.out = k.in + clipDur(k) * v; })} />
           </div>
         )}
         <div className="ve-row2">
-          <Field label="Track"><input value={c.track} onChange={(e) => { const t = e.target.value.toUpperCase().trim(); if (/^[VTA]\d{1,2}$/.test(t)) p({ track: t }); }} /></Field>
+          <Field label="Track"><input value={c.track} onChange={(e) => { const t = e.target.value.toUpperCase().trim(); if (/^[VTAR]\d{1,2}$/.test(t)) p({ track: t }); }} /></Field>
           <Field label="Duration"><input readOnly value={`${fmtTime(clipDur(c), fps)} · ${Math.round(clipDur(c) * fps)} f`} className="ve-mono" /></Field>
         </div>
         <div style={{ display: "flex", gap: 14 }}>
           <Check label="Hidden" checked={c.hidden} onChange={(v) => p({ hidden: v })} />
           {kind !== "text" && <Check label="Muted" checked={c.muted} onChange={(v) => p({ muted: v })} />}
-          {kind !== "audio" && <Check label="Behind subject" checked={c.behindSubject} onChange={(v) => p({ behindSubject: v })} />}
+          {kind !== "audio" && kind !== "review" && <Check label="Behind subject" checked={c.behindSubject} onChange={(v) => p({ behindSubject: v })} />}
         </div>
         {asset && !multi && <p className="ve-hint">{asset.name} · {asset.width}×{asset.height} · {asset.fps ? `${Math.round(asset.fps)}fps · ` : ""}{fmtTime(asset.duration, fps)} · source {c.in.toFixed(2)}–{c.out.toFixed(2)}s</p>}
         {c.link && !multi && (() => { const partners = s.comp.clips.filter((k) => k.link === c.link && k.id !== c.id); return (
           <p className="ve-hint">🔗 Linked with {partners.length ? partners.map((k) => `${k.track} · ${k.name || k.id}`).join(", ") : "(missing partner)"}. <button className="ve-btn sm" onClick={() => mutate((comp) => { for (const k of comp.clips) if (k.link === c.link) k.link = ""; })}>Unlink</button></p>
         ); })()}
       </Section>
+
+      {c.type === "review" && !multi && (
+        <Section title="Feedback for the agent">
+          <textarea rows={4} autoFocus={!c.text.content} placeholder="What should change here? The agent reads this with the timestamps." value={c.text.content} onChange={(e) => pt((k) => { k.text.content = e.target.value; })} />
+          <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
+            <Check label="Resolved" checked={c.hidden} onChange={(v) => p({ hidden: v })} />
+            <span className="ve-faint" style={{ fontSize: 11 }}>{fmtTime(c.start, fps)} → {fmtTime(c.end, fps)}</span>
+          </div>
+          <p className="ve-hint">Stays pinned to this time range. Hidden = resolved (render + agent skip it; reopen from the R1 lane).</p>
+        </Section>
+      )}
 
       {c.type === "text" && !multi && (
         <Section title="Text">

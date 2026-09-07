@@ -186,7 +186,7 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
   const images = active.filter((c) => c.type === "image" && TRACK_KIND(c.track) !== "audio");
   const texts = active.filter((c) => c.type === "text");
   const showFrame = s.frame && Math.abs(s.frame.time - playhead) < 0.02;
-  const anyVisual = active.some((c) => c.type !== "audio" && TRACK_KIND(c.track) !== "audio");
+  const anyVisual = active.some((c) => c.type !== "audio" && c.type !== "review" && TRACK_KIND(c.track) !== "audio");
   // media under the playhead whose file isn't readable right now (drive unplugged / moved)
   const offlineHere = active.map((c) => s.assets.find((a) => a.id === c.asset)).filter((a): a is NonNullable<typeof a> => !!a && a.online === false);
 

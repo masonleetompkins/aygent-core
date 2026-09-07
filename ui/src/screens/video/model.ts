@@ -2,7 +2,7 @@
 // The composition IS the edit. UI + agent both read/write it via video_* commands.
 
 export type TrackId = string; // V1 V2 V3 … T1 A1 A2
-export type ClipKind = "video" | "audio" | "image" | "text";
+export type ClipKind = "video" | "audio" | "image" | "text" | "review";
 
 export type Transform = { x: number; y: number; scale: number; rotation: number; opacity: number };
 export type TextStyle = {
@@ -86,9 +86,9 @@ export type Asset = {
 export type Word = { w: string; s: number; e: number };
 export type Transcript = { asset: string; language: string; text: string; words: Word[]; segments: { text: string; s: number; e: number }[]; created: number };
 
-export const TRACK_ORDER: TrackId[] = ["T1", "V3", "V2", "V1", "A1", "A2"]; // top = composited on top: titles over graphics over B-roll over A-roll
-export const TRACK_KIND = (t: TrackId): "video" | "text" | "audio" => t.startsWith("T") ? "text" : t.startsWith("A") ? "audio" : "video";
-export const TRACK_LABEL: Record<string, string> = { V3: "Graphics", V2: "B-roll", V1: "A-roll", T1: "Overlays", A1: "Voice", A2: "Music" };
+export const TRACK_ORDER: TrackId[] = ["T1", "V3", "V2", "V1", "A1", "A2"]; // top = composited on top: titles over graphics over B-roll over A-roll (R1 review lane is prepended dynamically in review mode)
+export const TRACK_KIND = (t: TrackId): "video" | "text" | "audio" | "review" => t.startsWith("R") ? "review" : t.startsWith("T") ? "text" : t.startsWith("A") ? "audio" : "video";
+export const TRACK_LABEL: Record<string, string> = { V3: "Graphics", V2: "B-roll", V1: "A-roll", T1: "Overlays", A1: "Voice", A2: "Music", R1: "Review" };
 
 export const uid = (p = "c") => `${p}${Date.now().toString(36)}${Math.floor(Math.random() * 1296).toString(36)}`;
 
@@ -146,7 +146,7 @@ export function normalize(raw: unknown, assets: Asset[] = []): Composition {
   const clips: Clip[] = clipsRaw.filter((c) => c && typeof c === "object").map((c, i) => {
     const start = num(c.start, 0);
     const end = Math.max(start + 0.04, num(c.end, start + 4));
-    const base = newClip({ track: str(c.track, "V1"), type: (["video", "audio", "image", "text"].includes(c.type) ? c.type : "video") as ClipKind });
+    const base = newClip({ track: str(c.track, "V1"), type: (["video", "audio", "image", "text", "review"].includes(c.type) ? c.type : "video") as ClipKind });
     const inn = num(c.in, 0);
     return {
       ...base,
@@ -177,7 +177,7 @@ export function normalize(raw: unknown, assets: Asset[] = []): Composition {
   };
 }
 
-export const duration = (c: Composition) => c.clips.reduce((m, k) => (k.hidden ? m : Math.max(m, k.end)), 0);
+export const duration = (c: Composition) => c.clips.reduce((m, k) => (k.hidden || k.type === "review" ? m : Math.max(m, k.end)), 0);
 export const clipDur = (c: Clip) => Math.max(0, c.end - c.start);
 
 export function fmtTime(t: number, fps = 30): string {

@@ -3,11 +3,11 @@
 // track change), drag edges = trim (source in/out follow, rate-aware), razor tool
 // or K splits, marquee-select on empty lane, drag an asset from Media to place.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Scissors, MousePointer2, Magnet, ZoomIn, ZoomOut, Trash2, Copy, AlignHorizontalSpaceAround, Eye, EyeOff, Volume2, VolumeX, Lock, Unlock, Undo2, Redo2 } from "lucide-react";
+import { Scissors, MousePointer2, MessageSquare, Magnet, ZoomIn, ZoomOut, Trash2, Copy, AlignHorizontalSpaceAround, Eye, EyeOff, Volume2, VolumeX, Lock, Unlock, Undo2, Redo2 } from "lucide-react";
 import { useVideo, useVideoSel, usePlayhead, set, get, seek, patchClips, beginGesture, splitAt, deleteSelected, duplicateSelected, closeGaps, addAssetToTimeline, undo, redo, canUndo, canRedo, mutate, withLinked } from "./store";
-import { type Clip, TRACK_ORDER, TRACK_KIND, TRACK_LABEL, duration as durOf, fmtTime, mediaUrl, clipDur } from "./model";
+import { type Clip, TRACK_ORDER, TRACK_KIND, TRACK_LABEL, duration as durOf, fmtTime, mediaUrl, clipDur, newClip } from "./model";
 
-const LANE_H: Record<string, number> = { video: 56, text: 34, audio: 44 };
+const LANE_H: Record<string, number> = { video: 56, text: 34, audio: 44, review: 44 };
 const MIN_ZOOM = 6, MAX_ZOOM = 600;
 
 export function Timeline() {
@@ -18,6 +18,7 @@ export function Timeline() {
   const hdrsRef = useRef<HTMLDivElement>(null);
   const [snapLine, setSnapLine] = useState<number | null>(null);
   const [marquee, setMarquee] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+  const [reviewDraft, setReviewDraft] = useState<{ a: number; b: number } | null>(null);
   const [overLane, setOverLane] = useState<string | null>(null);
   const [locked, setLocked] = useState<Record<string, boolean>>({});
   const [height, setHeight] = useState(300);
@@ -26,11 +27,14 @@ export function Timeline() {
   const fps = comp.scene.fps || 30;
   const tracks = useMemo(() => {
     const used = new Set(comp.clips.map((c) => c.track));
-    const extra = [...used].filter((t) => !TRACK_ORDER.includes(t)).sort();
+    const extra = [...used].filter((t) => !TRACK_ORDER.includes(t) && t !== "R1").sort();
     // extra V tracks (V4+) slot in just under T1 so text always stays on top
     const extraV = extra.filter((t) => t.startsWith("V")).reverse();
-    return ["T1", ...extraV, ...TRACK_ORDER.filter((t) => t !== "T1"), ...extra.filter((t) => !t.startsWith("V"))];
-  }, [comp.clips]);
+    const base = ["T1", ...extraV, ...TRACK_ORDER.filter((t) => t !== "T1"), ...extra.filter((t) => !t.startsWith("V"))];
+    // Review mode reveals the R1 feedback lane on top; it stays visible while notes exist.
+    const showR1 = s.tool === "review" || comp.clips.some((c) => c.track === "R1" || c.type === "review");
+    return showR1 ? ["R1", ...base.filter((t) => t !== "R1")] : base;
+  }, [comp.clips, s.tool]);
   const contentW = Math.max(laneWidth, (total + 10) * zoom + 200);
 
   useEffect(() => {
@@ -56,6 +60,7 @@ export function Timeline() {
   }
   const xToT = (clientX: number) => { const el = lanesRef.current!; const r = el.getBoundingClientRect(); return Math.max(0, (clientX - r.left + el.scrollLeft) / zoom); };
   const frameQ = (t: number) => Math.round(t * fps) / fps;
+  const laneTop = (track: string) => { let y = 0; for (const t of tracks) { if (t === track) return y; y += LANE_H[TRACK_KIND(t)] ?? 44; } return 0; };
 
   // ---- ruler scrub ----
   function onRulerDown(e: React.MouseEvent) {
@@ -73,6 +78,7 @@ export function Timeline() {
   function onClipDown(e: React.MouseEvent, clip: Clip, mode: "move" | "l" | "r") {
     e.stopPropagation(); e.preventDefault();
     if (locked[clip.track]) return;
+    if (clip.type === "review" && s.tool === "razor") return;
     if (s.tool === "razor") { splitAt(frameQ(xToT(e.clientX)), [clip.id]); return; }
     const multi = e.shiftKey || e.metaKey;
     let sel = selection.includes(clip.id) ? selection : multi ? [...selection, clip.id] : [clip.id];
@@ -108,7 +114,7 @@ export function Timeline() {
         const sn = snap(ns, excl); if (sn.hit !== null) ns = Math.max(minStart, Math.min(o.end - 1 / fps, sn.t)); setSnapLine(sn.hit);
         ns = frameQ(ns);
         const delta = ns - o.start;
-        patchClips(withLinked([clip.id]), () => ({ start: ns, in: o.type === "text" ? 0 : o.in + delta * o.speed }), { undo: false });
+        patchClips(withLinked([clip.id]), () => ({ start: ns, in: o.type === "text" || o.type === "review" ? 0 : o.in + delta * o.speed }), { undo: false });
       } else {
         const o = anchor;
         const asset = get().assets.find((a) => a.id === o.asset);
@@ -117,7 +123,7 @@ export function Timeline() {
         const sn = snap(ne, excl); if (sn.hit !== null) ne = Math.min(maxEnd, Math.max(o.start + 1 / fps, sn.t)); setSnapLine(sn.hit);
         ne = frameQ(ne);
         const delta = ne - o.end;
-        patchClips(withLinked([clip.id]), () => ({ end: ne, out: o.type === "text" ? ne - o.start : o.out + delta * o.speed }), { undo: false });
+        patchClips(withLinked([clip.id]), () => ({ end: ne, out: o.type === "text" || o.type === "review" ? ne - o.start : o.out + delta * o.speed }), { undo: false });
       }
     };
     const up = () => { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); setSnapLine(null); };
@@ -129,7 +135,26 @@ export function Timeline() {
     if (e.button !== 0) return;
     const el = lanesRef.current!; const r = el.getBoundingClientRect();
     const t0 = xToT(e.clientX);
-    if (s.tool === "razor") { splitAt(frameQ(t0), comp.clips.filter((c) => t0 > c.start && t0 < c.end).map((c) => c.id)); return; }
+    if (s.tool === "razor") { splitAt(frameQ(t0), comp.clips.filter((c) => c.type !== "review" && t0 > c.start && t0 < c.end).map((c) => c.id)); return; }
+    if (s.tool === "review") {
+      set({ playing: false }); seek(frameQ(t0));
+      if (laneAt(e.clientY) !== "R1" || locked["R1"]) return;
+      e.preventDefault();
+      const tA = frameQ(Math.max(0, t0));
+      let tB = tA;
+      const mv = (ev: MouseEvent) => { tB = frameQ(Math.max(0, xToT(ev.clientX))); setReviewDraft({ a: Math.min(tA, tB), b: Math.max(tA, tB) }); };
+      const up = () => {
+        window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up);
+        setReviewDraft(null);
+        const a = Math.min(tA, tB), b = Math.max(tA, tB);
+        const end = b - a < 0.5 ? a + 2 : b;
+        const clip = newClip({ track: "R1", type: "review", start: a, end, in: 0, out: end - a, name: "Note" });
+        mutate((c) => { c.clips.push(clip); });
+        set({ selection: [clip.id], dockTab: "inspector", dockOpen: true });
+      };
+      window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
+      return;
+    }
     set({ selection: e.shiftKey ? selection : [] , playing: false });
     seek(frameQ(t0));
     const x0 = e.clientX - r.left + el.scrollLeft, y0 = e.clientY - r.top + el.scrollTop;
@@ -213,12 +238,13 @@ export function Timeline() {
   const trackState = (t: string, key: "hidden" | "muted") => { const ks = comp.clips.filter((k) => k.track === t); return ks.length > 0 && ks.every((k) => k[key]); };
 
   return (
-    <div className={`ve-tl ${s.tool === "razor" ? "ve-razor-cursor" : ""}`} style={{ height }}>
+    <div className={`ve-tl ${s.tool === "razor" ? "ve-razor-cursor" : s.tool === "review" ? "ve-review-cursor" : ""}`} style={{ height }}>
       <div className="resize" onMouseDown={onResizeDown} />
       <div className="ve-tl-bar">
         <div className="ve-seg">
           <button className={s.tool === "select" ? "on" : ""} title="Select (V)" onClick={() => set({ tool: "select" })}><MousePointer2 size={13} /></button>
           <button className={s.tool === "razor" ? "on" : ""} title="Razor (C)" onClick={() => set({ tool: "razor" })}><Scissors size={13} /></button>
+          <button className={s.tool === "review" ? "on" : ""} title="Review (R)" onClick={() => set({ tool: "review" })}><MessageSquare size={13} /></button>
         </div>
         <button className={`ve-icon-btn ${s.snap ? "on" : ""}`} title="Snap (S)" onClick={() => set({ snap: !s.snap })}><Magnet size={14} /></button>
         <span style={{ width: 6 }} />
@@ -230,7 +256,7 @@ export function Timeline() {
         <button className="ve-icon-btn" title="Duplicate (⌘D)" disabled={!selection.length} onClick={duplicateSelected}><Copy size={14} /></button>
         <button className="ve-icon-btn" title="Close gaps on all tracks" disabled={!comp.clips.length} onClick={() => closeGaps()}><AlignHorizontalSpaceAround size={14} /></button>
         <span className="spacer" />
-        <span className="ve-faint" style={{ fontSize: 11 }}>{selection.length ? `${selection.length} selected` : `${comp.clips.length} clips · ${fmtTime(total, fps)}`}</span>
+        <span className="ve-faint" style={{ fontSize: 11 }}>{s.tool === "review" ? `${comp.clips.filter((c) => c.type === "review" && !c.hidden).length} open notes` : selection.length ? `${selection.length} selected` : `${comp.clips.length} clips · ${fmtTime(total, fps)}`}</span>
         <span style={{ width: 8 }} />
         <button className="ve-icon-btn" title="Zoom out (−)" onClick={() => zoomTo(zoom / 1.3)}><ZoomOut size={14} /></button>
         <input type="range" min={Math.log(MIN_ZOOM)} max={Math.log(MAX_ZOOM)} step={0.01} value={Math.log(zoom)} onChange={(e) => zoomTo(Math.exp(Number(e.target.value)))} style={{ width: 110 }} />
@@ -251,11 +277,11 @@ export function Timeline() {
           {tracks.map((t) => {
             const kind = TRACK_KIND(t);
             return (
-              <div key={t} className="ve-track-hdr" style={{ height: LANE_H[kind] }}>
+              <div key={t} className="ve-track-hdr" style={{ height: LANE_H[kind] ?? 44 }}>
                 <span className="id">{t}</span>
-                <span className="nm">{TRACK_LABEL[t] ?? (kind === "video" ? "Video" : kind === "text" ? "Text" : "Audio")}</span>
-                {kind !== "audio" && <button className={`t ${trackState(t, "hidden") ? "off" : ""}`} title="Toggle visibility" onClick={() => toggleTrack(t, "hidden")}>{trackState(t, "hidden") ? <EyeOff size={13} /> : <Eye size={13} />}</button>}
-                {kind !== "text" && <button className={`t ${trackState(t, "muted") ? "off" : ""}`} title="Toggle mute" onClick={() => toggleTrack(t, "muted")}>{trackState(t, "muted") ? <VolumeX size={13} /> : <Volume2 size={13} />}</button>}
+                <span className="nm">{TRACK_LABEL[t] ?? (kind === "video" ? "Video" : kind === "text" ? "Text" : kind === "review" ? "Review" : "Audio")}</span>
+                {kind !== "audio" && <button className={`t ${trackState(t, "hidden") ? "off" : ""}`} title={kind === "review" ? "Resolve / reopen all notes" : "Toggle visibility"} onClick={() => toggleTrack(t, "hidden")}>{trackState(t, "hidden") ? <EyeOff size={13} /> : <Eye size={13} />}</button>}
+                {kind !== "text" && kind !== "review" && <button className={`t ${trackState(t, "muted")} ? "off" : ""}`} title="Toggle mute" onClick={() => toggleTrack(t, "muted")}>{trackState(t, "muted") ? <VolumeX size={13} /> : <Volume2 size={13} />}</button>}
                 <button className={`t ${locked[t] ? "off" : ""}`} title="Lock track" onClick={() => setLocked({ ...locked, [t]: !locked[t] })}>{locked[t] ? <Lock size={12} /> : <Unlock size={12} />}</button>
               </div>
             );
@@ -267,12 +293,13 @@ export function Timeline() {
             {tracks.map((t) => {
               const kind = TRACK_KIND(t);
               return (
-                <div key={t} data-track={t} className={`ve-lane ${kind} ${overLane === t ? "over" : ""}`} style={{ height: LANE_H[kind], opacity: locked[t] ? 0.6 : 1 }} onMouseDown={onLaneDown}>
+                <div key={t} data-track={t} className={`ve-lane ${kind} ${overLane === t ? "over" : ""}`} style={{ height: LANE_H[kind] ?? 44, opacity: locked[t] ? 0.6 : 1 }} onMouseDown={onLaneDown}>
                   {comp.clips.filter((c) => c.track === t).map((c) => <ClipView key={c.id} clip={c} zoom={zoom} sel={selection.includes(c.id)} agentId={s.agentId} project={s.project} bust={s.cacheBust} onDown={onClipDown} />)}
                 </div>
               );
             })}
             <div style={{ height: 30 }} />
+            {reviewDraft && tracks.includes("R1") && <div className="ve-review-ghost" style={{ top: laneTop("R1") + 4, left: reviewDraft.a * zoom, width: Math.max(4, (reviewDraft.b - reviewDraft.a) * zoom) }} />}
             <LanePlayhead zoom={zoom} lanesRef={lanesRef} />
             {snapLine !== null && <div className="ve-snapline" style={{ left: snapLine * zoom }} />}
             {marquee && <div className="ve-marquee" style={{ left: Math.min(marquee.x0, marquee.x1), top: Math.min(marquee.y0, marquee.y1), width: Math.abs(marquee.x1 - marquee.x0), height: Math.abs(marquee.y1 - marquee.y0) }} />}
@@ -310,10 +337,10 @@ function ClipView({ clip: c, zoom, sel, agentId, project, bust, onDown }: { clip
     wave = { backgroundImage: `url(${mediaUrl(agentId, project, "cache", th.wave, bust)})`, backgroundSize: `${totalW}px 100%`, backgroundPosition: `${-(c.in / c.speed) * zoom}px 0` };
   }
   return (
-    <div className={`ve-clip ${c.type} ${sel ? "sel" : ""} ${c.hidden ? "hidden" : ""}`} style={{ left: c.start * zoom, width: w }} onMouseDown={(e) => onDown(e, c, "move")} title={`${c.name || (c.text ? c.text.content : "") || c.asset}
+    <div className={`ve-clip ${c.type} ${sel ? "sel" : ""} ${c.hidden ? "hidden" : ""}`} style={{ left: c.start * zoom, width: w }} onMouseDown={(e) => onDown(e, c, "move")} title={`${c.type === "review" ? (c.text.content || "Review note — click to edit") : c.name || (c.text ? c.text.content : "") || c.asset}
 ${fmtTime(c.start)} → ${fmtTime(c.end)}  ·  src ${c.in.toFixed(2)}–${c.out.toFixed(2)}${c.speed !== 1 ? ` · ${c.speed}×` : ""}${c.link ? " · linked" : ""}`}>
       {wave && <div className="wave" style={wave} />}
-      <div className="lbl">{c.link ? "🔗 " : ""}{c.muted ? "🔇 " : ""}{c.type === "text" ? c.text.content || "Title" : c.name || asset?.name || "clip"}{c.behindSubject ? " · behind" : ""}</div>
+      <div className="lbl">{c.type === "review" ? `${c.hidden ? "✓ " : "💬 "}${c.text.content || "Note…"}` : <>{c.link ? "🔗 " : ""}{c.muted ? "🔇 " : ""}{c.type === "text" ? c.text.content || "Title" : c.name || asset?.name || "clip"}{c.behindSubject ? " · behind" : ""}</>}</div>
       {c.transitionIn.duration > 0 && <div className="fade" style={{ left: 0, borderRight: `${c.transitionIn.duration * zoom}px solid transparent` }} />}
       {c.transitionOut.duration > 0 && <div className="fade" style={{ right: 0, borderLeft: `${c.transitionOut.duration * zoom}px solid transparent` }} />}
       <div className="h l" onMouseDown={(e) => onDown(e, c, "l")} />

@@ -246,7 +246,7 @@ impl Default for Composition {
     }
 }
 impl Composition {
-    pub fn duration(&self) -> f64 { self.clips.iter().filter(|c| !c.hidden).map(|c| c.end).fold(0.0, f64::max) }
+    pub fn duration(&self) -> f64 { self.clips.iter().filter(|c| !c.hidden && c.kind != "review").map(|c| c.end).fold(0.0, f64::max) }
 }
 
 pub fn blank_composition_json() -> serde_json::Value { serde_json::to_value(Composition::default()).unwrap_or_default() }

@@ -29,7 +29,7 @@ export type State = {
   zoom: number;            // px per second
   scrollX: number;
   selection: string[];     // clip ids
-  tool: "select" | "razor";
+  tool: "select" | "razor" | "review";
   snap: boolean;
   panel: Panel;
   dockOpen: boolean;
@@ -354,7 +354,7 @@ export function withLinked(ids: string[]): string[] {
   return [...out];
 }
 export function splitAt(time: number, ids?: string[]) {
-  const targets = withLinked(ids ?? (state.selection.length ? state.selection : state.comp.clips.filter((c) => time > c.start + 0.02 && time < c.end - 0.02).map((c) => c.id)));
+  const targets = withLinked(ids ?? (state.selection.length ? state.selection.filter((id) => state.comp.clips.find((c) => c.id === id)?.type !== "review") : state.comp.clips.filter((c) => c.type !== "review" && time > c.start + 0.02 && time < c.end - 0.02).map((c) => c.id)));
   mutate((c) => {
     const out: Clip[] = [];
     for (const k of c.clips) {
@@ -389,7 +389,8 @@ export function duplicateSelected() {
 }
 export function closeGaps(track?: string) {
   mutate((c) => {
-    const tracks = track ? [track] : Array.from(new Set(c.clips.map((k) => k.track)));
+    // Review lanes (R*) are timeline-anchored feedback — never ripple them.
+    const tracks = (track ? [track] : Array.from(new Set(c.clips.map((k) => k.track)))).filter((t) => !t.startsWith("R"));
     for (const t of tracks) {
       const ks = c.clips.filter((k) => k.track === t).sort((a, b) => a.start - b.start);
       let cursor = 0;

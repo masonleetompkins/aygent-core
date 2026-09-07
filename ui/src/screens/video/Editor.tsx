@@ -2,7 +2,7 @@
 //   top bar · tool rail | panel | player + timeline | dock (Agent / Inspector)
 // Keyboard: Space play · J/K/L · ←/→ frame · Home/End · K or ⌘K split · ⌫ delete
 //           ⇧⌫ ripple delete · ⌘D duplicate · ⌘Z/⇧⌘Z undo/redo · V select · C razor
-//           S snap · +/− zoom · ⇧Z fit · I inspector · ⌘⏎ focus agent · ⌘S save
+//           S snap · R review · +/− zoom · ⇧Z fit · I inspector · ⌘⏎ focus agent · ⌘S save
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -90,6 +90,7 @@ export function Editor({ agentId, agentName, folder }: { agentId: string | null;
         case "Backspace": case "Delete": e.preventDefault(); deleteSelected(e.shiftKey); break;
         case "v": case "V": set({ tool: "select" }); break;
         case "c": case "C": set({ tool: "razor" }); break;
+        case "r": case "R": set((st) => ({ tool: st.tool === "review" ? "select" : "review" })); break;
         case "s": case "S": set({ snap: !st.snap }); break;
         case "i": case "I": set({ dockOpen: true, dockTab: st.dockTab === "inspector" && st.dockOpen ? "agent" : "inspector" }); break;
         case "=": case "+": set({ zoom: Math.min(600, st.zoom * 1.3) }); break;

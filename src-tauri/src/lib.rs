@@ -2100,6 +2100,41 @@ fn attachment_blocks_openai(broker: &Arc<Broker>, agent_id: &str, rels: &[String
     blocks
 }
 
+/// VISION (video_look): read rendered canvas frames through the jail so the model
+/// SEES them inline. Frames are 854px JPEGs (bounded count + size); stale state is
+/// impossible — exec_full drains per call, take_pending_vision drains after the push.
+fn vision_bytes(broker: &Arc<Broker>, agent_id: &str, frames: &[video_tools::VisionFrame]) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    for f in frames.iter().take(4) {
+        let Ok(abs) = broker.resolve(agent_id, &f.rel, broker::Mode::Read) else { continue };
+        let Ok(bytes) = std::fs::read(&abs) else { continue };
+        if bytes.is_empty() || bytes.len() > 4_800_000 { continue; }
+        out.push((f.label.clone(), bytes));
+    }
+    out
+}
+/// Anthropic content blocks: [text, image, image, ...].
+fn vision_blocks_anthropic(vb: &[(String, Vec<u8>)]) -> Vec<serde_json::Value> {
+    use base64::Engine;
+    let mut blocks = Vec::new();
+    for (label, bytes) in vb {
+        blocks.push(serde_json::json!({ "type": "text", "text": format!("[canvas frame at {} — the Video tab preview shows the first frame]", label) }));
+        blocks.push(serde_json::json!({ "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": base64::engine::general_purpose::STANDARD.encode(bytes) } }));
+    }
+    blocks
+}
+/// OpenAI/Muse user-message blocks: [text, image_url, ...]. OpenAI passes them
+/// through verbatim; the Meta translator already maps image_url -> input_image.
+fn vision_blocks_openai(vb: &[(String, Vec<u8>)]) -> Vec<serde_json::Value> {
+    use base64::Engine;
+    let mut blocks = Vec::new();
+    for (label, bytes) in vb {
+        blocks.push(serde_json::json!({ "type": "text", "text": format!("[canvas frame at {} — delete spent frames with delete_file]", label) }));
+        blocks.push(serde_json::json!({ "type": "image_url", "image_url": { "url": format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)) } }));
+    }
+    blocks
+}
+
 #[tauri::command]
 fn agent_context_list(db: tauri::State<writer::Db>, agent_id: String) -> Result<Vec<context_docs::ContextDoc>, String> {
     context_docs::list(&db, &agent_id)
@@ -4998,7 +5033,8 @@ async fn agent_stream(
                     } else if mcp::is_mcp_tool(&name) {
                         mcp::exec(&name, &input)
                     } else if video_tools::is_video_tool(&name) {
-                        video_tools::exec(&broker, &scope_id, &name, &input)
+                        let o = video_tools::exec_full(&broker, &scope_id, &name, &input);
+                        (o.text, o.is_err)
                     } else if dashboard::is_dashboard_tool(&name) {
                         dashboard::exec_dashboard_tool(&db, &scope_id, &name, &input)
                     } else {
@@ -5026,6 +5062,15 @@ async fn agent_stream(
                         "role": "user",
                         "content": [{ "type": "tool_result", "tool_use_id": id, "content": result_text, "is_error": is_err }]
                     }));
+                    if name == "video_look" {
+                        let vf = video_tools::take_pending_vision();
+                        let vb = vision_bytes(&broker, &scope_id, &vf);
+                        if !vb.is_empty() {
+                            let mut vc = vec![serde_json::json!({ "type": "text", "text": "Canvas frame(s) — you SEE them as images in this message." })];
+                            vc.extend(vision_blocks_openai(&vb));
+                            messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": vc }));
+                        }
+                    }
                 }
             }
 
@@ -5255,7 +5300,8 @@ async fn agent_stream(
                     } else if mcp::is_mcp_tool(&name) {
                         mcp::exec(&name, &input)
                     } else if video_tools::is_video_tool(&name) {
-                        video_tools::exec(&broker, &scope_id, &name, &input)
+                        let o = video_tools::exec_full(&broker, &scope_id, &name, &input);
+                        (o.text, o.is_err)
                     } else if dashboard::is_dashboard_tool(&name) {
                         dashboard::exec_dashboard_tool(&db, &scope_id, &name, &input)
                     } else {
@@ -5295,9 +5341,21 @@ async fn agent_stream(
                         // the full result still goes to the model / logs regardless.
                         "detail": if is_err { result_text.clone() } else { result_text.chars().take(2000).collect::<String>() }
                     }));
+                    // VISION must ride INSIDE this tool_result (Anthropic requires every
+                    // tool_use to be followed immediately by its result; a separate user
+                    // message here would break role alternation and 400 the next call).
+                    let content_v: serde_json::Value = if name == "video_look" {
+                        let vf = video_tools::take_pending_vision();
+                        let vb = vision_bytes(&broker, &scope_id, &vf);
+                        if vb.is_empty() { serde_json::json!(result_text.clone()) } else {
+                            let mut vc = vec![serde_json::json!({ "type": "text", "text": format!("{}\n\nCanvas frame(s) — you SEE them as images in this message.", result_text) })];
+                            vc.extend(vision_blocks_anthropic(&vb));
+                            serde_json::json!(vc)
+                        }
+                    } else { serde_json::json!(result_text.clone()) };
                     tool_results.push(serde_json::json!({
                         "type": "tool_result", "tool_use_id": id,
-                        "content": result_text, "is_error": is_err
+                        "content": content_v, "is_error": is_err
                     }));
                 }
             }
@@ -5755,13 +5813,23 @@ pub async fn run_headless_turn(
                             } else if mcp::is_mcp_tool(&name) {
                                 mcp::exec(&name, &input)
                             } else if video_tools::is_video_tool(&name) {
-                                video_tools::exec(broker, agent_id, &name, &input)
+                                let o = video_tools::exec_full(broker, agent_id, &name, &input);
+                                (o.text, o.is_err)
                             } else if dashboard::is_dashboard_tool(&name) {
                                 dashboard::exec_dashboard_tool(db, agent_id, &name, &input)
                             } else {
                                 exec_tool_cfg(broker, agent_id, &name, &input, &pdf_cfg)
                             };
-                            tool_results.push(serde_json::json!({ "type": "tool_result", "tool_use_id": id, "content": result_text, "is_error": is_err }));
+                            let content_v: serde_json::Value = if name == "video_look" {
+                                let vf = video_tools::take_pending_vision();
+                                let vb = vision_bytes(broker, agent_id, &vf);
+                                if vb.is_empty() { serde_json::json!(result_text.clone()) } else {
+                                    let mut vc = vec![serde_json::json!({ "type": "text", "text": format!("{}\n\nCanvas frame(s) — you SEE them as images in this message.", result_text) })];
+                                    vc.extend(vision_blocks_anthropic(&vb));
+                                    serde_json::json!(vc)
+                                }
+                            } else { serde_json::json!(result_text.clone()) };
+                            tool_results.push(serde_json::json!({ "type": "tool_result", "tool_use_id": id, "content": content_v, "is_error": is_err }));
                         }
                         _ => {}
                     }
@@ -5841,7 +5909,8 @@ pub async fn run_headless_turn(
                 } else if mcp::is_mcp_tool(&name) {
                     mcp::exec(&name, &input)
                 } else if video_tools::is_video_tool(&name) {
-                    video_tools::exec(broker, agent_id, &name, &input)
+                    let o = video_tools::exec_full(broker, agent_id, &name, &input);
+                    (o.text, o.is_err)
                 } else if dashboard::is_dashboard_tool(&name) {
                     dashboard::exec_dashboard_tool(db, agent_id, &name, &input)
                 } else {
@@ -5849,6 +5918,15 @@ pub async fn run_headless_turn(
                 };
                 let _ = app.emit(&stream_channel, &serde_json::json!({ "kind": "ToolResult", "id": id, "name": name, "path": input.get("path").and_then(|p| p.as_str()).unwrap_or(""), "ok": !is_err, "detail": if is_err { result_text.clone() } else { result_text.chars().take(2000).collect::<String>() } }));
                 tool_results.push(serde_json::json!({ "type": "tool_result", "tool_use_id": id, "content": result_text, "is_error": is_err }));
+                if name == "video_look" {
+                    let vf = video_tools::take_pending_vision();
+                    let vb = vision_bytes(broker, agent_id, &vf);
+                    if !vb.is_empty() {
+                        let mut vc = vec![serde_json::json!({ "type": "text", "text": "Canvas frame(s) — you SEE them as images in this message." })];
+                        vc.extend(vision_blocks_openai(&vb));
+                        messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": vc }));
+                    }
+                }
             }
             messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": tool_results }));
         }

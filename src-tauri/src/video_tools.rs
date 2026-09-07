@@ -38,7 +38,7 @@ fn app() -> Result<tauri::AppHandle, String> { APP.get().cloned().ok_or_else(|| 
 /// AppHandle for the Hyperframes overlay module (same install_app source).
 pub fn app_handle() -> Option<tauri::AppHandle> { APP.get().cloned() }
 
-const NAMES: &[&str] = &["video_project", "video_edit", "video_transcribe", "video_silences", "video_takes", "video_auto_cut", "video_frame", "video_render", "video_audio_enhance", "video_matte", "video_build_captions", "video_render_overlay"];
+const NAMES: &[&str] = &["video_project", "video_edit", "video_transcribe", "video_silences", "video_takes", "video_auto_cut", "video_frame", "video_look", "video_render", "video_audio_enhance", "video_matte", "video_build_captions", "video_render_overlay"];
 pub fn is_video_tool(name: &str) -> bool { NAMES.contains(&name) || crate::video_hyperframes::is_hyperframes_tool(name) }
 
 pub fn tool_schemas() -> Vec<Value> {
@@ -46,7 +46,7 @@ pub fn tool_schemas() -> Vec<Value> {
     let mut v = vec![
         json!({ "name": "video_project", "description": "Overview of a video project: scene, duration, clips per track, assets (ids, durations, fps, audio), transcript/captions/graphics-style/LUT state, renders. Omit project to list all projects. Call this FIRST before editing.",
             "input_schema": { "type": "object", "properties": { "project": proj } } }),
-        json!({ "name": "video_edit", "description": "Apply precise edits to Video/<project>/composition.json and save. ops run in order. Ops: {op:'set', path:'captions.enabled', value:true} (dot path into the composition, e.g. scene.width, color.lut, color.sCurve, audio.duck.enabled, captions.keyWords, graphics.instructions) · {op:'add_clip', clip:{track,type:'video'|'audio'|'image'|'text',asset,start,end,in,out,name,text:{content,size,y,...},transform:{x,y,scale,opacity},fit,behindSubject,volume}} (video with audio on V1/V2 auto-lays a linked A1 waveform partner) · {op:'update_clip', id, patch:{...}} · {op:'remove_clip', id, ripple?:true} (linked partners go together) · {op:'split', id, at:<timeline seconds>} (linked partners split together) · {op:'move', id, start} · {op:'cutlist', asset, keep:[{in,out}], track?:'V1', pad?:0.03} (replaces that asset's clips on the track with contiguous selects + linked A1 partners). Times are seconds; start/end = timeline placement, in/out = source range. Returns the saved summary.",
+        json!({ "name": "video_edit", "description": "Apply precise edits to Video/<project>/composition.json and save. ops run in order. Ops: {op:'set', path:'captions.enabled', value:true} (dot path into the composition, e.g. scene.width, color.lut, color.sCurve, audio.duck.enabled, captions.keyWords, graphics.instructions) · {op:'add_clip', clip:{track,type:'video'|'audio'|'image'|'text'|'review',asset,start,end,in,out,name,text:{content,size,y,...},transform:{x,y,scale,opacity},fit,behindSubject,volume}} (video with audio on V1/V2 auto-lays a linked A1 waveform partner) · {op:'update_clip', id, patch:{...}} · {op:'remove_clip', id, ripple?:true} (linked partners go together) · {op:'split', id, at:<timeline seconds>} (linked partners split together) · {op:'move', id, start} · {op:'cutlist', asset, keep:[{in,out}], track?:'V1', pad?:0.03} (replaces that asset's clips on the track with contiguous selects + linked A1 partners). Times are seconds; start/end = timeline placement, in/out = source range. Returns the saved summary.",
             "input_schema": { "type": "object", "properties": { "project": proj, "ops": { "type": "array", "items": { "type": "object" } } }, "required": ["project", "ops"] } }),
         json!({ "name": "video_transcribe", "description": "Word-level transcript of an asset (OpenAI Whisper; audio is extracted + chunked automatically, any length). Saves Video/<project>/transcript.json used by captions, takes and auto_cut. Returns the segments with timestamps.",
             "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string", "description": "asset id (default: the first V1 video clip's asset, else the first video asset)" }, "language": { "type": "string", "description": "ISO code hint, e.g. en" } }, "required": ["project"] } }),
@@ -58,6 +58,8 @@ pub fn tool_schemas() -> Vec<Value> {
             "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "threshold_db": { "type": "number", "description": "default -35" }, "min_silence": { "type": "number", "description": "seconds, default 0.6" }, "pad": { "type": "number", "description": "seconds kept around speech, default 0.08" }, "keep": { "type": "string", "enum": ["last", "longest"] }, "drop_takes": { "type": "boolean", "description": "default true" } }, "required": ["project"] } }),
         json!({ "name": "video_frame", "description": "Render ONE composite frame (grade + overlays) at a timeline time to .cache/. Use to sanity-check a moment; the user sees it in the Video tab preview.",
             "input_schema": { "type": "object", "properties": { "project": proj, "time": { "type": "number" } }, "required": ["project", "time"] } }),
+        json!({ "name": "video_look", "description": "LOOK at the canvas: render the full composite (grade + LUT + overlays) at timeline time(s) and SEE the frame(s) as images in your next message. Your eyes in the editor — any timecode, any moment. The first frame also appears in the user's Video tab preview. Delete frames you no longer need with delete_file (Video/<project>/.cache/frame-*.jpg).",
+            "input_schema": { "type": "object", "properties": { "project": proj, "time": { "type": "number", "description": "timeline seconds to look at" }, "times": { "type": "array", "items": { "type": "number" }, "description": "up to 4 times to see side by side" } }, "required": ["project"] } }),
         json!({ "name": "video_render", "description": "Export the project with a preset from composition.exports (by name) or an explicit {width,height,bitrate,codec:'h264'|'hevc'|'prores'}. Blocking; progress streams to the UI. Output lands in Video/<project>/renders/.",
             "input_schema": { "type": "object", "properties": { "project": proj, "preset": { "type": "string", "description": "preset name, e.g. landscape | vertical" }, "width": { "type": "integer" }, "height": { "type": "integer" }, "bitrate": { "type": "string" }, "codec": { "type": "string" }, "name": { "type": "string", "description": "output file stem" } }, "required": ["project"] } }),
         json!({ "name": "video_audio_enhance", "description": "Enhance an asset's dialogue audio: engine 'auphonic' (needs Auphonic credentials in Settings → Video) or 'local' (ffmpeg denoise + leveler + loudnorm). Produces a new audio asset and points the source clips' audioAsset at it, so the enhanced track plays in place of the original.",
@@ -69,7 +71,7 @@ pub fn tool_schemas() -> Vec<Value> {
     v
 }
 
-pub const INSTRUCTIONS: &str = "\n\nVIDEO EDITOR: the Video tab is an agentic NLE. A project is Video/<name>/ with composition.json (the edit), assets.json (imported media — HARDLINKS, never copy media), transcript.json, chat.json. Use the video_* tools for every edit (frame-accurate numbers, validated + saved); never hand-write composition.json unless a tool cannot express the change. Workflow the user follows: video_project → video_auto_cut (silences + keep the LAST take; lays linked V1+A1 pairs) → review → video_transcribe (if not done) → graphics/captions as Hyperframes overlays (see below) → color via set color.lut 'luts/<file>.cube' + color.sCurve → video_audio_enhance → set audio.duck → video_render {preset:'landscape'|'vertical'}. Report clip ids + times in one line; the UI refreshes automatically after each tool. Video clips with audio carry a LINKED A1 waveform partner (clip.link shared) — split/move/remove keep pairs together, and the mix plays the pair once (no double audio).";
+pub const INSTRUCTIONS: &str = "\n\nVIDEO EDITOR: the Video tab is an agentic NLE. A project is Video/<name>/ with composition.json (the edit), assets.json (imported media — HARDLINKS, never copy media), transcript.json, chat.json. Use the video_* tools for every edit (frame-accurate numbers, validated + saved); never hand-write composition.json unless a tool cannot express the change. Workflow the user follows: video_project → video_auto_cut (silences + keep the LAST take; lays linked V1+A1 pairs) → review → video_transcribe (if not done) → graphics/captions as Hyperframes overlays (see below) → color via set color.lut 'luts/<file>.cube' + color.sCurve → video_audio_enhance → set audio.duck → video_render {preset:'landscape'|'vertical'}. Report clip ids + times in one line; the UI refreshes automatically after each tool. Video clips with audio carry a LINKED A1 waveform partner (clip.link shared) — split/move/remove keep pairs together, and the mix plays the pair once (no double audio). REVIEW: the user leaves timestamped feedback as review clips on R1 (video_project exposes reviewNotes/reviewNotesResolved) — read them first, act on each, mark done via update_clip {hidden:true}. VISION: video_look renders canvas frame(s) you SEE as images; delete spent frames with delete_file.";
 
 // ---------------------------------------------------------------------------
 // Entry points
@@ -83,6 +85,37 @@ pub fn exec(broker: &Arc<Broker>, agent_id: &str, name: &str, input: &Value) -> 
         Err(e) => (e, true),
     }
 }
+
+/// Frames a tool just rendered for the model to SEE (currently only video_look).
+/// `rel` is jail-relative (Video/<project>/.cache/frame-*.jpg); the agent loop
+/// reads the bytes through the jail and inlines them as provider image blocks.
+/// Delete with the normal delete_file tool when no longer needed.
+#[derive(Clone, Debug, Default)]
+pub struct VisionFrame { pub rel: String, pub label: String }
+
+thread_local! { static PENDING_VISION: std::cell::RefCell<Vec<VisionFrame>> = std::cell::RefCell::new(Vec::new()); }
+fn stash_vision(v: Vec<VisionFrame>) { PENDING_VISION.with(|p| *p.borrow_mut() = v); }
+fn take_vision() -> Vec<VisionFrame> { PENDING_VISION.with(|p| std::mem::take(&mut *p.borrow_mut())) }
+
+#[allow(dead_code)]
+pub struct ExecOut { pub text: String, pub is_err: bool, pub vision: Vec<VisionFrame> }
+
+/// exec + any vision frames the tool produced (drains stale frames first so a
+/// reused worker thread can never leak one turn's frames into the next).
+/// Frames stay in the thread-local stash for take_pending_vision (called by the
+/// agent loop right after it pushes the text result); the returned clone lets
+/// unit tests assert without touching thread state.
+/// Local-model loop keeps using exec (text only); cloud loops use exec_full.
+pub fn exec_full(broker: &Arc<Broker>, agent_id: &str, name: &str, input: &Value) -> ExecOut {
+    let _ = take_vision();
+    let (text, is_err) = exec(broker, agent_id, name, input);
+    let v = take_vision();
+    stash_vision(v.clone());
+    ExecOut { text, is_err, vision: v }
+}
+
+/// Drain frames stashed by the last exec_full on this thread.
+pub fn take_pending_vision() -> Vec<VisionFrame> { take_vision() }
 
 fn bounded(v: &Value) -> String {
     let s = serde_json::to_string_pretty(v).unwrap_or_default();
@@ -149,6 +182,29 @@ pub fn run(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, name: &str, 
             let rel = vr::frame(app, broker, agent_id, &p, &comp, f("time", 0.0), 1280)?;
             let _ = tauri::Emitter::emit(app, "video-frame-ready", json!({ "project": p, "path": rel, "time": f("time", 0.0) }));
             json!({ "frame": rel, "note": "rendered to Video/<project>/.cache — the Video tab shows it" })
+        }
+        "video_look" => {
+            let p = project.ok_or("project is required")?;
+            let mut times: Vec<f64> = vec![];
+            if let Some(t) = input.get("time").and_then(|v| v.as_f64()) { times.push(t); }
+            if let Some(arr) = input.get("times").and_then(|v| v.as_array()) {
+                for v in arr.iter().filter_map(|v| v.as_f64()).take(4) { times.push(v); }
+            }
+            if times.is_empty() { times.push(0.0); }
+            times.truncate(4);
+            let comp = load_comp(broker, agent_id, &p)?;
+            let dur = comp.duration().max(0.04);
+            let mut frames: Vec<Value> = vec![];
+            let mut vision: Vec<VisionFrame> = vec![];
+            for (i, t) in times.iter().enumerate() {
+                let t = t.clamp(0.0, (dur - 0.001).max(0.0));
+                let rel = vr::frame(app, broker, agent_id, &p, &comp, t, 854)?;
+                if i == 0 { let _ = tauri::Emitter::emit(app, "video-frame-ready", json!({ "project": p, "path": rel, "time": t })); }
+                frames.push(json!({ "time": round3(t), "frame": rel }));
+                vision.push(VisionFrame { rel: video::rel(&p, &rel), label: format!("{t:.2}s") });
+            }
+            stash_vision(vision);
+            json!({ "frames": frames, "note": "you SEE these frame(s) as images alongside this result. Delete frames you no longer need with delete_file." })
         }
         "video_render" => {
             let p = project.ok_or("project is required")?;
@@ -222,14 +278,22 @@ fn overview(broker: &Broker, agent_id: &str, project: &str) -> Result<Value, Str
     let tr = load_transcript(&proj);
     let mut tracks: HashMap<String, Vec<Value>> = HashMap::new();
     for c in &comp.clips {
-        tracks.entry(c.track.clone()).or_default().push(json!({ "id": c.id, "type": c.kind, "asset": c.asset, "name": c.name, "start": round3(c.start), "end": round3(c.end), "in": round3(c.in_), "out": round3(c.out), "hidden": c.hidden, "muted": c.muted, "link": c.link, "text": if c.kind == "text" { Some(&c.text.content) } else { None }, "behindSubject": c.behind_subject }));
+        tracks.entry(c.track.clone()).or_default().push(json!({ "id": c.id, "type": c.kind, "asset": c.asset, "name": c.name, "start": round3(c.start), "end": round3(c.end), "in": round3(c.in_), "out": round3(c.out), "hidden": c.hidden, "muted": c.muted, "link": c.link, "text": if c.kind == "text" || c.kind == "review" { Some(&c.text.content) } else { None }, "behindSubject": c.behind_subject }));
     }
     let luts: Vec<String> = std::fs::read_dir(proj.join("luts")).map(|rd| rd.flatten().map(|e| format!("luts/{}", e.file_name().to_string_lossy())).collect()).unwrap_or_default();
     let renders: Vec<String> = std::fs::read_dir(proj.join("renders")).map(|rd| rd.flatten().map(|e| format!("renders/{}", e.file_name().to_string_lossy())).collect()).unwrap_or_default();
     let overlays: Vec<String> = assets.iter().filter(|a| a.name.contains("(overlay HF)") || a.name.contains("(captions HF)")).map(|a| format!("{} ({})", a.id, a.name)).collect();
     let offline: Vec<Value> = assets.iter().filter(|a| !video::asset_abs(broker, agent_id, project, a).map(|p| p.is_file()).unwrap_or(false)).map(|a| json!({ "id": a.id, "name": a.name, "path": a.path })).collect();
+    let mut notes: Vec<Value> = vec![];
+    let mut notes_resolved: Vec<Value> = vec![];
+    for c in comp.clips.iter().filter(|c| c.kind == "review") {
+        let v = json!({ "id": c.id, "start": round3(c.start), "end": round3(c.end), "text": c.text.content });
+        if c.hidden { notes_resolved.push(v); } else { notes.push(v); }
+    }
     Ok(json!({
         "project": project,
+        "reviewNotes": notes,
+        "reviewNotesResolved": notes_resolved,
         "offlineMedia": offline,
         "warning": if offline.is_empty() { Value::Null } else { json!("Some media is OFFLINE (drive unplugged or file moved) — tell the user which files/paths and don't run transcribe/cut/render on them until relinked.") },
         "scene": comp.scene,
@@ -316,7 +380,19 @@ pub fn edit(broker: &Broker, agent_id: &str, project: &str, ops: &[Value]) -> Re
                 c["id"] = json!(cid);
                 // sensible defaults from the asset
                 let kind = c.get("type").and_then(|x| x.as_str()).unwrap_or("video").to_string();
-                if kind != "text" {
+                if kind == "review" {
+                    // Feedback notes: no media, pinned to the R1 review lane.
+                    // hidden = resolved (render skips them; UI greys them out).
+                    if c.get("track").is_none() { c["track"] = json!("R1"); }
+                    let start = c.get("start").and_then(|x| x.as_f64()).unwrap_or(0.0).max(0.0);
+                    c["start"] = json!(start);
+                    if c.get("end").is_none() { c["end"] = json!(start + 2.0); }
+                    c["in"] = json!(0.0);
+                    c["out"] = json!(c.get("end").and_then(|x| x.as_f64()).unwrap_or(start + 2.0) - start);
+                    if c.get("name").is_none() { c["name"] = json!("Note"); }
+                    v["clips"].as_array_mut().ok_or("clips")?.push(c);
+                    log.push(format!("add_clip {cid} (review note)"));
+                } else if kind != "text" {
                     let aid = c.get("asset").and_then(|x| x.as_str()).unwrap_or("");
                     let a = assets.iter().find(|a| a.id == aid || a.name == aid).ok_or_else(|| format!("add_clip: unknown asset {aid}"))?;
                     c["asset"] = json!(a.id);

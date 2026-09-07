@@ -99,9 +99,14 @@ export function AgentDock({ agentName }: { agentName?: string }) {
     setText("");
     await flushSave();
     const history = await maybeCompact(agentId);
+    const notes = comp.clips.filter((c) => c.type === "review" && !c.hidden && c.text.content.trim());
+    const notesTxt = notes.length
+      ? `\nOPEN REVIEW NOTES from the user (R1 lane — read each, act on it, mark resolved via video_edit update_clip {hidden:true}):\n` +
+        notes.map((c) => `- [${fmtTime(c.start, comp.scene.fps)} → ${fmtTime(c.end, comp.scene.fps)}] ${c.text.content.trim()}`).join("\n")
+      : "";
     const ctx = [
       `[Video editor context — project "${project}" · Video/${project}/ · scene ${comp.scene.width}x${comp.scene.height}@${comp.scene.fps} · ${comp.clips.length} clips · playhead ${fmtTime(playhead, comp.scene.fps)} (${playhead.toFixed(3)}s)` +
-      (selection.length ? ` · selected clip ids: ${selection.join(", ")}` : "") + `]`,
+      (selection.length ? ` · selected clip ids: ${selection.join(", ")}` : "") + `]${notesTxt}`,
       `Use the video_* tools (start with video_project if you need the current state). Keep the reply short: what changed, clip ids, times. Captions/graphics are Hyperframes transparent overlays (video_build_captions / video_render_overlay), styled by the Graphics panel — never drawtext/ASS. Overlays: PLAN first, build only after approval, one tool call per overlay in timeline order.`,
     ].join("\n");
     chatPush({ role: "user", text: p, at: Date.now() });
