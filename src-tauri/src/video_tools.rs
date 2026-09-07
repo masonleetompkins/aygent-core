@@ -803,7 +803,7 @@ pub fn enhance(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project:
     let af = if dn <= 0.001 {
         "highpass=f=70,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2".to_string()
     } else {
-        format!("highpass=f=70,afftdn=nf=-{nr}:nr={nr}:tn=1,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2")
+        format!("highpass=f=70,afftdn=nr={nr}:nf=-25:tn=1,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2")
     };
     let o = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&wav).args(["-af", &af, "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&out).output().map_err(|e| format!("ffmpeg: {e}"))?;
     if !o.status.success() { return Err(format!("local enhance failed: {}", String::from_utf8_lossy(&o.stderr).chars().take(400).collect::<String>())); }
@@ -836,7 +836,7 @@ pub fn audition(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project
     let af = if dn <= 0.001 {
         "highpass=f=70,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2".to_string()
     } else {
-        format!("highpass=f=70,afftdn=nf=-{nr}:nr={nr}:tn=1,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2")
+        format!("highpass=f=70,afftdn=nr={nr}:nf=-25:tn=1,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2")
     };
     let cache = proj.join(".cache");
     std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
