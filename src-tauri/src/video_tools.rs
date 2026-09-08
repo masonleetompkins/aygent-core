@@ -64,7 +64,7 @@ pub fn tool_schemas() -> Vec<Value> {
             "input_schema": { "type": "object", "properties": { "project": proj, "preset": { "type": "string", "description": "preset name, e.g. landscape | vertical" }, "width": { "type": "integer" }, "height": { "type": "integer" }, "bitrate": { "type": "string" }, "codec": { "type": "string" }, "name": { "type": "string", "description": "output file stem" } }, "required": ["project"] } }),
         json!({ "name": "video_audio_enhance", "description": "AUTOMATIC dialogue cleanup (local, nothing leaves the machine): DeepFilterNet3 neural voice isolation (optional one-time voice-model download, else a light FFT fallback) → voice EQ → loudness to -16 LUFS. No strength params — one master per source. Video sources produce a full-length .cleaned.mov proxy (picture stream-copied, cleaned audio padded to the video duration); audio-only sources produce a .cleaned.wav. Points the source clips' audioAsset at it. Blend original/cleaned live with audio.cleanMix (0..1, no re-clean needed).",
             "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" } }, "required": ["project", "asset"] } }),
-        json!({ "name": "video_voice_install", "description": "One-time download of the neural voice-isolation model (DeepFilterNet3 weights via uv, into the app runtime). Progress streams to the UI. Required once before video_audio_enhance can use the neural engine; without it cleanup uses the light FFT fallback.",
+        json!({ "name": "video_voice_install", "description": "One-time self-contained setup for neural voice isolation: provisions its own uv toolchain + Python + DeepFilterNet3 weights under runtime/voice (nothing re-used from MCP). Progress streams to the UI. Required once before video_audio_enhance can use the neural engine; without it cleanup uses the light FFT fallback.",
             "input_schema": { "type": "object", "properties": { "project": proj }, "required": ["project"] } }),
         json!({ "name": "video_voice_status", "description": "Is the neural voice-isolation model installed? Returns {installed, engine} — engine is 'neural' when ready, else 'fallback'.",
             "input_schema": { "type": "object", "properties": { "project": proj }, "required": ["project"] } }),
@@ -833,26 +833,100 @@ print('df-done', arr.shape, flush=True)
 "#;
 
 /// Voice-model root inside the app runtime (uv-managed env + weights).
+// Voice toolchain lives in its OWN space (runtime/voice) — never the shared
+// runtime/uv from MCP. The download button provisions everything: uv binary,
+// managed Python, torch weights. Nothing is re-used from elsewhere.
+const VOICE_UV_VERSION: &str = "0.12.2";
 fn voice_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     let d = crate::provision::runtime_dir(app)?.join("voice");
     std::fs::create_dir_all(&d).map_err(|e| format!("mkdir voice: {e}"))?;
     Ok(d)
 }
+fn voice_uv(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    let p = voice_dir(app).ok()?.join("bin").join("uv");
+    p.is_file().then_some(p)
+}
+/// UV_* env pinned INSIDE runtime/voice (mirrors provision::uv_env layout).
+fn voice_env(app: &tauri::AppHandle) -> Vec<(String, String)> {
+    let Ok(base) = voice_dir(app) else { return vec![]; };
+    let s = |p: std::path::PathBuf| p.to_string_lossy().to_string();
+    vec![
+        ("UV_CACHE_DIR".into(), s(base.join("cache"))),
+        ("UV_DATA_DIR".into(), s(base.join("data"))),
+        ("UV_TOOL_DIR".into(), s(base.join("tools"))),
+        ("UV_TOOL_BIN_DIR".into(), s(base.join("bin"))),
+        ("UV_PYTHON_INSTALL_DIR".into(), s(base.join("python"))),
+        ("UV_PYTHON_PREFERENCE".into(), "managed".into()),
+    ]
+}
 fn voice_ready(app: &tauri::AppHandle) -> bool {
     voice_dir(app).map(|d| d.join("READY").is_file()).unwrap_or(false)
+}
+/// Download the pinned uv tarball into runtime/voice/bin (same verified layout
+/// as provision::ensure_uv: arch tokens, system tar unpack, chmod +x,
+/// de-quarantine). Sync — runs on the tool's blocking worker via a local
+/// runtime for the async download; progress via video-tool-progress.
+/// No new deps: async reqwest (already) + system tar (already).
+fn voice_ensure_uv(app: &tauri::AppHandle, project: &str) -> Result<std::path::PathBuf, String> {
+    if let Some(p) = voice_uv(app) { return Ok(p); }
+    let emit = |msg: &str| { let _ = tauri::Emitter::emit(app, "video-tool-progress", serde_json::json!({ "project": project, "tool": "video_voice_install", "msg": msg })); };
+    emit("downloading voice toolchain (uv, one time)…");
+    let a = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
+    let stem = format!("uv-{a}-apple-darwin");
+    let url = format!("https://github.com/astral-sh/uv/releases/download/{VOICE_UV_VERSION}/{stem}.tar.gz");
+    let dir = voice_dir(app)?;
+    let tarball = dir.join("uv.tgz");
+    // async download on a local runtime (same run_thread pattern as transcribe)
+    let dl = || -> Result<(), String> {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+        rt.block_on(async {
+            let resp = reqwest::get(&url).await.map_err(|e| format!("uv download: {e}"))?;
+            if !resp.status().is_success() { return Err(format!("uv download: http {}", resp.status())); }
+            let bytes = resp.bytes().await.map_err(|e| format!("uv download: {e}"))?;
+            std::fs::write(&tarball, &bytes).map_err(|e| format!("uv save: {e}"))?;
+            Ok::<(), String>(())
+        })
+    };
+    dl()?;
+    let out = std::process::Command::new("tar")
+        .arg("-xzf").arg(&tarball).arg("-C").arg(&dir)
+        .output().map_err(|e| format!("tar uv: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("unpack uv failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    let from = dir.join(&stem).join("uv");
+    if !from.is_file() { return Err("uv binary missing in tarball".into()); }
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).map_err(|e| format!("mkdir voice/bin: {e}"))?;
+    let to = bin.join("uv");
+    std::fs::rename(&from, &to).map_err(|e| format!("place uv: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(md) = std::fs::metadata(&to) {
+            let mut perm = md.permissions();
+            perm.set_mode(0o755);
+            let _ = std::fs::set_permissions(&to, perm);
+        }
+    }
+    let _ = std::process::Command::new("xattr").arg("-dr").arg("com.apple.quarantine").arg(&to).output();
+    let _ = std::fs::remove_dir_all(dir.join(&stem));
+    let _ = std::fs::remove_file(&tarball);
+    voice_uv(app).ok_or_else(|| "uv binary missing after unpack".into())
 }
 
 /// One-time download of the DeepFilterNet3 weights into the app runtime.
 /// Streams progress to the UI; writes READY on success.
 pub fn voice_install(app: &tauri::AppHandle, _broker: &Broker, _agent_id: &str, project: &str) -> Result<Value, String> {
     let dir = voice_dir(app)?;
-    let uv = crate::provision::uv_bin(app).ok_or("uv is not provisioned — enable a Python MCP server once in MCP Connections (it installs uv), then retry")?;
+    // Self-contained: the button provisions the toolchain AND the model.
+    let uv = voice_ensure_uv(app, project)?;
     let script = dir.join("df_warmup.py");
     std::fs::write(&script, "from df.enhance import init_df\ninit_df()\nprint('voice-ready')\n").map_err(|e| e.to_string())?;
     let _ = tauri::Emitter::emit(app, "video-tool-progress", json!({ "project": project, "tool": "video_voice_install", "msg": "downloading voice model (~90MB, one time)…" }));
     let mut cmd = Command::new(&uv);
     cmd.args(["run", "--python", "3.11", "--with", "torch==2.5.1", "--with", "torchaudio==2.5.1", "--with", "deepfilternet", "--project"]).arg(&dir).arg(&script);
-    for (k, v) in crate::provision::uv_env(app) { cmd.env(k, v); }
+    for (k, v) in voice_env(app) { cmd.env(k, v); }
     cmd.env("PYTORCH_ENABLE_MPS_FALLBACK", "1");
     let o = cmd.output().map_err(|e| format!("uv: {e}"))?;
     if !o.status.success() {
@@ -865,7 +939,7 @@ pub fn voice_install(app: &tauri::AppHandle, _broker: &Broker, _agent_id: &str, 
 
 pub fn voice_status(app: &tauri::AppHandle, _broker: &Broker, _agent_id: &str, _project: &str) -> Result<Value, String> {
     let installed = voice_ready(app);
-    Ok(json!({ "installed": installed, "engine": if installed { "neural" } else { "fallback" } }))
+    Ok(json!({ "installed": installed, "uv": voice_uv(app).is_some(), "engine": if installed { "neural" } else { "fallback" } }))
 }
 
 /// Neural isolation pass (mono in → mono out). Returns false when the model
@@ -873,13 +947,13 @@ pub fn voice_status(app: &tauri::AppHandle, _broker: &Broker, _agent_id: &str, _
 fn df_isolate(app: &tauri::AppHandle, project: &str, wav: &Path, out: &Path) -> bool {
     let Ok(dir) = voice_dir(app) else { return false; };
     if !dir.join("READY").is_file() { return false; }
-    let Some(uv) = crate::provision::uv_bin(app) else { return false; };
+    let Some(uv) = voice_uv(app) else { return false; };
     let script = dir.join("df_run.py");
     if std::fs::write(&script, DF_SCRIPT).is_err() { return false; }
     let _ = tauri::Emitter::emit(app, "video-tool-progress", json!({ "project": project, "tool": "video_audio_enhance", "msg": "isolating voice (neural)…" }));
     let mut cmd = Command::new(&uv);
     cmd.args(["run", "--python", "3.11", "--with", "torch==2.5.1", "--with", "torchaudio==2.5.1", "--with", "deepfilternet", "--project"]).arg(&dir).arg(&script).arg(wav).arg(out);
-    for (k, v) in crate::provision::uv_env(app) { cmd.env(k, v); }
+    for (k, v) in voice_env(app) { cmd.env(k, v); }
     cmd.env("PYTORCH_ENABLE_MPS_FALLBACK", "1");
     cmd.output().map(|o| o.status.success() && out.is_file()).unwrap_or(false)
 }
