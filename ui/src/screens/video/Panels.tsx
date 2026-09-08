@@ -5,7 +5,7 @@
 // ASS/DOM caption pipeline is gone.
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Upload, Plus, X, FolderOpen, Download, Square, Sparkles, Music, Film, Image as ImageIcon, Mic2, RefreshCw, Link2, Layers, Unplug, FileText, Volume2, AudioLines, KeyRound, Play } from "lucide-react";
+import { Upload, Plus, X, FolderOpen, Download, Square, Sparkles, Music, Film, Image as ImageIcon, Mic2, RefreshCw, Link2, Layers, Unplug, FileText, Volume2, AudioLines, KeyRound, Download as DlIcon } from "lucide-react";
 import { useVideo, mutate, importPick, removeAsset, relinkAsset, reload, addAssetToTimeline, runTool, pickLut, startRender, cancelRender, reveal, toast, set, refreshRenders, refreshThumbs } from "./store";
 import { type Asset, type Composition, fmtDur, fmtBytes, mediaUrl, stockBrightHud, eli5DarkPack } from "./model";
 import { TranscriptEditor } from "./TranscriptEditor";
@@ -295,45 +295,54 @@ export function ColorPanel() {
 }
 
 // ---- AUDIO (local only) -----------------------------------------------------
-// No cloud, no credentials: normalize peaks + denoise strength per asset,
-// per-track trims, master gain. Manual ducking = volume keyframes on the
-// timeline lane (Inspector > Audio > Keyframes), which the agent can also write.
+// No cloud, no credentials: automatic neural voice cleanup per A-roll source,
+// live-blended with the original via Cleanup amount, per-track trims, master
+// gain. Manual ducking = volume keyframes on the timeline lane
+// (Inspector > Audio > Keyframes), which the agent can also write.
 export function AudioPanel() {
   const s = useVideo(); const a = s.comp.audio;
-  const [auditioning, setAuditioning] = useState<string | null>(null);
-  const [auditionUrl, setAuditionUrl] = useState<string | null>(null);
+  const [voice, setVoice] = useState<{ installed: boolean; engine: string } | null>(null);
+  const [installing, setInstalling] = useState(false);
   const aroll = s.comp.clips.find((c) => c.track === "V1" && c.type === "video");
   const cleaned = aroll && s.assets.find((x) => x.id === aroll.audioAsset);
   const tracks = Array.from(new Set(s.comp.clips.filter((c) => (c.type === "audio" || c.type === "video") && !c.hidden).map((c) => c.track))).sort();
+  const mix = a.cleanMix ?? 1;
+
+  useEffect(() => {
+    let live = true;
+    if (s.project) runTool<{ installed: boolean; engine: string }>("video_voice_status", {}).then((r) => { if (live && r) setVoice(r); }).catch(() => {});
+    return () => { live = false; };
+  }, [s.project]);
 
   async function cleanup(assetId: string) {
-    const r = await runTool<{ asset: string }>("video_audio_enhance", { asset: assetId, normalize_db: a.normalizeDb, denoise: a.denoise }, "cleaning dialogue…");
-    if (r) toast("dialogue cleaned — clips now play the cleaned track", "ok");
+    const r = await runTool<{ asset: string; engine: string }>("video_audio_enhance", { asset: assetId }, "cleaning dialogue…");
+    if (r) toast(`dialogue cleaned (${r.engine === "neural" ? "neural isolation" : "light cleanup"}) — drag Cleanup amount to blend`, "ok");
   }
-  async function audition(assetId: string) {
-    setAuditioning(assetId);
+  async function installVoice() {
+    setInstalling(true);
     try {
-      const r = await runTool<{ sample: string }>("video_audio_audition", { asset: assetId, denoise: a.denoise, at: Math.max(0, s.playhead - 2), len: 8 }, "rendering preview…");
-      if (r?.sample && s.agentId && s.project) setAuditionUrl(mediaUrl(s.agentId, s.project, "cache", r.sample, Date.now()));
-      else setAuditionUrl(null);
-    } finally { setAuditioning(null); }
+      const r = await runTool<{ engine: string }>("video_voice_install", {}, "downloading voice model…");
+      if (r) { setVoice({ installed: true, engine: r.engine }); toast("voice model installed — Clean now uses neural isolation", "ok"); }
+    } finally { setInstalling(false); }
   }
 
   return (
     <>
       <div className="ve-panel-head">Audio<span className="spacer" /><span className="ve-pill ok">local</span></div>
       <div className="ve-panel-body">
-        <Section title="Dialogue cleanup" right={cleaned ? (a.cleanEnabled !== false ? <span className="ve-pill ok">cleaned</span> : <span className="ve-pill">bypassed</span>) : null}>
-          <Slider label="Normalize peaks to" value={a.normalizeDb} min={-24} max={0} step={0.5} fmt={(v) => `${v} dBFS`} onChange={(v) => setPath("audio.normalizeDb", v)} />
-          <Slider label="Noise reduction" value={a.denoise} min={0} max={1} step={0.01} fmt={(v) => (v <= 0.001 ? "off" : `${Math.round(v * 100)}%`)} onChange={(v) => setPath("audio.denoise", v)} />
-          <p className="ve-hint">Normalize + denoise bake into the cleaned file when you clean. Preview a strength, adjust % freely, Clean again to regenerate.</p>
+        <Section title="Dialogue cleanup" right={cleaned ? (mix >= 0.999 ? <span className="ve-pill ok">cleaned</span> : mix <= 0.001 ? <span className="ve-pill">original</span> : <span className="ve-pill ok">{Math.round(mix * 100)}%</span>) : null}>
+          {voice && !voice.installed && (
+            <>
+              <p className="ve-hint">Neural voice isolation needs a one-time model download (~90MB). Until then, Clean uses a light fallback.</p>
+              <button className="ve-btn sm" disabled={installing || !!s.toolProgress} onClick={() => void installVoice()}><DlIcon size={12} /> {installing ? "Downloading…" : "Download voice model"}</button>
+            </>
+          )}
+          <Slider label="Cleanup amount" value={mix} min={0} max={1} step={0.01} fmt={(v) => (v <= 0.001 ? "original" : v >= 0.999 ? "full clean" : `${Math.round(v * 100)}%`)} onChange={(v) => setPath("audio.cleanMix", v)} />
+          <p className="ve-hint">Live blend — no re-clean needed. 0% is the original mic, 100% the isolated voice, 50/50 a true half mix. Preview + export match.</p>
           <div className="ve-btn-row">
-            <button className="ve-btn sm" disabled={!aroll || !!s.toolProgress} onClick={() => aroll && void audition(aroll.asset)}><Play size={12} /> {auditioning ? "Rendering…" : "Preview denoise"}</button>
             <button className="ve-btn sm primary" disabled={!aroll || !!s.toolProgress} onClick={() => aroll && void cleanup(aroll.asset)}><Sparkles size={12} /> {cleaned ? "Re-clean A-roll" : "Clean A-roll"}</button>
           </div>
-          {cleaned && <Check label="Use cleaned audio" checked={a.cleanEnabled !== false} onChange={(v) => setPath("audio.cleanEnabled", v)} />}
-          {auditionUrl && <audio controls src={auditionUrl} style={{ width: "100%" }} />}
-          {cleaned && <p className="ve-hint">{a.cleanEnabled !== false ? <>A-roll plays <b>{cleaned.name}</b> (preview + export).</> : <>Bypassed — original audio (preview + export).</>} Toggle above to A/B. Clear via Inspector → Audio asset.</p>}
+          {cleaned && <p className="ve-hint">A-roll plays <b>{cleaned.name}</b> blended at {Math.round(mix * 100)}% (preview + export). Clear via Inspector → Audio asset.</p>}
         </Section>
         <Section title="Tracks" right={<Volume2 size={13} style={{ color: "var(--text-faint)" }} />}>
           {tracks.length === 0 && <p className="ve-hint">No audible tracks yet — import media first.</p>}

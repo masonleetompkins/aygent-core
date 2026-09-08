@@ -214,8 +214,8 @@ impl Default for Duck { fn default() -> Self { Self { enabled: false, music_db: 
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
-pub struct AudioMix { pub duck: Duck, pub enhance: String, pub master_db: f64, pub loudnorm: bool, #[serde(default = "d_neg3")] pub normalize_db: f64, pub denoise: f64, #[serde(default)] pub track_gain: std::collections::HashMap<String, f64>, #[serde(default = "d_true")] pub clean_enabled: bool }
-impl Default for AudioMix { fn default() -> Self { Self { duck: Duck::default(), enhance: "local".into(), master_db: 0.0, loudnorm: false, normalize_db: -3.0, denoise: 0.0, track_gain: Default::default(), clean_enabled: true } } }
+pub struct AudioMix { pub duck: Duck, pub enhance: String, pub master_db: f64, pub loudnorm: bool, #[serde(default)] pub track_gain: std::collections::HashMap<String, f64>, #[serde(default = "d_one")] pub clean_mix: f64 }
+impl Default for AudioMix { fn default() -> Self { Self { duck: Duck::default(), enhance: "neural".into(), master_db: 0.0, loudnorm: false, track_gain: Default::default(), clean_mix: 1.0 } } }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -635,18 +635,37 @@ pub fn build_plan(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, proje
     let video_links: std::collections::HashSet<&str> = scaled.iter().filter(|c| c.kind == "video" && !c.link.is_empty()).map(|c| c.link.as_str()).collect();
     let mut voice: Vec<String> = vec![];
     let mut music: Vec<String> = vec![];
+    // Live cleanup blend: clips carrying a cleaned replacement emit TWO branches —
+    // original + cleaned — weighted by an equal-power crossfade of cleanMix, so the
+    // export mix matches the preview slider sample-accurately.
+    let cm = comp.audio.clean_mix.clamp(0.0, 1.0);
+    let (w_orig, w_clean) = ((0.5 * std::f64::consts::FRAC_PI_2 * (1.0 - cm)).cos(), (0.5 * std::f64::consts::FRAC_PI_2 * cm).sin());
+    let w_orig_db = 20.0 * w_orig.max(1e-4).log10();
+    let w_clean_db = 20.0 * w_clean.max(1e-4).log10();
     for c in scaled.iter().filter(|c| c.has_audio_role() && !c.hidden || (c.kind == "audio" && !c.muted)) {
         if c.kind == "audio" && !c.link.is_empty() && video_links.contains(c.link.as_str()) { continue; }
-        let asset_id = if comp.audio.clean_enabled && !c.audio_asset.is_empty() && abs.contains_key(&c.audio_asset) { c.audio_asset.as_str() } else { c.asset.as_str() };
-        let Some(a) = assets.get(asset_id) else { continue };
+        let has_rep = !c.audio_asset.is_empty() && abs.contains_key(&c.audio_asset) && assets.get(&c.audio_asset).map(|a| a.has_audio).unwrap_or(false);
+        let solo_clean = has_rep && cm >= 0.999;
+        let solo_orig = !has_rep || cm <= 0.001;
+        // (asset_id, is_cleaned_branch)
+        let mut branches: Vec<(&str, bool)> = vec![(c.asset.as_str(), false)];
+        if has_rep && !solo_clean && !solo_orig { branches.push((c.audio_asset.as_str(), true)); }
+        for (asset_id, is_clean) in branches {
+        let use_id = if solo_clean { c.audio_asset.as_str() } else { asset_id };
+        let Some(a) = assets.get(use_id) else { continue };
         if !a.has_audio { continue; }
-        let Some(i) = ctx.input_for(asset_id, None) else { continue };
+        let Some(i) = ctx.input_for(use_id, None) else { continue };
         let l = g.label("a");
         let sp = c.speed;
         let out = c.in_ + c.dur() * sp;
         let mut f = format!("[{i}:a]atrim=start={:.4}:end={:.4},asetpts=PTS-STARTPTS", c.in_, out);
         if (sp - 1.0).abs() > 0.001 { let mut r = sp; while r > 2.0 { f.push_str(",atempo=2.0"); r /= 2.0; } while r < 0.5 { f.push_str(",atempo=0.5"); r *= 2.0; } f.push_str(&format!(",atempo={r:.4}")); }
         f.push_str(",aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo");
+        // blend weight for this branch (solo endpoints skip the gain)
+        if !solo_clean && !solo_orig {
+            let wdb = if is_clean { w_clean_db } else { w_orig_db };
+            if wdb < -0.05 { f.push_str(&format!(",volume={:.2}dB", wdb)); }
+        }
         if c.volume != 0.0 { f.push_str(&format!(",volume={:.2}dB", c.volume)); }
         let tg = comp.audio.track_gain.get(&c.track).copied().unwrap_or(0.0);
         if tg != 0.0 { f.push_str(&format!(",volume={:.2}dB", tg)); }
@@ -669,6 +688,7 @@ pub fn build_plan(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, proje
         f.push_str(&format!(",adelay=delays={ms}:all=1"));
         g.push(format!("{f}[{l}]"));
         if c.track == "A2" { music.push(l) } else { voice.push(l) }
+        } // branches
     }
     let mix = |g: &mut Graph, ins: &[String], name: &str| -> String {
         if ins.len() == 1 { return ins[0].clone(); }
@@ -688,40 +708,13 @@ pub fn build_plan(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, proje
     let cache = proj.join(".cache");
     std::fs::create_dir_all(&cache).map_err(|e| format!("mkdir .cache: {e}"))?;
     let script = cache.join(script_name);
-    // Two-pass peak normalize (skipped when loudnorm owns the master): measure
-    // the mix peak with volumedetect, then gain so peaks land on normalizeDb.
-    // Measurement failure can never fail the render — it just yields +0 dB.
-    let mut norm_fx = String::new();
-    if !comp.audio.loudnorm && !all.is_empty() {
-        let tgt = comp.audio.normalize_db.clamp(-24.0, 0.0);
-        let m = mix(&mut g, &all, "mx");
-        let pm = g.label("pm");
-        g.push(format!("[{m}]volumedetect[{pm}]"));
-        if std::fs::write(&script, g.lines.join(";\n")).is_ok() {
-            if let Ok(ff) = video::ffmpeg(app) {
-                let mut args: Vec<String> = vec!["-hide_banner".into(), "-nostdin".into()];
-                args.extend(ctx.inputs.clone());
-                args.extend(filter_file_args(app, &script));
-                args.extend(["-map".into(), format!("[{pm}]"), "-f".into(), "null".into(), "-".into()]);
-                if let Ok(o) = Command::new(&ff).args(&args).output() {
-                    let err = String::from_utf8_lossy(&o.stderr);
-                    let peak = err.lines().filter_map(|l| l.find("max_volume:").and_then(|i| l[i + 12..].trim().split_whitespace().next()).and_then(|v| v.parse::<f64>().ok())).last();
-                    if let Some(pk) = peak.filter(|p| p.is_finite() && *p > -90.0) {
-                        let gain = (tgt - pk).clamp(-24.0, 24.0);
-                        if gain.abs() >= 0.05 { norm_fx.push_str(&format!(",volume={gain:.2}dB")); }
-                        let lin = 10f64.powf(tgt / 20.0).clamp(0.0625, 1.0);
-                        norm_fx.push_str(&format!(",alimiter=limit={lin:.4}:attack=7:release=100"));
-                    }
-                }
-            }
-        }
-        g.lines.pop(); // drop the measurement tail; the real tail follows
-    }
+    // No peak-normalize pass: the cleaned master is already leveled to -16 LUFS
+    // at cleanup time, and loudnorm on export stays the master switch.
     match all.len() {
         0 => g.push(format!("anullsrc=r=48000:cl=stereo,{tail}[{aout}]")),
         _ => {
             let m = mix(&mut g, &all, "mx2");
-            let tail2 = format!("apad=whole_dur={dur:.4},atrim=0:{dur:.4}{norm_fx}{master}{norm}");
+            let tail2 = format!("apad=whole_dur={dur:.4},atrim=0:{dur:.4}{master}{norm}");
             g.push(format!("[{m}]{tail2}[{aout}]"));
         }
     }

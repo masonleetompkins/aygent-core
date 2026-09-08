@@ -38,7 +38,7 @@ fn app() -> Result<tauri::AppHandle, String> { APP.get().cloned().ok_or_else(|| 
 /// AppHandle for the Hyperframes overlay module (same install_app source).
 pub fn app_handle() -> Option<tauri::AppHandle> { APP.get().cloned() }
 
-const NAMES: &[&str] = &["video_project", "video_edit", "video_transcribe", "video_silences", "video_takes", "video_auto_cut", "video_frame", "video_look", "video_render", "video_audio_enhance", "video_audio_audition", "video_matte", "video_build_captions", "video_render_overlay"];
+const NAMES: &[&str] = &["video_project", "video_edit", "video_transcribe", "video_silences", "video_takes", "video_auto_cut", "video_frame", "video_look", "video_render", "video_audio_enhance", "video_voice_install", "video_voice_status", "video_matte", "video_build_captions", "video_render_overlay"];
 pub fn is_video_tool(name: &str) -> bool { NAMES.contains(&name) || crate::video_hyperframes::is_hyperframes_tool(name) }
 
 pub fn tool_schemas() -> Vec<Value> {
@@ -46,7 +46,7 @@ pub fn tool_schemas() -> Vec<Value> {
     let mut v = vec![
         json!({ "name": "video_project", "description": "Overview of a video project: scene, duration, clips per track, assets (ids, durations, fps, audio), transcript/captions/graphics-style/LUT state, renders. Omit project to list all projects. Call this FIRST before editing.",
             "input_schema": { "type": "object", "properties": { "project": proj } } }),
-        json!({ "name": "video_edit", "description": "Apply precise edits to Video/<project>/composition.json and save. ops run in order. Ops: {op:'set', path:'captions.enabled', value:true} (dot path into the composition, e.g. scene.width, color.lut, color.sCurve, audio.duck.enabled, audio.cleanEnabled, captions.keyWords, graphics.instructions) · {op:'add_clip', clip:{track,type:'video'|'audio'|'image'|'text'|'review',asset,start,end,in,out,name,text:{content,size,y,...},transform:{x,y,scale,opacity},fit,behindSubject,volume}} (video with audio on V1/V2 auto-lays a linked A1 waveform partner) · {op:'update_clip', id, patch:{...}} · {op:'remove_clip', id, ripple?:true} (linked partners go together) · {op:'split', id, at:<timeline seconds>} (linked partners split together) · {op:'move', id, start} · {op:'cutlist', asset, keep:[{in,out}], track?:'V1', pad?:0.03} (replaces that asset's clips on the track with contiguous selects + linked A1 partners). Times are seconds; start/end = timeline placement, in/out = source range. Returns the saved summary.",
+        json!({ "name": "video_edit", "description": "Apply precise edits to Video/<project>/composition.json and save. ops run in order. Ops: {op:'set', path:'captions.enabled', value:true} (dot path into the composition, e.g. scene.width, color.lut, color.sCurve, audio.duck.enabled, audio.cleanMix, graphics.instructions) · {op:'add_clip', clip:{track,type:'video'|'audio'|'image'|'text'|'review',asset,start,end,in,out,name,text:{content,size,y,...},transform:{x,y,scale,opacity},fit,behindSubject,volume}} (video with audio on V1/V2 auto-lays a linked A1 waveform partner) · {op:'update_clip', id, patch:{...}} · {op:'remove_clip', id, ripple?:true} (linked partners go together) · {op:'split', id, at:<timeline seconds>} (linked partners split together) · {op:'move', id, start} · {op:'cutlist', asset, keep:[{in,out}], track?:'V1', pad?:0.03} (replaces that asset's clips on the track with contiguous selects + linked A1 partners). Times are seconds; start/end = timeline placement, in/out = source range. Returns the saved summary.",
             "input_schema": { "type": "object", "properties": { "project": proj, "ops": { "type": "array", "items": { "type": "object" } } }, "required": ["project", "ops"] } }),
         json!({ "name": "video_transcribe", "description": "Word-level transcript of an asset (OpenAI Whisper; audio is extracted + chunked automatically, any length). Saves Video/<project>/transcript.json used by captions, takes and auto_cut. Returns the segments with timestamps.",
             "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string", "description": "asset id (default: the first V1 video clip's asset, else the first video asset)" }, "language": { "type": "string", "description": "ISO code hint, e.g. en" } }, "required": ["project"] } }),
@@ -62,10 +62,12 @@ pub fn tool_schemas() -> Vec<Value> {
             "input_schema": { "type": "object", "properties": { "project": proj, "time": { "type": "number", "description": "timeline seconds to look at" }, "times": { "type": "array", "items": { "type": "number" }, "description": "up to 4 times to see side by side" } }, "required": ["project"] } }),
         json!({ "name": "video_render", "description": "Export the project with a preset from composition.exports (by name) or an explicit {width,height,bitrate,codec:'h264'|'hevc'|'prores'}. Blocking; progress streams to the UI. Output lands in Video/<project>/renders/.",
             "input_schema": { "type": "object", "properties": { "project": proj, "preset": { "type": "string", "description": "preset name, e.g. landscape | vertical" }, "width": { "type": "integer" }, "height": { "type": "integer" }, "bitrate": { "type": "string" }, "codec": { "type": "string" }, "name": { "type": "string", "description": "output file stem" } }, "required": ["project"] } }),
-        json!({ "name": "video_audio_enhance", "description": "LOCAL dialogue cleanup (ffmpeg only, nothing leaves the machine): normalize peaks to normalizeDb (default -3 dBFS) + background-noise reduction at denoise 0..1 (0 = off). Video sources produce a full-length .cleaned.mov proxy (picture stream-copied, cleaned audio padded to the video duration) so preview plays picture+sound as one element through cuts; audio-only sources produce a .cleaned.wav. Points the source clips' audioAsset at it, and sets audio.cleanEnabled=true (toggle it off to A/B the original). (TEMPORARY compat: engine/preset args are ignored if passed.)",
-            "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "normalize_db": { "type": "number", "description": "peak target dBFS, default -3" }, "denoise": { "type": "number", "description": "0..1 noise-reduction strength, default 0" } }, "required": ["project", "asset"] } }),
-        json!({ "name": "video_audio_audition", "description": "Preview a denoise strength WITHOUT touching the timeline: renders a short sample (at/len seconds) with that denoise amount to .cache/ for listening in the Video tab.",
-            "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "denoise": { "type": "number", "description": "0..1 strength" }, "at": { "type": "number", "description": "sample start (source seconds, default 0)" }, "len": { "type": "number", "description": "sample length seconds, default 8" } }, "required": ["project", "asset", "denoise"] } }),
+        json!({ "name": "video_audio_enhance", "description": "AUTOMATIC dialogue cleanup (local, nothing leaves the machine): DeepFilterNet3 neural voice isolation (optional one-time voice-model download, else a light FFT fallback) → voice EQ → loudness to -16 LUFS. No strength params — one master per source. Video sources produce a full-length .cleaned.mov proxy (picture stream-copied, cleaned audio padded to the video duration); audio-only sources produce a .cleaned.wav. Points the source clips' audioAsset at it. Blend original/cleaned live with audio.cleanMix (0..1, no re-clean needed).",
+            "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" } }, "required": ["project", "asset"] } }),
+        json!({ "name": "video_voice_install", "description": "One-time download of the neural voice-isolation model (DeepFilterNet3 weights via uv, into the app runtime). Progress streams to the UI. Required once before video_audio_enhance can use the neural engine; without it cleanup uses the light FFT fallback.",
+            "input_schema": { "type": "object", "properties": { "project": proj }, "required": ["project"] } }),
+        json!({ "name": "video_voice_status", "description": "Is the neural voice-isolation model installed? Returns {installed, engine} — engine is 'neural' when ready, else 'fallback'.",
+            "input_schema": { "type": "object", "properties": { "project": proj }, "required": ["project"] } }),
         json!({ "name": "video_matte", "description": "EXPERIMENTAL: generate a subject alpha matte for an asset with RobustVideoMatting (downloads torch via uv on first run; slow). Registers the matte asset and enables composition.matte so behindSubject overlay layers render behind the person.",
             "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "engine": { "type": "string", "description": "ignored (local only)" } }, "required": ["project", "asset"] } }),
     ];
@@ -73,7 +75,7 @@ pub fn tool_schemas() -> Vec<Value> {
     v
 }
 
-pub const INSTRUCTIONS: &str = "\n\nVIDEO EDITOR: the Video tab is an agentic NLE. A project is Video/<name>/ with composition.json (the edit), assets.json (imported media — HARDLINKS, never copy media), transcript.json, chat.json. Use the video_* tools for every edit (frame-accurate numbers, validated + saved); never hand-write composition.json unless a tool cannot express the change. Workflow the user follows: video_project → video_auto_cut (silences + keep the LAST take; lays linked V1+A1 pairs) → review → video_transcribe (if not done) → graphics/captions as Hyperframes overlays (see below) → audio via video_audio_enhance {normalizeDb, denoise} (local, peaks default -3 dBFS) + per-track audio.trackGain + audio.cleanEnabled bypass + manual ducking with clip volume keyframes {audio:{keyframes:[{t,db}]}} (video_audio_audition previews a denoise strength first); color via set color.lut 'luts/<file>.cube' + color.sCurve → video_audio_enhance → video_render {preset:'landscape'|'vertical'}. Report clip ids + times in one line; the UI refreshes automatically after each tool. Video clips with audio carry a LINKED A1 waveform partner (clip.link shared) — split/move/remove keep pairs together, and the mix plays the pair once (no double audio). REVIEW: the user leaves timestamped feedback as review clips on R1 (video_project exposes reviewNotes/reviewNotesResolved) — read them first, act on each, mark done via update_clip {hidden:true}. VISION: video_look renders canvas frame(s) you SEE as images; delete spent frames with delete_file.";
+pub const INSTRUCTIONS: &str = "\n\nVIDEO EDITOR: the Video tab is an agentic NLE. A project is Video/<name>/ with composition.json (the edit), assets.json (imported media — HARDLINKS, never copy media), transcript.json, chat.json. Use the video_* tools for every edit (frame-accurate numbers, validated + saved); never hand-write composition.json unless a tool cannot express the change. Workflow the user follows: video_project → video_auto_cut (silences + keep the LAST take; lays linked V1+A1 pairs) → review → video_transcribe (if not done) → graphics/captions as Hyperframes overlays (see below) → audio via video_audio_enhance (automatic neural cleanup, -16 LUFS master) + live blend via audio.cleanMix 0..1 + per-track audio.trackGain + manual ducking with clip volume keyframes {audio:{keyframes:[{t,db}]}}; color via set color.lut 'luts/<file>.cube' + color.sCurve → video_audio_enhance → video_render {preset:'landscape'|'vertical'}. Report clip ids + times in one line; the UI refreshes automatically after each tool. Video clips with audio carry a LINKED A1 waveform partner (clip.link shared) — split/move/remove keep pairs together, and the mix plays the pair once (no double audio). REVIEW: the user leaves timestamped feedback as review clips on R1 (video_project exposes reviewNotes/reviewNotesResolved) — read them first, act on each, mark done via update_clip {hidden:true}. VISION: video_look renders canvas frame(s) you SEE as images; delete spent frames with delete_file.";
 
 // ---------------------------------------------------------------------------
 // Entry points
@@ -212,11 +214,15 @@ pub fn run(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, name: &str, 
         }
         "video_audio_enhance" => {
             let p = project.ok_or("project is required")?;
-            enhance(app, broker, agent_id, &p, &s("asset").ok_or("asset is required")?, f("normalize_db", -3.0), f("denoise", 0.0))?
+            enhance(app, broker, agent_id, &p, &s("asset").ok_or("asset is required")?)?
         }
-        "video_audio_audition" => {
+        "video_voice_install" => {
             let p = project.ok_or("project is required")?;
-            audition(app, broker, agent_id, &p, &s("asset").ok_or("asset is required")?, f("denoise", 0.5), f("at", 0.0), f("len", 8.0))?
+            voice_install(app, broker, agent_id, &p)?
+        }
+        "video_voice_status" => {
+            let p = project.ok_or("project is required")?;
+            voice_status(app, broker, agent_id, &p)?
         }
         "video_matte" => {
             let p = project.ok_or("project is required")?;
@@ -781,7 +787,104 @@ fn register_generated(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, p
     Ok(a)
 }
 
-pub fn enhance(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, asset: &str, normalize_db: f64, denoise: f64) -> Result<Value, String> {
+// ---------------------------------------------------------------------------
+// Voice cleanup — AUTOMATIC (no strength params).
+//
+// Chain (mirrors the Auphonic reference preset: AutoEQ + Speech Isolation at
+// full + Adaptive Leveler 100% + -16 LUFS):
+//   1) extract mono 48k WAV
+//   2) neural isolation via DeepFilterNet3 (uv, one-time model download);
+//      falls back to a LIGHT static FFT touch (nr=6, no tracking) when the
+//      voice model isn't installed — keeps body, never robotic
+//   3) voice EQ: highpass 70 + low-mid warmth + presence (static read of the
+//      reference AutoEQ curve; adaptive per-voice EQ is approximated)
+//   4) dynamic loudnorm to -16 LUFS — this IS the leveler (slow gain riding,
+//      not peak normalize)
+// Blend happens LIVE at preview/export via audio.cleanMix (0..1 equal-power
+// crossfade) — no re-clean needed to change the amount.
+// ---------------------------------------------------------------------------
+
+// torchaudio file I/O is unreliable on macOS uv envs, so audio moves through
+// ffmpeg pipes (f32 in, s16 out) with torch used for tensors only. Verified
+// against the 0.5.6 API: enhance(model, state, 1-D tensor) -> 1-D wav.
+const DF_SCRIPT: &str = r#"
+import sys, subprocess
+import numpy as np
+import torch
+from df.enhance import init_df, enhance
+inp, outp = sys.argv[1], sys.argv[2]
+model, state, _ = init_df()
+sr = state.sr()
+raw = subprocess.run(
+    ['ffmpeg', '-v', 'error', '-i', inp, '-vn', '-ac', '1',
+     '-ar', str(sr), '-f', 'f32le', '-acodec', 'pcm_f32le', '-'],
+    capture_output=True).stdout
+audio = torch.from_numpy(np.frombuffer(raw, dtype=np.float32).copy()).unsqueeze(0)
+enh = enhance(model, state, audio)
+arr = np.asarray(
+    enh.detach().cpu().numpy() if torch.is_tensor(enh) else enh,
+    dtype=np.float32).ravel()
+pcm = (arr * 32767.0).clip(-32768, 32767).astype('<i2').tobytes()
+subprocess.run(
+    ['ffmpeg', '-v', 'error', '-y', '-f', 's16le', '-ar', str(sr),
+     '-ac', '1', '-i', '-', '-c:a', 'pcm_s16le', outp],
+    input=pcm).check_returncode()
+print('df-done', arr.shape, flush=True)
+"#;
+
+/// Voice-model root inside the app runtime (uv-managed env + weights).
+fn voice_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let d = crate::provision::runtime_dir(app)?.join("voice");
+    std::fs::create_dir_all(&d).map_err(|e| format!("mkdir voice: {e}"))?;
+    Ok(d)
+}
+fn voice_ready(app: &tauri::AppHandle) -> bool {
+    voice_dir(app).map(|d| d.join("READY").is_file()).unwrap_or(false)
+}
+
+/// One-time download of the DeepFilterNet3 weights into the app runtime.
+/// Streams progress to the UI; writes READY on success.
+pub fn voice_install(app: &tauri::AppHandle, _broker: &Broker, _agent_id: &str, project: &str) -> Result<Value, String> {
+    let dir = voice_dir(app)?;
+    let uv = crate::provision::uv_bin(app).ok_or("uv is not provisioned — enable a Python MCP server once in MCP Connections (it installs uv), then retry")?;
+    let script = dir.join("df_warmup.py");
+    std::fs::write(&script, "from df.enhance import init_df\ninit_df()\nprint('voice-ready')\n").map_err(|e| e.to_string())?;
+    let _ = tauri::Emitter::emit(app, "video-tool-progress", json!({ "project": project, "tool": "video_voice_install", "msg": "downloading voice model (~90MB, one time)…" }));
+    let mut cmd = Command::new(&uv);
+    cmd.args(["run", "--python", "3.11", "--with", "torch==2.5.1", "--with", "torchaudio==2.5.1", "--with", "deepfilternet", "--project"]).arg(&dir).arg(&script);
+    for (k, v) in crate::provision::uv_env(app) { cmd.env(k, v); }
+    cmd.env("PYTORCH_ENABLE_MPS_FALLBACK", "1");
+    let o = cmd.output().map_err(|e| format!("uv: {e}"))?;
+    if !o.status.success() {
+        let e = String::from_utf8_lossy(&o.stderr);
+        return Err(format!("voice-model download failed: {}", e.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")));
+    }
+    std::fs::write(dir.join("READY"), "DeepFilterNet3\n").map_err(|e| e.to_string())?;
+    Ok(json!({ "ok": true, "engine": "neural", "note": "voice model installed — Clean A-roll now uses neural isolation" }))
+}
+
+pub fn voice_status(app: &tauri::AppHandle, _broker: &Broker, _agent_id: &str, _project: &str) -> Result<Value, String> {
+    let installed = voice_ready(app);
+    Ok(json!({ "installed": installed, "engine": if installed { "neural" } else { "fallback" } }))
+}
+
+/// Neural isolation pass (mono in → mono out). Returns false when the model
+/// isn't installed so the caller can use the FFT fallback instead.
+fn df_isolate(app: &tauri::AppHandle, project: &str, wav: &Path, out: &Path) -> bool {
+    let Ok(dir) = voice_dir(app) else { return false; };
+    if !dir.join("READY").is_file() { return false; }
+    let Some(uv) = crate::provision::uv_bin(app) else { return false; };
+    let script = dir.join("df_run.py");
+    if std::fs::write(&script, DF_SCRIPT).is_err() { return false; }
+    let _ = tauri::Emitter::emit(app, "video-tool-progress", json!({ "project": project, "tool": "video_audio_enhance", "msg": "isolating voice (neural)…" }));
+    let mut cmd = Command::new(&uv);
+    cmd.args(["run", "--python", "3.11", "--with", "torch==2.5.1", "--with", "torchaudio==2.5.1", "--with", "deepfilternet", "--project"]).arg(&dir).arg(&script).arg(wav).arg(out);
+    for (k, v) in crate::provision::uv_env(app) { cmd.env(k, v); }
+    cmd.env("PYTORCH_ENABLE_MPS_FALLBACK", "1");
+    cmd.output().map(|o| o.status.success() && out.is_file()).unwrap_or(false)
+}
+
+pub fn enhance(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, asset: &str) -> Result<Value, String> {
     let proj = video::project_dir(broker, agent_id, project)?;
     let a = find_asset(broker, agent_id, project, Some(asset), true)?;
     if !a.has_audio { return Err("asset has no audio".into()); }
@@ -790,22 +893,33 @@ pub fn enhance(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project:
     let media = proj.join("media"); std::fs::create_dir_all(&media).map_err(|e| e.to_string())?;
     let stem: String = Path::new(&a.name).file_stem().and_then(|s| s.to_str()).unwrap_or("audio").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
     let out = media.join(format!("{stem}.cleaned.wav"));
-    // 1) extract a clean WAV
+    // 1) extract mono 48k WAV (neural stage wants mono; stereo re-created at mux)
     let wav = proj.join(".cache").join(format!("{}.src.wav", a.id));
     std::fs::create_dir_all(wav.parent().unwrap()).map_err(|e| e.to_string())?;
-    let o = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&abs).args(["-vn", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&wav).output().map_err(|e| format!("ffmpeg: {e}"))?;
+    let o = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&abs).args(["-vn", "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&wav).output().map_err(|e| format!("ffmpeg: {e}"))?;
     if !o.status.success() { return Err(format!("extract failed: {}", String::from_utf8_lossy(&o.stderr).chars().take(300).collect::<String>())); }
-    // LOCAL ONLY: highpass -> afftdn (strength-mapped) -> gentle leveling.
-    // Peak normalize to normalizeDb + optional loudnorm stay in the TIMELINE
-    // mix (audio.normalizeDb on export), so this file is denoise + leveling only.
-    let dn = denoise.clamp(0.0, 1.0);
-    let nr = (dn * 18.0).round() as i64; // 0..18 dB reduction (stable floor, no noise-tracking pump)
-    let af = if dn <= 0.001 {
-        "highpass=f=70,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2".to_string()
+    // 2) isolate: neural when installed, else a LIGHT static touch
+    let neural = voice_ready(app);
+    let iso = proj.join(".cache").join(format!("{}.iso.wav", a.id));
+    let mut engine = "fallback";
+    if neural && df_isolate(app, project, &wav, &iso) {
+        engine = "neural";
     } else {
-        format!("highpass=f=70,afftdn=nr={nr}:nf=-30,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2")
-    };
-    let o = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&wav).args(["-af", &af, "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&out).output().map_err(|e| format!("ffmpeg: {e}"))?;
+        // fallback: highpass + very light afftdn (nr=6, floor -35, no tracking)
+        // — removes hiss/HVAC, keeps voice body; never robotic.
+        let o = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&wav)
+            .args(["-af", "highpass=f=70,afftdn=nr=6:nf=-35", "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&iso)
+            .output().map_err(|e| format!("ffmpeg: {e}"))?;
+        if !o.status.success() { return Err(format!("fallback isolate failed: {}", String::from_utf8_lossy(&o.stderr).chars().take(300).collect::<String>())); }
+    }
+    let _ = std::fs::remove_file(&wav);
+    // 3) voice EQ + 4) loudnorm to -16 LUFS (the leveler: dynamic gain riding)
+    // EQ is a static read of the reference AutoEQ curve: warmth + presence.
+    let eq = "highpass=f=80,lowpass=f=12000,treble=g=-4:f=3000"; // dark natural voice curve, measured against the Auphonic reference (equalizer is a no-op in this ffmpeg build, treble/lowpass verified by band);
+    let o = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&iso)
+        .args(["-af", &format!("{eq},loudnorm=I=-16:TP=-1.5:LRA=11"), "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&out)
+        .output().map_err(|e| format!("ffmpeg: {e}"))?;
+    let _ = std::fs::remove_file(&iso);
     if !o.status.success() { return Err(format!("local enhance failed: {}", String::from_utf8_lossy(&o.stderr).chars().take(400).collect::<String>())); }
     // Full-length proxy: video sources get a .cleaned.mov (picture stream-copied,
     // cleaned audio padded to the full video duration + AAC for browser playback)
@@ -830,9 +944,8 @@ pub fn enhance(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project:
             (mov, "video")
         } else { (out.clone(), "audio") }
     } else { (out.clone(), "audio") };
-    let _ = std::fs::remove_file(&wav);
-    // Drop superseded cleaned replacements for this source (wav<->mov on
-    // re-clean) so Generated doesn't pile up stale files.
+    // Drop superseded cleaned replacements for this source so Generated
+    // doesn't pile up stale files (never the file just written).
     {
         let cleaned_name = format!("{} (cleaned)", a.name);
         let rep_rel = rep_path.strip_prefix(&proj).map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
@@ -841,7 +954,6 @@ pub fn enhance(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project:
         let mut gone: Vec<String> = vec![];
         m.assets.retain(|x| {
             let hit = x.name == cleaned_name && x.id != a.id;
-            // never delete the file we just wrote (same rel on re-clean)
             if hit && x.rel != rep_rel { gone.push(x.rel.clone()); }
             !hit
         });
@@ -859,43 +971,11 @@ pub fn enhance(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project:
     let mut comp = load_comp(broker, agent_id, project)?;
     let mut n = 0;
     for c in comp.clips.iter_mut().filter(|c| c.asset == a.id && c.kind == "video") { c.audio_asset = na.id.clone(); n += 1; }
-    comp.audio.enhance = "local".into();
-    comp.audio.normalize_db = normalize_db.clamp(-24.0, 0.0);
-    comp.audio.denoise = dn;
-    comp.audio.clean_enabled = true;
+    comp.audio.enhance = "neural".into();
+    comp.audio.clean_mix = 1.0;
     save_comp(broker, agent_id, project, &comp)?;
-    Ok(json!({ "ok": true, "engine": "local", "asset": na.id, "file": na.rel, "clipsUpdated": n, "normalizeDb": comp.audio.normalize_db, "denoise": dn }))
+    Ok(json!({ "ok": true, "engine": engine, "asset": na.id, "file": na.rel, "clipsUpdated": n, "cleanMix": 1.0 }))
 }
-
-/// Render a short denoise audition sample to .cache/ WITHOUT touching the
-/// timeline. Same chain as enhance (highpass + afftdn at strength + leveling),
-/// so what you hear is what the cleanup produces.
-pub fn audition(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, asset: &str, denoise: f64, at: f64, len: f64) -> Result<Value, String> {
-    let proj = video::project_dir(broker, agent_id, project)?;
-    let a = find_asset(broker, agent_id, project, Some(asset), true)?;
-    if !a.has_audio { return Err("asset has no audio".into()); }
-    let abs = video::asset_abs(broker, agent_id, project, &a)?;
-    let ff = video::ffmpeg(app)?;
-    let at = at.max(0.0).min(a.duration.max(0.0));
-    let len = len.clamp(1.0, 30.0).min((a.duration - at).max(1.0));
-    let dn = denoise.clamp(0.0, 1.0);
-    let nr = (dn * 18.0).round() as i64; // 0..18 dB (matches enhance)
-    let af = if dn <= 0.001 {
-        "highpass=f=70,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2".to_string()
-    } else {
-        format!("highpass=f=70,afftdn=nr={nr}:nf=-30,acompressor=threshold=-20dB:ratio=2:attack=10:release=150:makeup=2")
-    };
-    let cache = proj.join(".cache");
-    std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
-    let name = format!("audition-{}-dn{:02}.wav", a.id, (dn * 100.0).round() as i64);
-    let out = cache.join(&name);
-    let _ = tauri::Emitter::emit(app, "video-tool-progress", json!({ "project": project, "tool": "video_audio_audition", "msg": "rendering audition…" }));
-    let o = Command::new(&ff).args(["-v", "error", "-y", "-ss", &format!("{at:.3}"), "-t", &format!("{len:.3}"), "-i"]).arg(&abs)
-        .args(["-vn", "-af", &af, "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&out).output().map_err(|e| format!("ffmpeg: {e}"))?;
-    if !o.status.success() { return Err(format!("audition failed: {}", String::from_utf8_lossy(&o.stderr).chars().take(300).collect::<String>())); }
-    Ok(json!({ "ok": true, "sample": format!(".cache/{name}"), "denoise": dn, "at": at, "len": len, "note": "listen in the Video tab (Media > Generated, or the preview below), then run video_audio_enhance with the denoise you like" }))
-}
-
 // ---------------------------------------------------------------------------
 // Matte (RobustVideoMatting via uv) — experimental
 // ---------------------------------------------------------------------------

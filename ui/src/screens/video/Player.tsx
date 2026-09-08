@@ -60,14 +60,20 @@ type Slot = { id: string; asset: string; kind: "video" | "audio" };
 // Video-kind replacements (cleaned .mov proxies: picture stream-copied + cleaned
 // audio) play as ONE element via playClips below — no dub, so no dual-element
 // drift. Only audio-only replacements (legacy .wavs, audio sources) dub.
+// Equal-power crossfade weights shared by preview + export.
+export function cleanWeights(mix: number): [number, number] {
+  const m = Math.min(1, Math.max(0, mix ?? 1));
+  return [Math.cos(0.5 * Math.PI * (1 - m)), Math.sin(0.5 * Math.PI * m)];
+}
 function cleanDubs(comp: Composition, assets: Asset[]): Clip[] {
-  if (comp.audio.cleanEnabled === false) return [];
+  const mix = comp.audio.cleanMix ?? 1;
+  if (mix <= 0.001 || mix >= 0.999) return [];
   const byId = new Map(assets.map((a) => [a.id, a]));
   const out: Clip[] = [];
   for (const c of comp.clips) {
     if (c.hidden || c.muted || c.type !== "video" || !c.audioAsset) continue;
     const ra = byId.get(c.audioAsset);
-    if (!ra || ra.online === false || ra.kind === "video") continue;
+    if (!ra || ra.online === false) continue;
     out.push({ ...c, id: `${c.id}#dub`, type: "audio", asset: c.audioAsset, link: "", name: `${c.name} \u00b7 cleaned` });
   }
   return out;
@@ -76,7 +82,7 @@ function cleanDubs(comp: Composition, assets: Asset[]): Clip[] {
 // the replacement file directly (same in/out — the proxy is full-length), so
 // picture + cleaned sound share one clock through cuts and on full tracks.
 function playClips(comp: Composition, assets: Asset[]): Clip[] {
-  if (comp.audio.cleanEnabled === false) return comp.clips;
+  if ((comp.audio.cleanMix ?? 1) <= 0.001) return comp.clips;
   const byId = new Map(assets.map((a) => [a.id, a]));
   let swapped = false;
   const out = comp.clips.map((c) => {
@@ -203,13 +209,20 @@ function Stage({ scale, muted, safe }: { scale: number; muted: boolean; safe: bo
       // one: keep the tail (checked before wantMuted mutes it below).
       if (!isActive && playhead < c.start && keepTail(slot.id, el)) continue;
       const hasDub = c.type === "video" && dubbed.has(c.id);
+      const isDub = c.id.endsWith("#dub");
       const wantMuted = muted || c.muted || !isActive || hasDub;
       if (el.muted !== wantMuted) el.muted = wantMuted;
       // Preview mix mirrors the export graph: clip gain + track trim + the
-      // manual keyframe envelope (evaluated at clip-local time, like ffmpeg).
+      // manual keyframe envelope (evaluated at clip-local time, like ffmpeg),
+      // times the live cleanup-blend weight (equal-power crossfade).
       const tg = comp.audio.trackGain?.[c.track] ?? 0;
       const kdb = c.audio.keyframes.length ? kfDbAt(c.audio.keyframes, playhead) : 0;
-      const vol = hasDub && slot.kind === "video" ? 0 : Math.max(0, Math.min(1, Math.pow(10, (c.volume + tg + kdb) / 20)));
+      const [wO, wC] = cleanWeights(comp.audio.cleanMix ?? 1);
+      // Mid-range mix: the video element keeps picture but sounds the ORIGINAL
+      // at cos-weight; the #dub carries the cleaned file at sin-weight.
+      // Endpoints: 100% plays the proxy as one element; 0% plays original.
+      const blend = hasDub && slot.kind === "video" ? wO : isDub ? wC : 1;
+      const vol = hasDub && slot.kind === "video" && wO <= 0.001 ? 0 : Math.max(0, Math.min(1, Math.pow(10, (c.volume + tg + kdb) / 20) * blend));
       if (Math.abs(el.volume - vol) > 0.005) el.volume = vol;
       setRate(el, c.speed);
 
