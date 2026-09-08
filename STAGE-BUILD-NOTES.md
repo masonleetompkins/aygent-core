@@ -1,3 +1,36 @@
+# Stage build — 2026-09-08 ~14:14 PDT — v1.0.16 (media bins + Clean Audio count + timer picker)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, dead-code warnings only (same set). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `0286d79` — fix(video): Clean Audio counts audible clips only + holds Processing label for the whole run
+- `3d92aab` — feat(video): media list view with bins + task_continue timer picker
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41468536 bytes), mtime **Sep 8 14:14**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **18005722 bytes (~17.2 MB)**, mtime **Sep 8 14:14**
+
+**What changed:**
+1. **Media list view** — grid/list toggle in the panel header (persisted). List view has Premiere-style bins: create/rename/delete, collapse per bin, drag assets between bins or Move-to menu, Unfiled + Generated groups. Bins live in `assets.json` (`asset.folder` + `folders[]`), so clips never break. New agent tools `video_media_folder` / `video_media_move`; `video_project` + `video_load` expose folders.
+2. **Clean Audio count + Processing hold** — button counts distinct *audible* clips only (linked V+A pair = 1, silent clips skipped): one clip = "1 selected". A local flag holds "Processing…" for the entire run — no spinner flicker between phases.
+3. **task_continue timer picker** — parking the turn pops a chat modal: 1 / 3 / 5 / 10 / 15 min + "use suggestion". No answer in 3 min and the agent's `delay_secs` stands, so unattended builds never wedge. Picks queue if several fire at once. Modal mounts above Overlays so it's always clickable.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~8 min)
+1. **Media** — toggle grid/list; new bin; drag asset in; collapse, switch projects, collapse persists; Generated group shows cleaned proxies separately.
+2. **Audio** — select 1 clip → "Clean Audio (1 selected)"; run → "Processing…" holds at full opacity, toast names cleaned clips.
+3. **Timer** — trigger a task_continue → modal pops; pick 1 min; wake-up lands in ~1 min with the note attached.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
 # Stage build — 2026-09-08 v1.0.16 (Muse image budget + Clean Audio static master + selection cleanup) — 12:06 bundle
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
