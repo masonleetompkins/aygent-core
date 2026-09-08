@@ -19,6 +19,7 @@ import { Connections } from "./screens/Connections";
 import { Onboarding } from "./screens/Onboarding";
 import { initTheme, saveTheme, type Mode } from "./lib/theme";
 import { startHeadlessWatcher } from "./lib/turns";
+import { ContinuePicker } from "./components/ContinuePicker";
 
 // Phase 1: app shell (sidebar nav + content pane) on the design system.
 
@@ -286,6 +287,7 @@ export function App() {
           {screen === "browser" && <Browser />}
         </div>
       </div>
+      <ContinuePicker />
     </div>
   );
 }

@@ -105,11 +105,19 @@ pub struct Asset {
     pub codec: String,
     pub thumbs: Option<Thumbs>,
     pub imported: i64,
+    #[serde(default)] pub folder: String, // media bin id ("" = unfiled)
 }
+
+/// A media bin (Premiere-style folder) in the Media panel. Pure organization:
+/// clips reference assets by id, so moving assets between bins never breaks
+/// the edit. Bins live in assets.json next to the assets they group.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct MediaFolder { pub id: String, pub name: String, pub created: i64 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
-pub struct Manifest { pub assets: Vec<Asset> }
+pub struct Manifest { pub assets: Vec<Asset>, #[serde(default)] pub folders: Vec<MediaFolder> }
 
 pub fn load_manifest(broker: &Broker, agent_id: &str, project: &str) -> Manifest {
     read_json(broker, agent_id, &rel(project, "assets.json"))
@@ -420,7 +428,8 @@ pub fn video_load(broker: tauri::State<Arc<Broker>>, agent_id: String, project: 
     let assets = assets_with_status(&broker, &agent_id, &project);
     let transcript = read_json(&broker, &agent_id, &rel(&project, "transcript.json")).unwrap_or(serde_json::Value::Null);
     let chat = read_json(&broker, &agent_id, &rel(&project, "chat.json")).unwrap_or(serde_json::Value::Null);
-    Ok(serde_json::json!({ "project": project, "composition": composition, "assets": assets, "transcript": transcript, "chat": chat }))
+    let folders = serde_json::to_value(load_manifest(&broker, &agent_id, &project).folders).unwrap_or_default();
+    Ok(serde_json::json!({ "project": project, "composition": composition, "assets": assets, "transcript": transcript, "chat": chat, "folders": folders }))
 }
 
 #[tauri::command]
@@ -563,6 +572,59 @@ pub fn video_remove_asset(broker: tauri::State<Arc<Broker>>, agent_id: String, p
     }
     let _ = std::fs::remove_file(proj.join(format!(".cache/{}.strip.jpg", a.id)));
     let _ = std::fs::remove_file(proj.join(format!(".cache/{}.wave.png", a.id)));
+    save_manifest(&broker, &agent_id, &project, &m)
+}
+
+/// ---- MEDIA BINS (Premiere-style folders) ------------------------------------
+/// Pure organization over assets.json: create/rename/delete bins, move assets
+/// between them. Clips reference assets by id, so bins never break the edit.
+/// Deleting a bin just unfiles its assets (folder = "").
+
+fn folder_ok(name: &str) -> Result<String, String> {
+    let n = name.trim().to_string();
+    if n.is_empty() { return Err("folder name is empty".into()); }
+    if n.len() > 80 { return Err("folder name too long (max 80)".into()); }
+    Ok(n)
+}
+
+#[tauri::command]
+pub fn video_create_media_folder(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String, name: String) -> Result<serde_json::Value, String> {
+    project_dir(&broker, &agent_id, &project)?;
+    let mut m = load_manifest(&broker, &agent_id, &project);
+    let f = MediaFolder { id: new_id("f"), name: folder_ok(&name)?, created: now() };
+    m.folders.push(f.clone());
+    save_manifest(&broker, &agent_id, &project, &m)?;
+    Ok(serde_json::json!({ "id": f.id, "name": f.name }))
+}
+
+#[tauri::command]
+pub fn video_rename_media_folder(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String, folder_id: String, name: String) -> Result<(), String> {
+    project_dir(&broker, &agent_id, &project)?;
+    let mut m = load_manifest(&broker, &agent_id, &project);
+    let Some(f) = m.folders.iter_mut().find(|f| f.id == folder_id) else { return Err("no such folder".into()) };
+    f.name = folder_ok(&name)?;
+    save_manifest(&broker, &agent_id, &project, &m)
+}
+
+#[tauri::command]
+pub fn video_delete_media_folder(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String, folder_id: String) -> Result<(), String> {
+    project_dir(&broker, &agent_id, &project)?;
+    let mut m = load_manifest(&broker, &agent_id, &project);
+    if !m.folders.iter().any(|f| f.id == folder_id) { return Err("no such folder".into()); }
+    m.folders.retain(|f| f.id != folder_id);
+    for a in m.assets.iter_mut().filter(|a| a.folder == folder_id) { a.folder = String::new(); }
+    save_manifest(&broker, &agent_id, &project, &m)
+}
+
+#[tauri::command]
+pub fn video_move_media_assets(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String, asset_ids: Vec<String>, folder_id: String) -> Result<(), String> {
+    project_dir(&broker, &agent_id, &project)?;
+    let mut m = load_manifest(&broker, &agent_id, &project);
+    if !folder_id.is_empty() && !m.folders.iter().any(|f| f.id == folder_id) { return Err("no such folder".into()); }
+    if asset_ids.is_empty() { return Err("no assets".into()); }
+    let mut n = 0;
+    for a in m.assets.iter_mut().filter(|a| asset_ids.contains(&a.id)) { a.folder = folder_id.clone(); n += 1; }
+    if n == 0 { return Err("no such assets".into()); }
     save_manifest(&broker, &agent_id, &project, &m)
 }
 

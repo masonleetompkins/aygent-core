@@ -73,6 +73,7 @@ mod video_render; // VIDEO v0.3: composition.json -> ffmpeg filter graph -> MP4/
 mod video_media; // VIDEO v0.3: aygent-media:// jailed range-capable media serving for the editor.
 mod video_tools; // VIDEO v0.3: video_* agent tools (frame-accurate edit helpers).
 mod video_hyperframes; // VIDEO: Hyperframes transparent overlays — graphics + captions (T1/V3 clips).
+mod continue_gate; // task_continue TIMER PICKER (Mason 09-08): human picks 1/3/5/10/15 min via chat modal.
 
 use std::sync::Arc;
 use rand::Rng;
@@ -3920,9 +3921,9 @@ fn send_message_tool() -> serde_json::Value {
 fn task_continue_tool() -> serde_json::Value {
     serde_json::json!({
         "name": "task_continue",
-        "description": "Schedule YOURSELF a follow-up turn after a delay, so you can end this turn and still continue the work later (e.g. poll a long build, wait for a render, check a process). You will be woken with your note in a fresh continuation turn that streams live to your chat and has ALL your tools — you keep working there (shell_poll, read files, edit, call task_continue again), not just report. RULE: whenever you would otherwise write 'I'll check back', 'I'll continue later', 'once X finishes' or 'give me a few minutes', you MUST call this tool instead of saying it — words alone never wake you up. Put everything the next turn needs in the note (proc handles, paths, what to check, next step).",
+        "description": "Schedule YOURSELF a follow-up turn after a delay, so you can end this turn and still continue the work later (e.g. poll a long build, wait for a render, check a process). You will be woken with your note in a fresh continuation turn that streams live to your chat and has ALL your tools — you keep working there (shell_poll, read files, edit, call task_continue again), not just report. RULE: whenever you would otherwise write 'I'll check back', 'I'll continue later', 'once X finishes' or 'give me a few minutes', you MUST call this tool instead of saying it — words alone never wake you up. Put everything the next turn needs in the note (proc handles, paths, what to check, next step). Calling this pops a timer picker in chat (1/3/5/10/15 min) — the human chooses; your delay_secs is only the no-answer fallback.",
         "input_schema": { "type": "object", "properties": {
-            "delay_secs": { "type": "integer", "description": "seconds until wake-up (5-3600, default 60)" },
+            "delay_secs": { "type": "integer", "description": "SUGGESTED seconds until wake-up (5-3600, default 60) — the human picks the real duration (1/3/5/10/15 min) in a chat modal; your value is the fallback if they do not answer" },
             "note": { "type": "string", "description": "note to self: exactly what to check/continue on wake-up (include proc handles, file paths, next steps)" }
         }, "required": ["note"] }
     })
@@ -4990,16 +4991,7 @@ async fn agent_stream(
                     let (result_text, is_err) = if name == "whoami" {
                         (introspect::build_whoami(&app, &db, &scope_id, folder.as_deref()), false)
                     } else if name == "task_continue" {
-                        let delay = input.get("delay_secs").and_then(|d| d.as_u64()).unwrap_or(60).clamp(5, 3600);
-                        let note = input.get("note").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
-                        if note.is_empty() {
-                            ("task_continue refused: a non-empty note is required (say what to check on wake-up)".to_string(), true)
-                        } else {
-                            match mailbox::enqueue_continue(&db, &scope_id, &format!("conv:{}\n{}", session_id.clone().unwrap_or_default(), note), delay) {
-                                Ok(_) => (format!("wake-up scheduled in {delay}s — end your turn now; you'll be woken with your note"), false),
-                                Err(e) => (format!("task_continue failed: {e}"), true),
-                            }
-                        }
+                        continue_gate::handle_task_continue(&app, &db, &scope_id, session_id.clone().unwrap_or_default(), &input).await
                     } else if name == "send_message" {
                         let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
                         let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
@@ -5255,16 +5247,7 @@ async fn agent_stream(
                         let domains = folder.as_deref().map(|f| agent_browser_domains(&app, f)).unwrap_or_default();
                         browser::agent_tool(&app, &browser_state, &name, &input, &domains).await
                     } else if name == "task_continue" {
-                        let delay = input.get("delay_secs").and_then(|d| d.as_u64()).unwrap_or(60).clamp(5, 3600);
-                        let note = input.get("note").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
-                        if note.is_empty() {
-                            ("task_continue refused: a non-empty note is required (say what to check on wake-up)".to_string(), true)
-                        } else {
-                            match mailbox::enqueue_continue(&db, &scope_id, &format!("conv:{}\n{}", session_id.clone().unwrap_or_default(), note), delay) {
-                                Ok(_) => (format!("wake-up scheduled in {delay}s — end your turn now; you'll be woken with your note"), false),
-                                Err(e) => (format!("task_continue failed: {e}"), true),
-                            }
-                        }
+                        continue_gate::handle_task_continue(&app, &db, &scope_id, session_id.clone().unwrap_or_default(), &input).await
                     } else if name == "send_message" {
                         let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
                         let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
@@ -5779,16 +5762,7 @@ pub async fn run_headless_turn(
                             let (result_text, is_err) = if name == "whoami" {
                                 (introspect::build_whoami(app, db, agent_id, Some(&agent.folder_path)), false)
                             } else if name == "task_continue" {
-                                let delay = input.get("delay_secs").and_then(|d| d.as_u64()).unwrap_or(60).clamp(5, 3600);
-                                let note = input.get("note").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
-                                if note.is_empty() {
-                                    ("task_continue refused: a non-empty note is required".to_string(), true)
-                                } else {
-                                    match mailbox::enqueue_continue(db, agent_id, &format!("conv:{}\n{}", continue_conv.clone().unwrap_or_default(), note), delay) {
-                                        Ok(_) => (format!("wake-up scheduled in {delay}s — end your turn now; you'll be woken with your note"), false),
-                                        Err(e) => (format!("task_continue failed: {e}"), true),
-                                    }
-                                }
+                                continue_gate::handle_task_continue(app, db, agent_id, continue_conv.clone().unwrap_or_default(), &input).await
                             } else if name == "send_message" {
                                 let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
                                 let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
@@ -5884,15 +5858,7 @@ pub async fn run_headless_turn(
                 let (result_text, is_err) = if name == "whoami" {
                     (introspect::build_whoami(app, db, agent_id, Some(&agent.folder_path)), false)
                 } else if name == "task_continue" {
-                    let delay = input.get("delay_secs").and_then(|d| d.as_u64()).unwrap_or(60).clamp(5, 3600);
-                    let note = input.get("note").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
-                    if note.is_empty() { ("task_continue refused: a non-empty note is required".to_string(), true) }
-                    else {
-                        match mailbox::enqueue_continue(db, agent_id, &format!("conv:{}\n{}", continue_conv.clone().unwrap_or_default(), note), delay) {
-                            Ok(_) => (format!("wake-up scheduled in {delay}s — end your turn now; you'll be woken with your note"), false),
-                            Err(e) => (format!("task_continue failed: {e}"), true),
-                        }
-                    }
+                    continue_gate::handle_task_continue(app, db, agent_id, continue_conv.clone().unwrap_or_default(), &input).await
                 } else if name == "send_message" {
                     let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
                     let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
@@ -6077,6 +6043,7 @@ pub fn run() {
         .manage(sched_signal.clone())
         .manage(browser_proc)
         .manage(cancel_registry)
+        .manage(continue_gate::ContinueGate::default())
         .manage(remote_runtime)
         .invoke_handler(tauri::generate_handler![
             whisper::transcribe_audio_b64,
@@ -6117,6 +6084,7 @@ pub fn run() {
             video::video_status, video::video_projects, video::video_load, video::video_save, video::video_create,
             video::video_chat_save, video::video_pick_media, video::video_import_paths, video::video_delete_project, video::video_remove_asset, video::video_relink_asset,
             video::video_refresh_thumbs, video::video_list_luts, video::video_pick_lut, video::video_reveal,
+            video::video_create_media_folder, video::video_rename_media_folder, video::video_delete_media_folder, video::video_move_media_assets,
             video_render::video_render, video_render::video_render_cancel, video_render::video_frame,
             video_render::video_validate, video_render::video_list_renders,
             video_hyperframes::video_build_captions, video_hyperframes::video_render_overlay_cmd, video_hyperframes::video_pick_style_guide, video_hyperframes::video_caption_timing, video_hyperframes::video_save_transcript,
@@ -6139,6 +6107,7 @@ pub fn run() {
             agent_context_add, agent_context_list, agent_context_remove,
             agent_generate_soul,
             mailbox_pending_counts, mailbox_take_next, mailbox_roster,
+            continue_gate::task_continue_answer,
             get_app_knobs, set_app_knobs,
             memory_ingest, memory_retrieve, memory_stats,
             memory_append_daily, memory_gate_check, memory_remember,

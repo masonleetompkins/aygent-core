@@ -81,7 +81,11 @@ export type Asset = {
   duration: number; width: number; height: number; fps: number; hasVideo: boolean; hasAudio: boolean; audioChannels: number; codec: string;
   thumbs: Thumbs | null; imported: number;
   online?: boolean;        // computed by video_load: media readable right now (false = drive unplugged / moved)
+  folder: string;          // media bin id ("" = unfiled)
 };
+/** A media bin (Premiere-style folder). Pure organization — clips reference
+ *  assets by id, so bins never break the edit. Lives in assets.json. */
+export type MediaFolder = { id: string; name: string; created: number };
 
 export type Word = { w: string; s: number; e: number };
 export type Transcript = { asset: string; language: string; text: string; words: Word[]; segments: { text: string; s: number; e: number }[]; created: number };

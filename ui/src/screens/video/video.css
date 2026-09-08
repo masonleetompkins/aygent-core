@@ -292,3 +292,34 @@
    disabled dims to .4 which read as "broken" — and spins its icon. */
 .ve button.ve-btn.busy:disabled { opacity: 1; cursor: progress; }
 .ve .ve-spin { animation: ve-spin .9s linear infinite; }
+
+/* ---- media list view (Premiere-style bins) ---- */
+.ve-binlist { display: flex; flex-direction: column; gap: 6px; }
+.ve-binlist-bar { display: flex; gap: 6px; }
+.ve-bin-create { display: flex; align-items: center; gap: 8px; border: 1px dashed rgba(var(--accent-rgb), .4); border-radius: 9px; padding: 7px 10px; color: var(--text-muted); }
+.ve-bin-create input { flex: 1; min-width: 0; }
+.ve-bin { border: 1px solid rgba(var(--accent-rgb), .12); border-radius: 9px; background: var(--bg); overflow: hidden; transition: border-color 120ms, background 120ms; }
+.ve-bin.open { border-color: rgba(var(--accent-rgb), .3); }
+.ve-bin.over { border-color: var(--accent); background: rgba(var(--accent-rgb), .07); }
+.ve-bin-hd { display: flex; align-items: center; gap: 7px; padding: 7px 8px; cursor: pointer; color: var(--text-muted); font-weight: 700; font-size: 12px; }
+.ve-bin-hd:hover { color: var(--text); background: rgba(var(--accent-rgb), .05); }
+.ve-bin-hd .caret { display: inline-flex; width: 14px; color: var(--text-faint); }
+.ve-bin-hd .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ve-bin-hd .ct { font-size: 10.5px; font-weight: 600; color: var(--text-faint); font-variant-numeric: tabular-nums; background: rgba(var(--accent-rgb), .08); border-radius: 999px; padding: 1px 7px; }
+.ve-bin-hd input { flex: 1; min-width: 0; height: 24px; font-size: 12px; }
+.ve-bin-hd .ops { display: none; align-items: center; gap: 2px; }
+.ve-bin-hd:hover .ops { display: inline-flex; }
+.ve-bin-rows { display: flex; flex-direction: column; border-top: 1px solid rgba(var(--accent-rgb), .08); padding: 4px; gap: 1px; }
+.ve-bin-empty { font-size: 11px; color: var(--text-faint); padding: 6px 8px; font-style: italic; }
+.ve-brow { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: 6px; cursor: grab; border: 1px solid transparent; }
+.ve-brow:hover { background: rgba(var(--accent-rgb), .06); }
+.ve-brow.sel { border-color: var(--accent); background: rgba(var(--accent-rgb), .08); }
+.ve-brow.offline { opacity: .6; }
+.ve-brow .ic { display: inline-flex; color: var(--text-faint); flex-shrink: 0; }
+.ve-brow .n { flex: 1; min-width: 0; font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ve-brow .d { font-size: 10.5px; color: var(--text-faint); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.ve-brow .sz { min-width: 44px; text-align: right; }
+.ve-brow .ops { display: none; align-items: center; gap: 2px; flex-shrink: 0; }
+.ve-brow:hover .ops, .ve-brow.sel .ops { display: inline-flex; }
+.ve-move-pop { position: sticky; bottom: 0; z-index: 5; background: var(--surface); border: 1px solid rgba(var(--accent-rgb), .3); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; box-shadow: var(--elevation); }
+.ve-move-pop h4 { margin: 0; font-size: 12px; font-weight: 800; }

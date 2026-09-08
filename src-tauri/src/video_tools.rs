@@ -38,7 +38,7 @@ fn app() -> Result<tauri::AppHandle, String> { APP.get().cloned().ok_or_else(|| 
 /// AppHandle for the Hyperframes overlay module (same install_app source).
 pub fn app_handle() -> Option<tauri::AppHandle> { APP.get().cloned() }
 
-const NAMES: &[&str] = &["video_project", "video_edit", "video_transcribe", "video_silences", "video_takes", "video_auto_cut", "video_frame", "video_look", "video_render", "video_audio_enhance", "video_voice_install", "video_voice_status", "video_matte", "video_build_captions", "video_render_overlay"];
+const NAMES: &[&str] = &["video_project", "video_edit", "video_transcribe", "video_silences", "video_takes", "video_auto_cut", "video_frame", "video_look", "video_render", "video_audio_enhance", "video_voice_install", "video_voice_status", "video_matte", "video_media_folder", "video_media_move", "video_build_captions", "video_render_overlay"];
 pub fn is_video_tool(name: &str) -> bool { NAMES.contains(&name) || crate::video_hyperframes::is_hyperframes_tool(name) }
 
 pub fn tool_schemas() -> Vec<Value> {
@@ -70,6 +70,10 @@ pub fn tool_schemas() -> Vec<Value> {
             "input_schema": { "type": "object", "properties": { "project": proj }, "required": ["project"] } }),
         json!({ "name": "video_matte", "description": "EXPERIMENTAL: generate a subject alpha matte for an asset with RobustVideoMatting (downloads torch via uv on first run; slow). Registers the matte asset and enables composition.matte so behindSubject overlay layers render behind the person.",
             "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "engine": { "type": "string", "description": "ignored (local only)" } }, "required": ["project", "asset"] } }),
+        json!({ "name": "video_media_folder", "description": "Create / rename / delete a media bin (Premiere-style folder) in the Media panel list view. Pure organization — clips reference assets by id, so bins never break the edit.",
+            "input_schema": { "type": "object", "properties": { "project": proj, "op": { "type": "string", "description": "create | rename | delete" }, "name": { "type": "string", "description": "bin name (create/rename)" }, "folder": { "type": "string", "description": "bin id (rename/delete)" } }, "required": ["project", "op"] } }),
+        json!({ "name": "video_media_move", "description": "Move media assets into a bin (or back to Unfiled with an empty folder id) in the Media panel list view.",
+            "input_schema": { "type": "object", "properties": { "project": proj, "assets": { "type": "array", "items": { "type": "string" }, "description": "asset ids" }, "folder": { "type": "string", "description": "bin id (empty = Unfiled)" } }, "required": ["project", "assets"] } }),
     ];
     v.extend(crate::video_hyperframes::tool_schemas());
     v
@@ -226,6 +230,47 @@ pub fn run(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, name: &str, 
             let p = project.ok_or("project is required")?;
             voice_status(app, broker, agent_id, &p)?
         }
+        "video_media_folder" => {
+            let p = project.ok_or("project is required")?;
+            let op = s("op").ok_or("op is required (create | rename | delete)")?;
+            let mut m = video::load_manifest(broker, agent_id, &p);
+            if op == "create" {
+                let name = s("name").ok_or("name is required")?.trim().to_string();
+                if name.is_empty() || name.len() > 80 { return Err("bin name must be 1-80 chars".into()); }
+                let f = video::MediaFolder { id: video::new_id("f"), name: name.clone(), created: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) };
+                m.folders.push(f.clone());
+                video::save_manifest(broker, agent_id, &p, &m)?;
+                json!({ "ok": true, "id": f.id, "name": f.name })
+            } else if op == "rename" {
+                let fid = s("folder").ok_or("folder (bin id) is required")?;
+                let name = s("name").ok_or("name is required")?.trim().to_string();
+                if name.is_empty() || name.len() > 80 { return Err("bin name must be 1-80 chars".into()); }
+                let Some(f) = m.folders.iter_mut().find(|f| f.id == fid) else { return Err("no such bin".into()) };
+                f.name = name;
+                video::save_manifest(broker, agent_id, &p, &m)?;
+                json!({ "ok": true })
+            } else if op == "delete" {
+                let fid = s("folder").ok_or("folder (bin id) is required")?;
+                if !m.folders.iter().any(|f| f.id == fid) { return Err("no such bin".into()); }
+                m.folders.retain(|f| f.id != fid);
+                for a in m.assets.iter_mut().filter(|a| a.folder == fid) { a.folder = String::new(); }
+                video::save_manifest(broker, agent_id, &p, &m)?;
+                json!({ "ok": true })
+            } else { return Err("op must be create | rename | delete".into()); }
+        }
+        "video_media_move" => {
+            let p = project.ok_or("project is required")?;
+            let ids: Vec<String> = input.get("assets").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+            let fid = s("folder").unwrap_or_default();
+            let mut m = video::load_manifest(broker, agent_id, &p);
+            if !fid.is_empty() && !m.folders.iter().any(|f| f.id == fid) { return Err("no such bin".into()); }
+            if ids.is_empty() { return Err("assets (asset ids) is required".into()); }
+            let mut n = 0;
+            for a in m.assets.iter_mut().filter(|a| ids.contains(&a.id)) { a.folder = fid.clone(); n += 1; }
+            if n == 0 { return Err("no such assets".into()); }
+            video::save_manifest(broker, agent_id, &p, &m)?;
+            json!({ "ok": true, "moved": n })
+        }
         "video_matte" => {
             let p = project.ok_or("project is required")?;
             matte(app, broker, agent_id, &p, &s("asset").ok_or("asset is required")?)?
@@ -280,7 +325,8 @@ fn list_projects(broker: &Broker, agent_id: &str) -> Result<Value, String> {
 fn overview(broker: &Broker, agent_id: &str, project: &str) -> Result<Value, String> {
     let proj = video::project_dir(broker, agent_id, project)?;
     let comp = load_comp(broker, agent_id, project)?;
-    let assets = video::load_manifest(broker, agent_id, project).assets;
+    let manifest = video::load_manifest(broker, agent_id, project);
+    let assets = manifest.assets;
     let tr = load_transcript(&proj);
     let mut tracks: HashMap<String, Vec<Value>> = HashMap::new();
     for c in &comp.clips {
@@ -305,7 +351,8 @@ fn overview(broker: &Broker, agent_id: &str, project: &str) -> Result<Value, Str
         "scene": comp.scene,
         "duration": round3(comp.duration()),
         "tracks": tracks,
-        "assets": assets.iter().map(|a| json!({ "id": a.id, "name": a.name, "kind": a.kind, "duration": round2(a.duration), "fps": round2(a.fps), "size": format!("{}x{}", a.width, a.height), "hasAudio": a.has_audio, "linked": a.linked, "online": video::asset_abs(broker, agent_id, project, a).map(|p| p.is_file()).unwrap_or(false), "path": a.path })).collect::<Vec<_>>(),
+        "assets": assets.iter().map(|a| json!({ "id": a.id, "name": a.name, "kind": a.kind, "duration": round2(a.duration), "fps": round2(a.fps), "size": format!("{}x{}", a.width, a.height), "hasAudio": a.has_audio, "linked": a.linked, "online": video::asset_abs(broker, agent_id, project, a).map(|p| p.is_file()).unwrap_or(false), "path": a.path, "folder": a.folder })).collect::<Vec<_>>(),
+        "folders": manifest.folders.iter().map(|f| json!({ "id": f.id, "name": f.name })).collect::<Vec<_>>(),
         "transcript": tr.as_ref().map(|t| json!({ "asset": t.asset, "words": t.words.len(), "segments": t.segments.len() })),
         "captions": comp.captions,
         "graphics": comp.graphics,

@@ -6,7 +6,7 @@
 
 import { useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { type Asset, type Clip, type Composition, type Transcript, blankComposition, normalize, duration, clipDur, uid } from "./model";
+import { type Asset, type Clip, type Composition, type Transcript, type MediaFolder, blankComposition, normalize, duration, clipDur, uid } from "./model";
 
 export type Status = { ffmpeg: string | null; hyperframes: boolean; whisper: boolean; uv: boolean; proMode: boolean };
 export type Project = { name: string; modified: number; assets: number };
@@ -20,6 +20,7 @@ export type State = {
   project: string | null;
   comp: Composition;
   assets: Asset[];
+  folders: MediaFolder[];
   transcript: Transcript | null;
   dirty: boolean;
   saving: boolean;
@@ -48,7 +49,7 @@ export type State = {
 };
 
 let state: State = {
-  agentId: null, folder: null, status: null, projects: [], project: null, comp: blankComposition(), assets: [], transcript: null,
+  agentId: null, folder: null, status: null, projects: [], project: null, comp: blankComposition(), assets: [], folders: [], transcript: null,
   dirty: false, saving: false, playhead: 0, playing: false, loop: false, zoom: 60, scrollX: 0, selection: [], kfTrack: null, tool: "select", snap: true,
   panel: "media", dockOpen: true, dockTab: "agent", panelOpen: true, dockW: Math.max(280, Math.min(640, Number(localStorage.getItem("aygent.video.dockW")) || 360)), toast: null, render: null, toolProgress: null, frame: null, captionLines: [], luts: [], renders: [], cacheBust: 0,
 };
@@ -135,12 +136,12 @@ export async function init(agentId: string | null, folder: string | null) {
   const changed = agentId !== state.agentId;
   set({ agentId, folder });
   try { set({ status: await invoke<Status>("video_status", { folder }) }); } catch { /* keep */ }
-  if (!agentId) { set({ projects: [], project: null, comp: blankComposition(), assets: [] }); return; }
+  if (!agentId) { set({ projects: [], project: null, comp: blankComposition(), assets: [], folders: [] }); return; }
   await refreshProjects();
   if (changed || !state.project) {
     const last = localStorage.getItem(`aygent.video.last.${agentId}`);
     const pick = state.projects.find((p) => p.name === last)?.name ?? state.projects[0]?.name ?? null;
-    if (pick) await open(pick); else set({ project: null, comp: blankComposition(), assets: [], transcript: null, selection: [] });
+    if (pick) await open(pick); else set({ project: null, comp: blankComposition(), assets: [], folders: [], transcript: null, selection: [] });
   }
 }
 
@@ -153,10 +154,11 @@ export async function open(name: string) {
   const { agentId } = state; if (!agentId) return;
   await flushSave();
   try {
-    const r = await invoke<{ project: string; composition: unknown; assets: Asset[]; transcript: Transcript | null; chat: unknown }>("video_load", { agentId, project: name });
+    const r = await invoke<{ project: string; composition: unknown; assets: Asset[]; folders?: MediaFolder[]; transcript: Transcript | null; chat: unknown }>("video_load", { agentId, project: name });
     past.length = 0; future.length = 0;
     const assets = Array.isArray(r.assets) ? r.assets : [];
-    set({ project: r.project, comp: normalize(r.composition, assets), assets, transcript: r.transcript ?? null, dirty: false, playhead: 0, playing: false, selection: [], render: null, frame: null, cacheBust: Date.now() });
+    const folders = Array.isArray((r as any).folders) ? (r as any).folders : [];
+    set({ project: r.project, comp: normalize(r.composition, assets), assets, folders, transcript: r.transcript ?? null, dirty: false, playhead: 0, playing: false, selection: [], render: null, frame: null, cacheBust: Date.now() });
     localStorage.setItem(`aygent.video.last.${agentId}`, r.project);
     chatLoaded(r.chat);
     void refreshLuts(); void refreshRenders(); void refreshCaptionLines();
@@ -187,7 +189,7 @@ export async function removeProject(name: string): Promise<boolean> {
       if (saveTimer) { window.clearTimeout(saveTimer); saveTimer = null; }
       past.length = 0; future.length = 0;
       chatClear();
-      set({ project: null, comp: blankComposition(), assets: [], transcript: null, dirty: false, saving: false, playhead: 0, playing: false, selection: [], render: null, frame: null, captionLines: [] });
+      set({ project: null, comp: blankComposition(), assets: [], folders: [], transcript: null, dirty: false, saving: false, playhead: 0, playing: false, selection: [], render: null, frame: null, captionLines: [] });
       localStorage.removeItem(`aygent.video.last.${agentId}`);
     }
     await refreshProjects();
@@ -200,10 +202,11 @@ export async function removeProject(name: string): Promise<boolean> {
 export async function reload() {
   const { agentId, project } = state; if (!agentId || !project) return;
   try {
-    const r = await invoke<{ composition: unknown; assets: Asset[]; transcript: Transcript | null }>("video_load", { agentId, project });
+    const r = await invoke<{ composition: unknown; assets: Asset[]; folders?: MediaFolder[]; transcript: Transcript | null }>("video_load", { agentId, project });
     const assets = Array.isArray(r.assets) ? r.assets : [];
+    const folders = Array.isArray((r as any).folders) ? (r as any).folders : [];
     snapshot();
-    set({ comp: normalize(r.composition, assets), assets, transcript: r.transcript ?? null, dirty: false, cacheBust: Date.now() });
+    set({ comp: normalize(r.composition, assets), assets, folders, transcript: r.transcript ?? null, dirty: false, cacheBust: Date.now() });
     void refreshLuts(); void refreshRenders(); void refreshCaptionLines();
   } catch (e) { toast(String(e), "err"); }
 }
@@ -257,6 +260,36 @@ export async function removeAsset(id: string) {
     await invoke("video_remove_asset", { agentId, project, assetId: id });
     set((s) => ({ assets: s.assets.filter((a) => a.id !== id) }));
     mutate((c) => { c.clips = c.clips.filter((k) => k.asset !== id); });
+  } catch (e) { toast(String(e), "err"); }
+}
+export async function createMediaFolder(name: string) {
+  const { agentId, project } = state; if (!agentId || !project) { toast("open a project first"); return null; }
+  try {
+    const r = await invoke<{ id: string; name: string }>("video_create_media_folder", { agentId, project, name });
+    // local update without dirtying the comp
+    set((s) => ({ folders: [...s.folders, { id: r.id, name: r.name, created: Date.now() / 1000 }] }));
+    return r;
+  } catch (e) { toast(String(e), "err"); return null; }
+}
+export async function renameMediaFolder(id: string, name: string) {
+  const { agentId, project } = state; if (!agentId || !project) return;
+  try {
+    await invoke("video_rename_media_folder", { agentId, project, folderId: id, name });
+    set((s) => ({ folders: s.folders.map((f) => (f.id === id ? { ...f, name } : f)) }));
+  } catch (e) { toast(String(e), "err"); }
+}
+export async function deleteMediaFolder(id: string) {
+  const { agentId, project } = state; if (!agentId || !project) return;
+  try {
+    await invoke("video_delete_media_folder", { agentId, project, folderId: id });
+    set((s) => ({ folders: s.folders.filter((f) => f.id !== id), assets: s.assets.map((a) => (a.folder === id ? { ...a, folder: "" } : a)) }));
+  } catch (e) { toast(String(e), "err"); }
+}
+export async function moveMediaAssets(ids: string[], folderId: string) {
+  const { agentId, project } = state; if (!agentId || !project || !ids.length) return;
+  try {
+    await invoke("video_move_media_assets", { agentId, project, assetIds: ids, folderId });
+    set((s) => ({ assets: s.assets.map((a) => (ids.includes(a.id) ? { ...a, folder: folderId } : a)) }));
   } catch (e) { toast(String(e), "err"); }
 }
 export async function refreshLuts() {
