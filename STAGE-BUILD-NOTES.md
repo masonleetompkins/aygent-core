@@ -828,3 +828,31 @@ debug-assert that migrations end at `SCHEMA_VERSION`.
 2. **Playback** — smooth through cuts and full track; no choppiness.
 3. **Bypass toggle** — A/B cleaned vs original works.
 4. **Buttons** — Clean / Re-clean buttons wrap inside the panel, no overflow.
+
+---
+
+# Stage build — 2026-09-08 ~10:31 PDT — v1.0.16 (neural voice cleanup + live blend)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0 (dead-code warnings only, same set). Both bundles produced (.app + dmg).
+
+**Commit (on `staging`, pushed):** `654b00a` — feat(video): neural voice cleanup (DeepFilterNet3, optional download) + live Cleanup amount blend
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41384312 bytes), mtime **Sep 8 10:30**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **17964760 bytes (~17.1 MB)**, mtime **Sep 8 10:31**
+
+**What changed:**
+1. **Neural isolation** — DeepFilterNet3 via uv (torch 2.5.1 + torchaudio 2.5.1 pinned; torchaudio file I/O bypassed via ffmpeg pipes after verifying backend failures). API verified live against AUDIO REFERENCE, not just docs.
+2. **Measured EQ** — first curve was +6dB too bright vs the Auphonic reference; also caught `equalizer` as a silent no-op in provisioned ffmpeg. Final: `highpass=80,lowpass=12000,treble=-4` — within 1–4dB/band of Auphonic.
+3. **Live Cleanup amount** (`audio.cleanMix`, default 1) — equal-power crossfade, preview + export matched, no re-clean. Replaces bypass checkbox.
+4. **Deleted:** `video_audio_audition` (schema, dispatch, fn), Preview button, `denoise`/`normalizeDb`/`cleanEnabled` everywhere, two-pass peak normalize on export. Zero back-compat per plan.
+5. **Optional download** — Audio panel offers one-time voice-model install (~90MB); without it Clean uses a light nr=6 fallback that can't go robotic.
+6. Chain: mono extract → DF3 isolate → EQ → dynamic loudnorm −16 LUFS → full-length `.cleaned.mov` proxy (unchanged).
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~3 min)
+1. **Download voice model** — Audio panel → Download → READY, status flips to neural.
+2. **Clean A-roll** — succeeds, toast names the engine; produces `.cleaned.mov`.
+3. **Blend live** — drag Cleanup amount 0/50/100 → preview follows instantly, no re-clean; export matches.
+4. **Natural sound** — full clean sounds like close-mic'd voice, not robotic.
