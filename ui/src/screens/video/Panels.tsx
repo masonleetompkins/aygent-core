@@ -303,16 +303,22 @@ export function AudioPanel() {
   const s = useVideo(); const a = s.comp.audio;
   const [voice, setVoice] = useState<{ installed: boolean; engine: string } | null>(null);
   const [installing, setInstalling] = useState(false);
+  const [cleaning, setCleaning] = useState(false);
   const aroll = s.comp.clips.find((c) => c.track === "V1" && c.type === "video");
   // Target = the SELECTED audible clips (one or many; linked V+A partners
   // follow in the tool). Nothing selected → every clip of the A-roll source.
   const selClips = s.comp.clips.filter((c) => s.selection.includes(c.id) && (c.type === "video" || c.type === "audio") && c.asset);
+  // Count distinct AUDIBLE sources only: a linked V+A pair is ONE clip, and
+  // silent clips (video with no audio stream, images, text) don't count.
+  const assetById = new Map(s.assets.map((a) => [a.id, a]));
+  const audibleSel = selClips.filter((c) => c.type === "audio" || (c.type === "video" && (assetById.get(c.asset)?.hasAudio ?? true)));
+  const audioCount = new Set(audibleSel.map((c) => c.link || c.id)).size;
   const selTarget = selClips.length > 0;
   const audible = s.comp.clips.filter((c) => c.type === "video" && !c.hidden && c.asset);
   const cleanedIds = new Set(audible.filter((c) => c.audioAsset && s.assets.some((x) => x.id === c.audioAsset)).map((c) => c.id));
   const cleaned = aroll && s.assets.find((x) => x.id === aroll.audioAsset);
   const anyCleaned = cleanedIds.size > 0;
-  const processing = !!s.toolProgress && /clean/i.test(s.toolProgress);
+  const processing = cleaning || (!!s.toolProgress && /clean|isolat|enhance|dialogue|denois/i.test(s.toolProgress));
   const tracks = Array.from(new Set(s.comp.clips.filter((c) => (c.type === "audio" || c.type === "video") && !c.hidden).map((c) => c.track))).sort();
   const mix = a.cleanMix ?? 1;
 
@@ -324,9 +330,12 @@ export function AudioPanel() {
 
   async function cleanup() {
     const input = selTarget ? { clips: selClips.map((c) => c.id) } : aroll ? { asset: aroll.asset } : null;
-    if (!input) return;
-    const r = await runTool<{ engine: string; clipsUpdated: number }>("video_audio_enhance", input, "cleaning dialogue…");
-    if (r) toast(`${r.clipsUpdated} clip${r.clipsUpdated === 1 ? "" : "s"} cleaned (${r.engine === "neural" ? "neural isolation" : "light cleanup"}) — drag Cleanup amount to blend`, "ok");
+    if (!input || cleaning) return;
+    setCleaning(true);
+    try {
+      const r = await runTool<{ engine: string; clipsUpdated: number }>("video_audio_enhance", input, "cleaning dialogue…");
+      if (r) toast(`${r.clipsUpdated} clip${r.clipsUpdated === 1 ? "" : "s"} cleaned (${r.engine === "neural" ? "neural isolation" : "light cleanup"}) — drag Cleanup amount to blend`, "ok");
+    } finally { setCleaning(false); }
   }
   async function installVoice() {
     setInstalling(true);
@@ -350,8 +359,8 @@ export function AudioPanel() {
           <Slider label="Cleanup amount" value={mix} min={0} max={1} step={0.01} fmt={(v) => (v <= 0.001 ? "original" : v >= 0.999 ? "full clean" : `${Math.round(v * 100)}%`)} onChange={(v) => setPath("audio.cleanMix", v)} />
           <p className="ve-hint">Live blend — no re-clean needed. 0% is the original mic, 100% the isolated voice, 50/50 a true half mix. Preview + export match.</p>
           <div className="ve-btn-row">
-            <button className={`ve-btn sm primary${processing ? " busy" : ""}`} disabled={(!aroll && !selTarget) || !!s.toolProgress} onClick={() => void cleanup()} title={selTarget ? `Clean the ${selClips.length} selected clip${selClips.length === 1 ? "" : "s"}` : "Clean every clip of the A-roll source (select clips to clean only those)"}>
-              {processing ? <RefreshCw size={12} className="ve-spin" /> : <Sparkles size={12} />} {processing ? "Processing…" : selTarget ? `Clean Audio (${selClips.length} selected)` : "Clean Audio"}
+            <button className={`ve-btn sm primary${processing ? " busy" : ""}`} disabled={(!aroll && !selTarget) || !!s.toolProgress || cleaning} onClick={() => void cleanup()} title={selTarget ? `Clean the ${audioCount} selected clip${audioCount === 1 ? "" : "s"}` : "Clean every clip of the A-roll source (select clips to clean only those)"}>
+              {processing ? <RefreshCw size={12} className="ve-spin" /> : <Sparkles size={12} />} {processing ? "Processing…" : selTarget ? `Clean Audio (${audioCount} selected)` : "Clean Audio"}
             </button>
           </div>
           <p className="ve-hint">{selTarget ? "Cleans only the selected clips (linked video+audio pairs move together). Deselect to clean the whole A-roll." : "Select one or more clips on the timeline to clean just those; with nothing selected the whole A-roll is cleaned."}</p>
