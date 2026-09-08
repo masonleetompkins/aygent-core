@@ -776,3 +776,55 @@ feature work. Deleted legacy JSON stores (conversations.rs, settings.rs, most
 of agents.rs) plus orphans; wired `cef_engine::shutdown_engine` at
 `RunEvent::Exit`, made `sandbox` a real cargo feature, added a db.rs
 debug-assert that migrations end at `SCHEMA_VERSION`.
+
+---
+
+# Stage build — 2026-09-07 ~11:39 PDT — v1.0.16 (Create button reset fix, rebuild)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, dead-code warnings only (same set). Both bundles produced (.app + dmg).
+
+**Commit (on `staging`, pushed):** `14a7f1a` — fix(video): scope .ve button reset to non-.ve-btn so Create keeps padding
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41247736 bytes), mtime **Sep 7 11:39**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **17942691 bytes (~17.1 MB)**, mtime **Sep 7 11:39**
+
+**Root cause of the repeat failure:** the last two bundles were packaged off a stale `ui/dist` that still contained the unscoped `.ve button{...padding:0}` reset — so the Create button fix never actually shipped. `dist` rebuilt from source (verified `.ve button:not(.ve-btn)` in shipped CSS) before this build.
+
+**What changed:** generic reset now only strips background/border/padding on non-`.ve-btn` buttons; `.ve-btn`/`.ve-create-btn` padding + height survive. Create button renders unclipped.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~2 min)
+1. **Create** — welcome screen: + Create button fully legible, disabled until a name is typed, creates cleanly.
+
+---
+
+# Stage build — 2026-09-07 ~13:40 PDT — v1.0.16 (cleaned-audio proxy playback + re-clean sweep fix)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0 (two sequential builds, second includes sweep fix). Both bundles produced (.app + dmg).
+
+**Commits (on `staging`, pushed):**
+- `7df98fd` — fix(video): cleaned-audio proxy playback (full-length .cleaned.mov, single-element preview) + stable denoise floor + cleanup button wrap
+- `b6bd3dc` — fix(video): re-clean no longer deletes the proxy it just wrote (sweep keeps same-rel file; drop orphan wav)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41383208 bytes), mtime **Sep 7 13:40**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **17966285 bytes (~17.1 MB)**, mtime **Sep 7 13:40**
+
+**What changed:**
+1. Cleanup on video sources now builds a full-length `.cleaned.mov` proxy (picture stream-copied, cleaned audio apad-padded to full video duration, AAC) instead of a short `.wav` — preview plays one element, no dual-clock drift through cuts.
+2. Denoise retuned (nr 0..18, nf=-30, no afftdn noise-tracking) — stable floor, no pumping. Preview chain matches cleanup exactly.
+3. Re-clean stale sweep no longer deletes the file it just wrote (same-rel guard); intermediate wav removed once baked into proxy.
+4. Cleanup buttons wrap (`.ve-btn-row` verified in shipped `ui/dist` CSS).
+5. Export graph untouched (already handles duration via apad/atrim + peak normalize).
+
+**user-facing bug hit on the 13:27 bundle:** re-clean failed with `ffprobe failed: ... .cleaned.mov: No such file` because the sweep deleted the fresh proxy. Fixed in `b6bd3dc`, included in this 13:40 bundle.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~2 min)
+1. **Re-clean A-roll** — succeeds, produces `.cleaned.mov` in Generated, no ffprobe error.
+2. **Playback** — smooth through cuts and full track; no choppiness.
+3. **Bypass toggle** — A/B cleaned vs original works.
+4. **Buttons** — Clean / Re-clean buttons wrap inside the panel, no overflow.
