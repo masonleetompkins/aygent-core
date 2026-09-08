@@ -1,3 +1,32 @@
+# Stage build — 2026-09-08 v1.0.16 (Muse image budget + Clean Audio static master + selection cleanup) — 12:06 bundle
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `4845e11` — fix(muse): budget inline images + drop orphan function_call_output · fix(video): Clean Audio static-gain master, stronger fallback denoise, per-selection cleanup, button rename + Processing… state
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (binary 41.3 MB, 12:05)
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg` (~17.9 MB, 12:06)
+
+**What changed:**
+1. **Muse `400 Invalid upload request.`** — root cause (probed live against api.meta.ai with the real key): the endpoint rejects any request whose INLINE data-URL images total more than ~18 MB (7× a 1.9 MB screenshot OK, 8× → this 400, 9× → 413 payload_too_large). History resends every image every turn, so a chat with a few full-res screenshots was permanently dead — not a model bug. Fix in `meta_provider.rs`: `images_within_budget` keeps the NEWEST images whole up to `MUSE_IMAGE_BUDGET_BYTES` (12 MB); older ones degrade to a text stub. Model already saw them.
+2. **Muse `No function call found for function call output with call_id`** — the headless (task_continue) path sends a last-40 history window that can slice a call/result pair. `build_muse_input` now tracks emitted `function_call` ids and drops any `function_call_output` whose call isn't in the window.
+3. **Clean Audio master (the "raised noise floor / reverb swelling until I talk" bug)** — single-pass `loudnorm` is a gain RIDER: on a noise-only head it pushed gain toward -16 LUFS (pumping room tone + reverb) then ducked when speech arrived. Replaced with `acompressor` 2:1 above -24 dB (only pulls peaks down) → measured STATIC gain to -16 LUFS integrated (`measure_lufs`, loudnorm print_format=json) → `alimiter` -1.5 dBTP. A/B on the reference clip with a 4 s silent head: old chain widened head→speech by +17 dB of noise lift; new chain preserves the isolation's floor exactly.
+4. **Fallback denoise** (no voice model): `afftdn nr=12 nf=-40 tn=1` + `agate` 2:1 soft expander (threshold 0.008, knee 4). Pink-noise-over-speech test: head -48 → -69 dB, speech level unchanged.
+5. **Per-selection cleanup** — `video_audio_enhance` accepts `clips[]` (timeline ids; linked V+A partners follow via `linked_ids`). `enhance_source` masters each distinct source once; only targeted clips get `audioAsset` repointed. `asset` still cleans the whole source. `enhance_clips` reloads the composition after the manifest rewrite.
+6. **Audio panel button** — "Clean Audio" / "Clean Audio (N selected)" driven by `s.selection`; while running shows "Processing…" with a spinning icon at FULL opacity (`.ve-btn.busy:disabled { opacity: 1 }`) instead of the dim disabled look. Hint line explains select-to-target. Status line counts cleaned clips.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~8 min)
+1. **Muse** — in the long "Video Editor Dev" chat (527k tok, several screenshots) attach a new screenshot and send: reply streams, no 400. Trigger a task_continue wake-up: no call_id 400.
+2. **Audio** — import A-roll with a quiet head, Clean Audio (nothing selected): head stays quiet, no swell before speech; -16 LUFS integrated on export.
+3. **Selection** — select 2 clips → button reads "Clean Audio (2 selected)" → only those 2 play cleaned (Inspector → Audio asset), others original.
+4. **Button** — during processing reads "Processing…" with spinner, full opacity.
+
+---
+
 # Stage build — 2026-09-07 v1.0.16 (local audio suite + chat timeline + create polish)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
