@@ -135,13 +135,50 @@ fn flatten_text(content: &serde_json::Value) -> String {
 ///   assistant text -> {role:assistant, content:[output_text]}
 ///   assistant tool_calls -> {type:function_call, call_id, name, arguments} each
 ///   our tool_result blocks -> {type:function_call_output, call_id, output}
+/// Muse rejects a request whose INLINE IMAGES total more than ~18MB with a bare
+/// `400 Invalid upload request.` (verified live 09-08: 7x a 1.9MB screenshot OK,
+/// 8x -> that 400, 9x -> 413 payload_too_large). History resends every image on
+/// every turn, so a chat with a few full-res screenshots dies permanently.
+/// Budget: keep the NEWEST images whole until this many data-URL bytes are
+/// used; older ones degrade to a text stub. The model already saw them.
+const MUSE_IMAGE_BUDGET_BYTES: usize = 12 * 1024 * 1024;
+
+/// Byte length of a data: URL image (0 for remote URLs, which cost nothing inline).
+fn inline_image_len(b: &serde_json::Value) -> usize {
+    b.get("image_url").and_then(|i| i.get("url")).and_then(|u| u.as_str())
+        .filter(|u| u.starts_with("data:")).map(|u| u.len()).unwrap_or(0)
+}
+
+/// Ids (message index, block index) of image blocks that fit the budget,
+/// newest first. Anything not in the set is stubbed by build_muse_input.
+fn images_within_budget(arr: &[serde_json::Value]) -> std::collections::HashSet<(usize, usize)> {
+    let mut keep = std::collections::HashSet::new();
+    let mut used = 0usize;
+    for (mi, m) in arr.iter().enumerate().rev() {
+        let Some(blocks) = m.get("content").and_then(|c| c.as_array()) else { continue };
+        for (bi, b) in blocks.iter().enumerate().rev() {
+            if b.get("type").and_then(|t| t.as_str()) != Some("image_url") { continue; }
+            let n = inline_image_len(b);
+            if used + n <= MUSE_IMAGE_BUDGET_BYTES { used += n; keep.insert((mi, bi)); }
+        }
+    }
+    keep
+}
+
 fn build_muse_input(system: &str, messages: &serde_json::Value) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     if !system.is_empty() {
         out.push(json!({ "role": "system", "content": [ { "type": "input_text", "text": system } ] }));
     }
     let Some(arr) = messages.as_array() else { return out; };
-    for m in arr {
+    let keep_img = images_within_budget(arr);
+    // call_ids of function_call items emitted so far. A function_call_output whose
+    // call isn't in this window (history sliced mid-pair, e.g. the headless
+    // last-40 window, or a compacted chat) 400s with "No function call found for
+    // function call output with call_id" — drop it instead; the result text is
+    // already reflected in the assistant's later turns.
+    let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (mi, m) in arr.iter().enumerate() {
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
         let content = m.get("content").cloned().unwrap_or(json!(""));
         if role == "user" {
@@ -151,7 +188,7 @@ fn build_muse_input(system: &str, messages: &serde_json::Value) -> Vec<serde_jso
                 if !tool_blocks.is_empty() {
                     for b in tool_blocks {
                         let call_id = b.get("tool_use_id").and_then(|x| x.as_str()).unwrap_or("");
-                        if call_id.is_empty() { continue; }
+                        if call_id.is_empty() || !seen_calls.contains(call_id) { continue; }
                         let output = match b.get("content") {
                             Some(serde_json::Value::String(s)) => s.clone(),
                             Some(v) => flatten_text(v),
@@ -166,11 +203,14 @@ fn build_muse_input(system: &str, messages: &serde_json::Value) -> Vec<serde_jso
                     t != "text" && t != "input_text"
                 });
                 if has_media {
-                    let parts: Vec<serde_json::Value> = blocks.iter().filter_map(|b| {
+                    let parts: Vec<serde_json::Value> = blocks.iter().enumerate().filter_map(|(bi, b)| {
                         match b.get("type").and_then(|t| t.as_str()) {
                             Some("text") | Some("input_text") =>
                                 Some(json!({ "type": "input_text", "text": b.get("text").and_then(|t| t.as_str()).unwrap_or("") })),
                             Some("image_url") => {
+                                if inline_image_len(b) > 0 && !keep_img.contains(&(mi, bi)) {
+                                    return Some(json!({ "type": "input_text", "text": "[earlier image omitted to stay under the provider's upload limit — it was already seen; ask the user to re-attach if you need it again]" }));
+                                }
                                 let url = b.get("image_url").and_then(|i| i.get("url")).and_then(|u| u.as_str()).unwrap_or("");
                                 Some(json!({ "type": "input_image", "image_url": url }))
                             }
@@ -202,6 +242,7 @@ fn build_muse_input(system: &str, messages: &serde_json::Value) -> Vec<serde_jso
                     let name = blk.get("name").and_then(|x| x.as_str()).unwrap_or("");
                     let input = blk.get("input").cloned().unwrap_or(json!({}));
                     let args = if input.is_string() { input.as_str().unwrap_or("{}").to_string() } else { serde_json::to_string(&input).unwrap_or("{}".to_string()) };
+                    seen_calls.insert(id.to_string());
                     out.push(json!({ "type": "function_call", "call_id": id, "name": name, "arguments": args }));
                 }
                 continue;
@@ -214,6 +255,7 @@ fn build_muse_input(system: &str, messages: &serde_json::Value) -> Vec<serde_jso
                 for tc in tcs {
                     let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let f = tc.get("function").cloned().unwrap_or(json!({}));
+                    seen_calls.insert(id.to_string());
                     out.push(json!({
                         "type": "function_call", "call_id": id,
                         "name": f.get("name").and_then(|n| n.as_str()).unwrap_or(""),

@@ -62,8 +62,8 @@ pub fn tool_schemas() -> Vec<Value> {
             "input_schema": { "type": "object", "properties": { "project": proj, "time": { "type": "number", "description": "timeline seconds to look at" }, "times": { "type": "array", "items": { "type": "number" }, "description": "up to 4 times to see side by side" } }, "required": ["project"] } }),
         json!({ "name": "video_render", "description": "Export the project with a preset from composition.exports (by name) or an explicit {width,height,bitrate,codec:'h264'|'hevc'|'prores'}. Blocking; progress streams to the UI. Output lands in Video/<project>/renders/.",
             "input_schema": { "type": "object", "properties": { "project": proj, "preset": { "type": "string", "description": "preset name, e.g. landscape | vertical" }, "width": { "type": "integer" }, "height": { "type": "integer" }, "bitrate": { "type": "string" }, "codec": { "type": "string" }, "name": { "type": "string", "description": "output file stem" } }, "required": ["project"] } }),
-        json!({ "name": "video_audio_enhance", "description": "AUTOMATIC dialogue cleanup (local, nothing leaves the machine): DeepFilterNet3 neural voice isolation (optional one-time voice-model download, else a light FFT fallback) → voice EQ → loudness to -16 LUFS. No strength params — one master per source. Video sources produce a full-length .cleaned.mov proxy (picture stream-copied, cleaned audio padded to the video duration); audio-only sources produce a .cleaned.wav. Points the source clips' audioAsset at it. Blend original/cleaned live with audio.cleanMix (0..1, no re-clean needed).",
-            "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" } }, "required": ["project", "asset"] } }),
+        json!({ "name": "video_audio_enhance", "description": "AUTOMATIC dialogue cleanup (local, nothing leaves the machine): DeepFilterNet3 neural voice isolation (optional one-time voice-model download, else an FFT denoise fallback) → voice EQ → gentle compression → STATIC gain to -16 LUFS integrated + true-peak limiter (no gain riding, so room tone is never pumped up between phrases). One master per source asset. Video sources produce a full-length .cleaned.mov proxy (picture stream-copied); audio-only sources a .cleaned.wav. Pass `asset` to clean every clip of that source, or `clips` (timeline clip ids, linked partners follow) to clean ONLY those clips — each clip's audioAsset is pointed at the cleaned file. Blend original/cleaned live with audio.cleanMix (0..1, no re-clean needed).",
+            "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string", "description": "source asset id — cleans all its clips" }, "clips": { "type": "array", "items": { "type": "string" }, "description": "timeline clip ids to clean instead (selected clips)" } }, "required": ["project"] } }),
         json!({ "name": "video_voice_install", "description": "One-time self-contained setup for neural voice isolation: provisions its own uv toolchain + Python + DeepFilterNet3 weights under runtime/voice (nothing re-used from MCP). Progress streams to the UI. Required once before video_audio_enhance can use the neural engine; without it cleanup uses the light FFT fallback.",
             "input_schema": { "type": "object", "properties": { "project": proj }, "required": ["project"] } }),
         json!({ "name": "video_voice_status", "description": "Is the neural voice-isolation model installed? Returns {installed, engine} — engine is 'neural' when ready, else 'fallback'.",
@@ -214,7 +214,9 @@ pub fn run(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, name: &str, 
         }
         "video_audio_enhance" => {
             let p = project.ok_or("project is required")?;
-            enhance(app, broker, agent_id, &p, &s("asset").ok_or("asset is required")?)?
+            let clips: Vec<String> = input.get("clips").and_then(|c| c.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+            if !clips.is_empty() { enhance_clips(app, broker, agent_id, &p, &clips)? }
+            else { enhance(app, broker, agent_id, &p, &s("asset").ok_or("asset (or clips) is required")?)? }
         }
         "video_voice_install" => {
             let p = project.ok_or("project is required")?;
@@ -796,10 +798,16 @@ fn register_generated(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, p
 //   2) neural isolation via DeepFilterNet3 (uv, one-time model download);
 //      falls back to a LIGHT static FFT touch (nr=6, no tracking) when the
 //      voice model isn't installed — keeps body, never robotic
-//   3) voice EQ: highpass 70 + low-mid warmth + presence (static read of the
+//   3) voice EQ: highpass 80 + lowpass 12k + presence trim (static read of the
 //      reference AutoEQ curve; adaptive per-voice EQ is approximated)
-//   4) dynamic loudnorm to -16 LUFS — this IS the leveler (slow gain riding,
-//      not peak normalize)
+//   4) gentle 2:1 compression (leveling that only pulls loud words DOWN — it
+//      can never lift room tone) → measured STATIC gain to -16 LUFS integrated
+//      → true-peak limiter at -1.5 dBTP.
+//      NOT single-pass loudnorm: its dynamic mode is a gain rider that drove
+//      noise-only stretches (the head of a take, pauses) UP toward target and
+//      ducked when speech started — heard as "raised noise floor + reverb
+//      swelling until I talk" (Mason 09-08). Static gain keeps the floor where
+//      the isolation stage left it.
 // Blend happens LIVE at preview/export via audio.cleanMix (0..1 equal-power
 // crossfade) — no re-clean needed to change the amount.
 // ---------------------------------------------------------------------------
@@ -934,7 +942,7 @@ pub fn voice_install(app: &tauri::AppHandle, _broker: &Broker, _agent_id: &str, 
         return Err(format!("voice-model download failed: {}", e.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")));
     }
     std::fs::write(dir.join("READY"), "DeepFilterNet3\n").map_err(|e| e.to_string())?;
-    Ok(json!({ "ok": true, "engine": "neural", "note": "voice model installed — Clean A-roll now uses neural isolation" }))
+    Ok(json!({ "ok": true, "engine": "neural", "note": "voice model installed — Clean Audio now uses neural isolation" }))
 }
 
 pub fn voice_status(app: &tauri::AppHandle, _broker: &Broker, _agent_id: &str, _project: &str) -> Result<Value, String> {
@@ -958,9 +966,25 @@ fn df_isolate(app: &tauri::AppHandle, project: &str, wav: &Path, out: &Path) -> 
     cmd.output().map(|o| o.status.success() && out.is_file()).unwrap_or(false)
 }
 
-pub fn enhance(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, asset: &str) -> Result<Value, String> {
+/// Integrated loudness (LUFS) of a file via a loudnorm measurement pass.
+/// Returns None when unmeasurable (silence / parse failure) so the caller can
+/// skip the gain stage instead of guessing.
+fn measure_lufs(ff: &Path, wav: &Path) -> Option<f64> {
+    let o = Command::new(ff).args(["-hide_banner", "-nostats", "-i"]).arg(wav)
+        .args(["-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json", "-f", "null", "-"]).output().ok()?;
+    let err = String::from_utf8_lossy(&o.stderr);
+    let start = err.rfind('{')?;
+    let v: Value = serde_json::from_str(err[start..].trim()).ok()?;
+    let i: f64 = v.get("input_i")?.as_str()?.parse().ok()?;
+    if !i.is_finite() || i < -70.0 { return None; }
+    Some(i)
+}
+
+/// Clean ONE source asset: isolate → EQ → compress → static gain → limit, mux
+/// a full-length proxy for video sources, register "<name> (cleaned)" (replacing
+/// any stale one). Returns (cleaned asset, engine). Does NOT touch clips.
+fn enhance_source(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, a: &Asset) -> Result<(Asset, &'static str), String> {
     let proj = video::project_dir(broker, agent_id, project)?;
-    let a = find_asset(broker, agent_id, project, Some(asset), true)?;
     if !a.has_audio { return Err("asset has no audio".into()); }
     let abs = video::asset_abs(broker, agent_id, project, &a)?;
     let ff = video::ffmpeg(app)?;
@@ -979,21 +1003,35 @@ pub fn enhance(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project:
     if neural && df_isolate(app, project, &wav, &iso) {
         engine = "neural";
     } else {
-        // fallback: highpass + very light afftdn (nr=6, floor -35, no tracking)
-        // — removes hiss/HVAC, keeps voice body; never robotic.
+        // fallback (no voice model): highpass + tracked FFT denoise (nr=12, floor
+        // follows the take) + a SOFT 2:1 downward expander below -42 dBFS so room
+        // tone between phrases drops another ~12 dB without gating consonants.
+        // Measured on pink-noise-over-speech: head −48→−69 dB, speech untouched.
         let o = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&wav)
-            .args(["-af", "highpass=f=70,afftdn=nr=6:nf=-35", "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&iso)
+            .args(["-af", "highpass=f=70,afftdn=nr=12:nf=-40:tn=1,agate=threshold=0.008:ratio=2:attack=8:release=250:knee=4", "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&iso)
             .output().map_err(|e| format!("ffmpeg: {e}"))?;
         if !o.status.success() { return Err(format!("fallback isolate failed: {}", String::from_utf8_lossy(&o.stderr).chars().take(300).collect::<String>())); }
     }
     let _ = std::fs::remove_file(&wav);
-    // 3) voice EQ + 4) loudnorm to -16 LUFS (the leveler: dynamic gain riding)
-    // EQ is a static read of the reference AutoEQ curve: warmth + presence.
-    let eq = "highpass=f=80,lowpass=f=12000,treble=g=-4:f=3000"; // dark natural voice curve, measured against the Auphonic reference (equalizer is a no-op in this ffmpeg build, treble/lowpass verified by band);
+    // 3) voice EQ + gentle compression. EQ is a static read of the reference
+    // AutoEQ curve (equalizer is a no-op in this ffmpeg build; treble/lowpass
+    // verified by band). acompressor 2:1 above -24 dB only pulls peaks DOWN.
+    let eq = "highpass=f=80,lowpass=f=12000,treble=g=-4:f=3000";
+    let comp_fx = "acompressor=threshold=-24dB:ratio=2:attack=15:release=250:knee=6:makeup=1";
+    let shaped = proj.join(".cache").join(format!("{}.eq.wav", a.id));
     let o = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&iso)
-        .args(["-af", &format!("{eq},loudnorm=I=-16:TP=-1.5:LRA=11"), "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&out)
+        .args(["-af", &format!("{eq},{comp_fx}"), "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&shaped)
         .output().map_err(|e| format!("ffmpeg: {e}"))?;
     let _ = std::fs::remove_file(&iso);
+    if !o.status.success() { return Err(format!("local enhance failed: {}", String::from_utf8_lossy(&o.stderr).chars().take(400).collect::<String>())); }
+    // 4) STATIC gain to -16 LUFS integrated (measured, one number for the whole
+    // take — no gain riding, so pauses/room tone stay exactly as quiet relative
+    // to the voice as the isolation left them) + true-peak limiter at -1.5 dBTP.
+    let gain_db = measure_lufs(&ff, &shaped).map(|i| (-16.0 - i).clamp(-20.0, 30.0)).unwrap_or(0.0);
+    let o = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&shaped)
+        .args(["-af", &format!("volume={gain_db:.2}dB,alimiter=limit=-1.5dB:attack=5:release=50:level=false"), "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&out)
+        .output().map_err(|e| format!("ffmpeg: {e}"))?;
+    let _ = std::fs::remove_file(&shaped);
     if !o.status.success() { return Err(format!("local enhance failed: {}", String::from_utf8_lossy(&o.stderr).chars().take(400).collect::<String>())); }
     // Full-length proxy: video sources get a .cleaned.mov (picture stream-copied,
     // cleaned audio padded to the full video duration + AAC for browser playback)
@@ -1041,7 +1079,13 @@ pub fn enhance(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project:
         }
     }
     let na = register_generated(app, broker, agent_id, project, &rep_path, &format!("{} (cleaned)", a.name), rep_kind)?;
-    // point every clip of the source asset at the cleaned replacement
+    Ok((na, engine))
+}
+
+/// Clean every clip of `asset` (the whole-source button / agent default).
+pub fn enhance(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, asset: &str) -> Result<Value, String> {
+    let a = find_asset(broker, agent_id, project, Some(asset), true)?;
+    let (na, engine) = enhance_source(app, broker, agent_id, project, &a)?;
     let mut comp = load_comp(broker, agent_id, project)?;
     let mut n = 0;
     for c in comp.clips.iter_mut().filter(|c| c.asset == a.id && c.kind == "video") { c.audio_asset = na.id.clone(); n += 1; }
@@ -1049,6 +1093,41 @@ pub fn enhance(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project:
     comp.audio.clean_mix = 1.0;
     save_comp(broker, agent_id, project, &comp)?;
     Ok(json!({ "ok": true, "engine": engine, "asset": na.id, "file": na.rel, "clipsUpdated": n, "cleanMix": 1.0 }))
+}
+
+/// Clean ONLY the given timeline clips (the user's selection). Linked V+A
+/// partners follow. Each distinct source asset is mastered once, then only the
+/// targeted clips get their audioAsset pointed at it — other clips of the same
+/// source keep playing the original.
+pub fn enhance_clips(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, ids: &[String]) -> Result<Value, String> {
+    let assets = video::load_manifest(broker, agent_id, project).assets;
+    let mut comp = load_comp(broker, agent_id, project)?;
+    let raw: Vec<Value> = comp.clips.iter().map(|c| serde_json::to_value(c).unwrap_or(json!({}))).collect();
+    let targets = linked_ids(&raw, &ids.iter().cloned().collect::<HashSet<String>>());
+    let mut sources: Vec<String> = vec![];
+    for c in comp.clips.iter().filter(|c| targets.contains(&c.id) && c.kind == "video") {
+        if !sources.contains(&c.asset) { sources.push(c.asset.clone()); }
+    }
+    if sources.is_empty() { return Err("no audible clips in the selection".into()); }
+    let mut cleaned: HashMap<String, (Asset, &'static str)> = HashMap::new();
+    for sid in &sources {
+        let a = assets.iter().find(|a| &a.id == sid).ok_or_else(|| format!("clip references unknown asset {sid}"))?;
+        if !a.has_audio { continue; }
+        cleaned.insert(sid.clone(), enhance_source(app, broker, agent_id, project, a)?);
+    }
+    if cleaned.is_empty() { return Err("selected clips have no audio".into()); }
+    // reload: enhance_source rewrote the manifest (and may have removed stale cleaned assets)
+    let mut comp2 = load_comp(broker, agent_id, project)?;
+    std::mem::swap(&mut comp, &mut comp2);
+    let mut n = 0;
+    for c in comp.clips.iter_mut().filter(|c| targets.contains(&c.id) && c.kind == "video") {
+        if let Some((na, _)) = cleaned.get(&c.asset) { c.audio_asset = na.id.clone(); n += 1; }
+    }
+    comp.audio.enhance = "neural".into();
+    comp.audio.clean_mix = 1.0;
+    save_comp(broker, agent_id, project, &comp)?;
+    let engine = if cleaned.values().all(|(_, e)| *e == "neural") { "neural" } else { "fallback" };
+    Ok(json!({ "ok": true, "engine": engine, "assets": cleaned.values().map(|(a, _)| json!({ "asset": a.id, "file": a.rel })).collect::<Vec<_>>(), "clipsUpdated": n, "cleanMix": 1.0 }))
 }
 // ---------------------------------------------------------------------------
 // Matte (RobustVideoMatting via uv) — experimental

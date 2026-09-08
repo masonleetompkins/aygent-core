@@ -304,7 +304,15 @@ export function AudioPanel() {
   const [voice, setVoice] = useState<{ installed: boolean; engine: string } | null>(null);
   const [installing, setInstalling] = useState(false);
   const aroll = s.comp.clips.find((c) => c.track === "V1" && c.type === "video");
+  // Target = the SELECTED audible clips (one or many; linked V+A partners
+  // follow in the tool). Nothing selected → every clip of the A-roll source.
+  const selClips = s.comp.clips.filter((c) => s.selection.includes(c.id) && (c.type === "video" || c.type === "audio") && c.asset);
+  const selTarget = selClips.length > 0;
+  const audible = s.comp.clips.filter((c) => c.type === "video" && !c.hidden && c.asset);
+  const cleanedIds = new Set(audible.filter((c) => c.audioAsset && s.assets.some((x) => x.id === c.audioAsset)).map((c) => c.id));
   const cleaned = aroll && s.assets.find((x) => x.id === aroll.audioAsset);
+  const anyCleaned = cleanedIds.size > 0;
+  const processing = !!s.toolProgress && /clean/i.test(s.toolProgress);
   const tracks = Array.from(new Set(s.comp.clips.filter((c) => (c.type === "audio" || c.type === "video") && !c.hidden).map((c) => c.track))).sort();
   const mix = a.cleanMix ?? 1;
 
@@ -314,9 +322,11 @@ export function AudioPanel() {
     return () => { live = false; };
   }, [s.project]);
 
-  async function cleanup(assetId: string) {
-    const r = await runTool<{ asset: string; engine: string }>("video_audio_enhance", { asset: assetId }, "cleaning dialogue…");
-    if (r) toast(`dialogue cleaned (${r.engine === "neural" ? "neural isolation" : "light cleanup"}) — drag Cleanup amount to blend`, "ok");
+  async function cleanup() {
+    const input = selTarget ? { clips: selClips.map((c) => c.id) } : aroll ? { asset: aroll.asset } : null;
+    if (!input) return;
+    const r = await runTool<{ engine: string; clipsUpdated: number }>("video_audio_enhance", input, "cleaning dialogue…");
+    if (r) toast(`${r.clipsUpdated} clip${r.clipsUpdated === 1 ? "" : "s"} cleaned (${r.engine === "neural" ? "neural isolation" : "light cleanup"}) — drag Cleanup amount to blend`, "ok");
   }
   async function installVoice() {
     setInstalling(true);
@@ -340,9 +350,12 @@ export function AudioPanel() {
           <Slider label="Cleanup amount" value={mix} min={0} max={1} step={0.01} fmt={(v) => (v <= 0.001 ? "original" : v >= 0.999 ? "full clean" : `${Math.round(v * 100)}%`)} onChange={(v) => setPath("audio.cleanMix", v)} />
           <p className="ve-hint">Live blend — no re-clean needed. 0% is the original mic, 100% the isolated voice, 50/50 a true half mix. Preview + export match.</p>
           <div className="ve-btn-row">
-            <button className="ve-btn sm primary" disabled={!aroll || !!s.toolProgress} onClick={() => aroll && void cleanup(aroll.asset)}><Sparkles size={12} /> {cleaned ? "Re-clean A-roll" : "Clean A-roll"}</button>
+            <button className={`ve-btn sm primary${processing ? " busy" : ""}`} disabled={(!aroll && !selTarget) || !!s.toolProgress} onClick={() => void cleanup()} title={selTarget ? `Clean the ${selClips.length} selected clip${selClips.length === 1 ? "" : "s"}` : "Clean every clip of the A-roll source (select clips to clean only those)"}>
+              {processing ? <RefreshCw size={12} className="ve-spin" /> : <Sparkles size={12} />} {processing ? "Processing…" : selTarget ? `Clean Audio (${selClips.length} selected)` : "Clean Audio"}
+            </button>
           </div>
-          {cleaned && <p className="ve-hint">A-roll plays <b>{cleaned.name}</b> blended at {Math.round(mix * 100)}% (preview + export). Clear via Inspector → Audio asset.</p>}
+          <p className="ve-hint">{selTarget ? "Cleans only the selected clips (linked video+audio pairs move together). Deselect to clean the whole A-roll." : "Select one or more clips on the timeline to clean just those; with nothing selected the whole A-roll is cleaned."}</p>
+          {anyCleaned && <p className="ve-hint">{cleanedIds.size} of {audible.length} clips play cleaned audio{cleaned ? <> (<b>{cleaned.name}</b>)</> : null} blended at {Math.round(mix * 100)}% (preview + export). Clear via Inspector → Audio asset.</p>}
         </Section>
         <Section title="Tracks" right={<Volume2 size={13} style={{ color: "var(--text-faint)" }} />}>
           {tracks.length === 0 && <p className="ve-hint">No audible tracks yet — import media first.</p>}

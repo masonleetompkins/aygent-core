@@ -287,3 +287,8 @@
 /* ---- audio cleanup buttons: wrap inside the 300px panel, never spill ---- */
 .ve-btn-row { display: flex; gap: 8px; flex-wrap: wrap; min-width: 0; }
 .ve-btn-row > .ve-btn { flex: 1 1 120px; min-width: 0; justify-content: center; }
+
+/* Busy primary button (Clean Audio while processing): stays fully legible —
+   disabled dims to .4 which read as "broken" — and spins its icon. */
+.ve button.ve-btn.busy:disabled { opacity: 1; cursor: progress; }
+.ve .ve-spin { animation: ve-spin .9s linear infinite; }
