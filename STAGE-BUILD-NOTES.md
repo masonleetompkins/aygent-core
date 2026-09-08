@@ -856,3 +856,24 @@ debug-assert that migrations end at `SCHEMA_VERSION`.
 2. **Clean A-roll** — succeeds, toast names the engine; produces `.cleaned.mov`.
 3. **Blend live** — drag Cleanup amount 0/50/100 → preview follows instantly, no re-clean; export matches.
 4. **Natural sound** — full clean sounds like close-mic'd voice, not robotic.
+
+---
+
+# Stage build — 2026-09-08 ~11:05 PDT — v1.0.16 (self-contained voice toolchain)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg).
+
+**Commit (on `staging`, pushed):** `74a9223` — fix(video): voice download provisions its own uv toolchain (self-contained, no MCP needed)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41440568 bytes), mtime **Sep 8 11:04**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **17978743 bytes (~17.1 MB)**, mtime **Sep 8 11:05**
+
+**What changed:** Download-voice-model button provisions everything itself under `runtime/voice/` (pinned uv 0.12.2 tarball via async reqwest + system tar, managed Python, DF3 weights). Zero MCP dependency, zero new cargo deps. `voice_status` also reports `uv` presence.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~3 min)
+1. **Download voice model** — works standalone with Blender MCP off; toolchain + model land under `runtime/voice/`.
+2. **Clean A-roll** — neural isolation, toast names engine.
+3. **Blend live** — Cleanup amount 0/50/100, preview + export match.
