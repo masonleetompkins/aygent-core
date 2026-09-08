@@ -720,7 +720,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // ---- CONTEXT METER + $ COST (Mason, this session) -----------------------
   // The model's context window + price, fetched Rust-side (pricing.rs). Refetch
   // when the selected model changes so the % + cost track the real model.
-  type ModelInfo = { context_tokens: number; known: boolean; price: { input: number; output: number; cache_read: number; cache_write: number } };
+  type ModelInfo = { context_tokens: number; known: boolean; price: ModelPrice };
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
   useEffect(() => {
     let cancelled = false;
@@ -756,12 +756,9 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       // saved msgs may predate contextInput; fall back to input for those.
       const ci = (u.contextInput ?? 0) || (u.input + u.cacheRead + u.cacheWrite) || u.input || 0;
       if (ci > 0) lastContextInput = ci;
-      if (price) {
-        // Cost bills each component at its own rate: fresh input, output, cache
-        // read (cheap), cache creation. This is per-TURN and summed across turns.
-        cost += (u.input * price.input + u.output * price.output
-              + u.cacheRead * price.cache_read + u.cacheWrite * price.cache_write) / 1_000_000;
-      }
+      // Cost bills each component at its own rate (see turnCost) — per-TURN,
+      // summed across turns. The 5m/1h split wins over the folded total.
+      if (price) cost += turnCost(u, price);
     };
     for (const m of msgs) if (m.role === "assistant" && m.usage) add(m.usage);
     if (liveUsage) { add(liveUsage); }
@@ -792,7 +789,25 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // Bar width: show at least a 4% sliver once there's ANY usage, so a small fill
   // is visibly "a little" rather than an empty (broken-looking) bar.
   const ctxBarWidth = ctxTokens > 0 ? Math.max(4, ctxFrac * 100) : 0;
-  const ctxColor = ctxPct >= 90 ? "var(--danger)" : ctxPct >= 75 ? "#d98a1f" : "var(--text-muted)";
+  // ACCENT PILL (Mason 09-08): the meter is an outline pill in the accent
+  // color that fills with the accent as context climbs. Above 90% it turns
+  // red — unless the accent IS red, in which case it turns yellow so the
+  // warning stays visible against a red UI.
+  const accentIsRed = (() => {
+    try {
+      const cs = getComputedStyle(document.documentElement);
+      const raw = (cs.getPropertyValue("--accent").trim() || "").toLowerCase();
+      const m = /^#([0-9a-f]{6})$/.exec(raw);
+      if (!m) return /red|e0533d|d64545|ff5c5c|c14b3f/.test(raw);
+      const n = parseInt(m[1], 16);
+      const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+      return r > 150 && r - g > 60 && r - b > 60;
+    } catch { return false; }
+  })();
+  const ctxOver = ctxPct >= 90;
+  const ctxWarn = !ctxOver && ctxPct >= 75;
+  const ctxFill = ctxOver ? (accentIsRed ? "#eab308" : "var(--danger)") : "var(--accent)";
+  const ctxColor = ctxOver ? (accentIsRed ? "#eab308" : "var(--danger)") : ctxWarn ? "#d98a1f" : "var(--text-muted)";
 
   // COMPACT: summarize the model-facing history so a long chat can keep going.
   const [compacting, setCompacting] = useState(false);
@@ -846,9 +861,13 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6, flexWrap: "wrap" }}>
                 <div title={`${ctxTokens.toLocaleString()} / ${ctxWindow.toLocaleString()} tokens in context`}
                   style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  {/* mini bar */}
-                  <div style={{ width: 64, height: 6, borderRadius: 999, background: "var(--line)", overflow: "hidden" }}>
-                    <div style={{ width: `${ctxBarWidth}%`, height: "100%", background: ctxColor, transition: "width 200ms" }} />
+                  {/* accent outline pill: fills with the accent as context climbs */}
+                  <div style={{
+                    width: 64, height: 14, borderRadius: 999, overflow: "hidden", position: "relative",
+                    border: `var(--border-width) solid ${ctxOver ? ctxFill : "var(--accent)"}`,
+                    background: "transparent",
+                  }}>
+                    <div style={{ width: `${ctxBarWidth}%`, height: "100%", background: ctxFill, transition: "width 200ms" }} />
                   </div>
                   <span style={{ fontSize: 12, color: ctxColor, fontVariantNumeric: "tabular-nums", fontWeight: ctxPct >= 75 ? 600 : 400 }}>
                     {fmtTokens(ctxTokens)} / {fmtTokens(ctxWindow)} tokens
@@ -874,7 +893,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
             )}
             {/* At-the-wall warning: if context is nearly full, say so plainly. */}
             {!!folder && !!convId && ctxWindow > 0 && ctxPct >= 85 && (
-              <div style={{ marginTop: 6, fontSize: 12, color: "var(--danger)", maxWidth: 420 }}>
+              <div style={{ marginTop: 6, fontSize: 12, color: ctxOver ? ctxFill : "var(--danger)", maxWidth: 420 }}>
                 Context is nearly full ({fmtTokens(ctxTokens)} / {fmtTokens(ctxWindow)} tokens) — Compact now to avoid losing your next long reply.
               </div>
             )}
@@ -1256,11 +1275,20 @@ function fmtTokens(n: number): string {
   return (m < 10 ? m.toFixed(m % 1 === 0 ? 0 : 1) : m.toFixed(0)) + "M";
 }
 
-/** Per-turn $ cost from a usage record + the model's price ($/Mtok). 0 if no price. */
-function turnCost(u: TurnUsage, price?: { input: number; output: number; cache_read: number; cache_write: number }): number {
+export type ModelPrice = { input: number; output: number; cache_read: number; cache_write: number; cache_write_5m?: number; cache_write_1h?: number };
+
+/** Per-turn $ cost from a usage record + the model's price ($/Mtok). 0 if no price.
+ *  OpenCode parity: five separate buckets (fresh in / out / cache read /
+ *  cache write / reasoning-at-out-rate — here reasoning rides inside output).
+ *  When the 5m/1h write split is present it wins over the folded total —
+ *  never bill both (that would double-count the writes). */
+export function turnCost(u: TurnUsage, price?: ModelPrice): number {
   if (!price) return 0;
-  return (u.input * price.input + u.output * price.output
-        + u.cacheRead * price.cache_read + u.cacheWrite * price.cache_write) / 1_000_000;
+  const w5 = u.cacheWrite5m ?? 0, w1 = u.cacheWrite1h ?? 0;
+  const cw = (w5 + w1 > 0)
+    ? w5 * (price.cache_write_5m ?? price.cache_write) + w1 * (price.cache_write_1h ?? price.cache_write)
+    : u.cacheWrite * price.cache_write;
+  return (u.input * price.input + u.output * price.output + u.cacheRead * price.cache_read + cw) / 1_000_000;
 }
 
 /** HH:MM:SS in the user's locale, 24h so it's a fixed width in the margin. */
@@ -1273,7 +1301,7 @@ function fmtClock(ms?: number): string {
 
 /** Fixed-width gutter stamp. Reserves its width even when empty so bubbles
  *  don't shift horizontally between stamped and unstamped messages. */
-function Stamp({ at, usage, price }: { at?: number; usage?: TurnUsage; price?: { input: number; output: number; cache_read: number; cache_write: number } }) {
+function Stamp({ at, usage, price }: { at?: number; usage?: TurnUsage; price?: ModelPrice }) {
   // Under the timestamp: tokens used + $ cost for THIS turn (Mason, this
   // session). Tokens = input+output for the turn; cost from the model price.
   const cost = usage ? turnCost(usage, price) : 0;
@@ -1299,7 +1327,7 @@ function Stamp({ at, usage, price }: { at?: number; usage?: TurnUsage; price?: {
   );
 }
 
-function Bubble({ m, agentId, price, local }: { m: Msg; agentId?: string | null; price?: { input: number; output: number; cache_read: number; cache_write: number }; local?: boolean }) {
+function Bubble({ m, agentId, price, local }: { m: Msg; agentId?: string | null; price?: ModelPrice; local?: boolean }) {
   const isUser = m.role === "user";
   const memory = isUser && m.role === "user" ? m.memory : undefined;
   // The stamp lives OUTSIDE the bubble column, in the margin: to the LEFT of

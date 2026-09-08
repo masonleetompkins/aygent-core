@@ -391,7 +391,7 @@ pub async fn meta_stream_turn<F: FnMut(StreamEvent)>(
     // USAGE (context meter + $ cost): the Responses API reports token counts on
     // the response.completed frame (response.usage). Muse price is $0 in the
     // catalog, but the token counts still drive the context-fill meter.
-    let (mut u_in, mut u_out, mut u_cr): (u64, u64, u64) = (0, 0, 0);
+    let (mut u_in, mut u_out, mut u_cr, mut u_cw): (u64, u64, u64, u64) = (0, 0, 0, 0);
     let mut saw_done = false;
 
     let mut stream = resp.bytes_stream();
@@ -480,6 +480,9 @@ pub async fn meta_stream_turn<F: FnMut(StreamEvent)>(
                         if let Some(i) = us.get("input_tokens").and_then(|x| x.as_u64()) { u_in = i; }
                         if let Some(o) = us.get("output_tokens").and_then(|x| x.as_u64()) { u_out = o; }
                         if let Some(c) = us.get("input_tokens_details").and_then(|d| d.get("cached_tokens")).and_then(|x| x.as_u64()) { u_cr = c; }
+                        // OpenCode parity: the Responses API also reports cache WRITE
+                        // tokens — bill them at the write rate, not full input price.
+                        if let Some(w) = us.get("input_tokens_details").and_then(|d| d.get("cache_write_tokens")).and_then(|x| x.as_u64()) { u_cw = w; }
                     }
                     // Fallback: if no text deltas arrived, recover text + calls
                     // from the completed output[].
@@ -500,8 +503,8 @@ pub async fn meta_stream_turn<F: FnMut(StreamEvent)>(
                             }
                         }
                     }
-                    let fresh_in = u_in.saturating_sub(u_cr);
-                    on_event(StreamEvent::Usage { input: fresh_in, output: u_out, cache_read: u_cr, cache_write: 0, context_window: 0 });
+                    let fresh_in = u_in.saturating_sub(u_cr).saturating_sub(u_cw);
+                    on_event(StreamEvent::Usage { input: fresh_in, output: u_out, cache_read: u_cr, cache_write: u_cw, cache_write_5m: 0, cache_write_1h: 0, context_window: 0 });
                     on_event(StreamEvent::Done { stop_reason: stop_reason.clone() });
                     saw_done = true;
                 }

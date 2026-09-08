@@ -145,12 +145,17 @@ export type TurnItem =
  *  context-window fill; the others sum across rounds. */
 /** Token accounting for a turn.
  *  - `input`/`cacheRead`/`cacheWrite`/`output`: components for COST (summed as
- *    appropriate across the turn's tool-loop rounds).
+ *    appropriate across the turn's tool-loop rounds). `input` is FRESH-only —
+ *    OpenCode parity: cache tokens are billed in their own buckets, never at
+ *    input price (the backend subtracts them before emitting Usage).
+ *  - `cacheWrite5m`/`cacheWrite1h`: Anthropic's split cache-creation buckets
+ *    (different list rates). When present they win over folded `cacheWrite`;
+ *    `cache_write` from the backend is ALWAYS the total (back-compat).
  *  - `contextInput`: the TOTAL input the model processed on the LATEST round =
  *    input + cache_read + cache_creation. THIS is the real context-window fill
  *    (with prompt caching on, plain `input` is tiny because most tokens are
  *    billed as cache read/creation — that was the "2 / 1M" bug). */
-export type TurnUsage = { input: number; output: number; cacheRead: number; cacheWrite: number; contextInput: number; contextWindow?: number };
+export type TurnUsage = { input: number; output: number; cacheRead: number; cacheWrite: number; cacheWrite5m?: number; cacheWrite1h?: number; contextInput: number; contextWindow?: number };
 
 export type TurnState = {
   status: "idle" | "running";
@@ -231,9 +236,10 @@ function appendText(t: TurnState, chunk: string): TurnState {
  *  token count (the current context-window fill, since each round re-sends the
  *  whole history); output + cache SUM across the turn's rounds. */
 function accumulateUsage(t: TurnState, m: any): TurnState {
-  const prev = t.usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextInput: 0 };
+  const prev = t.usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite5m: 0, cacheWrite1h: 0, contextInput: 0 };
   const nIn = Number(m.input ?? 0), nOut = Number(m.output ?? 0);
   const nCr = Number(m.cache_read ?? m.cacheRead ?? 0), nCw = Number(m.cache_write ?? m.cacheWrite ?? 0);
+  const nCw5 = Number(m.cache_write_5m ?? m.cacheWrite5m ?? 0), nCw1 = Number(m.cache_write_1h ?? m.cacheWrite1h ?? 0);
   const win = Number(m.context_window ?? m.contextWindow ?? 0) || prev.contextWindow || undefined;
   // CONTEXT FILL = the TOTAL input the model saw on THIS round: fresh input +
   // cache reads + cache creation. With caching on, `input` alone is tiny; the
@@ -248,6 +254,8 @@ function accumulateUsage(t: TurnState, m: any): TurnState {
     output: prev.output + nOut,
     cacheRead: nCr || prev.cacheRead,
     cacheWrite: prev.cacheWrite + nCw,
+    cacheWrite5m: (prev.cacheWrite5m ?? 0) + nCw5,
+    cacheWrite1h: (prev.cacheWrite1h ?? 0) + nCw1,
     contextInput: roundContextInput || prev.contextInput,
     contextWindow: win,
   } };

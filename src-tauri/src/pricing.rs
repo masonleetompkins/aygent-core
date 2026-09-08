@@ -18,6 +18,15 @@
 // local path derives its window from the GGUF filename, not a price list.
 
 /// A model's cost profile, USD per 1,000,000 tokens.
+///
+/// OpenCode parity (session.ts getUsage + calculateCost): cost is billed in
+/// FIVE separate buckets — fresh input, output, cache read, cache write, and
+/// reasoning (at the output rate) — each at its own rate, never blended. The
+/// one structural difference: Anthropic splits cache CREATION into 5-minute
+/// vs 1-hour buckets (different list rates), so `cache_write` is the folded
+/// total (back-compat) while `cache_write_5m` / `cache_write_1h` carry the
+/// split when the provider reports it. Bill the split when present, else the
+/// folded total — never both.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct Price {
     /// Fresh input tokens (prompt), per Mtok.
@@ -27,26 +36,38 @@ pub struct Price {
     /// Cache-READ input tokens, per Mtok (Anthropic bills ~10% of input).
     pub cache_read: f64,
     /// Cache-WRITE (creation) input tokens, per Mtok (Anthropic ~125% of input).
+    /// Folded total of both buckets; used only when the split is absent.
     pub cache_write: f64,
+    /// 5-minute cache-creation bucket, per Mtok (Anthropic = 125% of input).
+    pub cache_write_5m: f64,
+    /// 1-hour cache-creation bucket, per Mtok (Anthropic = 2x the 5m rate).
+    pub cache_write_1h: f64,
 }
 
 impl Price {
     const fn simple(input: f64, output: f64) -> Self {
-        // Default Anthropic cache economics: read = 10% of input, write = 125%.
-        Price { input, output, cache_read: input * 0.1, cache_write: input * 1.25 }
+        // Default Anthropic cache economics: read = 10% of input, 5m write =
+        // 125%, 1h write = 2x the 5m rate (Anthropic list prices).
+        Price { input, output, cache_read: input * 0.1, cache_write: input * 1.25, cache_write_5m: input * 1.25, cache_write_1h: input * 2.5 }
     }
     const fn zero() -> Self {
-        Price { input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0 }
+        Price { input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0, cache_write_5m: 0.0, cache_write_1h: 0.0 }
     }
     /// Dollar cost of one turn's token counts. Cache reads/writes are billed at
-    /// their own rates; `input` here is FRESH (non-cached) input only.
+    /// their own rates; `input` here is FRESH (non-cached) input only. When the
+    /// 5m/1h split is present it wins over the folded `cache_write` total.
     #[allow(dead_code)]
-    pub fn cost(&self, input: u64, output: u64, cache_read: u64, cache_write: u64) -> f64 {
+    pub fn cost(&self, input: u64, output: u64, cache_read: u64, cache_write: u64, cache_write_5m: u64, cache_write_1h: u64) -> f64 {
         let m = 1_000_000.0;
+        let cw = if cache_write_5m + cache_write_1h > 0 {
+            (cache_write_5m as f64) * self.cache_write_5m / m + (cache_write_1h as f64) * self.cache_write_1h / m
+        } else {
+            (cache_write as f64) * self.cache_write / m
+        };
         (input as f64) * self.input / m
             + (output as f64) * self.output / m
             + (cache_read as f64) * self.cache_read / m
-            + (cache_write as f64) * self.cache_write / m
+            + cw
     }
 }
 
@@ -109,10 +130,10 @@ pub fn lookup(model_id: &str) -> ModelInfo {
         // CONTRIBUTOR id (discounted) MUST match before the generic muse-spark.
         //   Standard (muse-spark-1.1/-1.2): cached 0.15 / in 1.25 / out 4.25
         //   Contributor (muse-spark-1.2-contributor): cached 0.002 / in 0.10 / out 0.20
-        ("muse-spark-1.2-contributor", 1000 * K, Price { input: 0.10, output: 0.20, cache_read: 0.002, cache_write: 0.0 }),
-        ("contributor",                1000 * K, Price { input: 0.10, output: 0.20, cache_read: 0.002, cache_write: 0.0 }),
-        ("muse-spark",                 1000 * K, Price { input: 1.25, output: 4.25, cache_read: 0.15, cache_write: 0.0 }),
-        ("muse",                       1000 * K, Price { input: 1.25, output: 4.25, cache_read: 0.15, cache_write: 0.0 }),
+        ("muse-spark-1.2-contributor", 1000 * K, Price { input: 0.10, output: 0.20, cache_read: 0.002, cache_write: 0.0, cache_write_5m: 0.0, cache_write_1h: 0.0 }),
+        ("contributor",                1000 * K, Price { input: 0.10, output: 0.20, cache_read: 0.002, cache_write: 0.0, cache_write_5m: 0.0, cache_write_1h: 0.0 }),
+        ("muse-spark",                 1000 * K, Price { input: 1.25, output: 4.25, cache_read: 0.15, cache_write: 0.0, cache_write_5m: 0.0, cache_write_1h: 0.0 }),
+        ("muse",                       1000 * K, Price { input: 1.25, output: 4.25, cache_read: 0.15, cache_write: 0.0, cache_write_5m: 0.0, cache_write_1h: 0.0 }),
         ("llama",                       128 * K, Price::zero()),
     ];
 
@@ -155,6 +176,21 @@ mod tests {
         assert_eq!(contrib.price.output, 0.20, "contributor output");
         assert_eq!(contrib.price.cache_read, 0.002, "contributor cached");
         assert_eq!(contrib.context_tokens, 1_000_000, "contributor window");
+    }
+    #[test]
+    fn split_write_buckets_win_over_folded_total() {
+        // Anthropic Sonnet: 5m @ 3.75, 1h @ 7.50. A turn with 1k fresh in,
+        // 1k out, 10k read, 2k 5m-write, 1k 1h-write must bill the split,
+        // not the folded total (which would double-count the writes).
+        let p = lookup("claude-sonnet-4-5").price;
+        let split = p.cost(1_000, 1_000, 10_000, 3_000, 2_000, 1_000);
+        let expect = (1_000.0 * 3.0 + 1_000.0 * 15.0 + 10_000.0 * 0.3
+            + 2_000.0 * 3.75 + 1_000.0 * 7.5) / 1_000_000.0;
+        assert!((split - expect).abs() < 1e-9, "split billing: {split} vs {expect}");
+        // No split reported -> folded total at the blended write rate.
+        let folded = p.cost(1_000, 1_000, 10_000, 3_000, 0, 0);
+        let expect2 = (1_000.0 * 3.0 + 1_000.0 * 15.0 + 10_000.0 * 0.3 + 3_000.0 * 3.75) / 1_000_000.0;
+        assert!((folded - expect2).abs() < 1e-9, "folded billing: {folded} vs {expect2}");
     }
     #[test]
     fn anthropic_fallback_window_is_decimal() {

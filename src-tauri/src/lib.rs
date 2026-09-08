@@ -1575,7 +1575,7 @@ async fn chat_model_info(provider: Option<String>, model: String) -> serde_json:
     let mut context_tokens = table.context_tokens;
     let mut known = table.known;
     let (mut p_in, mut p_out) = (table.price.input, table.price.output);
-    let (mut p_cr, mut p_cw) = (table.price.cache_read, table.price.cache_write);
+    let (mut p_cr, mut p_cw, mut p_cw5, mut p_cw1) = (table.price.cache_read, table.price.cache_write, table.price.cache_write_5m, table.price.cache_write_1h);
     let mut display_name = model.clone();
 
     // DYNAMIC window (the fix): fetch the REAL context window from the provider
@@ -1595,7 +1595,7 @@ async fn chat_model_info(provider: Option<String>, model: String) -> serde_json:
                 if let Ok((ctx, pin, pout)) = openai_provider::openrouter_model_info(&key, &model).await {
                     if ctx > 0 { context_tokens = ctx; known = true; }
                     // OpenRouter publishes real price; use it over the table when present.
-                    if pin > 0.0 { p_in = pin; p_cr = pin * 0.1; p_cw = pin * 1.25; }
+                    if pin > 0.0 { p_in = pin; p_cr = pin * 0.1; p_cw = pin * 1.25; p_cw5 = pin * 1.25; p_cw1 = pin * 2.5; }
                     if pout > 0.0 { p_out = pout; }
                 }
             }
@@ -1619,7 +1619,7 @@ async fn chat_model_info(provider: Option<String>, model: String) -> serde_json:
         "context_tokens": context_tokens,
         "known": known,
         "display_name": display_name,
-        "price": { "input": p_in, "output": p_out, "cache_read": p_cr, "cache_write": p_cw }
+        "price": { "input": p_in, "output": p_out, "cache_read": p_cr, "cache_write": p_cw, "cache_write_5m": p_cw5, "cache_write_1h": p_cw1 }
     });
     if let Ok(mut cache) = MODEL_INFO_CACHE.lock() {
         cache.insert(cache_key, (std::time::Instant::now(), val.clone()));
