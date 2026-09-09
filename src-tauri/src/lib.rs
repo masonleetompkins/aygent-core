@@ -2009,6 +2009,38 @@ fn chat_attach_file(
     std::fs::write(&abs, &bytes).map_err(|e| format!("write attachment: {e}"))?;
     Ok(rel)
 }
+/// DIFF VIEW (Mason 09-09): snapshot a file's CURRENT content (jailed read)
+/// BEFORE the agent overwrites it, so the chat can render a streaming
+/// side-by-side diff (old on the left vs the new content arriving live in
+/// ToolUseDelta). Capped at 32k chars — `truncated` says so. Missing files
+/// (brand-new writes) and unreadable/binary files report `exists: false` /
+/// `binary: true` so the UI falls back to the plain code view instead of a
+/// bogus all-green diff.
+#[tauri::command]
+fn tool_file_before(
+    broker: tauri::State<'_, Arc<Broker>>,
+    agent_id: String,
+    path: String,
+) -> Result<serde_json::Value, String> {
+    use std::io::Read;
+    // Same scope-key rule as every other file tool (per-agent scope,
+    // "default" only if unregistered — see exec_tool_cfg).
+    let agent_id: &str = if broker.root_for(&agent_id).is_ok() { &agent_id } else { "default" };
+    match broker.resolve_and_open(agent_id, &path, broker::Mode::Read) {
+        Ok(mut f) => {
+            let mut s = String::new();
+            match f.read_to_string(&mut s) {
+                Ok(_) => {
+                    let truncated = s.len() > 32_768;
+                    if truncated { s.truncate(32_768); }
+                    Ok(serde_json::json!({ "exists": true, "content": s, "truncated": truncated, "binary": false }))
+                }
+                Err(_) => Ok(serde_json::json!({ "exists": true, "content": "", "truncated": false, "binary": true })),
+            }
+        }
+        Err(_) => Ok(serde_json::json!({ "exists": false, "content": "", "truncated": false, "binary": false })),
+    }
+}
 
 /// STOP BUTTON: the UI calls this when the user clicks Stop mid-turn. `channel`
 /// is the SAME per-conversation event channel id the Chat pane already passes
@@ -6048,6 +6080,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             whisper::transcribe_audio_b64,
             chat_attach_file,
+            tool_file_before,
             agent_stop,
             remote_cmds::remote_status,
             remote_cmds::remote_pair,

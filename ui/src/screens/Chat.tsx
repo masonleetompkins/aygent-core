@@ -2,7 +2,7 @@
 // calls appear as inline cards as they fire, multi-turn history persists.
 // Consumes normalized StreamEvents from the Rust streaming agent loop over a
 // Tauri event channel. Falls back to a thinking animation if no text streams.
-import { useEffect, useRef, useState, useLayoutEffect } from "react";
+import { useEffect, useMemo, useRef, useState, useLayoutEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Button } from "../components/ui";
 import { Icon, type IconName } from "../components/Icon";
@@ -11,8 +11,9 @@ import { useSparkBlobUrl, useSparkThemeSync, isSparkStateMsg } from "../lib/spar
 import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion, stopTurn } from "../lib/turns";
 import type { TurnItem, TurnUsage } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
+import { DiffView, DiffCounts, countDiff, isDiffable } from "../components/DiffView";
 
-type ToolLine = { name: string; path: string; ok?: boolean; detail?: string; summary?: string; body?: string; running?: boolean; spark?: { slug: string; title: string; html: string } };
+type ToolLine = { name: string; path: string; ok?: boolean; detail?: string; summary?: string; body?: string; running?: boolean; spark?: { slug: string; title: string; html: string }; before?: { exists: boolean; content: string; truncated: boolean; binary: boolean } | null };
 type Msg =
   // `at` = epoch ms. For a USER message it's when they hit send; for an
   // ASSISTANT message it's when the turn COMPLETED (set at finalize, not at
@@ -996,7 +997,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
             <Bubble agentId={agentId} local={isLocal} m={{
               role: "assistant",
               text: turn.liveText,
-              tools: turn.liveTools.map((t) => ({ name: t.name, path: t.path ?? "", ok: t.ok, detail: t.detail, summary: t.summary, body: t.body, running: t.running, spark: t.spark })),
+              tools: turn.liveTools.map((t) => ({ name: t.name, path: t.path ?? "", ok: t.ok, detail: t.detail, summary: t.summary, body: t.body, running: t.running, spark: t.spark, before: t.before ?? null })),
               timeline: turn.timeline,
               streaming: true,
             }} />
@@ -1453,23 +1454,35 @@ function ToolCard({ t, agentId }: { t: ToolLine; agentId?: string | null }) {
   // SPARKS: a spark_preview call renders as a live inline mini-app, not a
   // collapsed code card.
   if (t.spark && t.spark.html) return <SparkCard spark={t.spark} agentId={agentId} />;
+  // DIFF VIEW (Mason 09-09): code-editing calls render a streaming side-by-side
+  // diff (old left/red, new right/green) instead of the plain code dump. The
+  // before-snapshot lands async via tool_file_before; until then the card falls
+  // back to the plain body view, then swaps to the diff live.
+  const diffable = isDiffable(t.name, t.before ?? null);
+  const showDiff = diffable && !!t.body;
+  const counts = useMemo(
+    () => (showDiff ? countDiff(t.before!, t.body!) : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [showDiff, t.before?.content, t.body],
+  );
   const [userOpen, setUserOpen] = useState<boolean | null>(null); // null = no manual toggle yet
   const pending = t.ok === undefined;
-  // Live behavior (Mason 08-03): the RUNNING card auto-expands so you watch the
-  // work happen; it auto-collapses when done. A manual click wins over both.
-  const open = userOpen !== null ? userOpen : (!!t.running && !!t.body);
+  // Diff cards default OPEN (streams as the model writes); plain cards keep the
+  // old behavior (auto-expand while running, collapse when done). Manual wins.
+  const open = userOpen !== null ? userOpen : showDiff ? true : (!!t.running && !!t.body);
   const setOpen = (f: (o: boolean) => boolean) => setUserOpen(f(open));
   const paneRef = useRef<HTMLDivElement | null>(null);
   // Follow the stream: keep the pane pinned to the bottom while content grows
-  // during a live call. Finished cards never yank the reader's scroll.
+  // during a live call. Finished cards never yank the reader's scroll. Diff
+  // panes are excluded — pinning to the bottom would hide the changed lines.
   useEffect(() => {
-    if (open && t.running && paneRef.current) paneRef.current.scrollTop = paneRef.current.scrollHeight;
-  }, [open, t.running, t.body]);
+    if (open && t.running && !showDiff && paneRef.current) paneRef.current.scrollTop = paneRef.current.scrollHeight;
+  }, [open, t.running, t.body, showDiff]);
   const color = pending ? "var(--text-muted)" : t.ok ? "var(--ok)" : "var(--danger)";
   // A path is "revealable" once the call succeeded and points at a real file
   // (list_files on '.' or a refused call has nothing useful to reveal).
   const revealable = t.ok === true && !!t.path && t.path !== ".";
-  const expandable = !!(t.body || t.detail);
+  const expandable = !!(t.body || t.detail || showDiff);
 
   async function reveal() {
     try { await invoke("reveal_in_finder", { path: t.path }); } catch { /* jail refused — ignore */ }
@@ -1510,6 +1523,7 @@ function ToolCard({ t, agentId }: { t: ToolLine; agentId?: string | null }) {
             }}
           >{t.path}</button>
         )}
+        {counts && <DiffCounts add={counts.add} del={counts.del} />}
         <span style={{ flexShrink: 0 }}>{pending ? "…" : t.ok ? "✓" : "✗"}</span>
       </div>
       {/* Collapsed error hint: the first line of a failure is visible WITHOUT
@@ -1527,9 +1541,11 @@ function ToolCard({ t, agentId }: { t: ToolLine; agentId?: string | null }) {
           maxHeight: 300, overflow: "auto", padding: "8px 10px",
           color: "var(--text)", background: "var(--surface)",
         }}>
-          {t.body && (
+          {showDiff ? (
+            <DiffView before={t.before!} after={t.body!} running={t.running} />
+          ) : (t.body && (
             <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 12 }}>{t.body}</pre>
-          )}
+          ))}
           {t.body && t.detail && <div style={{ height: 8 }} />}
           {t.detail && (
             <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 12, opacity: 0.85 }}>{t.detail}</pre>

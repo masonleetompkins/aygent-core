@@ -32,6 +32,7 @@ export type ToolCard = {
   body?: string;        // expandable content: written file text, full command, fetched URL…
   id?: string;          // tool_use id — routes streaming deltas to this card
   rawArgs?: string;     // accumulating partial-JSON args while streaming
+  before?: { exists: boolean; content: string; truncated: boolean; binary: boolean } | null; // DIFF VIEW (Mason 09-09): file content BEFORE a write_file/github_write_file overwrote it (fetched jailed via tool_file_before at ToolUse time, so the diff streams live against the arriving new content). null = not a code edit / fetch failed.
   spark?: { slug: string; title: string; html: string }; // SPARKS: inline mini-app preview payload (rendered as a sandboxed iframe in Chat)
 };
 
@@ -40,7 +41,7 @@ export type ToolCard = {
 // string (i.e. the code being written, live); anything else shows raw args.
 // Cheap incremental extraction — find `"content":"` then unescape what follows.
 function liveBodyFromPartialArgs(name: string, raw: string): string | undefined {
-  if (name === "write_file" || name === "generate_pdf") {
+  if (name === "write_file" || name === "github_write_file" || name === "generate_pdf") {
     const key = '"content":';
     const at = raw.indexOf(key);
     if (at < 0) return undefined;
@@ -100,6 +101,12 @@ export function describeToolUse(name: string, input: any): { summary: string; bo
       return { summary: `✎ ${inp.path ?? "?"} · ${lines} line${lines === 1 ? "" : "s"}`, body: capBody(content) };
     }
     case "read_file": return { summary: `📄 ${inp.path ?? "?"}` };
+    case "github_write_file": {
+      const content = typeof inp.content === "string" ? inp.content : "";
+      const lines = content ? content.split("\n").length : 0;
+      const where = [inp.owner, inp.repo].filter(Boolean).join("/");
+      return { summary: `✎ ${inp.path ?? "?"}${where ? ` (${where})` : ""} · ${lines} line${lines === 1 ? "" : "s"}`, body: capBody(content) };
+    }
     case "list_files": return { summary: `📁 ${inp.path ?? "."}` };
     case "rename_file": return { summary: `➜ ${inp.from ?? "?"} → ${inp.to ?? "?"}` };
     case "delete_file": return { summary: `🗑 ${inp.path ?? "?"}` };
@@ -177,6 +184,8 @@ type AgentSlot = {
 };
 
 const slots = new Map<string, AgentSlot>();
+const slotAgents = new Map<string, string>(); // store slot key -> agentId (for jailed before-fetches)
+const beforeFetched = new Set<string>();      // tool_use ids already snapshotted (fetch once)
 const listeners = new Set<() => void>();
 
 function emit() { listeners.forEach((l) => l()); }
@@ -303,11 +312,49 @@ function upsertToolUse(cur: AgentSlot, m: any): void {
     if (tools[i].id === m.id && tools[i].running) {
       cur.turn = { ...patchTool(cur.turn, i, { path: m.input?.path, summary: d.summary, body: d.body, spark: d.spark, rawArgs: undefined }), status: "running" };
       emit();
+      void maybeFetchBefore(cur, m.id, m.name, m.input);
       return;
     }
   }
   cur.turn = { ...appendTool(cur.turn, { id: m.id, name: m.name, path: m.input?.path, running: true, summary: d.summary, body: d.body, spark: d.spark }), status: "running" };
   emit();
+  void maybeFetchBefore(cur, m.id, m.name, m.input);
+}
+
+// DIFF VIEW (Mason 09-09): for code-editing calls, snapshot the file's CURRENT
+// (jailed) content BEFORE the write executes — ToolUse fires before the agent
+// loop runs the tool, so this is always the true "before". Patched onto the
+// card whenever it lands (streaming or done); the diff renders old-vs-live.
+const CODE_EDIT_TOOLS = new Set(["write_file", "github_write_file"]);
+function slotKeyOf(cur: AgentSlot): string | undefined {
+  for (const [k, s] of slots) if (s === cur) return k;
+  return undefined;
+}
+async function maybeFetchBefore(cur: AgentSlot, id: string, name: string, input: any): Promise<void> {
+  if (!CODE_EDIT_TOOLS.has(name) || !id || beforeFetched.has(id)) return;
+  const path = input?.path;
+  if (typeof path !== "string" || !path) return;
+  const key = slotKeyOf(cur);
+  const agentId = (key && slotAgents.get(key)) || (key && key.includes("::") ? key.split("::")[0] : key);
+  if (!agentId) return;
+  beforeFetched.add(id);
+  try {
+    const r = await invoke<{ exists: boolean; content: string; truncated: boolean; binary: boolean }>("tool_file_before", { agentId, path });
+    const s = slot(key!);
+    const tools = s.turn.liveTools;
+    for (let i = tools.length - 1; i >= 0; i--) {
+      if (tools[i].id === id) {
+        // GitHub edits have no jailed local file - a missing local path is NOT a
+        // new file, so skip the diff and keep the plain code view.
+        const usable = !r.binary && (name === "write_file" || r.exists);
+        s.turn = patchTool(s.turn, i, { before: usable
+          ? { exists: r.exists, content: r.content ?? "", truncated: !!r.truncated, binary: false }
+          : null });
+        break;
+      }
+    }
+    emit();
+  } catch { /* snapshot failed — card falls back to the plain code view */ }
 }
 
 /** Subscribe to one agent's live turn state. Re-renders when it changes. */
@@ -356,6 +403,7 @@ function inboxChannel(agentId: string): string { return `inbox-${agentId}`; }
 
 async function attachHeadless(agentId: string) {
   if (headlessUnlisten.has(agentId)) return;
+  slotAgents.set(agentId, agentId);
   const un = await listen<any>(inboxChannel(agentId), (ev) => {
     const m = ev.payload; if (!m) return;
     const cur = slot(agentId);
@@ -448,6 +496,7 @@ export async function stopTurn(channel: string): Promise<boolean> {
  */
 export async function runTurn(a: RunArgs): Promise<unknown[]> {
   const key = a.slot ?? a.agentId;
+  slotAgents.set(key, a.agentId);
   const s = slot(key);
   // Reset this agent's live turn.
   s.turn = { status: "running", liveText: "", liveTools: [], timeline: [] };
