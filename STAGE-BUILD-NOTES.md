@@ -1,3 +1,36 @@
+# Stage build — 2026-09-08 ~21:15 PDT — v1.0.16 (streaming diff view + drag-drop attach)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, dead-code warnings only (same set). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `4dde151` — feat(chat): drag-and-drop files to attach (drop anywhere on chat column)
+- `c65c897` — feat(chat): streaming side-by-side diff view for code-editing tool calls
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41476008 bytes), mtime **Sep 8 21:12**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **17999711 bytes (~17.2 MB)**, mtime **Sep 8 21:12**
+- verified: `tool_file_before` in shipped binary, `Drop files to attach` + BEFORE/AFTER in shipped `ui/dist` JS
+
+**What changed:**
+1. **Streaming diff view** — `write_file` / `github_write_file` cards render a side-by-side diff: BEFORE (old, deletions red) left, AFTER (new, additions green) right, with line numbers, `+N`/`-N` counts in the card bar (real counts from an LCS line diff). Streams live as the model writes; default open, click the bar to collapse. Backend: new `tool_file_before` command snapshots jailed file content BEFORE the write (ToolUse fires pre-exec, so it is the true before); `turns.ts` patches it onto the card. New files show all-green AFTER; GitHub edits (no jailed local file) and binary/missing snapshots fall back to the plain code view. Counts exact, render capped at 400 rows. `github_write_file` also gets a proper `summary` + live `content` streaming (was a raw-args dump).
+2. **Drag-and-drop attach** — drop files anywhere on the chat column to attach (same path as the + button, same chips). Dashed accent overlay says "Drop files to attach" while dragging. Blocked when chat is blocked (no folder/key), same as +.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~6 min)
+1. **Diff** — ask agent to edit a file in its folder → card opens a BEFORE/AFTER diff with real +N/-N in the bar; collapse via the bar; new file = all-green AFTER.
+2. **Drag-drop** — drag a file onto chat → chip appears, send → model sees it.
+3. **Timer/bins (carry-over)** — task_continue pops the 1/3/5/10/15 picker; Media toggles grid/list with bins.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
 # Stage build — 2026-09-08 ~14:14 PDT — v1.0.16 (media bins + Clean Audio count + timer picker)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0, dead-code warnings only (same set). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
