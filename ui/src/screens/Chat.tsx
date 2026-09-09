@@ -141,6 +141,39 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // ---- Task #5: attachments (+ button). ANY file becomes agent context ----
   const [attachments, setAttachments] = useState<Array<{ name: string; rel?: string; pending: boolean }>>([]);
   const fileRef = useRef<HTMLInputElement>(null);
+  // DRAG-AND-DROP (Mason 09-09): drop files anywhere on the chat column to
+  // attach them — same path as the + button (onFilesPicked), so behavior is
+  // identical. dragDepth keeps the overlay from flickering across children.
+  const [dragOver, setDragOver] = useState(false);
+  const dragDepth = useRef(0);
+  function dropHasFiles(e: React.DragEvent) {
+    try { return Array.from(e.dataTransfer.types || []).includes("Files"); } catch { return false; }
+  }
+  function onDropZoneDragEnter(e: React.DragEvent) {
+    if (blocked || !agentId || !dropHasFiles(e)) return;
+    e.preventDefault();
+    dragDepth.current += 1;
+    setDragOver(true);
+  }
+  function onDropZoneDragOver(e: React.DragEvent) {
+    if (blocked || !agentId || !dropHasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  }
+  function onDropZoneDragLeave() {
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDragOver(false);
+  }
+  function onDropZoneDrop(e: React.DragEvent) {
+    dragDepth.current = 0;
+    setDragOver(false);
+    if (blocked || !agentId) return;
+    const files = e.dataTransfer.files;
+    if (!files || files.length === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    void onFilesPicked(files);
+  }
   async function onFilesPicked(files: FileList | null) {
     if (!files || !agentId) return;
     for (const file of Array.from(files)) {
@@ -829,7 +862,26 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   }
 
   return (
-    <div style={{ display: "flex", height: "100%", minHeight: 0, gap: "var(--space-4)", position: "relative" }}>
+    <div
+      onDragEnter={onDropZoneDragEnter}
+      onDragOver={onDropZoneDragOver}
+      onDragLeave={onDropZoneDragLeave}
+      onDrop={onDropZoneDrop}
+      style={{ display: "flex", height: "100%", minHeight: 0, gap: "var(--space-4)", position: "relative" }}>
+      {dragOver && (
+        <div style={{
+          position: "absolute", inset: 0, zIndex: 30, pointerEvents: "none",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          background: "color-mix(in srgb, var(--accent) 12%, transparent)",
+          border: "2px dashed var(--accent)", borderRadius: "var(--radius-card)",
+        }}>
+          <span style={{
+            fontSize: 15, fontWeight: 700, color: "var(--text)",
+            background: "var(--surface)", border: "var(--border-width) solid var(--line)",
+            borderRadius: 999, padding: "8px 16px", boxShadow: "var(--elevation)",
+          }}>Drop files to attach</span>
+        </div>
+      )}
       {/* MAIN CHAT COLUMN. In multi-pane mode it flexes to share width; solo it
          stays centered. height:100% + flex so the input pins to the bottom. */}
       {/* WIDTH (Mason 08-04): the old `maxWidth: 720` left ~25% dead space on
