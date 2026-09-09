@@ -36,6 +36,9 @@ pub struct AgentProfile {
     #[serde(default)]
     pub provider: String,
 
+    #[serde(default)]
+    pub model_variant: String,
+
     #[serde(default = "default_context_mode")]
     pub context_mode: String, // "isolated" | "shared:<poolId>"
     #[serde(default)]
@@ -137,6 +140,7 @@ pub fn create(
         folder_path: folder_path.to_string(),
         model: model.to_string(),
         provider: provider.to_string(),
+        model_variant: String::new(),
         context_mode: if context_mode.is_empty() { default_context_mode() } else { context_mode.to_string() },
         system_prompt: system_prompt.to_string(),
         created_at: now(),

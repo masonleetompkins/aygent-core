@@ -4,7 +4,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { Icon, type IconName } from "./Icon";
 
 export type ScreenId =
-  | "dashboard" | "chat" | "browser" | "agents" | "tools" | "skills" | "sparks" | "mcp" | "settings" | "scheduler" | "connections" | "savepoints";
+  | "dashboard" | "chat" | "browser" | "agents" | "tools" | "skills" | "sparks" | "video" | "mcp" | "settings" | "scheduler" | "connections" | "savepoints";
 
 export type NavGroup = "agent" | "global";
 export interface NavItem { id: ScreenId; label: string; icon: IconName; enabled: boolean; group: NavGroup; }
@@ -23,6 +23,7 @@ export const NAV: NavItem[] = [
   { id: "tools", label: "Tools", icon: "tools", enabled: true, group: "agent" },
   { id: "skills", label: "Skills", icon: "sparkles", enabled: true, group: "agent" },
   { id: "sparks", label: "Sparks", icon: "bolt", enabled: true, group: "agent" },
+  { id: "video", label: "Video", icon: "video", enabled: true, group: "agent" },
   { id: "scheduler", label: "Scheduler", icon: "scheduler", enabled: true, group: "agent" },
   { id: "savepoints", label: "Save Points", icon: "savepoints", enabled: true, group: "agent" },
   { id: "agents", label: "Agents", icon: "agents", enabled: true, group: "global" },

@@ -11,6 +11,7 @@ import { Browser } from "./screens/Browser";
 import { SavePoints } from "./screens/SavePoints";
 import { Tools, Skills } from "./screens/Tools";
 import { Sparks } from "./screens/Sparks";
+import { Video } from "./screens/Video";
 import { McpConnections } from "./screens/McpConnections";
 import { applyAppIcon } from "./lib/appIcon";
 import { Scheduler } from "./screens/Scheduler";
@@ -18,6 +19,7 @@ import { Connections } from "./screens/Connections";
 import { Onboarding } from "./screens/Onboarding";
 import { initTheme, saveTheme, type Mode } from "./lib/theme";
 import { startHeadlessWatcher } from "./lib/turns";
+import { ContinuePicker } from "./components/ContinuePicker";
 
 // Phase 1: app shell (sidebar nav + content pane) on the design system.
 
@@ -233,7 +235,7 @@ export function App() {
         refreshKey={rosterRefresh}
       />
       <Sidebar active={screen} onSelect={setScreen} showBrowser={browserInstalled} />
-      <div style={{ flex: 1, height: "100vh", minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column" }}>
+      <div style={{ flex: 1, height: "100vh", minHeight: 0, minWidth: screen === "video" ? 0 : undefined, overflowY: "auto", display: "flex", flexDirection: "column" }}>
         {/* The persistent daemon-status strip was dev telemetry — removed. The
            connection state now lives as a quiet sanity-check in Settings.
            full-height flex column so height:100% children (Chat) can fill the
@@ -242,7 +244,7 @@ export function App() {
            children actually shrink below their content size — without it, a
            child measures its frozen intrinsic size (the Browser pane was stuck
            at its large-window rect because this chain couldn't shrink). */}
-        <div style={{ padding: "28px 32px", flex: 1, minHeight: 0, minWidth: 0, display: "flex", flexDirection: "column" }}>
+        <div style={{ padding: screen === "video" ? 0 : "28px 32px", flex: 1, minHeight: 0, minWidth: 0, display: "flex", flexDirection: "column", overflow: screen === "video" ? "hidden" : undefined }}>
           {screen === "dashboard" && (
             <Dashboard agentId={activeAgent?.id ?? null} agentName={activeAgent?.name} folder={folder} onNavigate={(sc) => setScreen(sc as ScreenId)} />
           )}
@@ -280,10 +282,12 @@ export function App() {
           {screen === "tools" && <Tools folder={folder} agentId={activeAgent?.id ?? null} />}
           {screen === "skills" && <Skills folder={folder} agentId={activeAgent?.id ?? null} />}
           {screen === "sparks" && <Sparks agentId={activeAgent?.id ?? null} onNavigate={(sc) => setScreen(sc as ScreenId)} />}
+          {screen === "video" && <Video agentId={activeAgent?.id ?? null} agentName={activeAgent?.name} folder={folder} />}
           {screen === "mcp" && <McpConnections />}
           {screen === "browser" && <Browser />}
         </div>
       </div>
+      <ContinuePicker />
     </div>
   );
 }

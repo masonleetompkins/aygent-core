@@ -1,0 +1,59 @@
+<!doctype html>
+<!-- AYGENT Hyperframes captions overlay (transparent). Built by video_hyperframes.rs
+     (HYP_COMP) from this template file — never inline in module source.
+     Slots: {{CID}} {{DUR}} {{W}} {{H}} {{FPS}} {{Y_PX}} {{FONT_PX}} {{CAP_WEIGHT}} {{ACCENT}} {{MAXW_PCT}} {{LINES_JSON}} {{STYLE_NOTE}} -->
+<html lang="en"><head><meta charset="UTF-8"/>
+<meta name="viewport" content="width={{W}}, height={{H}}"/>
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:{{W}}px;height:{{H}}px;overflow:hidden;background:transparent}
+body{font-family:"SF Pro Display",-apple-system,"Helvetica Neue",sans-serif;-webkit-font-smoothing:antialiased}
+.ph{position:absolute;left:50%;transform:translate(-50%,-50%);white-space:nowrap;text-align:center;
+ font-weight:{{CAP_WEIGHT}};line-height:1.2;color:#fff;display:none;
+ text-shadow:0 4px 22px rgba(0,0,0,.65),0 1px 6px rgba(0,0,0,.5);top:{{Y_PX}}px;font-size:{{FONT_PX}}px}
+.wd{display:inline-block;opacity:0;transform:translateY(16px) scale(.86);white-space:nowrap}
+.wd.k{color:{{ACCENT}};text-shadow:0 0 26px {{ACCENT}},0 4px 20px rgba(0,0,0,.5)}
+</style></head>
+<body>
+<!-- STYLE-NOTE: {{STYLE_NOTE}} -->
+<div id="root" data-composition-id="{{CID}}" data-start="0" data-duration="{{DUR}}" data-width="{{W}}" data-height="{{H}}" data-fps="{{FPS}}">
+<div class="clip" data-start="0" data-duration="{{DUR}}" data-track-index="1" style="position:absolute;inset:0" id="stage"></div>
+</div>
+<script>
+const LINES = {{LINES_JSON}};
+const MAXW = {{W}} * {{MAXW_PCT}};
+window.__timelines = window.__timelines || {};
+const tl = gsap.timeline({paused:true});
+const stage = document.getElementById("stage");
+LINES.forEach((L, li) => {
+  const d = document.createElement("div");
+  d.className = "ph";
+  d.id = "L" + li;
+  L.words.forEach((w, wi) => {
+    const s = document.createElement("span");
+    s.className = "wd" + (w.key ? " k" : "");
+    s.textContent = w.w;
+    s.id = "L" + li + "w" + wi;
+    d.appendChild(s);
+    if (wi < L.words.length - 1) d.appendChild(document.createTextNode(" "));
+  });
+  stage.appendChild(d);
+  d.style.display = "block";
+  const wpx = d.scrollWidth;
+  if (wpx > MAXW) d.style.fontSize = Math.floor({{FONT_PX}} * MAXW / wpx) + "px";
+  d.style.display = "none";
+  tl.set("#L" + li, {display: "block", opacity: 1}, L.s);
+  L.words.forEach((w) => {
+    tl.to("#L" + li + "w" + w.i,
+      {opacity: 1, y: 0, scale: 1, duration: 0.17, ease: "back.out(2.2)"},
+      L.s + w.t);
+  });
+  const fade = Math.max(L.s + 0.5, L.e - 0.08);
+  tl.to("#L" + li, {opacity: 0, duration: 0.08}, fade);
+  tl.set("#L" + li, {display: "none"}, L.e);
+});
+tl.to({}, {duration: .01}, {{DUR}});
+window.__timelines["{{CID}}"] = tl;
+</script>
+</body></html>

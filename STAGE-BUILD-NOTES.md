@@ -1,3 +1,308 @@
+# Stage build — 2026-09-08 ~21:15 PDT — v1.0.16 (streaming diff view + drag-drop attach)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, dead-code warnings only (same set). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `4dde151` — feat(chat): drag-and-drop files to attach (drop anywhere on chat column)
+- `c65c897` — feat(chat): streaming side-by-side diff view for code-editing tool calls
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41476008 bytes), mtime **Sep 8 21:12**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **17999711 bytes (~17.2 MB)**, mtime **Sep 8 21:12**
+- verified: `tool_file_before` in shipped binary, `Drop files to attach` + BEFORE/AFTER in shipped `ui/dist` JS
+
+**What changed:**
+1. **Streaming diff view** — `write_file` / `github_write_file` cards render a side-by-side diff: BEFORE (old, deletions red) left, AFTER (new, additions green) right, with line numbers, `+N`/`-N` counts in the card bar (real counts from an LCS line diff). Streams live as the model writes; default open, click the bar to collapse. Backend: new `tool_file_before` command snapshots jailed file content BEFORE the write (ToolUse fires pre-exec, so it is the true before); `turns.ts` patches it onto the card. New files show all-green AFTER; GitHub edits (no jailed local file) and binary/missing snapshots fall back to the plain code view. Counts exact, render capped at 400 rows. `github_write_file` also gets a proper `summary` + live `content` streaming (was a raw-args dump).
+2. **Drag-and-drop attach** — drop files anywhere on the chat column to attach (same path as the + button, same chips). Dashed accent overlay says "Drop files to attach" while dragging. Blocked when chat is blocked (no folder/key), same as +.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~6 min)
+1. **Diff** — ask agent to edit a file in its folder → card opens a BEFORE/AFTER diff with real +N/-N in the bar; collapse via the bar; new file = all-green AFTER.
+2. **Drag-drop** — drag a file onto chat → chip appears, send → model sees it.
+3. **Timer/bins (carry-over)** — task_continue pops the 1/3/5/10/15 picker; Media toggles grid/list with bins.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
+# Stage build — 2026-09-08 ~14:14 PDT — v1.0.16 (media bins + Clean Audio count + timer picker)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, dead-code warnings only (same set). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `0286d79` — fix(video): Clean Audio counts audible clips only + holds Processing label for the whole run
+- `3d92aab` — feat(video): media list view with bins + task_continue timer picker
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41468536 bytes), mtime **Sep 8 14:14**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **18005722 bytes (~17.2 MB)**, mtime **Sep 8 14:14**
+
+**What changed:**
+1. **Media list view** — grid/list toggle in the panel header (persisted). List view has Premiere-style bins: create/rename/delete, collapse per bin, drag assets between bins or Move-to menu, Unfiled + Generated groups. Bins live in `assets.json` (`asset.folder` + `folders[]`), so clips never break. New agent tools `video_media_folder` / `video_media_move`; `video_project` + `video_load` expose folders.
+2. **Clean Audio count + Processing hold** — button counts distinct *audible* clips only (linked V+A pair = 1, silent clips skipped): one clip = "1 selected". A local flag holds "Processing…" for the entire run — no spinner flicker between phases.
+3. **task_continue timer picker** — parking the turn pops a chat modal: 1 / 3 / 5 / 10 / 15 min + "use suggestion". No answer in 3 min and the agent's `delay_secs` stands, so unattended builds never wedge. Picks queue if several fire at once. Modal mounts above Overlays so it's always clickable.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~8 min)
+1. **Media** — toggle grid/list; new bin; drag asset in; collapse, switch projects, collapse persists; Generated group shows cleaned proxies separately.
+2. **Audio** — select 1 clip → "Clean Audio (1 selected)"; run → "Processing…" holds at full opacity, toast names cleaned clips.
+3. **Timer** — trigger a task_continue → modal pops; pick 1 min; wake-up lands in ~1 min with the note attached.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
+# Stage build — 2026-09-08 v1.0.16 (Muse image budget + Clean Audio static master + selection cleanup) — 12:06 bundle
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `4845e11` — fix(muse): budget inline images + drop orphan function_call_output · fix(video): Clean Audio static-gain master, stronger fallback denoise, per-selection cleanup, button rename + Processing… state
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (binary 41.3 MB, 12:05)
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg` (~17.9 MB, 12:06)
+
+**What changed:**
+1. **Muse `400 Invalid upload request.`** — root cause (probed live against api.meta.ai with the real key): the endpoint rejects any request whose INLINE data-URL images total more than ~18 MB (7× a 1.9 MB screenshot OK, 8× → this 400, 9× → 413 payload_too_large). History resends every image every turn, so a chat with a few full-res screenshots was permanently dead — not a model bug. Fix in `meta_provider.rs`: `images_within_budget` keeps the NEWEST images whole up to `MUSE_IMAGE_BUDGET_BYTES` (12 MB); older ones degrade to a text stub. Model already saw them.
+2. **Muse `No function call found for function call output with call_id`** — the headless (task_continue) path sends a last-40 history window that can slice a call/result pair. `build_muse_input` now tracks emitted `function_call` ids and drops any `function_call_output` whose call isn't in the window.
+3. **Clean Audio master (the "raised noise floor / reverb swelling until I talk" bug)** — single-pass `loudnorm` is a gain RIDER: on a noise-only head it pushed gain toward -16 LUFS (pumping room tone + reverb) then ducked when speech arrived. Replaced with `acompressor` 2:1 above -24 dB (only pulls peaks down) → measured STATIC gain to -16 LUFS integrated (`measure_lufs`, loudnorm print_format=json) → `alimiter` -1.5 dBTP. A/B on the reference clip with a 4 s silent head: old chain widened head→speech by +17 dB of noise lift; new chain preserves the isolation's floor exactly.
+4. **Fallback denoise** (no voice model): `afftdn nr=12 nf=-40 tn=1` + `agate` 2:1 soft expander (threshold 0.008, knee 4). Pink-noise-over-speech test: head -48 → -69 dB, speech level unchanged.
+5. **Per-selection cleanup** — `video_audio_enhance` accepts `clips[]` (timeline ids; linked V+A partners follow via `linked_ids`). `enhance_source` masters each distinct source once; only targeted clips get `audioAsset` repointed. `asset` still cleans the whole source. `enhance_clips` reloads the composition after the manifest rewrite.
+6. **Audio panel button** — "Clean Audio" / "Clean Audio (N selected)" driven by `s.selection`; while running shows "Processing…" with a spinning icon at FULL opacity (`.ve-btn.busy:disabled { opacity: 1 }`) instead of the dim disabled look. Hint line explains select-to-target. Status line counts cleaned clips.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~8 min)
+1. **Muse** — in the long "Video Editor Dev" chat (527k tok, several screenshots) attach a new screenshot and send: reply streams, no 400. Trigger a task_continue wake-up: no call_id 400.
+2. **Audio** — import A-roll with a quiet head, Clean Audio (nothing selected): head stays quiet, no swell before speech; -16 LUFS integrated on export.
+3. **Selection** — select 2 clips → button reads "Clean Audio (2 selected)" → only those 2 play cleaned (Inspector → Audio asset), others original.
+4. **Button** — during processing reads "Processing…" with spinner, full opacity.
+
+---
+
+# Stage build — 2026-09-07 v1.0.16 (local audio suite + chat timeline + create polish)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `761a6bc` — feat(video): local audio suite (normalize+denoise, track trims, keyframe ducking) + chat timeline layout + create button polish
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app`
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg` (~17.2 MB)
+
+**What changed:**
+1. **Create button** — welcome form restyled: 38px input + button, 10px radius, disabled until a name is typed.
+2. **Auphonic removed** — credential command, keychain path, UI, and engine enum all gone. Audio is local-only.
+3. **Normalize** — `audio.normalizeDb` (default -3 dBFS): two-pass peak measure + gain with limiter safety on export; Clean A-roll writes it into the composition.
+4. **Noise reduction** — `audio.denoise` 0..1 slider (afftdn, strength-mapped) with **Preview denoise** rendering an 8s audition sample to .cache for listening before Clean A-roll commits.
+5. **No auto-ducking** — sidechain graph deleted; Duck defaults off; all audible clips mix flat. Quick action rewritten to manual keyframes.
+6. **Track volumes** — per-track trim sliders in the Audio panel (`audio.trackGain`), applied in export graph + preview.
+7. **Keyframe toggle** — dB lane under any audio/video track: click to add, drag (shift = fine), double-click to delete. Timeline seconds, shared by UI + agent (`update_clip {audio:{keyframes:[{t,db}]}}`), rendered + previewed by one shared evaluator.
+8. **Chat layout** — finished turns now persist + render the ordered timeline (text and tool cards interleaved as streamed) instead of regrouping all cards at the bottom.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~10 min)
+1. **Audio** — move denoise slider, Preview denoise, listen; Clean A-roll; export and confirm peaks + cleanup.
+2. **Tracks** — trim A2, toggle keyframes, add/drag a diamond, export with the dip.
+3. **Chat** — long agent turn keeps streamed order after finishing.
+4. **Create** — welcome form: button disabled until typed, creates cleanly.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
+# Stage build — 2026-09-07 ~09:02 PDT — v1.0.16 (review feedback round 2)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `66b0031` — feat(video): review UX — static note header, Apply Feedback button, gapless audio handoff
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41553704 bytes), mtime **Sep 7 09:02**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **18013969 bytes (~17.2 MB)**, mtime **Sep 7 09:02**
+
+**What changed (feedback round):**
+1. **Inspector: Title unlinked** — review notes show a static "Review note · time range" header instead of the linked Title field. The Feedback textarea is the single editor (timeline labels + tooltips read from it).
+2. **Apply Feedback button** — sticky footer at the bottom of the Inspector (Scene view + any selection) while open R1 notes exist. One click flushes the save, sends the apply prompt with all open notes + timestamps through the shared agent path, and flips the dock to the Agent tab. Button shows the open-note count, disables with "Working…" mid-turn.
+3. **Agent send path shared** — new `sendVideoPrompt`/`stopVideoTurn` in AgentDock; dock composer + Stop delegate to it (same context, history, compact, live-timeline reload lifecycle). Dead code removed.
+4. **Gapless audio handoff** — outgoing audible elements keep a ≤350 ms tail past each cut until every audible owner under the playhead is confirmed rolling (unpaused, buffered, on-position); tail runs before mute is applied so cuts never mute the cover early. Pre-roll warms every incoming clip: exact-arrival play with room, seek-parked hold-at-head for clips near source 0.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA for this build (~8 min)
+1. **Note header** — select an R1 note → header reads "Review note · range", no Title input; editing Feedback updates the lane label.
+2. **Apply Feedback** — with 2+ open notes, Inspector footer shows "Apply Feedback (2)" → click → dock flips to Agent, turn runs, notes resolve to hidden.
+3. **Audio** — play across 3+ cuts → no ~1 s silence at clip starts; pause/resume still frame-accurate.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
+# Stage build — 2026-09-07 ~06:17 PDT — v1.0.16 (review lane + agent vision)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `da012a7` — feat(video): review lane (R1 notes) + agent canvas vision (video_look)
+- `fa5ad78` — chore: bump version 1.0.15 → 1.0.16 (review lane + agent vision)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41,553,704 bytes), mtime **Sep 7 06:17**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **18,013,736 bytes (~17.2 MB)**, mtime **Sep 7 06:17**
+
+**What changed:**
+1. **Review mode** — third tool button (💬, `R`) next to Select/Razor. Entering Review reveals the **R1 lane** on top; it stays visible while notes exist. Click-drag on R1 drops a timestamped note (plain click = 2s note); Inspector's **Feedback for the agent** section edits text + resolved state. Notes never touch renders (excluded from duration, visuals, audio; razor/close-gaps skip them).
+2. **Agent vision** — new `video_look {project, time|times}` tool renders the real canvas (grade + LUT + overlays) at any timecode(s, max 4) and the model **sees the frames as images** in its next message — wired on Anthropic (merged into tool_result content), OpenAI/OpenRouter (image_url passthrough), and Meta (input_image translation) loops, interactive + headless. First frame also lands in the Video tab preview. Delete spent frames with `delete_file` on `Video/<project>/.cache/frame-*.jpg`.
+3. **Agent sees feedback three ways** — `video_project` exposes `reviewNotes`/`reviewNotesResolved`, every dock message carries open notes inline, and tool instructions say to read/act/resolve them (resolve = `video_edit update_clip {hidden:true}`).
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA for this build (~10 min)
+1. **Review** — open a project, hit `R`, drag on the R1 lane → note appears, type feedback in Inspector → agent dock message shows the note; ask agent to act → it resolves via `hidden:true`.
+2. **Vision** — ask agent "look at 12s and tell me what you see" → `video_look` runs, reply references the actual frame; first frame shows in Video tab preview.
+3. **Cleanup** — `delete_file` on a `frame-*.jpg` → gone; export unaffected.
+4. **No render pollution** — export with open notes → notes absent from output, duration unchanged.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
+---
+
+# Stage build — 2026-09-04 ~23:02 PDT — v1.0.15 (Spark variant knob)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `3767917` — feat(agents): per-agent model variant knob (Muse Spark reasoning effort); v1.0.15
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41,284,968 bytes), mtime **Sep 4 23:02**
+- dmg: `dmg/AYGENT_1.0.15_aarch64.dmg`, **17,966,773 bytes (~17.1 MB)**, mtime **Sep 4 23:02**
+
+**What changed:** Agent edit tab gets a second full-width Variant dropdown (Auto, minimal, low, medium, high, xhigh, max) shown when Provider is Muse Spark / OpenAI / OpenRouter. Stored per-agent, sent as `reasoning:{effort}` on `/responses`; chat model line shows `model: muse-spark-1.3 · high`. Other providers hide it.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+# Stage build — 2026-09-04 ~19:40 PDT — v1.0.14 (sidebar overflow fix)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `cbe89e6` — fix(video): sidebar overflow — fields shrink inside 300px panel; v1.0.14
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41,296,408 bytes), mtime **Sep 4 19:40**
+- dmg: `dmg/AYGENT_1.0.14_aarch64.dmg`, **17,952,514 bytes (~17.1 MB)**, mtime **Sep 4 19:40**
+
+**What changed:** Graphics-panel color rows, Type/Layout selects, and the Bright HUD/ELI5 seg buttons were spilling past the 300px sidebar. All inputs/selects/seg buttons now shrink + truncate (ellipsis) inside the panel; `\`ve-row2/3\`` children get `min-width: 0`; swatch hex inputs flex-shrink.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+# Stage build — 2026-09-04 ~17:20 PDT — v1.0.13 (video editor round 2)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `5c78c04` — fix(video): clamp caption line ends to next start (no co-showing); vertically center seg/dock-tab/scene-preset/quick/welcome buttons
+- `d15c856` — feat(video): structured brand style fields, stock Bright HUD prefill + ELI5 dark pack
+- `1bd8d39` — feat(video): transcript editor — full scrollable lines, per-word times, merge/split, editable words
+- `ad844a3` — feat(video): delete project from top bar; v1.0.13
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41,295,560 bytes), mtime **Sep 4 17:20**
+- dmg: `dmg/AYGENT_1.0.13_aarch64.dmg`, **17,950,575 bytes (~17.1 MB)**, mtime **Sep 4 17:20**
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## What this build adds (since v1.0.12)
+1. **Caption overlap fix** — line ends clamp to the next start; consecutive captions can't co-show.
+2. **Button alignment** — seg/dock-tab/scene-preset/quick/welcome buttons vertically centered.
+3. **Brand style fields** — Graphics panel: stock Bright HUD prefill (accent #00cafc, white panels, black ink), one-tap ELI5 dark pack (#0a0e15/#00e6ff), 9 color swatches, type/layout/motion fields. Agent reads a BRAND block; caption builds use panel size/weight/accent/width-cap.
+4. **Transcript editor** — Captions panel: full scrollable lines with timecodes, per-word editable text + times, merge lines, split at any word, add/delete words. Saves to transcript.json; sections to captions.lines (builds respect them).
+5. **Delete project** — trash button in the top bar next to the project picker (confirm dialog; removes Video/\<name>/, original footage untouched).
+
+## Smoke QA for this build (~12 min)
+1. **Delete** — open a scratch project, hit the trash icon in the top bar → confirm → project gone from the picker, welcome screen shows.
+2. **Transcript** — transcribe, open Captions → editor lists every line with timecodes → double-click a word, fix spelling, Save → rebuild captions → fixed word renders.
+3. **Merge/split** — checkbox 2 lines → Merge → one section; ✂ between words → two sections; rebuild → matches arrangement.
+4. **Brand** — Graphics panel shows Bright HUD stock values; switch to ELI5 dark → agent's next graphic uses dark tokens.
+5. **Captions** — rebuild overlay → consecutive lines never co-show; keyword accent follows the panel.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
+# Stage build — 2026-09-04 ~15:06 PDT — v1.0.12 (video Hyperframes rebuild)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit:** `b365023` — feat(video): Hyperframes graphics+captions rebuild, linked clips, style guides (on `staging`, pushed to `origin/staging`)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41,206,264 bytes), mtime **Sep 4 15:06**
+- dmg: `dmg/AYGENT_1.0.12_aarch64.dmg`, **17,925,860 bytes (~17.1 MB)**, mtime **Sep 4 15:06**
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## What this build adds
+1. **Linked A/V clips** — V1 video auto-creates a linked A1 audio follower; split/delete/duplicate/drag keep them together; Inspector shows the link.
+2. **Hyperframes captions** — `video_build_captions` renders transcript words (through the A-roll cuts) to a transparent caption composition in the project's style → T1 overlay clip. ASS/drawtext caption path removed.
+3. **Hyperframes graphics overlays** — `video_render_overlay` renders one approved graphic per call to a transparent V3 clip (plan-first protocol enforced in tool instructions). Graphics panel with instructions + style-guide picker (.md/.txt/.rtf/.pdf/.docx text extraction).
+4. **Backend** — new `video_hyperframes.rs` (toolchain via provisioned runtime, overlay staging/render/register), simplified Captions model, audio-dedupe on export, `video_pick_style_guide` command.
+
+## Smoke QA for this build (~10 min)
+1. **Video tab** — open a project, import media, cut A-roll on V1 → linked A1 follower appears and moves with it.
+2. **Captions** — transcribe, then build captions → T1 overlay appears; toggle Captions on/off in preview + export.
+3. **Graphics** — ask agent for a lower third → it replies with a PLAN first; approve → V3 overlay clip lands.
+4. **Style guide** — pick a .md guide in Graphics panel → agent's next graphic matches it.
+5. **Export** — render landscape → no doubled audio, captions + graphics composited.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
 # Stage build — 2026-09-03 ~09:43 PDT — v1.0.11 (web_search + Brave Search + Playwright MCP)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0, **10 warnings, 0 errors** (dead-code only: telegram/browser/exec — same set as prior builds). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
@@ -566,3 +871,104 @@ feature work. Deleted legacy JSON stores (conversations.rs, settings.rs, most
 of agents.rs) plus orphans; wired `cef_engine::shutdown_engine` at
 `RunEvent::Exit`, made `sandbox` a real cargo feature, added a db.rs
 debug-assert that migrations end at `SCHEMA_VERSION`.
+
+---
+
+# Stage build — 2026-09-07 ~11:39 PDT — v1.0.16 (Create button reset fix, rebuild)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, dead-code warnings only (same set). Both bundles produced (.app + dmg).
+
+**Commit (on `staging`, pushed):** `14a7f1a` — fix(video): scope .ve button reset to non-.ve-btn so Create keeps padding
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41247736 bytes), mtime **Sep 7 11:39**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **17942691 bytes (~17.1 MB)**, mtime **Sep 7 11:39**
+
+**Root cause of the repeat failure:** the last two bundles were packaged off a stale `ui/dist` that still contained the unscoped `.ve button{...padding:0}` reset — so the Create button fix never actually shipped. `dist` rebuilt from source (verified `.ve button:not(.ve-btn)` in shipped CSS) before this build.
+
+**What changed:** generic reset now only strips background/border/padding on non-`.ve-btn` buttons; `.ve-btn`/`.ve-create-btn` padding + height survive. Create button renders unclipped.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~2 min)
+1. **Create** — welcome screen: + Create button fully legible, disabled until a name is typed, creates cleanly.
+
+---
+
+# Stage build — 2026-09-07 ~13:40 PDT — v1.0.16 (cleaned-audio proxy playback + re-clean sweep fix)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0 (two sequential builds, second includes sweep fix). Both bundles produced (.app + dmg).
+
+**Commits (on `staging`, pushed):**
+- `7df98fd` — fix(video): cleaned-audio proxy playback (full-length .cleaned.mov, single-element preview) + stable denoise floor + cleanup button wrap
+- `b6bd3dc` — fix(video): re-clean no longer deletes the proxy it just wrote (sweep keeps same-rel file; drop orphan wav)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41383208 bytes), mtime **Sep 7 13:40**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **17966285 bytes (~17.1 MB)**, mtime **Sep 7 13:40**
+
+**What changed:**
+1. Cleanup on video sources now builds a full-length `.cleaned.mov` proxy (picture stream-copied, cleaned audio apad-padded to full video duration, AAC) instead of a short `.wav` — preview plays one element, no dual-clock drift through cuts.
+2. Denoise retuned (nr 0..18, nf=-30, no afftdn noise-tracking) — stable floor, no pumping. Preview chain matches cleanup exactly.
+3. Re-clean stale sweep no longer deletes the file it just wrote (same-rel guard); intermediate wav removed once baked into proxy.
+4. Cleanup buttons wrap (`.ve-btn-row` verified in shipped `ui/dist` CSS).
+5. Export graph untouched (already handles duration via apad/atrim + peak normalize).
+
+**user-facing bug hit on the 13:27 bundle:** re-clean failed with `ffprobe failed: ... .cleaned.mov: No such file` because the sweep deleted the fresh proxy. Fixed in `b6bd3dc`, included in this 13:40 bundle.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~2 min)
+1. **Re-clean A-roll** — succeeds, produces `.cleaned.mov` in Generated, no ffprobe error.
+2. **Playback** — smooth through cuts and full track; no choppiness.
+3. **Bypass toggle** — A/B cleaned vs original works.
+4. **Buttons** — Clean / Re-clean buttons wrap inside the panel, no overflow.
+
+---
+
+# Stage build — 2026-09-08 ~10:31 PDT — v1.0.16 (neural voice cleanup + live blend)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0 (dead-code warnings only, same set). Both bundles produced (.app + dmg).
+
+**Commit (on `staging`, pushed):** `654b00a` — feat(video): neural voice cleanup (DeepFilterNet3, optional download) + live Cleanup amount blend
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41384312 bytes), mtime **Sep 8 10:30**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **17964760 bytes (~17.1 MB)**, mtime **Sep 8 10:31**
+
+**What changed:**
+1. **Neural isolation** — DeepFilterNet3 via uv (torch 2.5.1 + torchaudio 2.5.1 pinned; torchaudio file I/O bypassed via ffmpeg pipes after verifying backend failures). API verified live against AUDIO REFERENCE, not just docs.
+2. **Measured EQ** — first curve was +6dB too bright vs the Auphonic reference; also caught `equalizer` as a silent no-op in provisioned ffmpeg. Final: `highpass=80,lowpass=12000,treble=-4` — within 1–4dB/band of Auphonic.
+3. **Live Cleanup amount** (`audio.cleanMix`, default 1) — equal-power crossfade, preview + export matched, no re-clean. Replaces bypass checkbox.
+4. **Deleted:** `video_audio_audition` (schema, dispatch, fn), Preview button, `denoise`/`normalizeDb`/`cleanEnabled` everywhere, two-pass peak normalize on export. Zero back-compat per plan.
+5. **Optional download** — Audio panel offers one-time voice-model install (~90MB); without it Clean uses a light nr=6 fallback that can't go robotic.
+6. Chain: mono extract → DF3 isolate → EQ → dynamic loudnorm −16 LUFS → full-length `.cleaned.mov` proxy (unchanged).
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~3 min)
+1. **Download voice model** — Audio panel → Download → READY, status flips to neural.
+2. **Clean A-roll** — succeeds, toast names the engine; produces `.cleaned.mov`.
+3. **Blend live** — drag Cleanup amount 0/50/100 → preview follows instantly, no re-clean; export matches.
+4. **Natural sound** — full clean sounds like close-mic'd voice, not robotic.
+
+---
+
+# Stage build — 2026-09-08 ~11:05 PDT — v1.0.16 (self-contained voice toolchain)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg).
+
+**Commit (on `staging`, pushed):** `74a9223` — fix(video): voice download provisions its own uv toolchain (self-contained, no MCP needed)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41440568 bytes), mtime **Sep 8 11:04**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **17978743 bytes (~17.1 MB)**, mtime **Sep 8 11:05**
+
+**What changed:** Download-voice-model button provisions everything itself under `runtime/voice/` (pinned uv 0.12.2 tarball via async reqwest + system tar, managed Python, DF3 weights). Zero MCP dependency, zero new cargo deps. `voice_status` also reports `uv` presence.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~3 min)
+1. **Download voice model** — works standalone with Blender MCP off; toolchain + model land under `runtime/voice/`.
+2. **Clean A-roll** — neural isolation, toast names engine.
+3. **Blend live** — Cleanup amount 0/50/100, preview + export match.

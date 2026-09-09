@@ -579,7 +579,7 @@ pub async fn local_stream_turn<F: FnMut(StreamEvent)>(
     // USAGE (context meter): local models have no $ cost, but the token counts +
     // the REAL (memory-capped) context window drive the fill %. We report the
     // window we actually ran with so the meter is accurate for THIS machine.
-    on_event(StreamEvent::Usage { input: prompt_tokens, output: generated, cache_read: 0, cache_write: 0, context_window: ctx });
+    on_event(StreamEvent::Usage { input: prompt_tokens, output: generated, cache_read: 0, cache_write: 0, cache_write_5m: 0, cache_write_1h: 0, context_window: ctx });
     on_event(StreamEvent::Done { stop_reason: "end_turn".into() });
     let content = serde_json::json!([{ "type": "text", "text": full }]);
     Ok((content, "end_turn".to_string()))

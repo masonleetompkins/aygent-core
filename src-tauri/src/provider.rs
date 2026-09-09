@@ -251,7 +251,14 @@ pub enum StreamEvent {
     /// Token accounting for ONE provider turn, parsed from the provider usage
     /// block (Anthropic message_start/message_delta). Emitted once per streamed
     /// turn so the UI can meter context fill + $ cost. Counts are for THIS turn.
-    Usage { input: u64, output: u64, cache_read: u64, cache_write: u64, #[serde(default)] context_window: u32 },
+    Usage { input: u64, output: u64, cache_read: u64, cache_write: u64,
+        /// 5-minute cache-creation bucket (Anthropic ephemeral_5m). 0 when the
+        /// provider does not split (folded into cache_write).
+        #[serde(default)] cache_write_5m: u64,
+        /// 1-hour cache-creation bucket (Anthropic ephemeral_1h, billed ~2x 5m).
+        /// 0 when the provider does not split (folded into cache_write).
+        #[serde(default)] cache_write_1h: u64,
+        #[serde(default)] context_window: u32 },
     /// A non-fatal note (e.g. fell back to non-streaming).
     Info { text: String },
     /// Fatal error for this turn.
@@ -320,7 +327,7 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
     // message_start frame (input_tokens + cache_read/creation) and the final
     // message_delta frame (output_tokens). We accumulate them and emit a single
     // Usage event at end-of-turn.
-    let (mut u_in, mut u_out, mut u_cr, mut u_cw): (u64, u64, u64, u64) = (0, 0, 0, 0);
+    let (mut u_in, mut u_out, mut u_cr, mut u_cw, mut u_cw5, mut u_cw1): (u64, u64, u64, u64, u64, u64) = (0, 0, 0, 0, 0, 0);
 
     let mut stream = resp.bytes_stream();
     // BUG FIX: buffer RAW BYTES, not a String. The old code did
@@ -371,6 +378,14 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
                             u_in = us.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(u_in);
                             u_cr = us.get("cache_read_input_tokens").and_then(|x| x.as_u64()).unwrap_or(u_cr);
                             u_cw = us.get("cache_creation_input_tokens").and_then(|x| x.as_u64()).unwrap_or(u_cw);
+                            // OpenCode parity: Anthropic splits cache creation into 5m
+                            // vs 1h buckets (different rates — 1h is ~2x 5m).
+                            // Prefer the split; fall back to the legacy total.
+                            if let Some(cc) = us.get("cache_creation") {
+                                let m5 = cc.get("ephemeral_5m_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                                let h1 = cc.get("ephemeral_1h_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                                if m5 + h1 > 0 { u_cw5 = m5; u_cw1 = h1; }
+                            }
                         }
                     }
                     Some("content_block_start") => {
@@ -468,7 +483,12 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
                         }
                     }
                     Some("message_stop") => {
-                        on_event(StreamEvent::Usage { input: u_in, output: u_out, cache_read: u_cr, cache_write: u_cw, context_window: 0 });
+                        // OpenCode parity: `input` is FRESH-only (cache tokens are
+                        // billed in their own buckets, never at input price).
+                        // Anthropic's input_tokens INCLUDES cached tokens.
+                        let fresh = u_in.saturating_sub(u_cr).saturating_sub(u_cw5 + u_cw1);
+                        let cw = if u_cw5 + u_cw1 > 0 { u_cw5 + u_cw1 } else { u_cw };
+                        on_event(StreamEvent::Usage { input: fresh, output: u_out, cache_read: u_cr, cache_write: cw, cache_write_5m: u_cw5, cache_write_1h: u_cw1, context_window: 0 });
                         on_event(StreamEvent::Done { stop_reason: stop_reason.clone() });
                         saw_done = true;
                     }
@@ -505,7 +525,7 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
                     }
                 }
                 Some("message_stop") => {
-                    on_event(StreamEvent::Usage { input: u_in, output: u_out, cache_read: u_cr, cache_write: u_cw, context_window: 0 });
+                    on_event(StreamEvent::Usage { input: u_in, output: u_out, cache_read: u_cr, cache_write: u_cw, cache_write_5m: 0, cache_write_1h: 0, context_window: 0 });
                     on_event(StreamEvent::Done { stop_reason: stop_reason.clone() });
                     saw_done = true;
                 }
@@ -523,7 +543,9 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
     // message_stop at all — abrupt close, proxy cut, etc.), synthesize one so the
     // UI spinner is always resolved. The turn's content is intact either way.
     if !saw_done {
-        on_event(StreamEvent::Usage { input: u_in, output: u_out, cache_read: u_cr, cache_write: u_cw, context_window: 0 });
+        let fresh = u_in.saturating_sub(u_cr).saturating_sub(u_cw5 + u_cw1);
+        let cw = if u_cw5 + u_cw1 > 0 { u_cw5 + u_cw1 } else { u_cw };
+        on_event(StreamEvent::Usage { input: fresh, output: u_out, cache_read: u_cr, cache_write: cw, cache_write_5m: u_cw5, cache_write_1h: u_cw1, context_window: 0 });
         on_event(StreamEvent::Done { stop_reason: stop_reason.clone() });
     }
 

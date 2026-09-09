@@ -94,6 +94,9 @@ pub fn build_whoami(
                 a.model.clone()
             };
             out.push_str(&format!("- Model: {model}\n"));
+            if !a.model_variant.trim().is_empty() {
+                out.push_str(&format!("- Variant: {}\n", a.model_variant));
+            }
         }
         None => out.push_str("- (unknown — no profile)\n"),
     }

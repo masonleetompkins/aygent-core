@@ -302,7 +302,7 @@ pub async fn complete(provider: &str, api_key: &str, model: &str, user_msg: &str
     let no_tools = json!([]);
     let mut text = String::new();
     let (assistant, _stop) = openai_stream_turn(
-        provider, api_key, model, "", &messages, &no_tools, None,
+        provider, api_key, model, None, "", &messages, &no_tools, None,
         |ev| {
             if let StreamEvent::TextDelta { text: t } = &ev { text.push_str(t); }
         },
@@ -316,6 +316,7 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
     provider: &str,
     api_key: &str,
     model: &str,
+    variant: Option<&str>,
     system: &str,
     messages: &serde_json::Value,
     tools: &serde_json::Value,
@@ -348,6 +349,15 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
         let built = build_openai_messages(system, messages);
         body["reasoning_effort"] = if messages_have_image(&built) { json!("low") } else { json!("none") };
     }
+    // MODEL VARIANT (Mason 09-05): an explicit per-agent reasoning effort wins
+    // over the auto none/low above. Sent on OpenAI proper AND OpenRouter
+    // (passthrough) — if the upstream model rejects the value, its 400 surfaces
+    // honestly instead of silently running at the wrong effort.
+    if let Some(v) = variant.map(str::trim).filter(|v| !v.is_empty()) {
+        if ["minimal", "low", "medium", "high", "xhigh", "max"].contains(&v) {
+            body["reasoning_effort"] = json!(v);
+        }
+    }
 
     // No-redirect client (see list_models): keeps the bearer token attached so
     // OpenRouter doesn't 401 with "Missing Authentication header" on a redirect.
@@ -378,7 +388,7 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
     let mut stop_reason = String::from("stop");
     // USAGE: OpenAI/OpenRouter report prompt/completion tokens (+ cached prompt
     // tokens) in a trailing usage frame; accumulate here, emit at end-of-turn.
-    let (mut u_in, mut u_out, mut u_cr): (u64, u64, u64) = (0, 0, 0);
+    let (mut u_in, mut u_out, mut u_cr, mut u_cw): (u64, u64, u64, u64) = (0, 0, 0, 0);
 
     let mut stream = resp.bytes_stream();
     // BUG FIX (same class as provider.rs): buffer RAW BYTES, not a String. The
@@ -413,6 +423,9 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
                 if let Some(i) = us.get("prompt_tokens").and_then(|x| x.as_u64()) { u_in = i; }
                 if let Some(o) = us.get("completion_tokens").and_then(|x| x.as_u64()) { u_out = o; }
                 if let Some(c) = us.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")).and_then(|x| x.as_u64()) { u_cr = c; }
+                // OpenCode parity: Responses/chat usage also reports cache WRITE
+                // tokens — capture them so they bill at the write rate.
+                if let Some(w) = us.get("prompt_tokens_details").and_then(|d| d.get("cache_write_tokens")).and_then(|x| x.as_u64()) { u_cw = w; }
             }
             let Some(choice) = ev.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()) else { continue };
 
@@ -475,8 +488,10 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
 
     // Emit token usage for the meter. OpenAI counts cached_tokens INSIDE
     // prompt_tokens, so fresh (full-price) input = prompt - cached.
-    let fresh_in = u_in.saturating_sub(u_cr);
-    on_event(StreamEvent::Usage { input: fresh_in, output: u_out, cache_read: u_cr, cache_write: 0, context_window: 0 });
+    // OpenCode parity: input_tokens INCLUDES cached + write tokens — bill each
+    // bucket at its own rate, never at full input price.
+    let fresh_in = u_in.saturating_sub(u_cr).saturating_sub(u_cw);
+    on_event(StreamEvent::Usage { input: fresh_in, output: u_out, cache_read: u_cr, cache_write: u_cw, cache_write_5m: 0, cache_write_1h: 0, context_window: 0 });
     on_event(StreamEvent::Done { stop_reason: stop_reason.clone() });
 
     let mut assistant = json!({ "role": "assistant", "content": text });

@@ -68,6 +68,12 @@ mod supervisor;
 mod telegram;
 mod tools_registry;
 mod spark_state; // SPARKS: jailed KV persistence (Sparks/<slug>/state.json) for interactive Sparks.
+mod video; // VIDEO v0.3: project store + hardlink import + probe/thumbs (Video/<project>/).
+mod video_render; // VIDEO v0.3: composition.json -> ffmpeg filter graph -> MP4/frame.
+mod video_media; // VIDEO v0.3: aygent-media:// jailed range-capable media serving for the editor.
+mod video_tools; // VIDEO v0.3: video_* agent tools (frame-accurate edit helpers).
+mod video_hyperframes; // VIDEO: Hyperframes transparent overlays — graphics + captions (T1/V3 clips).
+mod continue_gate; // task_continue TIMER PICKER (Mason 09-08): human picks 1/3/5/10/15 min via chat modal.
 
 use std::sync::Arc;
 use rand::Rng;
@@ -1527,15 +1533,16 @@ fn set_selected_model(db: tauri::State<writer::Db>, folder: String, model: Strin
 fn get_selection(db: tauri::State<writer::Db>, folder: String) -> Result<serde_json::Value, String> {
     let agent_id = agent_for_folder(&db, &folder)?;
     let a = repo::get_agent(&db, &agent_id)?.ok_or("agent not found")?;
-    Ok(serde_json::json!({ "provider": a.provider, "model": a.model }))
+    Ok(serde_json::json!({ "provider": a.provider, "model": a.model, "model_variant": a.model_variant }))
 }
 
 #[tauri::command]
-fn set_selection(db: tauri::State<writer::Db>, folder: String, provider: String, model: String) -> Result<(), String> {
+fn set_selection(db: tauri::State<writer::Db>, folder: String, provider: String, model: String, model_variant: Option<String>) -> Result<(), String> {
     let agent_id = agent_for_folder(&db, &folder)?;
     let mut a = repo::get_agent(&db, &agent_id)?.ok_or("agent not found")?;
     a.provider = provider;
     a.model = model;
+    if let Some(v) = model_variant { a.model_variant = v; }
     repo::update_agent(&db, a)
 }
 
@@ -1568,7 +1575,7 @@ async fn chat_model_info(provider: Option<String>, model: String) -> serde_json:
     let mut context_tokens = table.context_tokens;
     let mut known = table.known;
     let (mut p_in, mut p_out) = (table.price.input, table.price.output);
-    let (mut p_cr, mut p_cw) = (table.price.cache_read, table.price.cache_write);
+    let (mut p_cr, mut p_cw, mut p_cw5, mut p_cw1) = (table.price.cache_read, table.price.cache_write, table.price.cache_write_5m, table.price.cache_write_1h);
     let mut display_name = model.clone();
 
     // DYNAMIC window (the fix): fetch the REAL context window from the provider
@@ -1588,7 +1595,7 @@ async fn chat_model_info(provider: Option<String>, model: String) -> serde_json:
                 if let Ok((ctx, pin, pout)) = openai_provider::openrouter_model_info(&key, &model).await {
                     if ctx > 0 { context_tokens = ctx; known = true; }
                     // OpenRouter publishes real price; use it over the table when present.
-                    if pin > 0.0 { p_in = pin; p_cr = pin * 0.1; p_cw = pin * 1.25; }
+                    if pin > 0.0 { p_in = pin; p_cr = pin * 0.1; p_cw = pin * 1.25; p_cw5 = pin * 1.25; p_cw1 = pin * 2.5; }
                     if pout > 0.0 { p_out = pout; }
                 }
             }
@@ -1612,7 +1619,7 @@ async fn chat_model_info(provider: Option<String>, model: String) -> serde_json:
         "context_tokens": context_tokens,
         "known": known,
         "display_name": display_name,
-        "price": { "input": p_in, "output": p_out, "cache_read": p_cr, "cache_write": p_cw }
+        "price": { "input": p_in, "output": p_out, "cache_read": p_cr, "cache_write": p_cw, "cache_write_5m": p_cw5, "cache_write_1h": p_cw1 }
     });
     if let Ok(mut cache) = MODEL_INFO_CACHE.lock() {
         cache.insert(cache_key, (std::time::Instant::now(), val.clone()));
@@ -1633,11 +1640,27 @@ async fn conv_compact(
 ) -> Result<serde_json::Value, String> {
     let conv = repo::load_conversation(&db, &id)?;
     let history = conv.history.as_array().cloned().unwrap_or_default();
+    compact_history(&db, &conv.agent_id, history).await
+}
+
+/// VIDEO DOCK COMPACT: the editor's per-project conversation is NOT a repo
+/// conversation (it lives in Video/<project>/chat.json), so the UI hands us the
+/// provider-format history directly. Same summarizer, same seed shape.
+#[tauri::command]
+async fn history_compact(
+    db: tauri::State<'_, writer::Db>,
+    agent_id: String,
+    history: Vec<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    compact_history(&db, &agent_id, history).await
+}
+
+async fn compact_history(db: &writer::Db, agent_id: &str, history: Vec<serde_json::Value>) -> Result<serde_json::Value, String> {
     if history.len() < 4 {
         return Err("not enough conversation to compact yet".into());
     }
     // Resolve the agent own provider/model (fallback: anthropic auto/haiku).
-    let agent = repo::get_agent(&db, &conv.agent_id)?.ok_or("agent not found")?;
+    let agent = repo::get_agent(db, agent_id)?.ok_or("agent not found")?;
     let provider = if agent.provider.is_empty() { "anthropic".to_string() } else { agent.provider.clone() };
 
     // Flatten the history into a readable transcript for the summarizer. We keep
@@ -1765,6 +1788,7 @@ fn agents_create(
     folder_path: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    model_variant: Option<String>,
     context_mode: Option<String>,
     system_prompt: Option<String>,
 ) -> Result<repo::AgentProfile, String> {
@@ -1775,6 +1799,7 @@ fn agents_create(
         &folder_path.unwrap_or_default(),
         &model.unwrap_or_default(),
         &provider.unwrap_or_default(),
+        &model_variant.unwrap_or_default(),
         &context_mode.unwrap_or_default(),
         &system_prompt.unwrap_or_default(),
     )?;
@@ -1984,6 +2009,38 @@ fn chat_attach_file(
     std::fs::write(&abs, &bytes).map_err(|e| format!("write attachment: {e}"))?;
     Ok(rel)
 }
+/// DIFF VIEW (Mason 09-09): snapshot a file's CURRENT content (jailed read)
+/// BEFORE the agent overwrites it, so the chat can render a streaming
+/// side-by-side diff (old on the left vs the new content arriving live in
+/// ToolUseDelta). Capped at 32k chars — `truncated` says so. Missing files
+/// (brand-new writes) and unreadable/binary files report `exists: false` /
+/// `binary: true` so the UI falls back to the plain code view instead of a
+/// bogus all-green diff.
+#[tauri::command]
+fn tool_file_before(
+    broker: tauri::State<'_, Arc<Broker>>,
+    agent_id: String,
+    path: String,
+) -> Result<serde_json::Value, String> {
+    use std::io::Read;
+    // Same scope-key rule as every other file tool (per-agent scope,
+    // "default" only if unregistered — see exec_tool_cfg).
+    let agent_id: &str = if broker.root_for(&agent_id).is_ok() { &agent_id } else { "default" };
+    match broker.resolve_and_open(agent_id, &path, broker::Mode::Read) {
+        Ok(mut f) => {
+            let mut s = String::new();
+            match f.read_to_string(&mut s) {
+                Ok(_) => {
+                    let truncated = s.len() > 32_768;
+                    if truncated { s.truncate(32_768); }
+                    Ok(serde_json::json!({ "exists": true, "content": s, "truncated": truncated, "binary": false }))
+                }
+                Err(_) => Ok(serde_json::json!({ "exists": true, "content": "", "truncated": false, "binary": true })),
+            }
+        }
+        Err(_) => Ok(serde_json::json!({ "exists": false, "content": "", "truncated": false, "binary": false })),
+    }
+}
 
 /// STOP BUTTON: the UI calls this when the user clicks Stop mid-turn. `channel`
 /// is the SAME per-conversation event channel id the Chat pane already passes
@@ -2072,6 +2129,41 @@ fn attachment_blocks_openai(broker: &Arc<Broker>, agent_id: &str, rels: &[String
         } else {
             blocks.push(serde_json::json!({ "type": "text", "text": format!("[attached binary file: {name} — stored at {rel} ({} bytes); use your file/shell tools on it as needed]", bytes.len()) }));
         }
+    }
+    blocks
+}
+
+/// VISION (video_look): read rendered canvas frames through the jail so the model
+/// SEES them inline. Frames are 854px JPEGs (bounded count + size); stale state is
+/// impossible — exec_full drains per call, take_pending_vision drains after the push.
+fn vision_bytes(broker: &Arc<Broker>, agent_id: &str, frames: &[video_tools::VisionFrame]) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    for f in frames.iter().take(4) {
+        let Ok(abs) = broker.resolve(agent_id, &f.rel, broker::Mode::Read) else { continue };
+        let Ok(bytes) = std::fs::read(&abs) else { continue };
+        if bytes.is_empty() || bytes.len() > 4_800_000 { continue; }
+        out.push((f.label.clone(), bytes));
+    }
+    out
+}
+/// Anthropic content blocks: [text, image, image, ...].
+fn vision_blocks_anthropic(vb: &[(String, Vec<u8>)]) -> Vec<serde_json::Value> {
+    use base64::Engine;
+    let mut blocks = Vec::new();
+    for (label, bytes) in vb {
+        blocks.push(serde_json::json!({ "type": "text", "text": format!("[canvas frame at {} — the Video tab preview shows the first frame]", label) }));
+        blocks.push(serde_json::json!({ "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": base64::engine::general_purpose::STANDARD.encode(bytes) } }));
+    }
+    blocks
+}
+/// OpenAI/Muse user-message blocks: [text, image_url, ...]. OpenAI passes them
+/// through verbatim; the Meta translator already maps image_url -> input_image.
+fn vision_blocks_openai(vb: &[(String, Vec<u8>)]) -> Vec<serde_json::Value> {
+    use base64::Engine;
+    let mut blocks = Vec::new();
+    for (label, bytes) in vb {
+        blocks.push(serde_json::json!({ "type": "text", "text": format!("[canvas frame at {} — delete spent frames with delete_file]", label) }));
+        blocks.push(serde_json::json!({ "type": "image_url", "image_url": { "url": format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)) } }));
     }
     blocks
 }
@@ -3033,7 +3125,7 @@ async fn agent_run(
         // Dispatch the turn to the agent's actual provider (Muse etc.), not always Anthropic.
         let resp: serde_json::Value = match provider {
             "openai" | "openrouter" => {
-                let (assistant, _stop) = openai_provider::openai_stream_turn(&provider.to_string(), &key, &model, &turn_system, &messages, &tools, None, |_| {}).await?;
+                let (assistant, _stop) = openai_provider::openai_stream_turn(&provider.to_string(), &key, &model, None, &turn_system, &messages, &tools, None, |_| {}).await?;
                 // Convert OpenAI assistant (tool_calls) -> Anthropic-like content for the loop below.
                 // For the browser loop we only need content as Anthropic blocks; synthesize them.
                 let mut blocks: Vec<serde_json::Value> = Vec::new();
@@ -3054,7 +3146,7 @@ async fn agent_run(
                 serde_json::json!({"content": blocks, "stop_reason": stop})
             },
             "meta" => {
-                let (assistant, _stop) = meta_provider::meta_stream_turn(&key, &model, &turn_system, &messages, &tools, None, |_| {}).await?;
+                let (assistant, _stop) = meta_provider::meta_stream_turn(&key, &model, None, &turn_system, &messages, &tools, None, |_| {}).await?;
                 let mut blocks: Vec<serde_json::Value> = Vec::new();
                 if let Some(txt) = assistant.get("content").and_then(|c| c.as_str()) {
                     if !txt.is_empty() { blocks.push(serde_json::json!({"type":"text","text": txt})); }
@@ -3861,9 +3953,9 @@ fn send_message_tool() -> serde_json::Value {
 fn task_continue_tool() -> serde_json::Value {
     serde_json::json!({
         "name": "task_continue",
-        "description": "Schedule YOURSELF a follow-up turn after a delay, so you can end this turn and still continue/report later (e.g. poll a long build). You will be woken with your note in a fresh continuation turn that streams live to your chat. Use this whenever you would otherwise say 'I'll check back' — it is the only way to actually do it.",
+        "description": "Schedule YOURSELF a follow-up turn after a delay, so you can end this turn and still continue the work later (e.g. poll a long build, wait for a render, check a process). You will be woken with your note in a fresh continuation turn that streams live to your chat and has ALL your tools — you keep working there (shell_poll, read files, edit, call task_continue again), not just report. RULE: whenever you would otherwise write 'I'll check back', 'I'll continue later', 'once X finishes' or 'give me a few minutes', you MUST call this tool instead of saying it — words alone never wake you up. Put everything the next turn needs in the note (proc handles, paths, what to check, next step). Calling this pops a timer picker in chat (1/3/5/10/15 min) — the human chooses; your delay_secs is only the no-answer fallback.",
         "input_schema": { "type": "object", "properties": {
-            "delay_secs": { "type": "integer", "description": "seconds until wake-up (5-3600, default 60)" },
+            "delay_secs": { "type": "integer", "description": "SUGGESTED seconds until wake-up (5-3600, default 60) — the human picks the real duration (1/3/5/10/15 min) in a chat modal; your value is the fallback if they do not answer" },
             "note": { "type": "string", "description": "note to self: exactly what to check/continue on wake-up (include proc handles, file paths, next steps)" }
         }, "required": ["note"] }
     })
@@ -3973,6 +4065,10 @@ fn agent_tools_for_full(
     if conn_ctx.is_some() {
         for schema in dashboard::tool_schemas() { tools.push(schema); }
         extra_instructions.push_str(dashboard::tool_instructions());
+        // VIDEO v0.3: frame-accurate edit helpers (jailed; provisioned ffmpeg only).
+        for schema in video_tools::tool_schemas() { tools.push(schema); }
+        extra_instructions.push_str(video_tools::INSTRUCTIONS);
+        extra_instructions.push_str(video_hyperframes::HYPERFRAMES_INSTRUCTIONS);
         tools.push(spark_preview_tool());
         // WHOAMI is already in the base tool list (added unconditionally above).
         // Here we only add the instruction that tells the model it exists.
@@ -4103,6 +4199,7 @@ fn agent_tools_for_full(
 /// PRO MODE: is shell.exec enabled for this folder's agent? GUI-managed (no
 /// config files) — the scary-honest consent screen writes a flag per folder,
 /// same scheme as browser-policy. Fails closed (missing => false => Folder Mode).
+pub fn pro_mode_enabled_pub(app: &tauri::AppHandle, folder: &str) -> bool { pro_mode_enabled(app, folder) }
 fn pro_mode_enabled(app: &tauri::AppHandle, folder: &str) -> bool {
     let Ok(ad) = app_data(app) else { return false; };
     let path = ad.join("pro-mode").join(format!("{}.json", folder_key_fnv(folder)));
@@ -4504,6 +4601,12 @@ const AGENT_SYSTEM: &str = "You are AYGENT, a helpful, concise, friendly assista
     read a web page/API over HTTPS, and any connected-service tools (e.g. github_list_prs) for \
     that service. Prefer the smallest number of tool calls that gets the job done.";
 
+/// Appended to the system prompt on the Muse (meta) provider only.
+const MUSE_QUIET_TOOLS: &str = "\n\nTOOL-CALL STYLE: do NOT write a sentence restating or re-affirming the user's request \
+    before a tool call (no \"Pulling X now…\", \"Let me check Y…\", \"Got it — doing Z\"). Call the tool \
+    silently. Write text only when you have something to report: a result, a decision, a question, \
+    or the final answer. One reply at the end beats a status line before every call.";
+
 // Base system prompt for local models. When the model is tool-capable, we
 // APPEND its family-native tool instructions (local_tools::system_prompt_with_tools).
 const AGENT_SYSTEM_LOCAL: &str = "You are AYGENT, a helpful AI assistant running privately \
@@ -4765,6 +4868,8 @@ async fn agent_stream(
                             },
                         }
                     }
+                } else if video_tools::is_video_tool(&c.name) {
+                    video_tools::exec(&broker, &scope_id, &c.name, &c.input)
                 } else if dashboard::is_dashboard_tool(&c.name) {
                     dashboard::exec_dashboard_tool(&db, &scope_id, &c.name, &c.input)
                 } else {
@@ -4811,6 +4916,12 @@ async fn agent_stream(
             .map_err(|_| format!("no {provider_kind} key set — add one in Settings"))?;
         let model = model.filter(|m| !m.trim().is_empty())
             .ok_or_else(|| format!("no {provider_kind} model selected — pick one in Settings"))?;
+        // MODEL VARIANT: the agent's reasoning knob (Muse Spark effort etc.).
+        // Resolved from the profile so every caller (chat, video dock) gets it
+        // without changing the turn args. Soul/compact/planner use complete()
+        // (default effort) deliberately — short utility calls, keep them cheap.
+        let variant: String = repo::get_agent(&db, &scope_id).ok().flatten().map(|a| a.model_variant).unwrap_or_default();
+        let variant_opt = if variant.trim().is_empty() { None } else { Some(variant.as_str()) };
 
         // Baseline SAVE POINT before the turn (rewind anchor), same as Anthropic.
         if let Ok(root) = broker.root_for(&scope_id) {
@@ -4819,7 +4930,12 @@ async fn agent_stream(
 
         let (tools, reg_instr) = agent_tools_for_full(&app, Some(&scope_id), folder.as_deref(), !roster.is_empty(), Some((&db, &scope_id)));
         let pdf_cfg = pdf_config_for(&app, Some(&scope_id), folder.as_deref());
-        let sys = format!("{AGENT_SYSTEM}{extra_block}{reg_instr}");
+        // MUSE SPARK (Mason 09-04): the model narrates a one-line restatement of
+        // the user's intent before EVERY function call ("Pulling PR #3328 — let me
+        // locate that branch…"). Nothing on our side asked for it; it's the model's
+        // habit. Tell it plainly not to, on this provider only.
+        let muse_quiet = if provider_kind == "meta" { MUSE_QUIET_TOOLS } else { "" };
+        let sys = format!("{AGENT_SYSTEM}{extra_block}{reg_instr}{muse_quiet}");
         let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
         // ATTACHMENTS (bug fix — these were SILENTLY DROPPED on OpenAI/OpenRouter:
         // the Anthropic branch built real content blocks from `attachments`, this
@@ -4833,7 +4949,7 @@ async fn agent_stream(
             content.extend(attachment_blocks_openai(&broker, &scope_id, &att));
             messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": content }));
         }
-        let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("model: {model}") });
+        let _ = app.emit(&channel, &provider::StreamEvent::Info { text: if variant.trim().is_empty() { format!("model: {model}") } else { format!("model: {model} · {variant}") } });
 
         // PRO MODE UNCAPPED (Mason 08-03): same policy as the Anthropic path —
         // no round cap in Pro Mode; the stall detector replaces it. Non-Pro
@@ -4865,12 +4981,12 @@ async fn agent_stream(
             let mut round_errs: usize = 0;
             let stream_result = if provider_kind == "meta" {
                 meta_provider::meta_stream_turn(
-                    &key, &model, &sys, &messages, &tools, Some(&cancel_flag),
+                    &key, &model, variant_opt, &sys, &messages, &tools, Some(&cancel_flag),
                     |ev| { let _ = app.emit(&channel, &ev); },
                 ).await
             } else {
                 openai_provider::openai_stream_turn(
-                    &provider_kind, &key, &model, &sys, &messages, &tools, Some(&cancel_flag),
+                    &provider_kind, &key, &model, variant_opt, &sys, &messages, &tools, Some(&cancel_flag),
                     |ev| { let _ = app.emit(&channel, &ev); },
                 ).await
             };
@@ -4907,16 +5023,7 @@ async fn agent_stream(
                     let (result_text, is_err) = if name == "whoami" {
                         (introspect::build_whoami(&app, &db, &scope_id, folder.as_deref()), false)
                     } else if name == "task_continue" {
-                        let delay = input.get("delay_secs").and_then(|d| d.as_u64()).unwrap_or(60).clamp(5, 3600);
-                        let note = input.get("note").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
-                        if note.is_empty() {
-                            ("task_continue refused: a non-empty note is required (say what to check on wake-up)".to_string(), true)
-                        } else {
-                            match mailbox::enqueue_continue(&db, &scope_id, &format!("conv:{}\n{}", session_id.clone().unwrap_or_default(), note), delay) {
-                                Ok(_) => (format!("wake-up scheduled in {delay}s — end your turn now; you'll be woken with your note"), false),
-                                Err(e) => (format!("task_continue failed: {e}"), true),
-                            }
-                        }
+                        continue_gate::handle_task_continue(&app, &db, &scope_id, session_id.clone().unwrap_or_default(), &input).await
                     } else if name == "send_message" {
                         let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
                         let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
@@ -4949,6 +5056,9 @@ async fn agent_stream(
                         connector_exec::exec(&db, &scope_id, &name, &input).await
                     } else if mcp::is_mcp_tool(&name) {
                         mcp::exec(&name, &input)
+                    } else if video_tools::is_video_tool(&name) {
+                        let o = video_tools::exec_full(&broker, &scope_id, &name, &input);
+                        (o.text, o.is_err)
                     } else if dashboard::is_dashboard_tool(&name) {
                         dashboard::exec_dashboard_tool(&db, &scope_id, &name, &input)
                     } else {
@@ -4976,6 +5086,15 @@ async fn agent_stream(
                         "role": "user",
                         "content": [{ "type": "tool_result", "tool_use_id": id, "content": result_text, "is_error": is_err }]
                     }));
+                    if name == "video_look" {
+                        let vf = video_tools::take_pending_vision();
+                        let vb = vision_bytes(&broker, &scope_id, &vf);
+                        if !vb.is_empty() {
+                            let mut vc = vec![serde_json::json!({ "type": "text", "text": "Canvas frame(s) — you SEE them as images in this message." })];
+                            vc.extend(vision_blocks_openai(&vb));
+                            messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": vc }));
+                        }
+                    }
                 }
             }
 
@@ -5160,16 +5279,7 @@ async fn agent_stream(
                         let domains = folder.as_deref().map(|f| agent_browser_domains(&app, f)).unwrap_or_default();
                         browser::agent_tool(&app, &browser_state, &name, &input, &domains).await
                     } else if name == "task_continue" {
-                        let delay = input.get("delay_secs").and_then(|d| d.as_u64()).unwrap_or(60).clamp(5, 3600);
-                        let note = input.get("note").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
-                        if note.is_empty() {
-                            ("task_continue refused: a non-empty note is required (say what to check on wake-up)".to_string(), true)
-                        } else {
-                            match mailbox::enqueue_continue(&db, &scope_id, &format!("conv:{}\n{}", session_id.clone().unwrap_or_default(), note), delay) {
-                                Ok(_) => (format!("wake-up scheduled in {delay}s — end your turn now; you'll be woken with your note"), false),
-                                Err(e) => (format!("task_continue failed: {e}"), true),
-                            }
-                        }
+                        continue_gate::handle_task_continue(&app, &db, &scope_id, session_id.clone().unwrap_or_default(), &input).await
                     } else if name == "send_message" {
                         let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
                         let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
@@ -5204,6 +5314,9 @@ async fn agent_stream(
                         }
                     } else if mcp::is_mcp_tool(&name) {
                         mcp::exec(&name, &input)
+                    } else if video_tools::is_video_tool(&name) {
+                        let o = video_tools::exec_full(&broker, &scope_id, &name, &input);
+                        (o.text, o.is_err)
                     } else if dashboard::is_dashboard_tool(&name) {
                         dashboard::exec_dashboard_tool(&db, &scope_id, &name, &input)
                     } else {
@@ -5243,9 +5356,21 @@ async fn agent_stream(
                         // the full result still goes to the model / logs regardless.
                         "detail": if is_err { result_text.clone() } else { result_text.chars().take(2000).collect::<String>() }
                     }));
+                    // VISION must ride INSIDE this tool_result (Anthropic requires every
+                    // tool_use to be followed immediately by its result; a separate user
+                    // message here would break role alternation and 400 the next call).
+                    let content_v: serde_json::Value = if name == "video_look" {
+                        let vf = video_tools::take_pending_vision();
+                        let vb = vision_bytes(&broker, &scope_id, &vf);
+                        if vb.is_empty() { serde_json::json!(result_text.clone()) } else {
+                            let mut vc = vec![serde_json::json!({ "type": "text", "text": format!("{}\n\nCanvas frame(s) — you SEE them as images in this message.", result_text) })];
+                            vc.extend(vision_blocks_anthropic(&vb));
+                            serde_json::json!(vc)
+                        }
+                    } else { serde_json::json!(result_text.clone()) };
                     tool_results.push(serde_json::json!({
                         "type": "tool_result", "tool_use_id": id,
-                        "content": result_text, "is_error": is_err
+                        "content": content_v, "is_error": is_err
                     }));
                 }
             }
@@ -5483,9 +5608,11 @@ pub async fn run_headless_turn(
     } else if is_continue {
         format!(
             "WAKE-UP: you previously called task_continue and asked to resume work. Your note to self:\n\n{}\n\n\
-             Continue the task now: check any processes you started (shell_poll), finish the work, and report \
-             the outcome — this turn streams live to your chat. If you need more time, call task_continue again. \
-             Do NOT use send_message; there is no sender to reply to.",
+             This is a FULL working turn — you have all your tools. Continue the task now: check any processes you \
+             started (shell_poll), read/edit files, run commands, finish the work, then report the outcome — this \
+             turn streams live to your chat. If the work still is not done when you must stop, call task_continue \
+             AGAIN with an updated note (never just say you will check back). Do NOT use send_message; there is no \
+             sender to reply to.",
             msg_body
         )
     } else if is_scheduled {
@@ -5571,14 +5698,16 @@ pub async fn run_headless_turn(
         format!("\n\nOTHER AGENTS you can message with send_message:\n{list}")
     };
     let mounts_block = mounts_prompt_block(broker, agent_id);
-    let system = format!("{AGENT_SYSTEM}{persona}{roster_block}{context_block}{mounts_block}");
-
-    // Tools: base file tools + send_message (has_peers = it has a roster).
-    let (tools, _reg) = agent_tools_for_ex(app, Some(&agent.id), Some(&agent.folder_path), !roster.is_empty());
-    let pdf_cfg = pdf_config_for(app, Some(&agent.id), Some(&agent.folder_path));
-
     // Resolve provider/model (recipient's own; fallback anthropic auto/haiku).
     let provider_kind = if agent.provider.is_empty() { "anthropic".to_string() } else { agent.provider.clone() };
+    let muse_quiet = if provider_kind == "meta" { MUSE_QUIET_TOOLS } else { "" };
+
+    // Tools: the FULL registry (file tools, connectors, MCP, video, dashboard,
+    // task_continue…) — a wake-up must be able to keep doing real work, not just
+    // talk (Mason 09-04). `reg_instr` carries the registry's usage instructions.
+    let (tools, reg_instr) = agent_tools_for_full(app, Some(&agent.id), Some(&agent.folder_path), !roster.is_empty(), Some((db, &agent.id)));
+    let pdf_cfg = pdf_config_for(app, Some(&agent.id), Some(&agent.folder_path));
+    let system = format!("{AGENT_SYSTEM}{persona}{roster_block}{context_block}{mounts_block}{reg_instr}{muse_quiet}");
 
     // Baseline SAVE POINT before any writes.
     if let Ok(root) = broker.root_for(agent_id) { let _ = savepoint::snapshot(&root, "Checkpoint"); }
@@ -5610,6 +5739,23 @@ pub async fn run_headless_turn(
     }
     let mut messages = serde_json::json!([{ "role": "user", "content": framed }]);
     let mut reply_text = String::new();
+    // WAKE-UP CONTEXT (Mason 09-04): a task_continue wake-up must remember what it
+    // was doing. Feed the origin conversation's recent provider-format history to
+    // the model (bounded), while `messages` stays the turn DELTA that gets
+    // appended to that history at persist time (no duplication).
+    let prior_history: Vec<serde_json::Value> = if is_continue {
+        continue_conv.as_ref()
+            .and_then(|cid| repo::load_conversation(db, cid).ok())
+            .and_then(|c| c.history.as_array().cloned())
+            .map(|h| { let n = h.len(); h.into_iter().skip(n.saturating_sub(40)).collect() })
+            .unwrap_or_default()
+    } else { Vec::new() };
+    let with_prior = |turn: &serde_json::Value| -> serde_json::Value {
+        if prior_history.is_empty() { return turn.clone(); }
+        let mut all = prior_history.clone();
+        if let Some(t) = turn.as_array() { all.extend(t.iter().cloned()); }
+        serde_json::Value::Array(all)
+    };
 
     // Only Anthropic + OpenAI/OpenRouter run headless for now (local models are
     // slower + the human path is where they're exercised). Non-cloud recipients
@@ -5625,8 +5771,9 @@ pub async fn run_headless_turn(
             // STREAM LIVE to the recipient's inbox channel — same event shape the
             // human path emits — so an open pane WATCHES the work happen (tokens +
             // tool cards), not just a rail spinner.
+            let model_msgs = with_prior(&messages);
             let (content, stop) = provider::anthropic_stream_turn(
-                &key, &model, &system, &messages, &tools, Some(&hl_cancel_flag),
+                &key, &model, &system, &model_msgs, &tools, Some(&hl_cancel_flag),
                 |ev| { let _ = app.emit(&stream_channel, &ev); },
             ).await?;
             messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": content.clone() }));
@@ -5647,16 +5794,7 @@ pub async fn run_headless_turn(
                             let (result_text, is_err) = if name == "whoami" {
                                 (introspect::build_whoami(app, db, agent_id, Some(&agent.folder_path)), false)
                             } else if name == "task_continue" {
-                                let delay = input.get("delay_secs").and_then(|d| d.as_u64()).unwrap_or(60).clamp(5, 3600);
-                                let note = input.get("note").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
-                                if note.is_empty() {
-                                    ("task_continue refused: a non-empty note is required".to_string(), true)
-                                } else {
-                                    match mailbox::enqueue_continue(db, agent_id, &format!("conv:{}\n{}", continue_conv.clone().unwrap_or_default(), note), delay) {
-                                        Ok(_) => (format!("wake-up scheduled in {delay}s — end your turn now; you'll be woken with your note"), false),
-                                        Err(e) => (format!("task_continue failed: {e}"), true),
-                                    }
-                                }
+                                continue_gate::handle_task_continue(app, db, agent_id, continue_conv.clone().unwrap_or_default(), &input).await
                             } else if name == "send_message" {
                                 let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
                                 let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
@@ -5680,12 +5818,24 @@ pub async fn run_headless_turn(
                                 }
                             } else if mcp::is_mcp_tool(&name) {
                                 mcp::exec(&name, &input)
+                            } else if video_tools::is_video_tool(&name) {
+                                let o = video_tools::exec_full(broker, agent_id, &name, &input);
+                                (o.text, o.is_err)
                             } else if dashboard::is_dashboard_tool(&name) {
                                 dashboard::exec_dashboard_tool(db, agent_id, &name, &input)
                             } else {
                                 exec_tool_cfg(broker, agent_id, &name, &input, &pdf_cfg)
                             };
-                            tool_results.push(serde_json::json!({ "type": "tool_result", "tool_use_id": id, "content": result_text, "is_error": is_err }));
+                            let content_v: serde_json::Value = if name == "video_look" {
+                                let vf = video_tools::take_pending_vision();
+                                let vb = vision_bytes(broker, agent_id, &vf);
+                                if vb.is_empty() { serde_json::json!(result_text.clone()) } else {
+                                    let mut vc = vec![serde_json::json!({ "type": "text", "text": format!("{}\n\nCanvas frame(s) — you SEE them as images in this message.", result_text) })];
+                                    vc.extend(vision_blocks_anthropic(&vb));
+                                    serde_json::json!(vc)
+                                }
+                            } else { serde_json::json!(result_text.clone()) };
+                            tool_results.push(serde_json::json!({ "type": "tool_result", "tool_use_id": id, "content": content_v, "is_error": is_err }));
                         }
                         _ => {}
                     }
@@ -5700,42 +5850,83 @@ pub async fn run_headless_turn(
     } else if provider_kind == "openai" || provider_kind == "openrouter" || provider_kind == "meta" {
         let key = keychain::get_key(&provider_kind).map_err(|_| format!("recipient has no {provider_kind} key"))?;
         if agent.model.trim().is_empty() { return Err("recipient has no model set".into()); }
-        // STREAMING (Mason 08-06): stream token-by-token so AYGENT Remote shows
-        // partial text as it arrives (was a single delta on completion — the
-        // whole reply popped in at once over the tunnel). Emits real TextDelta
-        // events on the stream channel, exactly like the Anthropic headless path.
+        // TOOL LOOP (Mason 09-04): this branch used to be a single no-tools text
+        // turn, so a task_continue wake-up on Muse/OpenAI could only TALK — it could
+        // not shell_poll, read files or call task_continue again. Now it runs the
+        // same bounded tool loop as the Anthropic headless path, streaming live.
         let _ = app.emit(&stream_channel, &provider::StreamEvent::Info { text: "thinking…".into() });
-        let msgs = serde_json::json!([{ "role": "user", "content": framed }]);
-        let no_tools = serde_json::json!([]);
-        let hl_stream = if provider_kind == "meta" {
-            meta_provider::meta_stream_turn(&key, &agent.model, &system, &msgs, &no_tools, Some(&hl_cancel_flag),
-                |ev| {
-                    if let provider::StreamEvent::TextDelta { text } = &ev { reply_text.push_str(text); }
-                    let _ = app.emit(&stream_channel, &ev);
-                }).await
-        } else {
-        openai_provider::openai_stream_turn(
-            &provider_kind, &key, &agent.model, &system, &msgs, &no_tools, Some(&hl_cancel_flag),
-            |ev| {
-                // Accumulate the assistant text AND forward the live event so the
-                // remote/inbox pane streams it.
-                if let provider::StreamEvent::TextDelta { text } = &ev { reply_text.push_str(text); }
-                let _ = app.emit(&stream_channel, &ev);
-            },
-        ).await
-        };
-        match hl_stream {
-            Ok((assistant, _stop)) => {
-                // If the stream produced no TextDelta (some models only fill the
-                // final message content), fall back to the assembled content.
-                if reply_text.trim().is_empty() {
-                    if let Some(c) = assistant.get("content").and_then(|c| c.as_str()) {
-                        reply_text = c.to_string();
-                        let _ = app.emit(&stream_channel, &provider::StreamEvent::TextDelta { text: reply_text.clone() });
+        // Headless turns act AS the agent, so they carry its variant too.
+        let variant_hl: String = agent.model_variant.clone();
+        let variant_hl_opt = if variant_hl.trim().is_empty() { None } else { Some(variant_hl.as_str()) };
+        let mut sent_in_turn: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        for _ in 0..12 {
+            let model_msgs = with_prior(&messages);
+            let mut round_text = String::new();
+            let hl_stream = if provider_kind == "meta" {
+                meta_provider::meta_stream_turn(&key, &agent.model, variant_hl_opt, &system, &model_msgs, &tools, Some(&hl_cancel_flag),
+                    |ev| { if let provider::StreamEvent::TextDelta { text } = &ev { round_text.push_str(text); } let _ = app.emit(&stream_channel, &ev); }).await
+            } else {
+                openai_provider::openai_stream_turn(&provider_kind, &key, &agent.model, variant_hl_opt, &system, &model_msgs, &tools, Some(&hl_cancel_flag),
+                    |ev| { if let provider::StreamEvent::TextDelta { text } = &ev { round_text.push_str(text); } let _ = app.emit(&stream_channel, &ev); }).await
+            };
+            let (assistant, stop) = match hl_stream {
+                Ok(v) => v,
+                Err(e) => { reply_text = format!("(couldn't complete the reply: {e})"); break; }
+            };
+            // Text the stream didn't deliver as deltas (some models only fill content).
+            if round_text.trim().is_empty() {
+                if let Some(c) = assistant.get("content").and_then(|c| c.as_str()) { if !c.trim().is_empty() { round_text = c.to_string(); let _ = app.emit(&stream_channel, &provider::StreamEvent::TextDelta { text: c.to_string() }); } }
+            }
+            if !round_text.trim().is_empty() { reply_text.push_str(round_text.trim()); reply_text.push('\n'); }
+            messages.as_array_mut().unwrap().push(assistant.clone());
+            let calls = assistant.get("tool_calls").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+            if calls.is_empty() || stop != "tool_use" { break; }
+            let mut tool_results = Vec::new();
+            for c in &calls {
+                let id = c.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                let name = c.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string();
+                let input: serde_json::Value = c.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str())
+                    .and_then(|a| serde_json::from_str(a).ok()).unwrap_or(serde_json::json!({}));
+                let (result_text, is_err) = if name == "whoami" {
+                    (introspect::build_whoami(app, db, agent_id, Some(&agent.folder_path)), false)
+                } else if name == "task_continue" {
+                    continue_gate::handle_task_continue(app, db, agent_id, continue_conv.clone().unwrap_or_default(), &input).await
+                } else if name == "send_message" {
+                    let to = input.get("to_agent").and_then(|t| t.as_str()).unwrap_or("");
+                    let body = input.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                    if !sent_in_turn.insert((to.to_string(), body.to_string())) { (format!("already delivered to {to} in this turn"), false) }
+                    else {
+                        match mailbox::send(db, agent_id, to, body, msg.id) {
+                            Ok(mailbox::SendResult::Queued { .. }) => { app.state::<drainer::DrainSignal>().nudge(); (format!("message delivered to {to}"), false) }
+                            Ok(mailbox::SendResult::Refused { reason }) => (format!("not sent: {reason}"), true),
+                            Err(e) => (format!("send failed: {e}"), true),
+                        }
+                    }
+                } else if connectors::is_connector_tool(&name) {
+                    connector_exec::exec(db, agent_id, &name, &input).await
+                } else if mcp::is_mcp_tool(&name) {
+                    mcp::exec(&name, &input)
+                } else if video_tools::is_video_tool(&name) {
+                    let o = video_tools::exec_full(broker, agent_id, &name, &input);
+                    (o.text, o.is_err)
+                } else if dashboard::is_dashboard_tool(&name) {
+                    dashboard::exec_dashboard_tool(db, agent_id, &name, &input)
+                } else {
+                    exec_tool_cfg(broker, agent_id, &name, &input, &pdf_cfg)
+                };
+                let _ = app.emit(&stream_channel, &serde_json::json!({ "kind": "ToolResult", "id": id, "name": name, "path": input.get("path").and_then(|p| p.as_str()).unwrap_or(""), "ok": !is_err, "detail": if is_err { result_text.clone() } else { result_text.chars().take(2000).collect::<String>() } }));
+                tool_results.push(serde_json::json!({ "type": "tool_result", "tool_use_id": id, "content": result_text, "is_error": is_err }));
+                if name == "video_look" {
+                    let vf = video_tools::take_pending_vision();
+                    let vb = vision_bytes(broker, agent_id, &vf);
+                    if !vb.is_empty() {
+                        let mut vc = vec![serde_json::json!({ "type": "text", "text": "Canvas frame(s) — you SEE them as images in this message." })];
+                        vc.extend(vision_blocks_openai(&vb));
+                        messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": vc }));
                     }
                 }
             }
-            Err(e) => { reply_text = format!("(couldn't complete the reply: {e})"); }
+            messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": tool_results }));
         }
     } else {
         reply_text = format!("({} runs a local model — headless inter-agent turns use a cloud provider for now.)", agent.name);
@@ -5884,10 +6075,12 @@ pub fn run() {
         .manage(sched_signal.clone())
         .manage(browser_proc)
         .manage(cancel_registry)
+        .manage(continue_gate::ContinueGate::default())
         .manage(remote_runtime)
         .invoke_handler(tauri::generate_handler![
             whisper::transcribe_audio_b64,
             chat_attach_file,
+            tool_file_before,
             agent_stop,
             remote_cmds::remote_status,
             remote_cmds::remote_pair,
@@ -5921,6 +6114,14 @@ pub fn run() {
             sparks_list, sparks_read, sparks_delete,
             spark_save,
             spark_state_get, spark_state_set, spark_state_set_key,
+            video::video_status, video::video_projects, video::video_load, video::video_save, video::video_create,
+            video::video_chat_save, video::video_pick_media, video::video_import_paths, video::video_delete_project, video::video_remove_asset, video::video_relink_asset,
+            video::video_refresh_thumbs, video::video_list_luts, video::video_pick_lut, video::video_reveal,
+            video::video_create_media_folder, video::video_rename_media_folder, video::video_delete_media_folder, video::video_move_media_assets,
+            video_render::video_render, video_render::video_render_cancel, video_render::video_frame,
+            video_render::video_validate, video_render::video_list_renders,
+            video_hyperframes::video_build_captions, video_hyperframes::video_render_overlay_cmd, video_hyperframes::video_pick_style_guide, video_hyperframes::video_caption_timing, video_hyperframes::video_save_transcript,
+            video_tools::video_tool,
             dashboard::dashboard_load, dashboard::dashboard_upsert_module,
             dashboard::dashboard_remove_module, dashboard::dashboard_arrange,
             dashboard::dashboard_undo,
@@ -5931,7 +6132,7 @@ pub fn run() {
             savepoint_undo, savepoint_redo,
             savepoint_get_retention, savepoint_set_retention, savepoint_purge,
             conv_list, conv_load, conv_save, conv_rename, conv_delete, conv_reorder,
-            conv_compact, chat_model_info,
+            conv_compact, history_compact, chat_model_info,
             agents_list, agents_create, agents_update, agents_reorder, agents_delete,
             agents_set_active, agents_get_active, agents_sharing_folder,
             agent_mounts_list, agent_mount_add, agent_mount_remove,
@@ -5939,6 +6140,7 @@ pub fn run() {
             agent_context_add, agent_context_list, agent_context_remove,
             agent_generate_soul,
             mailbox_pending_counts, mailbox_take_next, mailbox_roster,
+            continue_gate::task_continue_answer,
             get_app_knobs, set_app_knobs,
             memory_ingest, memory_retrieve, memory_stats,
             memory_append_daily, memory_gate_check, memory_remember,
@@ -5958,7 +6160,9 @@ pub fn run() {
             onboarding_status, onboarding_pick_root, onboarding_set_root,
             onboarding_make_agent_home, onboarding_finish, import_memory
         ])
+        .register_uri_scheme_protocol(video_media::SCHEME, video_media::handle)
         .setup(move |_app| {
+            video_tools::install_app(_app.handle().clone());
             // CACHE-BUST FIRST (Mason 08-08): if this is a new build, clear the
             // stale WKWebView frontend cache before the window loads, so the new
             // UI code actually runs. Must happen before any content load.

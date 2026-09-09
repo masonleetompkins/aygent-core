@@ -1,0 +1,630 @@
+// AYGENT — VIDEO v0.3 side panels: Media · Graphics · Captions (Hyperframes) · Color · Audio · Export.
+// Each panel edits the composition through the store (autosaved) or triggers a
+// video_* tool — the SAME core the agent uses, so button == prompt.
+// Graphics + captions are built with Hyperframes (transparent overlays); the old
+// ASS/DOM caption pipeline is gone.
+import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { Upload, Plus, X, FolderOpen, Folder, FolderPlus, Download, Square, Sparkles, Music, Film, Image as ImageIcon, Mic2, RefreshCw, Link2, Layers, Unplug, FileText, Volume2, AudioLines, KeyRound, Download as DlIcon, ChevronRight, ChevronDown, LayoutGrid, List, Pencil, Trash2 } from "lucide-react";
+import { useVideo, mutate, importPick, removeAsset, relinkAsset, reload, addAssetToTimeline, runTool, pickLut, startRender, cancelRender, reveal, toast, set, refreshRenders, refreshThumbs, createMediaFolder, renameMediaFolder, deleteMediaFolder, moveMediaAssets } from "./store";
+import { type Asset, type Composition, type MediaFolder, fmtDur, fmtBytes, mediaUrl, stockBrightHud, eli5DarkPack } from "./model";
+import { TranscriptEditor } from "./TranscriptEditor";
+
+// ---- small field kit ------------------------------------------------------
+export function Field({ label, val, children }: { label: string; val?: string | number; children: React.ReactNode }) {
+  return <div className="ve-field"><label>{label}{val !== undefined && <span className="val">{val}</span>}</label>{children}</div>;
+}
+export function Slider({ label, value, min, max, step = 0.01, onChange, fmt }: { label: string; value: number; min: number; max: number; step?: number; onChange: (v: number) => void; fmt?: (v: number) => string }) {
+  return <Field label={label} val={fmt ? fmt(value) : value.toFixed(2)}><input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(Number(e.target.value))} onDoubleClick={() => onChange(0)} /></Field>;
+}
+export function Num({ label, value, step = 1, min, max, onChange, suffix }: { label: string; value: number; step?: number; min?: number; max?: number; onChange: (v: number) => void; suffix?: string }) {
+  const [txt, setTxt] = useState(String(round(value)));
+  useEffect(() => setTxt(String(round(value))), [value]);
+  const commit = () => { const n = Number(txt); if (isFinite(n)) onChange(Math.max(min ?? -Infinity, Math.min(max ?? Infinity, n))); else setTxt(String(round(value))); };
+  return <Field label={label + (suffix ? ` (${suffix})` : "")}><input type="number" step={step} min={min} max={max} value={txt} onChange={(e) => setTxt(e.target.value)} onBlur={commit} onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }} /></Field>;
+}
+const round = (v: number) => Math.round(v * 1000) / 1000;
+export function Check({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
+  return <label className="ve-check"><input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />{label}</label>;
+}
+export function Seg<T extends string>({ value, options, onChange }: { value: T; options: { v: T; l: string }[]; onChange: (v: T) => void }) {
+  return <div className="ve-seg">{options.map((o) => <button key={o.v} className={o.v === value ? "on" : ""} onClick={() => onChange(o.v)}>{o.l}</button>)}</div>;
+}
+export function Section({ title, right, children }: { title: string; right?: React.ReactNode; children: React.ReactNode }) {
+  return <div className="ve-section"><h4>{title}{right}</h4>{children}</div>;
+}
+/** "/Volumes/Mason_2022/…" → "Mason_2022"; internal disk → "Macintosh HD". */
+export const volumeOf = (p: string) => { const m = /^\/Volumes\/([^/]+)/.exec(p); return m ? m[1] : "Macintosh HD"; };
+const setPath = (path: string, value: unknown) => mutate((c) => { const parts = path.split("."); let cur: any = c; for (let i = 0; i < parts.length - 1; i++) cur = cur[parts[i]]; cur[parts[parts.length - 1]] = value; });
+
+// ---- MEDIA ----------------------------------------------------------------
+type MediaView = "grid" | "list";
+const isGeneratedAsset = (a: Asset) =>
+  a.name.includes("(alpha)") || a.name.includes("(enhanced)") || a.name.includes("(cleaned)") || a.name.includes("(HF)") || a.name.includes("(overlay)");
+
+export function MediaPanel() {
+  const s = useVideo();
+  const [sel, setSel] = useState<string | null>(null);
+  const [view, setView] = useState<MediaView>(() => {
+    try { return localStorage.getItem("aygent.video.mediaView") === "list" ? "list" : "grid"; } catch { return "grid"; }
+  });
+  const files = s.assets.filter((a) => !isGeneratedAsset(a));
+  const generated = s.assets.filter(isGeneratedAsset);
+  const offline = s.assets.filter((a) => a.online === false);
+  function pickView(v: MediaView) { setView(v); try { localStorage.setItem("aygent.video.mediaView", v); } catch { /* ignore */ } }
+  return (
+    <>
+      <div className="ve-panel-head">Media<span className="spacer" />
+        <button className={`ve-icon-btn ${view === "grid" ? "on" : ""}`} title="Grid view" onClick={() => pickView("grid")}><LayoutGrid size={14} /></button>
+        <button className={`ve-icon-btn ${view === "list" ? "on" : ""}`} title="List view with bins" onClick={() => pickView("list")}><List size={14} /></button>
+        <button className="ve-icon-btn" title="Rebuild thumbnails" onClick={() => void refreshThumbs()}><RefreshCw size={14} /></button>
+        <button className="ve-btn sm primary" onClick={() => void importPick()}><Upload size={13} /> Import</button>
+      </div>
+      <div className="ve-panel-body">
+        <div className="ve-drop" onClick={() => void importPick()}>
+          <Link2 size={18} />
+          <div><b>Drop footage here</b> or click to pick</div>
+          <div className="ve-faint" style={{ fontSize: 11 }}>Files are <b>hardlinked</b>, never copied. Same-volume only; others link by reference.</div>
+        </div>
+        {offline.length > 0 && (
+          <div className="ve-offline">
+            <div className="hd"><Unplug size={14} /> {offline.length === 1 ? "1 file is offline" : `${offline.length} files are offline`}</div>
+            {offline.map((a) => (
+              <div key={a.id} className="row">
+                <div className="nm">{a.name}</div>
+                <div className="pth" title={a.path}>{a.path}</div>
+                <div className="acts">
+                  <span className="ve-faint">{a.linked ? "hardlink missing" : `plug in ${volumeOf(a.path)}`}</span>
+                  <button className="ve-btn sm" onClick={() => void relinkAsset(a.id)}><Link2 size={12} /> Relink…</button>
+                </div>
+              </div>
+            ))}
+            <button className="ve-btn sm" style={{ alignSelf: "flex-start" }} onClick={() => void reload()}><RefreshCw size={12} /> Check again</button>
+          </div>
+        )}
+        {view === "grid" ? (
+          <>
+            {files.length > 0 && <AssetGrid assets={files} sel={sel} setSel={setSel} />}
+            {generated.length > 0 && <Section title="Generated"><AssetGrid assets={generated} sel={sel} setSel={setSel} /></Section>}
+          </>
+        ) : (
+          <AssetList files={files} generated={generated} sel={sel} setSel={setSel} />
+        )}
+        <p className="ve-hint">Drag a clip onto a lane, or double-click to append at the end. <kbd className="ve-kbd">⌫</kbd> on a card unlinks it.</p>
+      </div>
+    </>
+  );
+}
+type MediaSel = { sel: string | null; setSel: (v: string | null) => void };
+function kindIcon(kind: Asset["kind"], size = 14) {
+  return kind === "audio" ? <Music size={size} /> : kind === "image" ? <ImageIcon size={size} /> : <Film size={size} />;
+}
+function AssetGrid({ assets, sel, setSel }: { assets: Asset[] } & MediaSel) {
+  const s = useVideo();
+  return (
+    <div className="ve-media">
+      {assets.map((a) => {
+        const thumb = a.thumbs?.strip && s.agentId && s.project ? mediaUrl(s.agentId, s.project, "cache", a.thumbs.strip, s.cacheBust) : null;
+        const fw = a.thumbs?.frameW ?? 114, fh = a.thumbs?.frameH ?? 64;
+        return (
+          <div key={a.id} className={`item ${sel === a.id ? "sel" : ""} ${a.online === false ? "offline" : ""}`} draggable onDragStart={(e) => { e.dataTransfer.setData("application/aygent-asset", a.id); e.dataTransfer.effectAllowed = "copy"; }}
+            onClick={() => setSel(a.id)} onDoubleClick={() => addAssetToTimeline(a)} tabIndex={0}
+            onKeyDown={(e) => { if ((e.key === "Backspace" || e.key === "Delete") && sel === a.id) { e.preventDefault(); if (confirm(`Unlink ${a.name}? Clips using it are removed.`)) void removeAsset(a.id); } }}>
+            <div className={`thumb ${a.kind}`} style={thumb && a.kind !== "audio" ? { backgroundImage: `url(${thumb})`, backgroundSize: `${(fw / fh) * 100 * (a.thumbs?.stripFrames ?? 1)}% 100%`, backgroundPosition: "left center" } : undefined}>
+              {a.kind === "audio" ? <Music size={22} /> : !thumb ? (a.kind === "image" ? <ImageIcon size={22} /> : <Film size={22} />) : null}
+            </div>
+            <span className="badge">{a.kind === "video" ? `${a.height}p` : a.kind.toUpperCase()}{!a.linked ? " · REF" : ""}</span>
+              {a.online === false && <span className="badge off" title={a.path}>OFFLINE</span>}
+            <button className="x" title="Unlink" onClick={(e) => { e.stopPropagation(); if (confirm(`Unlink ${a.name}? Clips using it are removed.`)) void removeAsset(a.id); }}><X size={12} /></button>
+            <div className="meta"><div className="n" title={a.path}>{a.name}</div><div className="d"><span>{a.kind === "image" ? `${a.width}×${a.height}` : fmtDur(a.duration)}</span><span>{a.fps ? `${Math.round(a.fps)}fps` : fmtBytes(a.size)}</span></div></div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---- LIST VIEW (Premiere-style bins) ----------------------------------------
+// One collapsible bin per folder + an "Unfiled" bin; generated assets keep
+// their own collapsed group. Assets move between bins via drag or the "Move
+// to" menu. Exported under _test for unit checks.
+function AssetList({ files, generated, sel, setSel }: { files: Asset[]; generated: Asset[] } & MediaSel) {
+  const s = useVideo();
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() => {
+    try { return JSON.parse(localStorage.getItem("aygent.video.binsCollapsed") ?? "{}"); } catch { return {}; }
+  });
+  const [creating, setCreating] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [targetBin, setTargetBin] = useState("");
+  const [moveIds, setMoveIds] = useState<string[] | null>(null);
+  const isCollapsed = (id: string) => collapsed[id] ?? (id === "__gen");
+  function toggle(id: string) {
+    setCollapsed((c) => {
+      const next = { ...c, [id]: !(c[id] ?? (id === "__gen")) };
+      try { localStorage.setItem("aygent.video.binsCollapsed", JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+  }
+  const folders: MediaFolder[] = s.folders;
+  const byFolder = new Map<string, Asset[]>();
+  const unfiled: Asset[] = [];
+  for (const a of files) {
+    if (a.folder && folders.some((f) => f.id === a.folder)) {
+      const arr = byFolder.get(a.folder) ?? [];
+      arr.push(a); byFolder.set(a.folder, arr);
+    } else unfiled.push(a);
+  }
+  async function commitCreate() {
+    const name = draft.trim();
+    if (!name) { setCreating(false); setDraft(""); return; }
+    const r = await createMediaFolder(name);
+    setCreating(false); setDraft("");
+    if (r) toggleOff(r.id);
+  }
+  function toggleOff(id: string) {
+    setCollapsed((c) => {
+      if (c[id] === false) return c;
+      const next = { ...c, [id]: false };
+      try { localStorage.setItem("aygent.video.binsCollapsed", JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+  }
+  async function commitRename(id: string) {
+    const name = renameDraft.trim();
+    setRenaming(null);
+    if (name) await renameMediaFolder(id, name);
+  }
+  async function commitMove() {
+    if (moveIds && moveIds.length) await moveMediaAssets(moveIds, targetBin);
+    setMoveIds(null); setTargetBin("");
+  }
+  return (
+    <div className="ve-binlist">
+      <div className="ve-binlist-bar">
+        <button className="ve-btn sm" onClick={() => setCreating(true)}><FolderPlus size={12} /> New bin</button>
+      </div>
+      {creating && (
+        <form className="ve-bin-create" onSubmit={(e) => { e.preventDefault(); void commitCreate(); }}>
+          <Folder size={14} />
+          <input autoFocus value={draft} placeholder="Bin name" onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => e.key === "Escape" && (setCreating(false), setDraft(""))} onBlur={() => void commitCreate()} aria-label="New bin name" />
+        </form>
+      )}
+      {folders.map((f) => (
+        <BinGroup key={f.id} id={f.id} name={f.name} assets={byFolder.get(f.id) ?? []} open={!isCollapsed(f.id)} onToggle={() => toggle(f.id)}
+          sel={sel} setSel={setSel} renaming={renaming === f.id} renameDraft={renameDraft} setRenameDraft={setRenameDraft}
+          onStartRename={() => { setRenaming(f.id); setRenameDraft(f.name); }} onCommitRename={() => void commitRename(f.id)} onCancelRename={() => setRenaming(null)}
+          onDelete={() => { if (confirm(`Delete bin "${f.name}"? Its media stays in Unfiled.`)) void deleteMediaFolder(f.id); }}
+          onOpenMove={(ids) => { setMoveIds(ids); setTargetBin(""); }} folders={folders} />
+      ))}
+      <BinGroup id="__unfiled" name="Unfiled" assets={unfiled} open={!isCollapsed("__unfiled")} onToggle={() => toggle("__unfiled")}
+        sel={sel} setSel={setSel} renaming={false} renameDraft="" setRenameDraft={() => {}} onStartRename={() => {}} onCommitRename={() => {}} onCancelRename={() => {}} onDelete={null} onOpenMove={(ids) => { setMoveIds(ids); setTargetBin(""); }} folders={folders} bare />
+      {generated.length > 0 && (
+        <BinGroup id="__gen" name="Generated" assets={generated} open={!isCollapsed("__gen")} onToggle={() => toggle("__gen")}
+          sel={sel} setSel={setSel} renaming={false} renameDraft="" setRenameDraft={() => {}} onStartRename={() => {}} onCommitRename={() => {}} onCancelRename={() => {}} onDelete={null} onOpenMove={(ids) => { setMoveIds(ids); setTargetBin(""); }} folders={folders} bare />
+      )}
+      {moveIds && (
+        <div className="ve-move-pop" role="dialog" aria-label="Move media to bin">
+          <h4>Move {moveIds.length} item{moveIds.length === 1 ? "" : "s"} to…</h4>
+          <select value={targetBin} onChange={(e) => setTargetBin(e.target.value)} autoFocus>
+            <option value="">Unfiled</option>
+            {folders.map((f) => <option key={f.id} value={f.id}>{f.name}</option>)}
+          </select>
+          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+            <button className="ve-btn sm" onClick={() => { setMoveIds(null); setTargetBin(""); }}>Cancel</button>
+            <button className="ve-btn sm primary" onClick={() => void commitMove()}>Move</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BinGroup({ id, name, assets, open, onToggle, sel, setSel, renaming, renameDraft, setRenameDraft, onStartRename, onCommitRename, onCancelRename, onDelete, onOpenMove, folders, bare }: {
+  id: string; name: string; assets: Asset[]; open: boolean; onToggle: () => void;
+  sel: string | null; setSel: (v: string | null) => void;
+  renaming: boolean; renameDraft: string; setRenameDraft: (v: string) => void;
+  onStartRename: () => void; onCommitRename: () => void; onCancelRename: () => void; onDelete: (() => void) | null;
+  onOpenMove: (ids: string[]) => void; folders: MediaFolder[]; bare?: boolean;
+}) {
+  const [over, setOver] = useState(false);
+  function onDrop(e: React.DragEvent) {
+    const aid = e.dataTransfer.getData("application/aygent-asset");
+    setOver(false);
+    if (!aid) return;
+    e.preventDefault(); e.stopPropagation();
+    void moveMediaAssets([aid], bare ? "" : id);
+  }
+  return (
+    <div className={`ve-bin ${open ? "open" : ""} ${over ? "over" : ""}`}
+      onDragOver={(e) => { if (e.dataTransfer.types.includes("application/aygent-asset")) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setOver(true); } }}
+      onDragLeave={() => setOver(false)} onDrop={onDrop}>
+      <div className="ve-bin-hd" onClick={onToggle} title={open ? "Collapse" : "Expand"}>
+        <span className="caret">{open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</span>
+        <Folder size={14} />
+        {renaming ? (
+          <input autoFocus value={renameDraft} aria-label="Rename bin"
+            onClick={(e) => e.stopPropagation()} onChange={(e) => setRenameDraft(e.target.value)}
+            onBlur={onCommitRename} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); onCommitRename(); } if (e.key === "Escape") { e.preventDefault(); onCancelRename(); } }} />
+        ) : (
+          <span className="nm" title={name}>{name}</span>
+        )}
+        <span className="ct">{assets.length}</span>
+        {!bare && !renaming && (
+          <span className="ops" onClick={(e) => e.stopPropagation()}>
+            <button className="ve-icon-btn" style={{ width: 22, height: 22 }} title="Rename bin" onClick={onStartRename}><Pencil size={12} /></button>
+            {onDelete && <button className="ve-icon-btn" style={{ width: 22, height: 22 }} title="Delete bin (media stays)" onClick={onDelete}><Trash2 size={12} /></button>}
+          </span>
+        )}
+      </div>
+      {open && (
+        <div className="ve-bin-rows">
+          {assets.length === 0 && <div className="ve-bin-empty">Empty — drag media here.</div>}
+          {assets.map((a) => <AssetRow key={a.id} a={a} sel={sel === a.id} setSel={setSel} onOpenMove={onOpenMove} folders={folders} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AssetRow({ a, sel, setSel, onOpenMove, folders }: { a: Asset; sel: boolean; setSel: (v: string | null) => void; onOpenMove: (ids: string[]) => void; folders: MediaFolder[] }) {
+  return (
+    <div className={`ve-brow ${sel ? "sel" : ""} ${a.online === false ? "offline" : ""}`} draggable
+      onDragStart={(e) => { e.dataTransfer.setData("application/aygent-asset", a.id); e.dataTransfer.effectAllowed = "move"; }}
+      onClick={() => setSel(a.id)} onDoubleClick={() => addAssetToTimeline(a)} tabIndex={0}
+      onKeyDown={(e) => { if ((e.key === "Backspace" || e.key === "Delete") && sel) { e.preventDefault(); if (confirm(`Unlink ${a.name}? Clips using it are removed.`)) void removeAsset(a.id); } }}>
+      <span className="ic">{kindIcon(a.kind)}</span>
+      <span className="n" title={a.path}>{a.name}</span>
+      <span className="d">{a.kind === "image" ? `${a.width}×${a.height}` : fmtDur(a.duration)}</span>
+      <span className="d sz">{a.fps ? `${Math.round(a.fps)}fps` : fmtBytes(a.size)}</span>
+      {a.online === false && <span className="ve-pill err" style={{ height: 18, fontSize: 10 }}>offline</span>}
+      {!a.linked && <span className="ve-faint" style={{ fontSize: 10 }}>REF</span>}
+      <span className="ops">
+        {folders.length > 0 && <button className="ve-icon-btn" style={{ width: 22, height: 22 }} title="Move to bin…" onClick={(e) => { e.stopPropagation(); onOpenMove([a.id]); }}><FolderOpen size={12} /></button>}
+        <button className="ve-icon-btn" style={{ width: 22, height: 22 }} title="Unlink" onClick={(e) => { e.stopPropagation(); if (confirm(`Unlink ${a.name}? Clips using it are removed.`)) void removeAsset(a.id); }}><X size={12} /></button>
+      </span>
+    </div>
+  );
+}
+
+export const _testBins = { isGeneratedAsset };
+// ---- GRAPHICS (Hyperframes) -------------------------------------------------
+// The look of every Hyperframes overlay (graphics + captions) is driven here:
+// plain-text instructions plus an optional style-guide file. The agent reads
+// both when it builds overlays with video_render_overlay.
+const GUIDE_EXTS = [".md", ".txt", ".rtf", ".pdf", ".docx"];
+export function GraphicsPanel() {
+  const s = useVideo();
+  const g = s.comp.graphics;
+  const [instructions, setInstructions] = useState(g.instructions);
+  useEffect(() => setInstructions(g.instructions), [g.instructions]);
+  const commitInstructions = () => { if (instructions !== g.instructions) setPath("graphics.instructions", instructions); };
+
+  async function pickGuide() {
+    const { agentId, project } = s;
+    if (!agentId || !project) { toast("open a project first"); return; }
+    try {
+      const r = await invoke<{ name: string; chars: number }>("video_pick_style_guide", { agentId, project });
+      toast(`style guide: ${r.name} (${r.chars} chars)`, "ok");
+      await reload();
+    } catch (e) { toast(String(e), "err"); }
+  }
+  function clearGuide() {
+    mutate((c) => { c.graphics.styleGuide = ""; c.graphics.styleGuideName = ""; });
+  }
+
+  const setG = (patch: Partial<Composition["graphics"]>) => mutate((c) => { Object.assign(c.graphics, patch); });
+  const swatch = (label: string, key: "accent" | "accentInk" | "panel" | "ink" | "inkSoft" | "muted" | "positive" | "negative" | "amber", val: string) => (
+    <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+      <input type="color" value={/^#[0-9a-fA-F]{6}$/.test(val) ? val : "#000000"} title={label} onChange={(e) => setG({ [key]: e.target.value } as any)} />
+      <input value={val} title={label} aria-label={label} onChange={(e) => setG({ [key]: e.target.value } as any)} style={{ flex: "1 1 0", minWidth: 0 }} />
+    </div>
+  );
+
+  return (
+    <>
+      <div className="ve-panel-head">Graphics<span className="spacer" /><span className="ve-pill">Hyperframes</span></div>
+      <div className="ve-panel-body">
+        <Section title="Brand style" right={g.theme === "bright-hud" ? <span className="ve-pill ok">stock</span> : <span className="ve-pill">custom</span>}>
+          <Seg value={g.theme} options={[{ v: "bright-hud", l: "Bright HUD" }, { v: "eli5-dark", l: "ELI5 dark" }]} onChange={(v) => mutate((c) => { c.graphics = v === "eli5-dark" ? { ...eli5DarkPack(), instructions: c.graphics.instructions, styleGuide: c.graphics.styleGuide, styleGuideName: c.graphics.styleGuideName } : { ...stockBrightHud(), instructions: c.graphics.instructions, styleGuide: c.graphics.styleGuide, styleGuideName: c.graphics.styleGuideName }; })} />
+          <p className="ve-hint">Stock = your Bright HUD brand (white panels, black ink, cyan #00cafc). ELI5 dark = the picture-locked dark system (#0a0e15 / #00e6ff). Switching keeps your instructions + guide.</p>
+          <div className="ve-row2">
+            <Field label="Accent">{swatch("Accent", "accent", g.accent)}</Field>
+            <Field label="Accent ink">{swatch("Accent ink", "accentInk", g.accentInk)}</Field>
+          </div>
+          <div className="ve-row2">
+            <Field label="Panel">{swatch("Panel", "panel", g.panel)}</Field>
+            <Field label="Headline ink">{swatch("Headline ink", "ink", g.ink)}</Field>
+          </div>
+          <div className="ve-row2">
+            <Field label="Body ink">{swatch("Body ink", "inkSoft", g.inkSoft)}</Field>
+            <Field label="Muted">{swatch("Muted", "muted", g.muted)}</Field>
+          </div>
+          <div className="ve-row3">
+            <Field label="Up">{swatch("Up metrics", "positive", g.positive)}</Field>
+            <Field label="Down">{swatch("Down / gap", "negative", g.negative)}</Field>
+            <Field label="Ask">{swatch("Question", "amber", g.amber)}</Field>
+          </div>
+        </Section>
+        <Section title="Type">
+          <div className="ve-row2">
+            <Field label="Display font"><input value={g.fontDisplay} onChange={(e) => setG({ fontDisplay: e.target.value })} /></Field>
+            <Field label="Mono font"><input value={g.fontMono} onChange={(e) => setG({ fontMono: e.target.value })} /></Field>
+          </div>
+          <div className="ve-row2">
+            <Num label="Headline weight" value={g.headlineWeight} step={100} min={100} max={900} onChange={(v) => setG({ headlineWeight: v })} />
+            <Num label="Caption size (px)" value={g.captionSize} step={1} min={16} max={200} onChange={(v) => setG({ captionSize: v })} />
+          </div>
+          <div className="ve-row3">
+            <Num label="Caption wt" value={g.captionWeight} step={100} min={100} max={900} onChange={(v) => setG({ captionWeight: v })} />
+            <Num label="Max words" value={g.captionMaxWords} step={1} min={1} max={8} onChange={(v) => setG({ captionMaxWords: v })} />
+            <Num label="Max lines" value={g.maxLines} step={1} min={1} max={4} onChange={(v) => setG({ maxLines: v })} />
+          </div>
+        </Section>
+        <Section title="Layout + motion">
+          <div className="ve-row3">
+            <Field label="Align"><select value={g.align} onChange={(e) => setG({ align: e.target.value })}><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></Field>
+            <Num label="Max styles" value={g.maxVariations} step={1} min={1} max={4} onChange={(v) => setG({ maxVariations: v })} />
+            <Num label="Width cap %" value={g.widthCapPct} step={1} min={40} max={100} onChange={(v) => setG({ widthCapPct: v })} />
+          </div>
+          <div className="ve-row3">
+            <Field label="Placement"><select value={g.placement} onChange={(e) => setG({ placement: e.target.value })}><option value="upper-right">Upper right</option><option value="upper-third">Upper third</option><option value="center">Center</option></select></Field>
+            <Field label="Motion"><select value={g.motion} onChange={(e) => setG({ motion: e.target.value })}><option value="subtle">Subtle</option><option value="kinetic">Kinetic</option></select></Field>
+            <Field label="Ease"><select value={g.ease} onChange={(e) => setG({ ease: e.target.value })}><option value="cubic-bezier(0.16,1,0.3,1)">Bright HUD</option><option value="power3.out">power3.out</option><option value="back.out(1.8)">back.out</option></select></Field>
+          </div>
+          <p className="ve-hint">Constraints from your feedback: {g.maxLines} lines max, left axis, {g.maxVariations} text styles per graphic, {g.motion} motion.</p>
+        </Section>
+        <Section title="Style instructions">
+          <textarea rows={6} value={instructions} placeholder={"e.g. Bold kinetic type, SF Pro Heavy, cyan (#00e6ff) glows on dark grid panels, mono kickers, generous spacing. Lower-thirds slide in from the left."} onChange={(e) => setInstructions(e.target.value)} onBlur={commitInstructions} />
+          <p className="ve-hint">Plain text. The agent follows this every time it builds a graphic or caption overlay.</p>
+        </Section>
+        <Section title="Style guide" right={g.styleGuideName ? <button className="ve-icon-btn" style={{ width: 22, height: 22 }} title="Remove style guide" onClick={clearGuide}><X size={12} /></button> : null}>
+          {g.styleGuideName ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <FileText size={15} style={{ flexShrink: 0, color: "var(--text-muted)" }} />
+              <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600, fontSize: 12.5 }} title={g.styleGuideName}>{g.styleGuideName}</span>
+              <span className="ve-pill ok">{g.styleGuide.length} chars</span>
+            </div>
+          ) : (
+            <p className="ve-hint">No guide yet — instructions above are the whole style.</p>
+          )}
+          <button className="ve-btn" onClick={() => void pickGuide()}><Upload size={13} /> Upload guide</button>
+          <p className="ve-hint">{GUIDE_EXTS.join(" · ")} — text is extracted and saved into the project, so the agent always sees it.</p>
+        </Section>
+        <Section title="Overlays">
+          <p className="ve-hint">Graphics land as overlay clips on <b>V3</b> (graphics) and <b>T1</b> (captions) — transparent Hyperframes renders, composited on export. Ask the agent: <i>"plan graphics for this video"</i> — it plans first, then builds one overlay per approval.</p>
+        </Section>
+      </div>
+    </>
+  );
+}
+
+// ---- CAPTIONS (Hyperframes) -------------------------------------------------
+// No styling controls here anymore: the look comes from the Graphics panel.
+// This panel owns the transcript → a transparent caption overlay on T1.
+export function CaptionsPanel() {
+  const s = useVideo(); const cap = s.comp.captions;
+  const [kw, setKw] = useState(cap.keyWords.join(", "));
+  useEffect(() => setKw(cap.keyWords.join(", ")), [cap.keyWords]);
+  const hasTx = !!s.transcript;
+  const hfOk = !!s.status?.hyperframes;
+  const building = !!s.toolProgress;
+
+  async function build() {
+    const keyWords = kw.split(",").map((x) => x.trim()).filter(Boolean);
+    if (JSON.stringify(keyWords) !== JSON.stringify(cap.keyWords)) setPath("captions.keyWords", keyWords);
+    await runTool("video_build_captions", { keyWords }, "building captions…");
+  }
+
+  return (
+    <>
+      <div className="ve-panel-head">Captions<span className="spacer" /><Check label="On" checked={cap.enabled} onChange={(v) => setPath("captions.enabled", v)} /><span className="ve-pill">Hyperframes</span></div>
+      <div className="ve-panel-body">
+        <Section title="Transcript" right={hasTx ? <span className="ve-pill ok">{s.transcript!.words.length} words</span> : <span className="ve-pill">none</span>}>
+          <button className="ve-btn primary" disabled={!s.assets.some((a) => a.hasAudio) || building} onClick={() => void runTool("video_transcribe", {}, "transcribing…")}><Mic2 size={13} /> {hasTx ? "Re-transcribe A-roll" : "Transcribe A-roll"}</button>
+          {!s.status?.whisper && <p className="ve-hint" style={{ color: "var(--warn)" }}>Needs an OpenAI key (Settings) — Whisper word timestamps.</p>}
+        </Section>
+        {hasTx && <TranscriptEditor />}
+        <Section title="Build">
+          <Field label="Key words (highlighted)"><input value={kw} placeholder="agent, AYGENT, free" onChange={(e) => setKw(e.target.value)} onBlur={() => setPath("captions.keyWords", kw.split(",").map((x) => x.trim()).filter(Boolean))} /></Field>
+          <Slider label="Vertical position" value={cap.y} min={0.05} max={0.95} fmt={(v) => `${Math.round(v * 100)}%`} onChange={(v) => setPath("captions.y", v)} />
+          <button className="ve-btn primary" disabled={!hasTx || !hfOk || building} onClick={() => void build()}><Sparkles size={13} /> {building ? "Building…" : "Build caption overlay"}</button>
+          {!hfOk && <p className="ve-hint" style={{ color: "var(--warn)" }}>Enable Hyperframes in Tools to build captions.</p>}
+          <p className="ve-hint">Renders a transparent overlay clip on <b>T1</b> from the transcript, timed through your cuts. Style comes from the Graphics panel. Rebuild after re-cutting.</p>
+        </Section>
+      </div>
+    </>
+  );
+}
+
+// ---- COLOR ----------------------------------------------------------------
+export function ColorPanel() {
+  const s = useVideo(); const g = s.comp.color;
+  const sel = s.comp.clips.find((c) => c.id === s.selection[0]);
+  return (
+    <>
+      <div className="ve-panel-head">Color<span className="spacer" /><Check label="Adjustment layer" checked={s.comp.adjustmentLayer} onChange={(v) => setPath("adjustmentLayer", v)} /></div>
+      <div className="ve-panel-body">
+        <Section title="LUT (on the adjustment layer)" right={<button className="ve-btn sm" onClick={() => void pickLut().then((r) => { if (r) setPath("color.lut", r); })}><FolderOpen size={12} /> .cube</button>}>
+          <select value={g.lut} onChange={(e) => setPath("color.lut", e.target.value)}>
+            <option value="">none</option>
+            {s.luts.map((l) => <option key={l} value={l}>{l.replace(/^luts\//, "")}</option>)}
+          </select>
+          <Slider label="Intensity" value={g.lutIntensity} min={0} max={1} fmt={(v) => `${Math.round(v * 100)}%`} onChange={(v) => setPath("color.lutIntensity", v)} />
+          <p className="ve-hint">Drop a .cube into Media to add it here. The LUT applies on export (lut3d, tetrahedral) — the preview approximates exposure/contrast/saturation only.</p>
+        </Section>
+        <Section title="Global grade">
+          <Slider label="S-curve" value={g.sCurve} min={0} max={1} fmt={(v) => `${Math.round(v * 100)}%`} onChange={(v) => setPath("color.sCurve", v)} />
+          <Slider label="Exposure" value={g.exposure} min={-1} max={1} onChange={(v) => setPath("color.exposure", v)} />
+          <Slider label="Contrast" value={g.contrast} min={-1} max={1} onChange={(v) => setPath("color.contrast", v)} />
+          <Slider label="Saturation" value={g.saturation} min={-1} max={1} onChange={(v) => setPath("color.saturation", v)} />
+          <Slider label="Temperature" value={g.temperature} min={-1} max={1} onChange={(v) => setPath("color.temperature", v)} />
+        </Section>
+        {sel && sel.type !== "text" && sel.type !== "audio" && (
+          <Section title={`Clip grade · ${sel.name || sel.id}`}>
+            <Slider label="S-curve" value={sel.color.sCurve} min={0} max={1} fmt={(v) => `${Math.round(v * 100)}%`} onChange={(v) => mutate((c) => { c.clips.find((k) => k.id === sel.id)!.color.sCurve = v; })} />
+            <Slider label="Exposure" value={sel.color.exposure} min={-1} max={1} onChange={(v) => mutate((c) => { c.clips.find((k) => k.id === sel.id)!.color.exposure = v; })} />
+            <Slider label="Contrast" value={sel.color.contrast} min={-1} max={1} onChange={(v) => mutate((c) => { c.clips.find((k) => k.id === sel.id)!.color.contrast = v; })} />
+            <Slider label="Saturation" value={sel.color.saturation} min={-1} max={1} onChange={(v) => mutate((c) => { c.clips.find((k) => k.id === sel.id)!.color.saturation = v; })} />
+            <Slider label="Temperature" value={sel.color.temperature} min={-1} max={1} onChange={(v) => mutate((c) => { c.clips.find((k) => k.id === sel.id)!.color.temperature = v; })} />
+            <Field label="Clip LUT"><select value={sel.color.lut} onChange={(e) => mutate((c) => { c.clips.find((k) => k.id === sel.id)!.color.lut = e.target.value; })}><option value="">none</option>{s.luts.map((l) => <option key={l} value={l}>{l.replace(/^luts\//, "")}</option>)}</select></Field>
+          </Section>
+        )}
+        <Section title="Subject matte (experimental)" right={s.comp.matte.enabled ? <span className="ve-pill ok">on</span> : null}>
+          <p className="ve-hint">RobustVideoMatting separates you from the background so overlay clips flagged <b>behind subject</b> render behind you. First run downloads PyTorch via uv (slow).</p>
+          <button className="ve-btn" disabled={!s.status?.uv || !!s.toolProgress || !s.assets.some((a) => a.kind === "video")} onClick={() => { const a = s.comp.clips.find((c) => c.track === "V1" && c.type === "video")?.asset ?? s.assets.find((x) => x.kind === "video")?.id; if (a) void runTool("video_matte", { asset: a }, "matting (RVM)…"); }}><Layers size={13} /> Generate matte for A-roll</button>
+          {!s.status?.uv && <p className="ve-hint" style={{ color: "var(--warn)" }}>uv isn't provisioned yet — enable any Python MCP server once (MCP Connections) to install it.</p>}
+          {s.comp.matte.enabled && <><Slider label="Edge feather" value={s.comp.matte.feather} min={0} max={12} step={0.5} fmt={(v) => `${v}px`} onChange={(v) => setPath("matte.feather", v)} /><Check label="Matte enabled" checked={s.comp.matte.enabled} onChange={(v) => setPath("matte.enabled", v)} /></>}
+        </Section>
+      </div>
+    </>
+  );
+}
+
+// ---- AUDIO (local only) -----------------------------------------------------
+// No cloud, no credentials: automatic neural voice cleanup per A-roll source,
+// live-blended with the original via Cleanup amount, per-track trims, master
+// gain. Manual ducking = volume keyframes on the timeline lane
+// (Inspector > Audio > Keyframes), which the agent can also write.
+export function AudioPanel() {
+  const s = useVideo(); const a = s.comp.audio;
+  const [voice, setVoice] = useState<{ installed: boolean; engine: string } | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const [cleaning, setCleaning] = useState(false);
+  const aroll = s.comp.clips.find((c) => c.track === "V1" && c.type === "video");
+  // Target = the SELECTED audible clips (one or many; linked V+A partners
+  // follow in the tool). Nothing selected → every clip of the A-roll source.
+  const selClips = s.comp.clips.filter((c) => s.selection.includes(c.id) && (c.type === "video" || c.type === "audio") && c.asset);
+  // Count distinct AUDIBLE sources only: a linked V+A pair is ONE clip, and
+  // silent clips (video with no audio stream, images, text) don't count.
+  const assetById = new Map(s.assets.map((a) => [a.id, a]));
+  const audibleSel = selClips.filter((c) => c.type === "audio" || (c.type === "video" && (assetById.get(c.asset)?.hasAudio ?? true)));
+  const audioCount = new Set(audibleSel.map((c) => c.link || c.id)).size;
+  const selTarget = selClips.length > 0;
+  const audible = s.comp.clips.filter((c) => c.type === "video" && !c.hidden && c.asset);
+  const cleanedIds = new Set(audible.filter((c) => c.audioAsset && s.assets.some((x) => x.id === c.audioAsset)).map((c) => c.id));
+  const cleaned = aroll && s.assets.find((x) => x.id === aroll.audioAsset);
+  const anyCleaned = cleanedIds.size > 0;
+  const processing = cleaning || (!!s.toolProgress && /clean|isolat|enhance|dialogue|denois/i.test(s.toolProgress));
+  const tracks = Array.from(new Set(s.comp.clips.filter((c) => (c.type === "audio" || c.type === "video") && !c.hidden).map((c) => c.track))).sort();
+  const mix = a.cleanMix ?? 1;
+
+  useEffect(() => {
+    let live = true;
+    if (s.project) runTool<{ installed: boolean; engine: string }>("video_voice_status", {}).then((r) => { if (live && r) setVoice(r); }).catch(() => {});
+    return () => { live = false; };
+  }, [s.project]);
+
+  async function cleanup() {
+    const input = selTarget ? { clips: selClips.map((c) => c.id) } : aroll ? { asset: aroll.asset } : null;
+    if (!input || cleaning) return;
+    setCleaning(true);
+    try {
+      const r = await runTool<{ engine: string; clipsUpdated: number }>("video_audio_enhance", input, "cleaning dialogue…");
+      if (r) toast(`${r.clipsUpdated} clip${r.clipsUpdated === 1 ? "" : "s"} cleaned (${r.engine === "neural" ? "neural isolation" : "light cleanup"}) — drag Cleanup amount to blend`, "ok");
+    } finally { setCleaning(false); }
+  }
+  async function installVoice() {
+    setInstalling(true);
+    try {
+      const r = await runTool<{ engine: string }>("video_voice_install", {}, "downloading voice model…");
+      if (r) { setVoice({ installed: true, engine: r.engine }); toast("voice model installed — Clean now uses neural isolation", "ok"); }
+    } finally { setInstalling(false); }
+  }
+
+  return (
+    <>
+      <div className="ve-panel-head">Audio<span className="spacer" /><span className="ve-pill ok">local</span></div>
+      <div className="ve-panel-body">
+        <Section title="Dialogue cleanup" right={cleaned ? (mix >= 0.999 ? <span className="ve-pill ok">cleaned</span> : mix <= 0.001 ? <span className="ve-pill">original</span> : <span className="ve-pill ok">{Math.round(mix * 100)}%</span>) : null}>
+          {voice && !voice.installed && (
+            <>
+              <p className="ve-hint">Neural voice isolation needs a one-time model download (~90MB). Until then, Clean uses a light fallback.</p>
+              <button className="ve-btn sm" disabled={installing || !!s.toolProgress} onClick={() => void installVoice()}><DlIcon size={12} /> {installing ? "Downloading…" : "Download voice model"}</button>
+            </>
+          )}
+          <Slider label="Cleanup amount" value={mix} min={0} max={1} step={0.01} fmt={(v) => (v <= 0.001 ? "original" : v >= 0.999 ? "full clean" : `${Math.round(v * 100)}%`)} onChange={(v) => setPath("audio.cleanMix", v)} />
+          <p className="ve-hint">Live blend — no re-clean needed. 0% is the original mic, 100% the isolated voice, 50/50 a true half mix. Preview + export match.</p>
+          <div className="ve-btn-row">
+            <button className={`ve-btn sm primary${processing ? " busy" : ""}`} disabled={(!aroll && !selTarget) || !!s.toolProgress || cleaning} onClick={() => void cleanup()} title={selTarget ? `Clean the ${audioCount} selected clip${audioCount === 1 ? "" : "s"}` : "Clean every clip of the A-roll source (select clips to clean only those)"}>
+              {processing ? <RefreshCw size={12} className="ve-spin" /> : <Sparkles size={12} />} {processing ? "Processing…" : selTarget ? `Clean Audio (${audioCount} selected)` : "Clean Audio"}
+            </button>
+          </div>
+          <p className="ve-hint">{selTarget ? "Cleans only the selected clips (linked video+audio pairs move together). Deselect to clean the whole A-roll." : "Select one or more clips on the timeline to clean just those; with nothing selected the whole A-roll is cleaned."}</p>
+          {anyCleaned && <p className="ve-hint">{cleanedIds.size} of {audible.length} clips play cleaned audio{cleaned ? <> (<b>{cleaned.name}</b>)</> : null} blended at {Math.round(mix * 100)}% (preview + export). Clear via Inspector → Audio asset.</p>}
+        </Section>
+        <Section title="Tracks" right={<Volume2 size={13} style={{ color: "var(--text-faint)" }} />}>
+          {tracks.length === 0 && <p className="ve-hint">No audible tracks yet — import media first.</p>}
+          {tracks.map((t) => (
+            <div key={t} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span className="ve-pill" style={{ minWidth: 34, justifyContent: "center" }}>{t}</span>
+              <input type="range" min={-24} max={12} step={0.5} value={a.trackGain?.[t] ?? 0}
+                title={`${t} trim`} style={{ flex: 1 }}
+                onChange={(e) => mutate((c) => { c.audio.trackGain[t] = Number(e.target.value); })} />
+              <span className="ve-mono" style={{ fontSize: 11, minWidth: 52, textAlign: "right" }}>{(a.trackGain?.[t] ?? 0).toFixed(1)} dB</span>
+              <button className={`ve-icon-btn ${s.kfTrack === t ? "on" : ""}`} title={s.kfTrack === t ? "Hide keyframes" : "Edit keyframes (manual ducking)"}
+                onClick={() => set({ kfTrack: s.kfTrack === t ? null : t })}><KeyRound size={13} /></button>
+              {(a.trackGain?.[t] ?? 0) !== 0 && <button className="ve-icon-btn" title="Reset trim" onClick={() => mutate((c) => { delete c.audio.trackGain[t]; })}><X size={12} /></button>}
+            </div>
+          ))}
+          <p className="ve-hint"><AudioLines size={12} style={{ verticalAlign: -2 }} /> Keyframe toggle opens the dB lane under the track: click to add, drag to move (⇧ = fine), double-click to delete. The agent writes the same keyframes.</p>
+        </Section>
+        <Section title="Master">
+          <Slider label="Master gain" value={a.masterDb} min={-12} max={12} step={0.5} fmt={(v) => `${v} dB`} onChange={(v) => setPath("audio.masterDb", v)} />
+          <Check label="Loudness normalize on export (−16 LUFS)" checked={a.loudnorm} onChange={(v) => setPath("audio.loudnorm", v)} />
+        </Section>
+      </div>
+    </>
+  );
+}
+
+// ---- EXPORT ---------------------------------------------------------------
+const SIZES = [["16:9 · 1080p", 1920, 1080], ["16:9 · 4K", 3840, 2160], ["9:16 · 1080×1920", 1080, 1920], ["1:1 · 1080", 1080, 1080], ["4:5 · 1080×1350", 1080, 1350]] as const;
+export function ExportPanel() {
+  const s = useVideo(); const ex = s.comp.exports;
+  useEffect(() => { void refreshRenders(); }, [s.project]);
+  const upd = (i: number, p: Partial<Composition["exports"][number]>) => mutate((c) => { c.exports[i] = { ...c.exports[i], ...p }; });
+  return (
+    <>
+      <div className="ve-panel-head">Export<span className="spacer" /><button className="ve-btn sm" onClick={() => mutate((c) => { c.exports.push({ name: `preset-${c.exports.length + 1}`, width: c.scene.width, height: c.scene.height, bitrate: "12M", codec: "h264", fps: 0 }); })}><Plus size={13} /> Preset</button></div>
+      <div className="ve-panel-body">
+        {s.render && (s.render.running || s.render.error) && (
+          <Section title={s.render.running ? "Rendering" : "Failed"}>
+            {s.render.running && <div className="ve-progress"><div className="bar"><i style={{ width: `${s.render.pct}%` }} /></div><span className="ve-mono">{s.render.pct}%</span><button className="ve-icon-btn" onClick={() => void cancelRender()} title="Cancel"><Square size={13} /></button></div>}
+            {s.render.error && <p className="ve-hint" style={{ color: "var(--danger)", userSelect: "text" }}>{s.render.error}</p>}
+          </Section>
+        )}
+        {ex.map((p, i) => (
+          <Section key={i} title={p.name} right={<button className="ve-icon-btn" style={{ width: 22, height: 22 }} onClick={() => mutate((c) => { c.exports.splice(i, 1); })}><X size={12} /></button>}>
+            <Field label="Name"><input value={p.name} onChange={(e) => upd(i, { name: e.target.value })} /></Field>
+            <Field label="Size">
+              <select value={`${p.width}x${p.height}`} onChange={(e) => { const [w, h] = e.target.value.split("x").map(Number); if (w && h) upd(i, { width: w, height: h }); }}>
+                {SIZES.map(([l, w, h]) => <option key={l} value={`${w}x${h}`}>{l}</option>)}
+                {!SIZES.some(([, w, h]) => w === p.width && h === p.height) && <option value={`${p.width}x${p.height}`}>{p.width}×{p.height}</option>}
+              </select>
+            </Field>
+            <div className="ve-row3">
+              <Num label="W" value={p.width} step={2} min={16} onChange={(v) => upd(i, { width: v })} />
+              <Num label="H" value={p.height} step={2} min={16} onChange={(v) => upd(i, { height: v })} />
+              <Field label="Bitrate"><input value={p.bitrate} onChange={(e) => upd(i, { bitrate: e.target.value })} /></Field>
+            </div>
+            <div className="ve-row2">
+              <Field label="Codec"><select value={p.codec} onChange={(e) => upd(i, { codec: e.target.value as any })}><option value="h264">H.264 (VideoToolbox)</option><option value="hevc">HEVC</option><option value="prores">ProRes 422 HQ</option></select></Field>
+              <Num label="FPS (0 = scene)" value={p.fps} step={1} min={0} max={120} onChange={(v) => upd(i, { fps: v })} />
+            </div>
+            <button className="ve-btn primary" disabled={!!s.render?.running || !s.comp.clips.length} onClick={() => void startRender(p)}><Download size={13} /> Export {p.width}×{p.height}</button>
+            {p.width / p.height !== s.comp.scene.width / s.comp.scene.height && <p className="ve-hint" style={{ color: "var(--warn)" }}>Aspect differs from the scene ({s.comp.scene.width}×{s.comp.scene.height}) — clips will be fit with <b>cover</b>. For a proper reframe, ask the agent: "make a 9:16 version".</p>}
+          </Section>
+        ))}
+        <Section title="Renders" right={<button className="ve-icon-btn" style={{ width: 22, height: 22 }} onClick={() => void reveal("renders")}><FolderOpen size={12} /></button>}>
+          {s.renders.length === 0 && <p className="ve-hint">Nothing exported yet.</p>}
+          {s.renders.map((r) => <button key={r.path} className="ve-btn" style={{ justifyContent: "space-between" }} onClick={() => void reveal(r.path)} title="Reveal in Finder"><span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{r.path.replace(/^renders\//, "")}</span><span className="ve-faint">{fmtBytes(r.bytes)}</span></button>)}
+        </Section>
+      </div>
+    </>
+  );
+}
+
+export function useProjectEffect(fn: () => void) { const p = useVideo().project; const ref = useRef(fn); ref.current = fn; useEffect(() => { ref.current(); }, [p]); }
+export { set as _set };

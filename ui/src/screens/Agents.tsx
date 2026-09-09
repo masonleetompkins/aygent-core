@@ -255,7 +255,7 @@ export function Agents({
                 <span style={{ fontWeight: 700, fontSize: 16 }}>{a.name}</span>
               </div>
               <div style={{ fontSize: 12, color: "var(--text-faint)", fontFamily: "ui-monospace, monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {a.folder_path || "no folder"} · {a.model || "auto"} · {a.provider || "anthropic"} · {a.context_mode}
+                {a.folder_path || "no folder"} · {a.model || "auto"}{a.model_variant ? ` · ${a.model_variant}` : ""} · {a.provider || "anthropic"} · {a.context_mode}
               </div>
             </div>
             <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
@@ -292,6 +292,7 @@ export function AgentForm({
   const [color, setColor] = useState(initial?.color ?? "#5b8cff");
   const [folder, setFolder] = useState(initial?.folder_path ?? "");
   const [model, setModel] = useState(initial?.model ?? "");
+  const [variant, setVariant] = useState(initial?.model_variant ?? "");
   const [provider, setProvider] = useState(initial?.provider ?? "anthropic");
   const [contextMode, setContextMode] = useState(initial?.context_mode ?? "isolated");
   const [systemPrompt, setSystemPrompt] = useState(initial?.system_prompt ?? "");
@@ -378,7 +379,7 @@ export function AgentForm({
       try {
         const created = await invoke<AgentProfile>("agents_create", {
           name: name.trim(), icon, color, folderPath: folder, model, provider,
-          contextMode, systemPrompt,
+          modelVariant: variant, contextMode, systemPrompt,
         });
         setSavedId(created.id);
         onRosterChange?.(); // new chip appears in the rail immediately
@@ -561,14 +562,14 @@ export function AgentForm({
       if (initial) {
         const updated: AgentProfile = {
           ...initial, name: name.trim(), icon, color,
-          folder_path: folder, model, provider, context_mode: contextMode, system_prompt: systemPrompt,
+          folder_path: folder, model, provider, model_variant: variant, context_mode: contextMode, system_prompt: systemPrompt,
         };
         await invoke("agents_update", { profile: updated });
         onDone(updated);
       } else {
         const created = await invoke<AgentProfile>("agents_create", {
           name: name.trim(), icon, color, folderPath: folder, model, provider,
-          contextMode, systemPrompt,
+          modelVariant: variant, contextMode, systemPrompt,
         });
         onDone(created);
       }
@@ -620,7 +621,7 @@ export function AgentForm({
 
         <div style={{ display: "flex", gap: 12 }}>
           <label style={fieldLabel}>Provider
-            <select value={provider} onChange={(e) => { setProvider(e.target.value); setModel(""); }} style={selectStyle}>
+            <select value={provider} onChange={(e) => { setProvider(e.target.value); setModel(""); setVariant(""); }} style={selectStyle}>
               <option value="anthropic">Anthropic</option>
               <option value="openai">OpenAI</option>
               <option value="openrouter">OpenRouter</option>
@@ -690,6 +691,20 @@ export function AgentForm({
               </span>
             )}
           </label>
+          {(provider === "meta" || provider === "openai" || provider === "openrouter") && (
+            <label style={fieldLabel}>Variant
+              <select value={variant} onChange={(e) => setVariant(e.target.value)} style={selectStyle}>
+                <option value="">Auto (provider default)</option>
+                {["minimal", "low", "medium", "high", "xhigh"].map((v) => <option key={v} value={v}>{v}</option>)}
+                {provider === "meta" && <option value="max">max</option>}
+              </select>
+              <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>
+                {provider === "meta"
+                  ? "Reasoning effort for Muse Spark — same model id, more or less thinking. Higher = smarter + slower + pricier."
+                  : "Reasoning-effort passthrough — only some models honor it; others error honestly."}
+              </span>
+            </label>
+          )}
         </div>
 
         {/* CONTEXT MODE (2026-08-03): how much conversation context this agent

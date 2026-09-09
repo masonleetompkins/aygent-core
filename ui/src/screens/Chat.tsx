@@ -2,7 +2,7 @@
 // calls appear as inline cards as they fire, multi-turn history persists.
 // Consumes normalized StreamEvents from the Rust streaming agent loop over a
 // Tauri event channel. Falls back to a thinking animation if no text streams.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useLayoutEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Button } from "../components/ui";
 import { Icon, type IconName } from "../components/Icon";
@@ -11,8 +11,9 @@ import { useSparkBlobUrl, useSparkThemeSync, isSparkStateMsg } from "../lib/spar
 import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion, stopTurn } from "../lib/turns";
 import type { TurnItem, TurnUsage } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
+import { DiffView, DiffCounts, countDiff, isDiffable } from "../components/DiffView";
 
-type ToolLine = { name: string; path: string; ok?: boolean; detail?: string; summary?: string; body?: string; running?: boolean; spark?: { slug: string; title: string; html: string } };
+type ToolLine = { name: string; path: string; ok?: boolean; detail?: string; summary?: string; body?: string; running?: boolean; spark?: { slug: string; title: string; html: string }; before?: { exists: boolean; content: string; truncated: boolean; binary: boolean } | null };
 type Msg =
   // `at` = epoch ms. For a USER message it's when they hit send; for an
   // ASSISTANT message it's when the turn COMPLETED (set at finalize, not at
@@ -141,6 +142,39 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // ---- Task #5: attachments (+ button). ANY file becomes agent context ----
   const [attachments, setAttachments] = useState<Array<{ name: string; rel?: string; pending: boolean }>>([]);
   const fileRef = useRef<HTMLInputElement>(null);
+  // DRAG-AND-DROP (Mason 09-09): drop files anywhere on the chat column to
+  // attach them — same path as the + button (onFilesPicked), so behavior is
+  // identical. dragDepth keeps the overlay from flickering across children.
+  const [dragOver, setDragOver] = useState(false);
+  const dragDepth = useRef(0);
+  function dropHasFiles(e: React.DragEvent) {
+    try { return Array.from(e.dataTransfer.types || []).includes("Files"); } catch { return false; }
+  }
+  function onDropZoneDragEnter(e: React.DragEvent) {
+    if (blocked || !agentId || !dropHasFiles(e)) return;
+    e.preventDefault();
+    dragDepth.current += 1;
+    setDragOver(true);
+  }
+  function onDropZoneDragOver(e: React.DragEvent) {
+    if (blocked || !agentId || !dropHasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  }
+  function onDropZoneDragLeave() {
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDragOver(false);
+  }
+  function onDropZoneDrop(e: React.DragEvent) {
+    dragDepth.current = 0;
+    setDragOver(false);
+    if (blocked || !agentId) return;
+    const files = e.dataTransfer.files;
+    if (!files || files.length === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    void onFilesPicked(files);
+  }
   async function onFilesPicked(files: FileList | null) {
     if (!files || !agentId) return;
     for (const file of Array.from(files)) {
@@ -279,17 +313,27 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // to one line. Cap ~200px (~8 lines), not 50vh (that let an empty box balloon
   // to half the window inside the flex column). Mason 07-28.
   const prevTaHeightRef = useRef<number>(44);
-  useEffect(() => {
+  useLayoutEffect(() => {
     const ta = taRef.current; if (!ta) return;
+    const prev = prevTaHeightRef.current;
+    // Cheap early-out: on a same-line keystroke scrollHeight can't have changed
+    // unless the line wrapped, and reading it is a layout read — fine, but we only
+    // WRITE (height + scrollTop) when the value actually differs.
     ta.style.height = "auto";
     const next = Math.min(ta.scrollHeight, 200);
-    const prev = prevTaHeightRef.current;
     ta.style.height = next + "px";
+    if (next === prev) return;
     prevTaHeightRef.current = next;
-    // Only re-pin when the textarea actually GREW (new line / paste). Per-keystroke
-    // pinning while typing on the same line caused visible stutter. Also respect
-    // near-bottom so a user reading history isn't yanked while typing.
-    if (next > prev && isNearBottom(120)) pinToBottom();
+    // GROWTH COMPENSATION (Mason 09-04): the composer sits below the message
+    // list, so every extra line steals that many px from the list's viewport
+    // and covered the newest message. Shift the list's scrollTop by EXACTLY the
+    // delta, synchronously (useLayoutEffect — before paint), so the messages
+    // appear to move up one line per line typed. No rAF, no full re-pin, no
+    // "jump to bottom": nothing visible moves except the new line, so there's
+    // nothing to stutter. Skipped when the user has scrolled up to read history.
+    const el = scrollRef.current; if (!el) return;
+    const wasNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160 + Math.max(0, next - prev);
+    if (wasNearBottom) el.scrollTop = el.scrollTop + (next - prev);
   }, [input]);
 
   // #4 detect an @mention token at the caret and surface matching agents.
@@ -710,7 +754,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // ---- CONTEXT METER + $ COST (Mason, this session) -----------------------
   // The model's context window + price, fetched Rust-side (pricing.rs). Refetch
   // when the selected model changes so the % + cost track the real model.
-  type ModelInfo = { context_tokens: number; known: boolean; price: { input: number; output: number; cache_read: number; cache_write: number } };
+  type ModelInfo = { context_tokens: number; known: boolean; price: ModelPrice };
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
   useEffect(() => {
     let cancelled = false;
@@ -746,12 +790,9 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       // saved msgs may predate contextInput; fall back to input for those.
       const ci = (u.contextInput ?? 0) || (u.input + u.cacheRead + u.cacheWrite) || u.input || 0;
       if (ci > 0) lastContextInput = ci;
-      if (price) {
-        // Cost bills each component at its own rate: fresh input, output, cache
-        // read (cheap), cache creation. This is per-TURN and summed across turns.
-        cost += (u.input * price.input + u.output * price.output
-              + u.cacheRead * price.cache_read + u.cacheWrite * price.cache_write) / 1_000_000;
-      }
+      // Cost bills each component at its own rate (see turnCost) — per-TURN,
+      // summed across turns. The 5m/1h split wins over the folded total.
+      if (price) cost += turnCost(u, price);
     };
     for (const m of msgs) if (m.role === "assistant" && m.usage) add(m.usage);
     if (liveUsage) { add(liveUsage); }
@@ -782,7 +823,25 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // Bar width: show at least a 4% sliver once there's ANY usage, so a small fill
   // is visibly "a little" rather than an empty (broken-looking) bar.
   const ctxBarWidth = ctxTokens > 0 ? Math.max(4, ctxFrac * 100) : 0;
-  const ctxColor = ctxPct >= 90 ? "var(--danger)" : ctxPct >= 75 ? "#d98a1f" : "var(--text-muted)";
+  // ACCENT PILL (Mason 09-08): the meter is an outline pill in the accent
+  // color that fills with the accent as context climbs. Above 90% it turns
+  // red — unless the accent IS red, in which case it turns yellow so the
+  // warning stays visible against a red UI.
+  const accentIsRed = (() => {
+    try {
+      const cs = getComputedStyle(document.documentElement);
+      const raw = (cs.getPropertyValue("--accent").trim() || "").toLowerCase();
+      const m = /^#([0-9a-f]{6})$/.exec(raw);
+      if (!m) return /red|e0533d|d64545|ff5c5c|c14b3f/.test(raw);
+      const n = parseInt(m[1], 16);
+      const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+      return r > 150 && r - g > 60 && r - b > 60;
+    } catch { return false; }
+  })();
+  const ctxOver = ctxPct >= 90;
+  const ctxWarn = !ctxOver && ctxPct >= 75;
+  const ctxFill = ctxOver ? (accentIsRed ? "#eab308" : "var(--danger)") : "var(--accent)";
+  const ctxColor = ctxOver ? (accentIsRed ? "#eab308" : "var(--danger)") : ctxWarn ? "#d98a1f" : "var(--text-muted)";
 
   // COMPACT: summarize the model-facing history so a long chat can keep going.
   const [compacting, setCompacting] = useState(false);
@@ -804,7 +863,26 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   }
 
   return (
-    <div style={{ display: "flex", height: "100%", minHeight: 0, gap: "var(--space-4)", position: "relative" }}>
+    <div
+      onDragEnter={onDropZoneDragEnter}
+      onDragOver={onDropZoneDragOver}
+      onDragLeave={onDropZoneDragLeave}
+      onDrop={onDropZoneDrop}
+      style={{ display: "flex", height: "100%", minHeight: 0, gap: "var(--space-4)", position: "relative" }}>
+      {dragOver && (
+        <div style={{
+          position: "absolute", inset: 0, zIndex: 30, pointerEvents: "none",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          background: "color-mix(in srgb, var(--accent) 12%, transparent)",
+          border: "2px dashed var(--accent)", borderRadius: "var(--radius-card)",
+        }}>
+          <span style={{
+            fontSize: 15, fontWeight: 700, color: "var(--text)",
+            background: "var(--surface)", border: "var(--border-width) solid var(--line)",
+            borderRadius: 999, padding: "8px 16px", boxShadow: "var(--elevation)",
+          }}>Drop files to attach</span>
+        </div>
+      )}
       {/* MAIN CHAT COLUMN. In multi-pane mode it flexes to share width; solo it
          stays centered. height:100% + flex so the input pins to the bottom. */}
       {/* WIDTH (Mason 08-04): the old `maxWidth: 720` left ~25% dead space on
@@ -836,9 +914,13 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6, flexWrap: "wrap" }}>
                 <div title={`${ctxTokens.toLocaleString()} / ${ctxWindow.toLocaleString()} tokens in context`}
                   style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  {/* mini bar */}
-                  <div style={{ width: 64, height: 6, borderRadius: 999, background: "var(--line)", overflow: "hidden" }}>
-                    <div style={{ width: `${ctxBarWidth}%`, height: "100%", background: ctxColor, transition: "width 200ms" }} />
+                  {/* accent outline pill: fills with the accent as context climbs */}
+                  <div style={{
+                    width: 64, height: 14, borderRadius: 999, overflow: "hidden", position: "relative",
+                    border: `var(--border-width) solid ${ctxOver ? ctxFill : "var(--accent)"}`,
+                    background: "transparent",
+                  }}>
+                    <div style={{ width: `${ctxBarWidth}%`, height: "100%", background: ctxFill, transition: "width 200ms" }} />
                   </div>
                   <span style={{ fontSize: 12, color: ctxColor, fontVariantNumeric: "tabular-nums", fontWeight: ctxPct >= 75 ? 600 : 400 }}>
                     {fmtTokens(ctxTokens)} / {fmtTokens(ctxWindow)} tokens
@@ -864,7 +946,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
             )}
             {/* At-the-wall warning: if context is nearly full, say so plainly. */}
             {!!folder && !!convId && ctxWindow > 0 && ctxPct >= 85 && (
-              <div style={{ marginTop: 6, fontSize: 12, color: "var(--danger)", maxWidth: 420 }}>
+              <div style={{ marginTop: 6, fontSize: 12, color: ctxOver ? ctxFill : "var(--danger)", maxWidth: 420 }}>
                 Context is nearly full ({fmtTokens(ctxTokens)} / {fmtTokens(ctxWindow)} tokens) — Compact now to avoid losing your next long reply.
               </div>
             )}
@@ -915,7 +997,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
             <Bubble agentId={agentId} local={isLocal} m={{
               role: "assistant",
               text: turn.liveText,
-              tools: turn.liveTools.map((t) => ({ name: t.name, path: t.path ?? "", ok: t.ok, detail: t.detail, summary: t.summary, body: t.body, running: t.running, spark: t.spark })),
+              tools: turn.liveTools.map((t) => ({ name: t.name, path: t.path ?? "", ok: t.ok, detail: t.detail, summary: t.summary, body: t.body, running: t.running, spark: t.spark, before: t.before ?? null })),
               timeline: turn.timeline,
               streaming: true,
             }} />
@@ -1246,11 +1328,20 @@ function fmtTokens(n: number): string {
   return (m < 10 ? m.toFixed(m % 1 === 0 ? 0 : 1) : m.toFixed(0)) + "M";
 }
 
-/** Per-turn $ cost from a usage record + the model's price ($/Mtok). 0 if no price. */
-function turnCost(u: TurnUsage, price?: { input: number; output: number; cache_read: number; cache_write: number }): number {
+export type ModelPrice = { input: number; output: number; cache_read: number; cache_write: number; cache_write_5m?: number; cache_write_1h?: number };
+
+/** Per-turn $ cost from a usage record + the model's price ($/Mtok). 0 if no price.
+ *  OpenCode parity: five separate buckets (fresh in / out / cache read /
+ *  cache write / reasoning-at-out-rate — here reasoning rides inside output).
+ *  When the 5m/1h write split is present it wins over the folded total —
+ *  never bill both (that would double-count the writes). */
+export function turnCost(u: TurnUsage, price?: ModelPrice): number {
   if (!price) return 0;
-  return (u.input * price.input + u.output * price.output
-        + u.cacheRead * price.cache_read + u.cacheWrite * price.cache_write) / 1_000_000;
+  const w5 = u.cacheWrite5m ?? 0, w1 = u.cacheWrite1h ?? 0;
+  const cw = (w5 + w1 > 0)
+    ? w5 * (price.cache_write_5m ?? price.cache_write) + w1 * (price.cache_write_1h ?? price.cache_write)
+    : u.cacheWrite * price.cache_write;
+  return (u.input * price.input + u.output * price.output + u.cacheRead * price.cache_read + cw) / 1_000_000;
 }
 
 /** HH:MM:SS in the user's locale, 24h so it's a fixed width in the margin. */
@@ -1263,7 +1354,7 @@ function fmtClock(ms?: number): string {
 
 /** Fixed-width gutter stamp. Reserves its width even when empty so bubbles
  *  don't shift horizontally between stamped and unstamped messages. */
-function Stamp({ at, usage, price }: { at?: number; usage?: TurnUsage; price?: { input: number; output: number; cache_read: number; cache_write: number } }) {
+function Stamp({ at, usage, price }: { at?: number; usage?: TurnUsage; price?: ModelPrice }) {
   // Under the timestamp: tokens used + $ cost for THIS turn (Mason, this
   // session). Tokens = input+output for the turn; cost from the model price.
   const cost = usage ? turnCost(usage, price) : 0;
@@ -1289,7 +1380,7 @@ function Stamp({ at, usage, price }: { at?: number; usage?: TurnUsage; price?: {
   );
 }
 
-function Bubble({ m, agentId, price, local }: { m: Msg; agentId?: string | null; price?: { input: number; output: number; cache_read: number; cache_write: number }; local?: boolean }) {
+function Bubble({ m, agentId, price, local }: { m: Msg; agentId?: string | null; price?: ModelPrice; local?: boolean }) {
   const isUser = m.role === "user";
   const memory = isUser && m.role === "user" ? m.memory : undefined;
   // The stamp lives OUTSIDE the bubble column, in the margin: to the LEFT of
@@ -1363,23 +1454,35 @@ function ToolCard({ t, agentId }: { t: ToolLine; agentId?: string | null }) {
   // SPARKS: a spark_preview call renders as a live inline mini-app, not a
   // collapsed code card.
   if (t.spark && t.spark.html) return <SparkCard spark={t.spark} agentId={agentId} />;
+  // DIFF VIEW (Mason 09-09): code-editing calls render a streaming side-by-side
+  // diff (old left/red, new right/green) instead of the plain code dump. The
+  // before-snapshot lands async via tool_file_before; until then the card falls
+  // back to the plain body view, then swaps to the diff live.
+  const diffable = isDiffable(t.name, t.before ?? null);
+  const showDiff = diffable && !!t.body;
+  const counts = useMemo(
+    () => (showDiff ? countDiff(t.before!, t.body!) : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [showDiff, t.before?.content, t.body],
+  );
   const [userOpen, setUserOpen] = useState<boolean | null>(null); // null = no manual toggle yet
   const pending = t.ok === undefined;
-  // Live behavior (Mason 08-03): the RUNNING card auto-expands so you watch the
-  // work happen; it auto-collapses when done. A manual click wins over both.
-  const open = userOpen !== null ? userOpen : (!!t.running && !!t.body);
+  // Diff cards default OPEN (streams as the model writes); plain cards keep the
+  // old behavior (auto-expand while running, collapse when done). Manual wins.
+  const open = userOpen !== null ? userOpen : showDiff ? true : (!!t.running && !!t.body);
   const setOpen = (f: (o: boolean) => boolean) => setUserOpen(f(open));
   const paneRef = useRef<HTMLDivElement | null>(null);
   // Follow the stream: keep the pane pinned to the bottom while content grows
-  // during a live call. Finished cards never yank the reader's scroll.
+  // during a live call. Finished cards never yank the reader's scroll. Diff
+  // panes are excluded — pinning to the bottom would hide the changed lines.
   useEffect(() => {
-    if (open && t.running && paneRef.current) paneRef.current.scrollTop = paneRef.current.scrollHeight;
-  }, [open, t.running, t.body]);
+    if (open && t.running && !showDiff && paneRef.current) paneRef.current.scrollTop = paneRef.current.scrollHeight;
+  }, [open, t.running, t.body, showDiff]);
   const color = pending ? "var(--text-muted)" : t.ok ? "var(--ok)" : "var(--danger)";
   // A path is "revealable" once the call succeeded and points at a real file
   // (list_files on '.' or a refused call has nothing useful to reveal).
   const revealable = t.ok === true && !!t.path && t.path !== ".";
-  const expandable = !!(t.body || t.detail);
+  const expandable = !!(t.body || t.detail || showDiff);
 
   async function reveal() {
     try { await invoke("reveal_in_finder", { path: t.path }); } catch { /* jail refused — ignore */ }
@@ -1420,6 +1523,7 @@ function ToolCard({ t, agentId }: { t: ToolLine; agentId?: string | null }) {
             }}
           >{t.path}</button>
         )}
+        {counts && <DiffCounts add={counts.add} del={counts.del} />}
         <span style={{ flexShrink: 0 }}>{pending ? "…" : t.ok ? "✓" : "✗"}</span>
       </div>
       {/* Collapsed error hint: the first line of a failure is visible WITHOUT
@@ -1437,9 +1541,11 @@ function ToolCard({ t, agentId }: { t: ToolLine; agentId?: string | null }) {
           maxHeight: 300, overflow: "auto", padding: "8px 10px",
           color: "var(--text)", background: "var(--surface)",
         }}>
-          {t.body && (
+          {showDiff ? (
+            <DiffView before={t.before!} after={t.body!} running={t.running} />
+          ) : (t.body && (
             <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 12 }}>{t.body}</pre>
-          )}
+          ))}
           {t.body && t.detail && <div style={{ height: 8 }} />}
           {t.detail && (
             <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 12, opacity: 0.85 }}>{t.detail}</pre>
