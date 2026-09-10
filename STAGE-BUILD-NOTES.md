@@ -1,3 +1,39 @@
+# Stage build — 2026-09-10 ~13:30 PDT — v1.0.16 (rough-cut word-snap + sequences + drop-zone + composer)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, dead-code warnings only (incl. 2 new unused hyperframes load/save shims — kept as legacy wrappers). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `cec59d3` — fix(video): rough-cut word-snap — silence cuts expand to Whisper word edges
+- `17a7d12` — feat(video): sequences backend — per-edit composition files, sequence-aware tools
+- `4940aa3` — feat(video): sequences sidebar, drop-zone collapse, instant composer clear
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41737896 bytes), mtime **Sep 10 13:24**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **18080035 bytes (~17.2 MB)**, mtime **Sep 10 13:25**
+- verified: `video_create_sequence` + `ve-seqrow` + `Import media` in shipped `ui/dist` JS
+
+**What changed (all four of Mason's reports):**
+1. **Rough-cut accuracy** — energy-based silence cuts ate quiet word edges (plosive onsets, fricative tails sit ~10dB under the vowel core). Keeps now EXPAND to the nearest Whisper word boundaries (0.35s snap window, real pauses stay cut), transcribing first when needed. `video_auto_cut` schema documents it.
+2. **Drop zone collapses** — after footage is in, the big zone becomes one `Import media` toggle row instead of eating half the panel forever. Empty projects still show it.
+3. **Composer clears on send** — the Video dock cleared its input only when the turn *completed*; now it clears the moment the message is accepted (user bubble is already pushed). No more deleting your last message to write the next.
+4. **Sequences sidebar** — new `Seqs` rail tab: multiple edits, one footage pool. Main = legacy composition.json (old projects untouched); others live in sequences/<name>.json. Create blank/duplicated, rename, delete, drag sequences between bins (bins = localStorage, like media bins). Every video_* tool + render/frame/captions/overlay/style-guide takes `sequence` (default main); `video_sequence` tool manages them; `video_project` lists them; agent context names the active sequence.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~8 min)
+1. **Rough cut** — auto-cut A-roll with soft onsets → first/last words of clips survive; real pauses still cut.
+2. **Drop zone** — import footage → zone collapses to `Import media`; toggle re-opens it.
+3. **Composer** — send a dock message → box clears immediately, turn runs.
+4. **Sequences** — Seqs tab → new sequence (blank + duplicate), switch (timeline swaps, undo cleared), rename, delete (main protected); bins nest + persist per project.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
 # Stage build — 2026-09-10 ~11:10 PDT — v1.0.16 (media import rebuild: nested bins, folder import, progress)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0, dead-code warnings only (same set + one new `import_one` unused — it now forwards to `import_one_in`). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
