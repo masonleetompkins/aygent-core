@@ -27,12 +27,11 @@ export function MediaPanel() {
   const volumeOf = (p: string) => { const m = /^\/Volumes\/([^/]+)/.exec(p); return m ? m[1] : "Macintosh HD"; };
   return (
     <>
-      <div className="ve-panel-head">Media<span className="spacer" />
+      <div className="ve-panel-head"><span className="ve-title">Media</span><span className="spacer" />
         <button className={`ve-icon-btn ${view === "grid" ? "on" : ""}`} title="Grid view" onClick={() => pickView("grid")}><LayoutGrid size={14} /></button>
         <button className={`ve-icon-btn ${view === "list" ? "on" : ""}`} title="List view with bins" onClick={() => pickView("list")}><List size={14} /></button>
         <button className="ve-icon-btn" title="Rebuild thumbnails" onClick={() => void refreshThumbs()}><RefreshCw size={14} /></button>
-        <button className="ve-btn sm" title="Import a whole folder as a bin (subfolders nest)" onClick={() => void importFolder()}><FolderInput size={13} /> Folder</button>
-        <button className="ve-btn sm primary" onClick={() => void importPick()}><Upload size={13} /> Import</button>
+        <ImportButton />
       </div>
       <div className="ve-panel-body">
         <MediaDropTarget onPick={() => void importPick()} />
@@ -69,6 +68,26 @@ export function MediaPanel() {
         <p className="ve-hint">Drag a clip onto a lane, or double-click to append at the end. <kbd className="ve-kbd">⌫</kbd> on a card unlinks it.</p>
       </div>
     </>
+  );
+}
+/** Single Import button: files AND folders. Click opens a menu — the native
+ *  file picker only selects files, the folder picker only folders, so one
+ *  button offers both (no separate cluttering Folder button in the header). */
+function ImportButton() {
+  const [menu, setMenu] = useState(false);
+  return (
+    <div style={{ position: "relative", flexShrink: 0 }}>
+      <button className="ve-btn sm primary" onClick={() => setMenu((v) => !v)} title="Import files or a whole folder as bins"><Upload size={13} /> Import</button>
+      {menu && (
+        <>
+          <div style={{ position: "fixed", inset: 0, zIndex: 40 }} onClick={() => setMenu(false)} />
+          <div className="ve-menu" role="menu">
+            <button role="menuitem" onClick={() => { setMenu(false); void importPick(); }}>Files&hellip;</button>
+            <button role="menuitem" onClick={() => { setMenu(false); void importFolder(); }}>Folder as bins&hellip;</button>
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 /** The big drop zone. HTML5 dragover only PAINTS + records the hover target
@@ -204,7 +223,6 @@ function AssetList({ files, generated, sel, setSel }: { files: Asset[]; generate
     <div className="ve-binlist">
       <div className="ve-binlist-bar">
         <button className="ve-btn sm" onClick={() => { setCreating(""); setDraft(""); }}><FolderPlus size={12} /> New bin</button>
-        <button className="ve-btn sm" title="Import a whole folder here as nested bins" onClick={() => void importFolder()}><FolderInput size={12} /> Import folder</button>
       </div>
       {creating === "" && (
         <form className="ve-bin-create" onSubmit={(e) => { e.preventDefault(); void commitCreate(); }}>
