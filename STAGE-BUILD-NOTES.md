@@ -1047,3 +1047,20 @@ debug-assert that migrations end at `SCHEMA_VERSION`.
 1. **Download voice model** — works standalone with Blender MCP off; toolchain + model land under `runtime/voice/`.
 2. **Clean A-roll** — neural isolation, toast names engine.
 3. **Blend live** — Cleanup amount 0/50/100, preview + export match.
+
+---
+
+# Stage build — 2026-09-10 — v1.0.16 (Muse reasoning replay)
+
+**Status:** ✅ Built clean (`cargo tauri build` exit 0, dead-code warnings only). Unsigned stage build.
+
+**Commit (staging):** `c5dde25` — muse: replay encrypted reasoning items across tool rounds (fixes re-plan loop).
+
+**What changed:** `meta_provider.rs` sends `store:false` + `include:[reasoning.encrypted_content]`, captures Muse reasoning items, stores them on the assistant message (`reasoning`, `reasoning_model`), and replays them verbatim in `build_muse_input` (same model id only). Fixes the Muse tool-loop where every round re-planned from scratch (identical preambles, re-reading the same files).
+
+**Artifacts:** `src-tauri/target/release/bundle/macos/AYGENT.app`, `dmg/AYGENT_1.0.16_aarch64.dmg`. Binary contains `reasoning.encrypted_content` (verified via strings).
+
+## Smoke QA
+1. Quit running AYGENT. Launch stage app, pick a Muse agent in Pro Mode.
+2. Give a multi-step task (read 2-3 files, edit one). Expect distinct/absent preambles per round, no repeated reads of the same file, edit lands.
+3. First Muse call must not 400 (would mean Meta rejected `include`/`store`).
