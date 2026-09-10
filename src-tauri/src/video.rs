@@ -113,7 +113,7 @@ pub struct Asset {
 /// the edit. Bins live in assets.json next to the assets they group.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
-pub struct MediaFolder { pub id: String, pub name: String, pub created: i64 }
+pub struct MediaFolder { pub id: String, pub name: String, pub created: i64, #[serde(default)] pub parent: String }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
@@ -312,6 +312,11 @@ pub fn build_thumbs(app: &tauri::AppHandle, proj: &Path, abs: &Path, a: &Asset) 
 /// Import one source file into a project: hardlink into media/ (same volume) or
 /// record a reference (other volume). Probes + builds thumbs. Returns the asset.
 pub fn import_one(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, src: &Path) -> Result<Asset, String> {
+    import_one_in(app, broker, agent_id, project, src, "")
+}
+
+/// import_one + bin assignment (folder import parks each file in its bin).
+pub fn import_one_in(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, src: &Path, folder: &str) -> Result<Asset, String> {
     let proj = project_dir(broker, agent_id, project)?;
     let src = std::fs::canonicalize(src).map_err(|e| format!("source: {e}"))?;
     if !src.is_file() { return Err(format!("not a file: {}", src.display())); }
@@ -353,6 +358,7 @@ pub fn import_one(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, proje
         linked,
         size: std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0),
         imported: now(),
+        folder: folder.to_string(),
         ..Default::default()
     };
     let abs = if linked { dst.clone() } else { src.clone() };
@@ -457,43 +463,125 @@ pub async fn video_pick_media(app: tauri::AppHandle, broker: tauri::State<'_, Ar
     project_dir(&broker, &agent_id, &project)?;
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<Vec<tauri_plugin_dialog::FilePath>>>();
     app.dialog().file()
-        .add_filter("Media", &["mp4", "mov", "m4v", "mkv", "webm", "mp3", "wav", "m4a", "aac", "flac", "png", "jpg", "jpeg", "webp", "gif", "cube"])
+        .add_filter("Media", &["mp4", "mov", "m4v", "mkv", "webm", "avi", "mts", "m2ts", "mxf", "mp3", "wav", "m4a", "aac", "flac", "ogg", "aif", "aiff", "png", "jpg", "jpeg", "webp", "gif", "heic", "tif", "tiff", "cube"])
         .set_title("Import media (hardlinked, not copied)")
         .pick_files(move |chosen| { let _ = tx.send(chosen); });
     let chosen = rx.await.map_err(|_| "picker closed".to_string())?;
     let Some(files) = chosen else { return Ok(serde_json::json!({ "assets": [], "errors": [] })) };
     let paths: Vec<String> = files.into_iter().filter_map(|f| f.into_path().ok()).map(|p| p.to_string_lossy().to_string()).collect();
-    import_paths_impl(app, broker.inner().clone(), agent_id, project, paths).await
+    import_paths_impl(app, broker.inner().clone(), agent_id, project, paths, String::new()).await
 }
 
-/// Import absolute paths (drag-drop from Finder lands here).
+/// Import absolute paths (drag-drop from Finder lands here). `folder` parks
+/// loose files in that bin (drop-onto-bin); directories always become their
+/// own nested bin tree regardless.
 #[tauri::command]
-pub async fn video_import_paths(app: tauri::AppHandle, broker: tauri::State<'_, Arc<Broker>>, agent_id: String, project: String, paths: Vec<String>) -> Result<serde_json::Value, String> {
-    import_paths_impl(app, broker.inner().clone(), agent_id, project, paths).await
+pub async fn video_import_paths(app: tauri::AppHandle, broker: tauri::State<'_, Arc<Broker>>, agent_id: String, project: String, paths: Vec<String>, folder: Option<String>) -> Result<serde_json::Value, String> {
+    import_paths_impl(app, broker.inner().clone(), agent_id, project, paths, folder.unwrap_or_default()).await
 }
 
-async fn import_paths_impl(app: tauri::AppHandle, broker: Arc<Broker>, agent_id: String, project: String, paths: Vec<String>) -> Result<serde_json::Value, String> {
+/// Native folder picker → import the whole folder as a bin, subfolders as
+/// nested bins (Premiere-style). `parent` nests the new tree under that bin.
+#[tauri::command]
+pub async fn video_pick_folder(app: tauri::AppHandle, broker: tauri::State<'_, Arc<Broker>>, agent_id: String, project: String, parent: Option<String>) -> Result<serde_json::Value, String> {
+    use tauri_plugin_dialog::DialogExt;
+    project_dir(&broker, &agent_id, &project)?;
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<tauri_plugin_dialog::FilePath>>();
+    app.dialog().file()
+        .set_title("Import folder as bins (subfolders nest)")
+        .pick_folder(move |chosen| { let _ = tx.send(chosen); });
+    let chosen = rx.await.map_err(|_| "picker closed".to_string())?;
+    let Some(dir) = chosen else { return Ok(serde_json::json!({ "assets": [], "errors": [] })) };
+    let path = dir.into_path().map_err(|e| e.to_string())?.to_string_lossy().to_string();
+    import_paths_impl(app, broker.inner().clone(), agent_id, project, vec![path], parent.unwrap_or_default()).await
+}
+
+/// One enumerated import item: a file plus the bin it belongs in ("" = unfiled).
+struct ImportItem { path: PathBuf, display: String, folder: String }
+
+/// Walk a directory into nested bins mirroring its structure. Returns the
+/// collected files. Hidden entries skipped, symlink cycles guarded, depth
+/// capped — a media folder, not a filesystem browser.
+fn walk_dir(dir: &Path, bin_id: &str, folders: &mut Vec<MediaFolder>, out: &mut Vec<ImportItem>, depth: u8, seen: &mut Vec<PathBuf>, truncated: &mut bool) {
+    if depth > 8 || out.len() >= 200 { if out.len() >= 200 { *truncated = true; } return; }
+    let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if seen.contains(&canon) { return; }
+    seen.push(canon);
+    let mut entries: Vec<_> = std::fs::read_dir(dir).map(|r| r.flatten().collect()).unwrap_or_default();
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') { continue; }
+        let p = e.path();
+        if out.len() >= 200 { *truncated = true; return; }
+        if p.is_dir() {
+            let sub = MediaFolder { id: new_id("f"), name: name.chars().take(80).collect(), created: now(), parent: bin_id.to_string() };
+            let sid = sub.id.clone();
+            folders.push(sub);
+            walk_dir(&p, &sid, folders, out, depth + 1, seen, truncated);
+        } else if p.is_file() {
+            out.push(ImportItem { path: p.clone(), display: p.to_string_lossy().to_string(), folder: bin_id.to_string() });
+        }
+    }
+}
+
+fn emit_progress(app: &tauri::AppHandle, project: &str, done: usize, total: usize, name: &str) {
+    let _ = app.emit("video-import-progress", serde_json::json!({ "project": project, "done": done, "total": total, "name": name }));
+}
+
+async fn import_paths_impl(app: tauri::AppHandle, broker: Arc<Broker>, agent_id: String, project: String, paths: Vec<String>, folder: String) -> Result<serde_json::Value, String> {
     if paths.len() > 200 { return Err("too many files at once (max 200)".into()); }
+    project_dir(&broker, &agent_id, &project)?;
+    // Validate the target bin once, up front.
+    if !folder.is_empty() {
+        let m = load_manifest(&broker, &agent_id, &project);
+        if !m.folders.iter().any(|f| f.id == folder) { return Err("no such folder".into()); }
+    }
     tokio::task::spawn_blocking(move || {
+        // Phase 1 (fast): enumerate everything, building nested bins for dirs.
+        let mut m = load_manifest(&broker, &agent_id, &project);
+        let mut items: Vec<ImportItem> = Vec::new();
+        let mut errors: Vec<serde_json::Value> = Vec::new();
+        let mut truncated = false;
+        let mut seen: Vec<PathBuf> = Vec::new();
+        for p in &paths {
+            let path = PathBuf::from(p);
+            if path.is_dir() {
+                let bin_name: String = path.file_name().and_then(|n| n.to_str()).unwrap_or("Folder").chars().take(80).collect();
+                let bin = MediaFolder { id: new_id("f"), name: if bin_name.is_empty() { "Folder".into() } else { bin_name }, created: now(), parent: folder.clone() };
+                let bid = bin.id.clone();
+                m.folders.push(bin);
+                walk_dir(&path, &bid, &mut m.folders, &mut items, 0, &mut seen, &mut truncated);
+                if items.is_empty() && !truncated { errors.push(serde_json::json!({ "path": p, "error": "folder has no importable files" })); }
+            } else {
+                items.push(ImportItem { path: path.clone(), display: p.clone(), folder: folder.clone() });
+            }
+            if items.len() >= 200 { truncated = true; break; }
+        }
+        if truncated { errors.push(serde_json::json!({ "path": "", "error": "capped at 200 files — import the rest separately" })); }
+        if !items.is_empty() || m.folders.iter().any(|_| true) { save_manifest(&broker, &agent_id, &project, &m)?; }
+        let total = items.len();
+        // Phase 2 (slow): probe + thumbs, one progress event per file so the
+        // UI never looks hung on a 20-clip import.
         let mut assets = Vec::new();
-        let mut errors = Vec::new();
-        for p in paths {
-            let path = PathBuf::from(&p);
-            // A .cube next to footage is a LUT, not a clip: park it in luts/.
-            if path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("cube")).unwrap_or(false) {
-                match import_lut(&broker, &agent_id, &project, &path) {
+        for (i, it) in items.into_iter().enumerate() {
+            let short = it.path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+            emit_progress(&app, &project, i, total, &short);
+            if it.path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("cube")).unwrap_or(false) {
+                match import_lut(&broker, &agent_id, &project, &it.path) {
                     Ok(rel) => assets.push(serde_json::json!({ "lut": rel })),
-                    Err(e) => errors.push(serde_json::json!({ "path": p, "error": e })),
+                    Err(e) => errors.push(serde_json::json!({ "path": it.display, "error": e })),
                 }
                 continue;
             }
-            match import_one(&app, &broker, &agent_id, &project, &path) {
+            match import_one_in(&app, &broker, &agent_id, &project, &it.path, &it.folder) {
                 Ok(a) => assets.push(serde_json::to_value(a).unwrap_or_default()),
-                Err(e) => errors.push(serde_json::json!({ "path": p, "error": e })),
+                Err(e) => errors.push(serde_json::json!({ "path": it.display, "error": e })),
             }
         }
+        emit_progress(&app, &project, total, total, "");
         let _ = app.emit("video-assets-changed", serde_json::json!({ "project": project }));
-        Ok(serde_json::json!({ "assets": assets, "errors": errors }))
+        Ok(serde_json::json!({ "assets": assets, "errors": errors, "folders": serde_json::to_value(load_manifest(&broker, &agent_id, &project).folders).unwrap_or_default() }))
     }).await.map_err(|e| format!("import task: {e}"))?
 }
 
@@ -588,13 +676,15 @@ fn folder_ok(name: &str) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn video_create_media_folder(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String, name: String) -> Result<serde_json::Value, String> {
+pub fn video_create_media_folder(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String, name: String, parent: Option<String>) -> Result<serde_json::Value, String> {
     project_dir(&broker, &agent_id, &project)?;
     let mut m = load_manifest(&broker, &agent_id, &project);
-    let f = MediaFolder { id: new_id("f"), name: folder_ok(&name)?, created: now() };
+    let parent = parent.unwrap_or_default();
+    if !parent.is_empty() && !m.folders.iter().any(|f| f.id == parent) { return Err("no such parent bin".into()); }
+    let f = MediaFolder { id: new_id("f"), name: folder_ok(&name)?, created: now(), parent: parent.clone() };
     m.folders.push(f.clone());
     save_manifest(&broker, &agent_id, &project, &m)?;
-    Ok(serde_json::json!({ "id": f.id, "name": f.name }))
+    Ok(serde_json::json!({ "id": f.id, "name": f.name, "parent": f.parent }))
 }
 
 #[tauri::command]
@@ -610,9 +700,29 @@ pub fn video_rename_media_folder(broker: tauri::State<Arc<Broker>>, agent_id: St
 pub fn video_delete_media_folder(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String, folder_id: String) -> Result<(), String> {
     project_dir(&broker, &agent_id, &project)?;
     let mut m = load_manifest(&broker, &agent_id, &project);
-    if !m.folders.iter().any(|f| f.id == folder_id) { return Err("no such folder".into()); }
+    let Some(dead) = m.folders.iter().find(|f| f.id == folder_id).cloned() else { return Err("no such folder".into()); };
     m.folders.retain(|f| f.id != folder_id);
-    for a in m.assets.iter_mut().filter(|a| a.folder == folder_id) { a.folder = String::new(); }
+    for f in m.folders.iter_mut().filter(|f| f.parent == folder_id) { f.parent = dead.parent.clone(); }
+    for a in m.assets.iter_mut().filter(|a| a.folder == folder_id) { a.folder = dead.parent.clone(); }
+    save_manifest(&broker, &agent_id, &project, &m)
+}
+
+/// Move a bin under another bin (Premiere-style nesting). "" = top level.
+/// Refuses cycles (a bin can never become its own descendant).
+#[tauri::command]
+pub fn video_move_media_folder(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String, folder_id: String, parent: String) -> Result<(), String> {
+    project_dir(&broker, &agent_id, &project)?;
+    let mut m = load_manifest(&broker, &agent_id, &project);
+    if !m.folders.iter().any(|f| f.id == folder_id) { return Err("no such folder".into()); }
+    if !parent.is_empty() && !m.folders.iter().any(|f| f.id == parent) { return Err("no such parent bin".into()); }
+    if parent == folder_id { return Err("a bin cannot contain itself".into()); }
+    // cycle guard: walk up from the proposed parent; folder_id must not appear
+    let mut cursor = parent.clone();
+    while !cursor.is_empty() {
+        if cursor == folder_id { return Err("a bin cannot move inside its own sub-bin".into()); }
+        cursor = m.folders.iter().find(|f| f.id == cursor).map(|f| f.parent.clone()).unwrap_or_default();
+    }
+    if let Some(f) = m.folders.iter_mut().find(|f| f.id == folder_id) { f.parent = parent; }
     save_manifest(&broker, &agent_id, &project, &m)
 }
 

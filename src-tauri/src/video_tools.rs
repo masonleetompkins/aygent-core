@@ -70,8 +70,8 @@ pub fn tool_schemas() -> Vec<Value> {
             "input_schema": { "type": "object", "properties": { "project": proj }, "required": ["project"] } }),
         json!({ "name": "video_matte", "description": "EXPERIMENTAL: generate a subject alpha matte for an asset with RobustVideoMatting (downloads torch via uv on first run; slow). Registers the matte asset and enables composition.matte so behindSubject overlay layers render behind the person.",
             "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "engine": { "type": "string", "description": "ignored (local only)" } }, "required": ["project", "asset"] } }),
-        json!({ "name": "video_media_folder", "description": "Create / rename / delete a media bin (Premiere-style folder) in the Media panel list view. Pure organization — clips reference assets by id, so bins never break the edit.",
-            "input_schema": { "type": "object", "properties": { "project": proj, "op": { "type": "string", "description": "create | rename | delete" }, "name": { "type": "string", "description": "bin name (create/rename)" }, "folder": { "type": "string", "description": "bin id (rename/delete)" } }, "required": ["project", "op"] } }),
+        json!({ "name": "video_media_folder", "description": "Create / rename / delete / move a media bin (Premiere-style folder, nesting supported via parent) in the Media panel list view. Pure organization — clips reference assets by id, so bins never break the edit.",
+            "input_schema": { "type": "object", "properties": { "project": proj, "op": { "type": "string", "description": "create | rename | delete | move" }, "name": { "type": "string", "description": "bin name (create/rename)" }, "folder": { "type": "string", "description": "bin id (rename/delete/move)" }, "parent": { "type": "string", "description": "parent bin id (create/move; empty = top level)" } }, "required": ["project", "op"] } }),
         json!({ "name": "video_media_move", "description": "Move media assets into a bin (or back to Unfiled with an empty folder id) in the Media panel list view.",
             "input_schema": { "type": "object", "properties": { "project": proj, "assets": { "type": "array", "items": { "type": "string" }, "description": "asset ids" }, "folder": { "type": "string", "description": "bin id (empty = Unfiled)" } }, "required": ["project", "assets"] } }),
     ];
@@ -237,7 +237,9 @@ pub fn run(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, name: &str, 
             if op == "create" {
                 let name = s("name").ok_or("name is required")?.trim().to_string();
                 if name.is_empty() || name.len() > 80 { return Err("bin name must be 1-80 chars".into()); }
-                let f = video::MediaFolder { id: video::new_id("f"), name: name.clone(), created: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) };
+                let parent = s("parent").unwrap_or_default();
+                if !parent.is_empty() && !m.folders.iter().any(|f| f.id == parent) { return Err("no such parent bin".into()); }
+                let f = video::MediaFolder { id: video::new_id("f"), name: name.clone(), created: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0), parent };
                 m.folders.push(f.clone());
                 video::save_manifest(broker, agent_id, &p, &m)?;
                 json!({ "ok": true, "id": f.id, "name": f.name })
@@ -251,12 +253,27 @@ pub fn run(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, name: &str, 
                 json!({ "ok": true })
             } else if op == "delete" {
                 let fid = s("folder").ok_or("folder (bin id) is required")?;
-                if !m.folders.iter().any(|f| f.id == fid) { return Err("no such bin".into()); }
+                let Some(dead) = m.folders.iter().find(|f| f.id == fid).cloned() else { return Err("no such bin".into()) };
                 m.folders.retain(|f| f.id != fid);
-                for a in m.assets.iter_mut().filter(|a| a.folder == fid) { a.folder = String::new(); }
+                for f in m.folders.iter_mut().filter(|f| f.parent == fid) { f.parent = dead.parent.clone(); }
+                for a in m.assets.iter_mut().filter(|a| a.folder == fid) { a.folder = dead.parent.clone(); }
                 video::save_manifest(broker, agent_id, &p, &m)?;
                 json!({ "ok": true })
-            } else { return Err("op must be create | rename | delete".into()); }
+            } else if op == "move" {
+                let fid = s("folder").ok_or("folder (bin id) is required")?;
+                let parent = s("parent").unwrap_or_default();
+                if !m.folders.iter().any(|f| f.id == fid) { return Err("no such bin".into()); }
+                if !parent.is_empty() && !m.folders.iter().any(|f| f.id == parent) { return Err("no such parent bin".into()); }
+                if parent == fid { return Err("a bin cannot contain itself".into()); }
+                let mut cursor = parent.clone();
+                while !cursor.is_empty() {
+                    if cursor == fid { return Err("a bin cannot move inside its own sub-bin".into()); }
+                    cursor = m.folders.iter().find(|f| f.id == cursor).map(|f| f.parent.clone()).unwrap_or_default();
+                }
+                if let Some(f) = m.folders.iter_mut().find(|f| f.id == fid) { f.parent = parent; }
+                video::save_manifest(broker, agent_id, &p, &m)?;
+                json!({ "ok": true })
+            } else { return Err("op must be create | rename | delete | move".into()); }
         }
         "video_media_move" => {
             let p = project.ok_or("project is required")?;
@@ -352,7 +369,7 @@ fn overview(broker: &Broker, agent_id: &str, project: &str) -> Result<Value, Str
         "duration": round3(comp.duration()),
         "tracks": tracks,
         "assets": assets.iter().map(|a| json!({ "id": a.id, "name": a.name, "kind": a.kind, "duration": round2(a.duration), "fps": round2(a.fps), "size": format!("{}x{}", a.width, a.height), "hasAudio": a.has_audio, "linked": a.linked, "online": video::asset_abs(broker, agent_id, project, a).map(|p| p.is_file()).unwrap_or(false), "path": a.path, "folder": a.folder })).collect::<Vec<_>>(),
-        "folders": manifest.folders.iter().map(|f| json!({ "id": f.id, "name": f.name })).collect::<Vec<_>>(),
+        "folders": manifest.folders.iter().map(|f| json!({ "id": f.id, "name": f.name, "parent": f.parent })).collect::<Vec<_>>(),
         "transcript": tr.as_ref().map(|t| json!({ "asset": t.asset, "words": t.words.len(), "segments": t.segments.len() })),
         "captions": comp.captions,
         "graphics": comp.graphics,
