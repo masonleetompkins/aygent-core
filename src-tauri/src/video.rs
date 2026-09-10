@@ -69,6 +69,45 @@ pub fn project_dir(broker: &Broker, agent_id: &str, project: &str) -> Result<Pat
 
 pub fn rel(project: &str, tail: &str) -> String { format!("{VIDEO_ROOT}/{project}/{tail}") }
 
+/// Sequence file for an edit. The default sequence is the legacy
+/// `composition.json` (so old projects open untouched); named sequences live
+/// at `sequences/<name>.json`. Names are slug-checked at every entry point.
+pub fn seq_rel(project: &str, sequence: &str) -> String {
+    if sequence.is_empty() || sequence == "main" { rel(project, "composition.json") }
+    else { rel(project, &format!("sequences/{sequence}.json")) }
+}
+
+pub fn seq_ok(s: &str) -> bool { s.is_empty() || s == "main" || slug_ok(s) }
+
+/// List sequences in a project: the default (`main`, when composition.json
+/// exists) plus every `sequences/*.json`. Returns (name, modified) sorted
+/// with main first, then by recency.
+pub fn list_sequences(broker: &Broker, agent_id: &str, project: &str) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let Ok(dir) = project_dir(broker, agent_id, project) else { return out; };
+    let stamp = |p: &std::path::Path| std::fs::metadata(p).ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64).unwrap_or(0);
+    if dir.join("composition.json").is_file() {
+        out.push(serde_json::json!({ "name": "main", "modified": stamp(&dir.join("composition.json")) }));
+    }
+    if let Ok(rd) = std::fs::read_dir(dir.join("sequences")) {
+        let mut rest: Vec<serde_json::Value> = Vec::new();
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_file() || p.extension().and_then(|x| x.to_str()) != Some("json") { continue; }
+            let name = e.file_name().to_string_lossy().to_string();
+            let name = name.strip_suffix(".json").unwrap_or(&name).to_string();
+            if !slug_ok(&name) || name == "main" { continue; }
+            rest.push(serde_json::json!({ "name": name, "modified": stamp(&p) }));
+        }
+        rest.sort_by_key(|v| -v["modified"].as_i64().unwrap_or(0));
+        out.extend(rest);
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Assets manifest
 // ---------------------------------------------------------------------------
@@ -421,31 +460,98 @@ pub fn video_create(broker: tauri::State<Arc<Broker>>, agent_id: String, project
     if !slug_ok(&project) { return Err("invalid project name — use letters, digits, - _".into()); }
     let comp = composition.filter(|c| c.is_object()).unwrap_or_else(crate::video_render::blank_composition_json);
     let abs = write_json(&broker, &agent_id, &rel(&project, "composition.json"), &comp)?;
-    if let Some(p) = abs.parent() { ensure_gitignore(p); let _ = std::fs::create_dir_all(p.join("media")); }
+    if let Some(p) = abs.parent() { ensure_gitignore(p); let _ = std::fs::create_dir_all(p.join("media")); let _ = std::fs::create_dir_all(p.join("sequences")); }
     Ok(serde_json::json!({ "project": project, "composition": comp }))
 }
 
 #[tauri::command]
-pub fn video_load(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String) -> Result<serde_json::Value, String> {
+pub fn video_load(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String, sequence: Option<String>) -> Result<serde_json::Value, String> {
     if agent_id.trim().is_empty() { return Err("select an agent first".into()); }
     if !slug_ok(&project) { return Err("invalid project name".into()); }
-    let composition = read_json(&broker, &agent_id, &rel(&project, "composition.json"))
-        .ok_or_else(|| format!("no such project: {project}"))?;
+    let seq = sequence.unwrap_or_default();
+    if !seq_ok(&seq) { return Err("invalid sequence name — use letters, digits, - _".into()); }
+    let composition = read_json(&broker, &agent_id, &seq_rel(&project, &seq))
+        .ok_or_else(|| if seq.is_empty() || seq == "main" { format!("no such project: {project}") } else { format!("no such sequence: {seq}") })?;
     let assets = assets_with_status(&broker, &agent_id, &project);
     let transcript = read_json(&broker, &agent_id, &rel(&project, "transcript.json")).unwrap_or(serde_json::Value::Null);
     let chat = read_json(&broker, &agent_id, &rel(&project, "chat.json")).unwrap_or(serde_json::Value::Null);
     let folders = serde_json::to_value(load_manifest(&broker, &agent_id, &project).folders).unwrap_or_default();
-    Ok(serde_json::json!({ "project": project, "composition": composition, "assets": assets, "transcript": transcript, "chat": chat, "folders": folders }))
+    let sequences = list_sequences(&broker, &agent_id, &project);
+    let seq_name = if seq.is_empty() { "main".to_string() } else { seq };
+    Ok(serde_json::json!({ "project": project, "sequence": seq_name, "sequences": sequences, "composition": composition, "assets": assets, "transcript": transcript, "chat": chat, "folders": folders }))
 }
 
 #[tauri::command]
-pub fn video_save(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String, composition: serde_json::Value) -> Result<(), String> {
+pub fn video_save(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String, composition: serde_json::Value, sequence: Option<String>) -> Result<(), String> {
     if agent_id.trim().is_empty() { return Err("select an agent first".into()); }
     if !slug_ok(&project) { return Err("invalid project name — use letters, digits, - _".into()); }
+    let seq = sequence.unwrap_or_default();
+    if !seq_ok(&seq) { return Err("invalid sequence name".into()); }
     if !composition.is_object() { return Err("composition must be a JSON object".into()); }
-    let abs = write_json(&broker, &agent_id, &rel(&project, "composition.json"), &composition)?;
-    if let Some(p) = abs.parent() { ensure_gitignore(p); }
+    let abs = write_json(&broker, &agent_id, &seq_rel(&project, &seq), &composition)?;
+    if let Some(p) = abs.parent() { ensure_gitignore(&project_root_fallback(p)); }
     Ok(())
+}
+
+/// Sequences share one project dir: media, transcript, bins, chat.
+/// `parent` of a written sequences/<name>.json is sequences/ — gitignore + dir
+/// setup belong on the PROJECT root, not the sequences subdir.
+fn project_root_fallback(p: &std::path::Path) -> std::path::PathBuf {
+    if p.file_name().and_then(|n| n.to_str()) == Some("sequences") {
+        p.parent().map(|x| x.to_path_buf()).unwrap_or_else(|| p.to_path_buf())
+    } else { p.to_path_buf() }
+}
+
+/// Sequence CRUD: create (from blank or duplicated), rename, delete.
+/// Media, transcript, bins, chat are project-level and shared — only the
+/// composition file is per-sequence. Deleting the last sequence is refused
+/// (a project always has at least `main`).
+#[tauri::command]
+pub fn video_create_sequence(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String, name: String, from: Option<String>) -> Result<serde_json::Value, String> {
+    if agent_id.trim().is_empty() { return Err("select an agent first".into()); }
+    if !slug_ok(&project) { return Err("invalid project name".into()); }
+    let name = name.trim().to_string();
+    if name == "main" || !slug_ok(&name) { return Err("invalid sequence name — use letters, digits, - _ (not 'main')".into()); }
+    let from = from.unwrap_or_default();
+    if !seq_ok(&from) { return Err("invalid source sequence".into()); }
+    project_dir(&broker, &agent_id, &project)?;
+    if read_json(&broker, &agent_id, &seq_rel(&project, &name)).is_some() { return Err(format!("sequence '{name}' already exists")); }
+    let comp = if from.is_empty() { crate::video_render::blank_composition_json() }
+    else { read_json(&broker, &agent_id, &seq_rel(&project, &from)).ok_or_else(|| format!("no such sequence: {from}"))? };
+    if !comp.is_object() { return Err("source sequence is corrupt".into()); }
+    write_json(&broker, &agent_id, &seq_rel(&project, &name), &comp)?;
+    Ok(serde_json::json!({ "name": name, "sequences": list_sequences(&broker, &agent_id, &project) }))
+}
+
+#[tauri::command]
+pub fn video_rename_sequence(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String, from: String, to: String) -> Result<serde_json::Value, String> {
+    if agent_id.trim().is_empty() { return Err("select an agent first".into()); }
+    if !slug_ok(&project) { return Err("invalid project name".into()); }
+    if from == "main" || from.is_empty() { return Err("the main sequence cannot be renamed".into()); }
+    if to == "main" || !slug_ok(&to) { return Err("invalid sequence name".into()); }
+    project_dir(&broker, &agent_id, &project)?;
+    let src = seq_rel(&project, &from);
+    let comp = read_json(&broker, &agent_id, &src).ok_or_else(|| format!("no such sequence: {from}"))?;
+    if read_json(&broker, &agent_id, &seq_rel(&project, &to)).is_some() { return Err(format!("sequence '{to}' already exists")); }
+    write_json(&broker, &agent_id, &seq_rel(&project, &to), &comp)?;
+    // delete the old file directly (it is jail-relative + slug-checked)
+    let abs = broker.resolve(&agent_id, &src, broker::Mode::Write).map_err(|e| format!("refused by jail: {e:?}"))?;
+    let _ = std::fs::remove_file(abs);
+    Ok(serde_json::json!({ "name": to, "sequences": list_sequences(&broker, &agent_id, &project) }))
+}
+
+#[tauri::command]
+pub fn video_delete_sequence(broker: tauri::State<Arc<Broker>>, agent_id: String, project: String, name: String) -> Result<serde_json::Value, String> {
+    if agent_id.trim().is_empty() { return Err("select an agent first".into()); }
+    if !slug_ok(&project) { return Err("invalid project name".into()); }
+    if name == "main" || name.is_empty() { return Err("the main sequence cannot be deleted".into()); }
+    if !slug_ok(&name) { return Err("invalid sequence name".into()); }
+    project_dir(&broker, &agent_id, &project)?;
+    let target = seq_rel(&project, &name);
+    if read_json(&broker, &agent_id, &target).is_none() { return Err(format!("no such sequence: {name}")); }
+    let abs = broker.resolve(&agent_id, &target, broker::Mode::Write).map_err(|e| format!("refused by jail: {e:?}"))?;
+    std::fs::remove_file(&abs).map_err(|e| format!("delete failed: {e}"))?;
+    Ok(serde_json::json!({ "sequences": list_sequences(&broker, &agent_id, &project) }))
 }
 
 #[tauri::command]
