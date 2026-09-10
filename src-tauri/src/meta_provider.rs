@@ -165,7 +165,7 @@ fn images_within_budget(arr: &[serde_json::Value]) -> std::collections::HashSet<
     keep
 }
 
-fn build_muse_input(system: &str, messages: &serde_json::Value) -> Vec<serde_json::Value> {
+fn build_muse_input(model: &str, system: &str, messages: &serde_json::Value) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     if !system.is_empty() {
         out.push(json!({ "role": "system", "content": [ { "type": "input_text", "text": system } ] }));
@@ -225,6 +225,18 @@ fn build_muse_input(system: &str, messages: &serde_json::Value) -> Vec<serde_jso
             continue;
         }
         if role == "assistant" {
+            // REASONING CONTINUITY (Mason 09-10): Muse Spark is a reasoning model.
+            // Its encrypted reasoning items are the model's memory of WHY it did
+            // the previous tool calls. Without replaying them the model re-plans
+            // from scratch every round -> re-reads the same files and re-emits the
+            // same preamble sentence (the "loop" screenshot). Replay verbatim (Meta
+            // requires the rs_ id unchanged), only for the SAME model id so a model
+            // switch mid-chat can't 400 on a foreign reasoning id.
+            if m.get("reasoning_model").and_then(|x| x.as_str()) == Some(model) {
+                if let Some(rs) = m.get("reasoning").and_then(|r| r.as_array()) {
+                    for it in rs { out.push(it.clone()); }
+                }
+            }
             // AYGENT also stores Anthropic-shaped history (content = [{type:"tool_use",id,name,input}])
             // from the browser agent loop. Handle that here so Muse sees the function calls
             // even when history was written in Anthropic shape (otherwise second turn 400s with
@@ -344,9 +356,13 @@ pub async fn meta_stream_turn<F: FnMut(StreamEvent)>(
     let tools_json = tools_to_muse(tools);
     let mut body = json!({
         "model": model,
-        "input": build_muse_input(system, messages),
+        "input": build_muse_input(model, system, messages),
         "max_output_tokens": 32000,
         "stream": true,
+        // Stateless + ask for the encrypted reasoning so we can replay it next
+        // round (what OpenCode's Responses provider sends; see build_muse_input).
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
     });
     // MODEL VARIANT (Mason 09-05): per-agent reasoning knob for Spark models
     // (minimal|low|medium|high|xhigh|max). Same model id, more/less thinking.
@@ -387,6 +403,8 @@ pub async fn meta_stream_turn<F: FnMut(StreamEvent)>(
     // Map an fc_ item id -> its call_id (from output_item.added/done) so a
     // streamed args frame can be tied to the right call.
     let mut item_to_call: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
+    // Reasoning items (verbatim, incl. encrypted_content) in output order.
+    let mut reasoning_items: Vec<serde_json::Value> = Vec::new();
     let mut stop_reason = String::from("completed");
     // USAGE (context meter + $ cost): the Responses API reports token counts on
     // the response.completed frame (response.usage). Muse price is $0 in the
@@ -453,6 +471,9 @@ pub async fn meta_stream_turn<F: FnMut(StreamEvent)>(
                 // arguments; emit the ToolUse here (NOT on .added, where args are "").
                 Some("response.output_item.done") => {
                     if let Some(item) = ev.get("item") {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("reasoning") {
+                            reasoning_items.push(item.clone());
+                        }
                         if let Some((call_id, name, mut args)) = call_from_item(item) {
                             let item_id = item.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
                             // Prefer accumulated streamed args if the item's own are empty/blank.
@@ -486,6 +507,11 @@ pub async fn meta_stream_turn<F: FnMut(StreamEvent)>(
                     }
                     // Fallback: if no text deltas arrived, recover text + calls
                     // from the completed output[].
+                    if reasoning_items.is_empty() {
+                        if let Some(items) = ev.get("response").and_then(|r| r.get("output")).and_then(|o| o.as_array()) {
+                            for it in items { if it.get("type").and_then(|t| t.as_str()) == Some("reasoning") { reasoning_items.push(it.clone()); } }
+                        }
+                    }
                     if answer.is_empty() {
                         if let Some(out) = ev.get("response").and_then(|r| r.get("output")) {
                             answer = extract_output_text(out);
@@ -531,6 +557,10 @@ pub async fn meta_stream_turn<F: FnMut(StreamEvent)>(
         tool_calls_json.push(json!({ "id": id, "type": "function", "function": { "name": name, "arguments": args } }));
     }
     let mut assistant = json!({ "role": "assistant", "content": answer });
+    if !reasoning_items.is_empty() {
+        assistant["reasoning"] = json!(reasoning_items);
+        assistant["reasoning_model"] = json!(model);
+    }
     if !tool_calls_json.is_empty() {
         assistant["tool_calls"] = json!(tool_calls_json);
         stop_reason = "tool_use".into();
