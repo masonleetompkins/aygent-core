@@ -10,7 +10,7 @@ import { type Asset, type Clip, type Composition, type Transcript, type MediaFol
 
 export type Status = { ffmpeg: string | null; hyperframes: boolean; whisper: boolean; uv: boolean; proMode: boolean };
 export type Project = { name: string; modified: number; assets: number };
-export type Panel = "media" | "graphics" | "captions" | "color" | "audio" | "export";
+export type Panel = "media" | "sequences" | "graphics" | "captions" | "color" | "audio" | "export";
 
 export type State = {
   agentId: string | null;
@@ -18,6 +18,8 @@ export type State = {
   status: Status | null;
   projects: Project[];
   project: string | null;
+  sequence: string; // active edit sequence (main = composition.json)
+  sequences: { name: string; modified: number }[];
   comp: Composition;
   assets: Asset[];
   folders: MediaFolder[];
@@ -50,7 +52,7 @@ export type State = {
 };
 
 let state: State = {
-  agentId: null, folder: null, status: null, projects: [], project: null, comp: blankComposition(), assets: [], folders: [], transcript: null,
+  agentId: null, folder: null, status: null, projects: [], project: null, sequence: "main", sequences: [], comp: blankComposition(), assets: [], folders: [], transcript: null,
   dirty: false, saving: false, playhead: 0, playing: false, loop: false, zoom: 60, scrollX: 0, selection: [], kfTrack: null, tool: "select", snap: true,
   panel: "media", dockOpen: true, dockTab: "agent", panelOpen: true, dockW: Math.max(280, Math.min(640, Number(localStorage.getItem("aygent.video.dockW")) || 360)), toast: null, render: null, toolProgress: null, frame: null, captionLines: [], luts: [], renders: [], cacheBust: 0, importProgress: null,
 };
@@ -119,7 +121,7 @@ export async function save(): Promise<boolean> {
   if (!agentId || !project) return false;
   set({ saving: true });
   try {
-    await invoke("video_save", { agentId, project, composition: comp });
+    await invoke("video_save", { agentId, project, composition: comp, sequence: state.sequence });
     set({ dirty: false, saving: false });
     void refreshCaptionLines();
     return true;
@@ -151,23 +153,71 @@ export async function refreshProjects() {
   try { set({ projects: await invoke<Project[]>("video_projects", { agentId }) }); } catch (e) { toast(String(e), "err"); }
 }
 
-export async function open(name: string) {
+export async function open(name: string, sequence?: string) {
   const { agentId } = state; if (!agentId) return;
   await flushSave();
   try {
-    const r = await invoke<{ project: string; composition: unknown; assets: Asset[]; folders?: MediaFolder[]; transcript: Transcript | null; chat: unknown }>("video_load", { agentId, project: name });
+    const r = await invoke<{ project: string; sequence: string; sequences: { name: string; modified: number }[]; composition: unknown; assets: Asset[]; folders?: MediaFolder[]; transcript: Transcript | null; chat: unknown }>("video_load", { agentId, project: name, sequence: sequence ?? seqStored(name) ?? "main" });
     past.length = 0; future.length = 0;
     const assets = Array.isArray(r.assets) ? r.assets : [];
     const folders: MediaFolder[] = (Array.isArray((r as any).folders) ? (r as any).folders : []).map((f: any) => ({ id: String(f.id ?? ''), name: String(f.name ?? 'bin'), parent: String(f.parent ?? ''), created: Number(f.created ?? 0) }));
-    set({ project: r.project, comp: normalize(r.composition, assets), assets, folders, transcript: r.transcript ?? null, dirty: false, playhead: 0, playing: false, selection: [], render: null, frame: null, cacheBust: Date.now() });
+    const seq = r.sequence || "main";
+    set({ project: r.project, sequence: seq, sequences: Array.isArray(r.sequences) ? r.sequences : [], comp: normalize(r.composition, assets), assets, folders, transcript: r.transcript ?? null, dirty: false, playhead: 0, playing: false, selection: [], render: null, frame: null, cacheBust: Date.now() });
     localStorage.setItem(`aygent.video.last.${agentId}`, r.project);
+    seqStore(name, seq);
     chatLoaded(r.chat);
     void refreshLuts(); void refreshRenders(); void refreshCaptionLines();
-    // repair any thumbs missing after an interrupted import
     if (assets.some((a) => !a.thumbs)) void refreshThumbs();
   } catch (e) { toast(String(e), "err"); }
 }
-
+/** Switch edit sequence inside the open project (flush + full UI reset). */
+export async function openSequence(seq: string) {
+  const { project } = state; if (!project) return;
+  await open(project, seq || "main");
+}
+/** Per-project last-sequence memory (localStorage). */
+function seqKey(project: string) { return `aygent.video.seq.${state.agentId ?? "-"}.${project}`; }
+function seqStored(project: string): string | null {
+  try { return localStorage.getItem(seqKey(project)); } catch { return null; }
+}
+function seqStore(project: string, seq: string) {
+  try { localStorage.setItem(seqKey(project), seq); } catch { /* ignore */ }
+}
+/** Create a sequence (blank, or duplicated from another) and open it. */
+export async function createSequence(name: string, from?: string): Promise<boolean> {
+  const { agentId, project } = state; if (!agentId || !project) { toast("open a project first"); return false; }
+  const clean = name.trim().replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 80);
+  if (!clean || clean === "main") { toast("pick a sequence name (not 'main')", "err"); return false; }
+  await flushSave();
+  try {
+    const r = await invoke<{ name: string; sequences: { name: string; modified: number }[] }>("video_create_sequence", { agentId, project, name: clean, from: from || "" });
+    set({ sequences: r.sequences });
+    await open(project, r.name);
+    toast(`sequence ${r.name} created${from ? ` from ${from}` : ""}`, "ok");
+    return true;
+  } catch (e) { toast(String(e), "err"); return false; }
+}
+export async function renameSequence(from: string, to: string): Promise<boolean> {
+  const { agentId, project } = state; if (!agentId || !project) return false;
+  try {
+    const r = await invoke<{ name: string; sequences: { name: string; modified: number }[] }>("video_rename_sequence", { agentId, project, from, to });
+    set({ sequences: r.sequences });
+    if (state.sequence === from) await open(project, r.name);
+    return true;
+  } catch (e) { toast(String(e), "err"); return false; }
+}
+export async function deleteSequence(name: string): Promise<boolean> {
+  const { agentId, project } = state; if (!agentId || !project) return false;
+  try {
+    const r = await invoke<{ sequences: { name: string; modified: number }[] }>("video_delete_sequence", { agentId, project, name });
+    set({ sequences: r.sequences });
+    if (state.sequence === name) await open(project, "main");
+    else void reload();
+    toast(`sequence ${name} deleted`, "ok");
+    return true;
+  } catch (e) { toast(String(e), "err"); return false; }
+}
+// (open() replaced above with the sequence-aware version)
 export async function create(name: string, size?: { w: number; h: number }) {
   const { agentId } = state; if (!agentId) return;
   const comp = blankComposition();
@@ -203,11 +253,11 @@ export async function removeProject(name: string): Promise<boolean> {
 export async function reload() {
   const { agentId, project } = state; if (!agentId || !project) return;
   try {
-    const r = await invoke<{ composition: unknown; assets: Asset[]; folders?: MediaFolder[]; transcript: Transcript | null }>("video_load", { agentId, project });
+    const r = await invoke<{ composition: unknown; assets: Asset[]; folders?: MediaFolder[]; transcript: Transcript | null; sequences?: { name: string; modified: number }[] }>("video_load", { agentId, project, sequence: state.sequence });
     const assets = Array.isArray(r.assets) ? r.assets : [];
     const folders: MediaFolder[] = (Array.isArray((r as any).folders) ? (r as any).folders : []).map((f: any) => ({ id: String(f.id ?? ''), name: String(f.name ?? 'bin'), parent: String(f.parent ?? ''), created: Number(f.created ?? 0) }));
     snapshot();
-    set({ comp: normalize(r.composition, assets), assets, folders, transcript: r.transcript ?? null, dirty: false, cacheBust: Date.now() });
+    set({ comp: normalize(r.composition, assets), assets, folders, transcript: r.transcript ?? null, dirty: false, cacheBust: Date.now(), sequences: Array.isArray((r as any).sequences) ? (r as any).sequences : state.sequences });
     void refreshLuts(); void refreshRenders(); void refreshCaptionLines();
   } catch (e) { toast(String(e), "err"); }
 }
@@ -365,7 +415,7 @@ export async function runTool<T = any>(name: string, input: Record<string, unkno
   await flushSave();
   set({ toolProgress: label ?? name.replace("video_", "").replace("_", " ") + "…" });
   try {
-    const r = await invoke<T>("video_tool", { agentId, name, input: { project, ...input } });
+    const r = await invoke<T>("video_tool", { agentId, name, input: { project, sequence: state.sequence, ...input } });
     set({ toolProgress: null });
     await reload();
     return r;
@@ -376,7 +426,7 @@ export async function renderFrame(time = state.playhead) {
   const { agentId, project, comp } = state; if (!agentId || !project) return;
   set({ toolProgress: "rendering frame…" });
   try {
-    const path = await invoke<string>("video_frame", { agentId, project, time, composition: comp });
+    const path = await invoke<string>("video_frame", { agentId, project, time, composition: comp, sequence: state.sequence });
     set({ frame: { path, time, at: Date.now() }, toolProgress: null });
   } catch (e) { set({ toolProgress: null }); toast(String(e), "err"); }
 }
@@ -386,7 +436,7 @@ export async function startRender(preset: Composition["exports"][number]) {
   await flushSave();
   set({ render: { pct: 0, running: true } });
   try {
-    const r = await invoke<{ path: string; bytes: number }>("video_render", { agentId, project, preset });
+    const r = await invoke<{ path: string; bytes: number }>("video_render", { agentId, project, preset, sequence: state.sequence });
     set({ render: { pct: 100, running: false, path: r.path } });
     toast(`exported ${r.path.split("/").pop()}`, "ok");
     void refreshRenders();

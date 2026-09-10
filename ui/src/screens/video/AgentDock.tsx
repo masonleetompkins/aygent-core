@@ -45,7 +45,7 @@ let videoChannel: string | null = null;
  *  there is nothing to send or a turn is already running. */
 export async function sendVideoPrompt(prompt: string): Promise<boolean> {
   const p = prompt.trim();
-  const { agentId, project, folder, comp, selection, playhead } = get();
+  const { agentId, project, folder, comp, selection, playhead, sequence } = get();
   const slotKey = agentId ? turnSlotKey(agentId, "video") : null;
   if (!p || !agentId || !project || !slotKey) return false;
   if (isRunning(slotKey)) return false;
@@ -66,7 +66,7 @@ export async function sendVideoPrompt(prompt: string): Promise<boolean> {
       notes.map((c) => `- [${fmtTime(c.start, comp.scene.fps)} \u2192 ${fmtTime(c.end, comp.scene.fps)}] ${c.text.content.trim()}`).join("\n")
     : "";
   const ctx = [
-    `[Video editor context — project "${project}" · Video/${project}/ · scene ${comp.scene.width}x${comp.scene.height}@${comp.scene.fps} · ${comp.clips.length} clips · playhead ${fmtTime(playhead, comp.scene.fps)} (${playhead.toFixed(3)}s)` +
+    `[Video editor context — project "${project}" · sequence "${sequence}" · Video/${project}/ · scene ${comp.scene.width}x${comp.scene.height}@${comp.scene.fps} · ${comp.clips.length} clips · playhead ${fmtTime(playhead, comp.scene.fps)} (${playhead.toFixed(3)}s)` +
     (selection.length ? ` · selected clip ids: ${selection.join(", ")}` : "") + `]${notesTxt}`,
     `Use the video_* tools (start with video_project if you need the current state). Keep the reply short: what changed, clip ids, times. Captions/graphics are Hyperframes transparent overlays (video_build_captions / video_render_overlay), styled by the Graphics panel — never drawtext/ASS. Overlays: PLAN first, build only after approval, one tool call per overlay in timeline order.`,
   ].join("\n");
@@ -148,8 +148,14 @@ export function AgentDock({ agentName }: { agentName?: string }) {
   const ctxPct = turn.usage?.contextWindow ? (turn.usage.contextInput || 0) / turn.usage.contextWindow : 0;
 
   async function send(prompt?: string) {
-    const ok = await sendVideoPrompt(prompt ?? text);
-    if (ok) setText("");
+    // Clear the composer the moment the message is accepted — the turn runs
+    // async and completes later, but the text is already pushed as the user
+    // bubble inside sendVideoPrompt. (Previously the old draft sat in the box
+    // until the turn finished.)
+    const outgoing = (prompt ?? text).trim();
+    if (!outgoing) return;
+    setText("");
+    await sendVideoPrompt(prompt ?? outgoing);
   }
 
   const disabled = !s.agentId || !s.project;

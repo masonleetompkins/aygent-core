@@ -15,6 +15,9 @@ export const isGeneratedAsset = (a: Asset) =>
 export function MediaPanel() {
   const s = useVideo();
   const [sel, setSel] = useState<string | null>(null);
+  // Once footage is in, the big drop zone collapses to one toggle row — it
+  // used to eat half the panel forever after the first import.
+  const [showDrop, setShowDrop] = useState(false);
   const [view, setView] = useState<MediaView>(() => {
     try { return localStorage.getItem("aygent.video.mediaView") === "list" ? "list" : "grid"; } catch { return "grid"; }
   });
@@ -34,7 +37,12 @@ export function MediaPanel() {
         <ImportButton />
       </div>
       <div className="ve-panel-body">
-        <MediaDropTarget onPick={() => void importPick()} />
+        {(files.length > 0 || s.folders.length > 0) ? (
+          <button className="ve-btn sm" style={{ alignSelf: "flex-start" }} onClick={() => setShowDrop((v) => !v)}>
+            {showDrop ? "Hide import" : "Import media"}
+          </button>
+        ) : null}
+        {(!files.length && !s.folders.length) || showDrop ? <MediaDropTarget onPick={() => void importPick()} /> : null}
         {prog && (
           <div className="ve-importprog" role="status" aria-label="Import progress">
             <div className="ve-progress"><div className="bar"><i style={{ width: `${pct}%` }} /></div><span className="ve-mono">{prog.total > 0 ? `${prog.done}/${prog.total}` : "…"}</span></div>
