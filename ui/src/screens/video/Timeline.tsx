@@ -4,7 +4,7 @@
 // or K splits, marquee-select on empty lane, drag an asset from Media to place.
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Scissors, MousePointer2, MessageSquare, Magnet, ZoomIn, ZoomOut, Trash2, Copy, AlignHorizontalSpaceAround, Eye, EyeOff, Volume2, VolumeX, Lock, Unlock, Undo2, Redo2, X } from "lucide-react";
-import { useVideo, useVideoSel, usePlayhead, set, get, seek, patchClips, beginGesture, splitAt, deleteSelected, duplicateSelected, closeGaps, addAssetToTimeline, undo, redo, canUndo, canRedo, mutate, withLinked } from "./store";
+import { useVideo, useVideoSel, usePlayhead, set, get, seek, patchClips, beginGesture, splitAt, deleteSelected, duplicateSelected, closeGaps, addAssetToTimeline, undo, redo, canUndo, canRedo, mutate, withLinked, setDropBin, setLaneDrop } from "./store";
 import { type Clip, TRACK_ORDER, TRACK_KIND, TRACK_LABEL, duration as durOf, fmtTime, mediaUrl, clipDur, newClip, kfDbAt } from "./model";
 
 const LANE_H: Record<string, number> = { video: 56, text: 34, audio: 44, review: 44, keyframes: 46 };
@@ -207,11 +207,29 @@ export function Timeline() {
     return l?.dataset.track ?? null;
   }
   function onDragOver(e: React.DragEvent) {
-    if (!e.dataTransfer.types.includes("application/aygent-asset")) return;
+    const types = Array.from(e.dataTransfer.types ?? []);
+    // OS files (Finder): record lane+time for the native drop (which carries
+    // the real paths) and highlight; the import + placement happens there.
+    if (types.includes("Files")) {
+      const lane = laneAt(e.clientY);
+      if (!lane) return;
+      e.preventDefault(); e.dataTransfer.dropEffect = "copy";
+      setDropBin("");
+      setLaneDrop({ track: lane, t: snap(frameQ(xToT(e.clientX))).t });
+      setOverLane((prev) => (prev === lane ? prev : lane));
+      return;
+    }
+    if (!types.includes("application/aygent-asset")) return;
     e.preventDefault(); e.dataTransfer.dropEffect = "copy";
-    setOverLane(laneAt(e.clientY));
+    const lane = laneAt(e.clientY);
+    setOverLane((prev) => (prev === lane ? prev : lane));
   }
   function onDrop(e: React.DragEvent) {
+    const types = Array.from(e.dataTransfer.types ?? []);
+    // OS file drop: the native Tauri handler owns the import (real paths) +
+    // lane placement — just swallow the HTML5 event so the browser never
+    // navigates. Internal asset drops fall through to the placer below.
+    if (types.includes("Files")) { e.preventDefault(); setOverLane(null); return; }
     const id = e.dataTransfer.getData("application/aygent-asset"); setOverLane(null);
     if (!id) return;
     e.preventDefault();
@@ -303,7 +321,7 @@ export function Timeline() {
           );})}
           <div className="ve-track-hdr" style={{ height: 30 }}><span className="ve-faint" style={{ fontSize: 10.5 }}>inspector → track: V3, V4… adds lanes</span></div>
         </div>
-        <div className="ve-lanes aygent-scroll" ref={lanesRef} onWheel={onWheel} onDragOver={onDragOver} onDragLeave={() => setOverLane(null)} onDrop={onDrop}>
+        <div className="ve-lanes aygent-scroll" ref={lanesRef} onWheel={onWheel} onDragOver={onDragOver} onDragLeave={() => { setOverLane(null); setLaneDrop(null); }} onDrop={onDrop}>
           <div style={{ position: "relative", width: contentW, minHeight: "100%" }}>
             {tracks.flatMap((t) => {
               const kind = TRACK_KIND(t);

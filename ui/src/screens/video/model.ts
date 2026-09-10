@@ -85,7 +85,7 @@ export type Asset = {
 };
 /** A media bin (Premiere-style folder). Pure organization — clips reference
  *  assets by id, so bins never break the edit. Lives in assets.json. */
-export type MediaFolder = { id: string; name: string; created: number };
+export type MediaFolder = { id: string; name: string; created: number; parent: string };
 
 export type Word = { w: string; s: number; e: number };
 export type Transcript = { asset: string; language: string; text: string; words: Word[]; segments: { text: string; s: number; e: number }[]; created: number };

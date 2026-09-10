@@ -293,6 +293,10 @@
 .ve button.ve-btn.busy:disabled { opacity: 1; cursor: progress; }
 .ve .ve-spin { animation: ve-spin .9s linear infinite; }
 
+/* ---- import progress ---- */
+.ve-importprog { display: flex; flex-direction: column; gap: 4px; border: 1px solid rgba(var(--accent-rgb), .3); border-radius: 10px; padding: 8px 10px; background: var(--bg); }
+.ve-importprog .nm { font-size: 11px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* ---- media list view (Premiere-style bins) ---- */
 .ve-binlist { display: flex; flex-direction: column; gap: 6px; }
 .ve-binlist-bar { display: flex; gap: 6px; }

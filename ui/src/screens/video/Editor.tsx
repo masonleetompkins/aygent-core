@@ -8,8 +8,8 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { Film, Shapes, Captions, Palette, AudioLines, Download, PanelLeftClose, PanelLeft, PanelRightClose, PanelRight, Plus, FolderOpen, Save, Trash2 } from "lucide-react";
 import "./video.css";
-import { useVideo, init, open, create, save, set, get, togglePlay, seek, stepFrames, splitAt, deleteSelected, duplicateSelected, undo, redo, importPaths, reload, refreshProjects, reveal, removeProject, type Panel } from "./store";
-import { duration as durOf } from "./model";
+import { useVideo, init, open, create, save, set, get, togglePlay, seek, stepFrames, splitAt, deleteSelected, duplicateSelected, undo, redo, importPaths, getDropBin, getLaneDrop, setLaneDrop, toast, reload, refreshProjects, reveal, removeProject, addAssetToTimeline, type Panel } from "./store";
+import { duration as durOf, TRACK_KIND } from "./model";
 import { Player } from "./Player";
 import { Timeline } from "./Timeline";
 import { Inspector } from "./Inspector";
@@ -30,6 +30,41 @@ export function Editor({ agentId, agentName, folder }: { agentId: string | null;
 
   useEffect(() => { void init(agentId, folder); }, [agentId, folder]);
 
+  // Finder drag-drop → hardlink import. The NATIVE Tauri drop event carries the
+  // real OS paths (HTML5 File objects must not be trusted for paths); the HTML5
+  // dragover handlers in the Media panel only track WHICH bin is hovered
+  // (setDropBin) and paint the highlight — the import itself happens here.
+  useEffect(() => {
+    let un: (() => void) | null = null;
+    getCurrentWebview().onDragDropEvent((ev) => {
+      const t = ev.payload.type;
+      if (t === "enter" || t === "over") setDropping(true);
+      else if (t === "leave") setDropping(false);
+      else if (t === "drop") {
+        setDropping(false);
+        const paths = (ev.payload as { paths: string[] }).paths ?? [];
+        if (!get().project) return;
+        if (!paths.length) { toast("drop had no file paths — use Import instead", "err"); return; }
+        const lane = getLaneDrop();
+        setLaneDrop(null);
+        if (lane) {
+          // lane drop: import WITHOUT the empty-timeline auto-lay, then place
+          // each fresh clip exactly where it was dropped (track-aware).
+          void importPaths(paths, getDropBin(), { autoPlace: false }).then((assets) => {
+            for (const a of assets) {
+              const kind = a.kind === "audio" ? "audio" : "video";
+              const track = TRACK_KIND(lane.track) === kind ? lane.track : undefined;
+              addAssetToTimeline(a, Math.max(0, lane.t), track);
+            }
+          });
+        } else {
+          void importPaths(paths, getDropBin());
+        }
+      }
+    }).then((f) => { un = f; }).catch(() => {});
+    return () => { if (un) un(); };
+  }, []);
+
   // backend events: agent tools changed the project · render progress · frames
   useEffect(() => {
     const un: Promise<() => void>[] = [
@@ -44,24 +79,9 @@ export function Editor({ agentId, agentName, folder }: { agentId: string | null;
       }),
       listen<{ project: string; path: string; time: number }>("video-frame-ready", (e) => { if (e.payload.project === get().project) { set({ frame: { path: e.payload.path, time: e.payload.time, at: Date.now() } }); seek(e.payload.time); } }),
       listen<{ project: string; msg: string }>("video-tool-progress", (e) => { if (e.payload.project === get().project) set({ toolProgress: e.payload.msg }); }),
+      listen<{ project: string; done: number; total: number; name: string }>("video-import-progress", (e) => { if (e.payload.project === get().project) set({ importProgress: { done: e.payload.done, total: e.payload.total, name: e.payload.name } }); }),
     ];
     return () => { un.forEach((p) => p.then((f) => f())); };
-  }, []);
-
-  // Finder drag-drop → hardlink import (Tauri native drop events carry real paths)
-  useEffect(() => {
-    let un: (() => void) | null = null;
-    getCurrentWebview().onDragDropEvent((ev) => {
-      const t = ev.payload.type;
-      if (t === "enter" || t === "over") setDropping(true);
-      else if (t === "leave") setDropping(false);
-      else if (t === "drop") {
-        setDropping(false);
-        const paths = (ev.payload as { paths: string[] }).paths ?? [];
-        if (paths.length && get().project && rootRef.current && document.body.contains(rootRef.current)) void importPaths(paths);
-      }
-    }).then((f) => { un = f; }).catch(() => {});
-    return () => { if (un) un(); };
   }, []);
 
   // keyboard
