@@ -54,7 +54,7 @@ pub fn tool_schemas() -> Vec<Value> {
             "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "threshold_db": { "type": "number", "description": "default -35" }, "min_duration": { "type": "number", "description": "seconds, default 0.5" } }, "required": ["project", "asset"] } }),
         json!({ "name": "video_takes", "description": "Find repeated takes in the transcript (the speaker re-saying a line). Returns groups of similar segments with the recommended keep (last take by default, or the longest coherent one). Requires video_transcribe first.",
             "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "keep": { "type": "string", "enum": ["last", "longest"] }, "similarity": { "type": "number", "description": "0..1, default 0.6" } }, "required": ["project"] } }),
-        json!({ "name": "video_auto_cut", "description": "One shot rough cut: drop silences/dead air and duplicate takes from an A-roll asset, then lay the kept ranges as tight contiguous V1 selects (+ linked A1 waveform partners). Transcribes first if needed. Returns the cutlist + what was dropped so the user can review.",
+        json!({ "name": "video_auto_cut", "description": "One shot rough cut: drop silences/dead air and duplicate takes from an A-roll asset, then lay the kept ranges as tight contiguous V1 selects (+ linked A1 waveform partners). Cut points snap to Whisper word boundaries (quiet word onsets/tails are never clipped) — transcribes first if needed. Returns the cutlist + what was dropped so the user can review.",
             "input_schema": { "type": "object", "properties": { "project": proj, "asset": { "type": "string" }, "threshold_db": { "type": "number", "description": "default -35" }, "min_silence": { "type": "number", "description": "seconds, default 0.6" }, "pad": { "type": "number", "description": "seconds kept around speech, default 0.08" }, "keep": { "type": "string", "enum": ["last", "longest"] }, "drop_takes": { "type": "boolean", "description": "default true" } }, "required": ["project"] } }),
         json!({ "name": "video_frame", "description": "Render ONE composite frame (grade + overlays) at a timeline time to .cache/. Use to sanity-check a moment; the user sees it in the Video tab preview.",
             "input_schema": { "type": "object", "properties": { "project": proj, "time": { "type": "number" } }, "required": ["project", "time"] } }),
@@ -821,6 +821,36 @@ pub fn auto_cut(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project
                 let e2 = sil.iter().filter(|(ss, _)| *ss >= e - 0.15).map(|(_, se)| *se).fold(e, f64::min).max(e);
                 keep_ranges = subtract(keep_ranges, &(s2.max(0.0), e2.min(dur)));
                 dropped_takes.push(json!({ "s": round2(s2), "e": round2(e2), "text": t["text"] }));
+            }
+        }
+    }
+    // WORD-SNAP (accuracy fix): energy-based cuts eat quiet word edges
+    // (plosive onsets, fricative tails sit 10dB under the vowel core). Expand
+    // each keep to the nearest Whisper word boundaries — but only when a word
+    // edge sits within 0.35s OUTSIDE the energy cut, so real pauses stay cut.
+    // Needs the transcript even when drop_takes is off: transcribe if needed.
+    {
+        let tr = match load_transcript(&proj).filter(|t| t.asset == a.id) { Some(t) => Some(t), None => transcribe(app, broker, agent_id, project, Some(&a.id), None).ok().map(|t| t.1) };
+        if let Some(tr) = tr.filter(|t| !t.words.is_empty()) {
+            const SNAP_WIN: f64 = 0.35;
+            const EDGE_IN: f64 = 0.12;
+            for (s, e) in keep_ranges.iter_mut() {
+                // start: nearest word-start at or just before s (but not a word
+                // that already ends well inside the keep — that would be a
+                // mid-speech point, not an edge)
+                let mut best_s: Option<f64> = None;
+                for w in &tr.words {
+                    if w.s > *s + EDGE_IN { break; }
+                    if w.s >= *s - SNAP_WIN && w.e > *s + EDGE_IN { best_s = Some(w.s); }
+                }
+                if let Some(ws) = best_s { if ws < *s { *s = ws.max(0.0); } }
+                // end: nearest word-end at or just after e
+                let mut best_e: Option<f64> = None;
+                for w in tr.words.iter().rev() {
+                    if w.e < *e - EDGE_IN { break; }
+                    if w.e <= *e + SNAP_WIN && w.s < *e - EDGE_IN { best_e = Some(w.e); }
+                }
+                if let Some(we) = best_e { if we > *e { *e = we.min(dur); } }
             }
         }
     }
