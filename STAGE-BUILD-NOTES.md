@@ -1,3 +1,42 @@
+# Stage build — 2026-09-10 ~11:10 PDT — v1.0.16 (media import rebuild: nested bins, folder import, progress)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, dead-code warnings only (same set + one new `import_one` unused — it now forwards to `import_one_in`). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `9a46d69` — feat(video): nested bins, folder import as bin tree, import progress events, full picker filter
+- `e0c84e1` — feat(video): nested bins UI, folder import, import progress, fixed bin drag + lane drops
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41686008 bytes), mtime **Sep 10 11:08**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **18062025 bytes (~17.2 MB)**, mtime **Sep 10 11:08**
+- verified: `video_pick_folder` in shipped `ui/dist` JS
+
+**What changed (all six of Mason's media reports):**
+1. **Import progress bar** — backend emits `video-import-progress` per file (done/total/name); the Media panel shows a live bar (`3/20 · clip-04.mp4`), `scanning…` during enumeration, `finishing…` at the end. A 20-clip import never looks hung again.
+2. **No more silent failures** — per-file errors surface as toasts with a `linked N · M failed` count; one bad file no longer aborts the batch; an all-fail import says `import failed: <reason>` instead of nothing.
+3. **Import button picker fixed** — the dialog filter now lists EVERY supported ext (avi/mts/m2ts/mxf/ogg/aif/aiff/heic/tif/tiff were accepted backend-side but greyed out in the picker).
+4. **Finder drag-drop works** — the native Tauri drop event is the single import path again (it carries real OS paths). HTML5 hover only paints the target + records it; drop-zone, bins, and timeline lanes all participate. Dropped folders become bin trees.
+5. **Bin-to-bin drag works** — headers are draggable on a separate `BIN_MIME` (the old code set the same asset mime on a header nobody could drag, and drops read the wrong key). Drop nests, cycle-guarded; Unfiled accepts back to top level.
+6. **Folder import + Nested Bins capability** — Folder button, per-bin import-here, and `video_pick_folder` command; directory walks mirror structure (hidden skipped, depth ≤ 8, symlink-cycle guard, 200-file cap). Bins carry `parent`; delete promotes children/assets up; agent tools (`video_media_folder` + move op, `video_media_move`, `video_project` folder listing) all know about nesting.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~8 min)
+1. **Progress** — import 10+ clips → live `N/M · name` bar, completes with `linked N` toast.
+2. **Picker** — Import button selects .mts/.avi/.heic (previously greyed out).
+3. **Drop zone** — drag files + a folder onto Drop footage here → files land, folder becomes a bin with nested sub-bins.
+4. **Bin drag** — drag a bin header into another bin → nests (indented); drag back to Unfiled → top level; self-nesting refused.
+5. **Folder import** — Folder button / bin import-here → whole directory as a bin tree.
+6. **Lane drop** — drag a Finder file onto a timeline lane → imports and places the clip at the drop time.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
 # Stage build — 2026-09-08 ~21:15 PDT — v1.0.16 (streaming diff view + drag-drop attach)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0, dead-code warnings only (same set). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
