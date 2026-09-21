@@ -305,6 +305,8 @@ function LocalModels({ folder, activePath, onChoose }: {
   const [selected, setSelected] = useState<CatModel | null>(null);
   const [highlight, setHighlight] = useState(-1);
   const [pulling, setPulling] = useState<string | null>(null);
+  const [pullProg, setPullProg] = useState<{ file: string; index: number; files: number; pct: number } | null>(null);
+  const [mlxPulled, setMlxPulled] = useState<Array<{ repo: string; path: string; size_gb: number }>>([]);
   const [pullMsg, setPullMsg] = useState<string | null>(null);
   const seqRef = useRef(0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -325,6 +327,7 @@ function LocalModels({ folder, activePath, onChoose }: {
   useEffect(() => {
     invoke<HW>("detect_hardware").then(setHw).catch(() => {});
     refreshDownloaded();
+    refreshMlxPulled();
   }, []);
 
   // click outside to close dropdown
@@ -453,14 +456,30 @@ function LocalModels({ folder, activePath, onChoose }: {
   }
 
   async function mlxPull(repo: string) {
-    setPulling(repo); setPullMsg(null); setErr(null);
+    const channel = `mlx-pull-${Date.now()}`;
+    setPulling(repo); setPullMsg(null); setErr(null); setPullProg(null);
+    const un = await listen<any>(channel, (e) => {
+      const pl = e.payload || {};
+      if (pl.done) { setPullProg(null); return; }
+      const { file, index, files, got, total } = pl;
+      setPullProg({ file: file || "", index: index || 0, files: files || 0, pct: total ? got / total : 0 });
+    });
     try {
-      await invoke("mlx_pull_cmd", { channel: `mlx-pull-${Date.now()}`, repo });
+      await invoke("mlx_pull_cmd", { channel, repo });
       setPullMsg(`✓ ${repo} cached — select it in any agent (provider: Local MLX)`);
+      await refreshMlxPulled();
     } catch (e) { setPullMsg(`✗ ${String(e)}`); }
-    finally { setPulling(null); }
+    finally { un(); setPulling(null); setPullProg(null); }
   }
 
+  async function refreshMlxPulled() {
+    try { setMlxPulled(await invoke<Array<{ repo: string; path: string; size_gb: number }>>("mlx_downloaded")); }
+    catch { /* best-effort */ }
+  }
+  async function mlxDel(repo: string) {
+    try { await invoke("mlx_delete_cmd", { repo }); await refreshMlxPulled(); }
+    catch (e) { setErr(String(e)); }
+  }
   async function del(d: Downloaded) {
     try { await invoke("local_delete", { filename: d.filename }); await refreshDownloaded(); if (selected && d.filename && selected.quants.some(q => q.filename === d.filename)) { /* keep card */ } }
     catch (e) { setErr(String(e)); }
@@ -482,7 +501,7 @@ function LocalModels({ folder, activePath, onChoose }: {
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
             <span style={{ fontSize: 13, color: "var(--text-muted)", flex: 1 }}>~{q ? q.size_gb.toFixed(1) : "?"}GB download · {q ? q.quant : ""} · whole repo (safetensors)</span>
-            <Button variant="secondary" onClick={() => void mlxPull(m.repo)} disabled={!!pulling}>{busy ? "Pulling…" : "Pull"}</Button>
+            {busy && pullProg ? <span style={{ fontSize: 12, fontFamily: "ui-monospace, monospace", color: "var(--text-muted)" }}>{pullProg.file} ({pullProg.index + 1}/{pullProg.files}) · {Math.round(pullProg.pct * 100)}%</span> : <Button variant="secondary" onClick={() => void mlxPull(m.repo)} disabled={!!pulling}>{busy ? "Pulling…" : "Pull"}</Button>}
           </div>
           {pullMsg && <Pill tone={pullMsg.startsWith("✗") ? "danger" : "ok"}>{pullMsg}</Pill>}
           <span style={{ fontSize: 12, color: "var(--text-faint)" }}>MLX models run chat-only (no file tools) via the Local (MLX) provider — pick this repo in any agent’s setup after pulling.</span>
@@ -568,6 +587,23 @@ function LocalModels({ folder, activePath, onChoose }: {
           “works with file tools” can read &amp; write files in the agent’s folder — and every change is
           a Save Point, so you can always rewind.
         </p>
+      )}
+      {mlxPulled.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text-muted)" }}>Installed · MLX</span>
+          {mlxPulled.map((m) => (
+            <div key={m.repo} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ flex: 1, border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-card)", padding: "10px 14px", background: "var(--bg)", boxShadow: "var(--elevation)" }}>
+                <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+                  <b style={{ fontSize: 14 }}>{m.repo}</b>
+                  <span style={{ ...hint, fontFamily: "ui-monospace, monospace", fontSize: 12 }}>{m.size_gb.toFixed(1)}GB · MLX</span>
+                </div>
+                <span style={{ ...hint, fontSize: 12 }}>chat only — no file tools</span>
+              </div>
+              <Button variant="secondary" onClick={() => void mlxDel(m.repo)}>Delete</Button>
+            </div>
+          ))}
+        </div>
       )}
 
       {/* OpenRouter-style search */}
@@ -672,58 +708,61 @@ function LocalModels({ folder, activePath, onChoose }: {
 
 
 // ---- MLX MODELS (Apple Silicon) ------------------------------------------------
-// mlx-community/* weights via a uv-managed mlx_lm.server sidecar. v1: chat-only
-// turns (no file tools); weights auto-download on first chat or prefetched here.
+// mlx-community/* weights via a uv-managed mlx_lm.server sidecar. No setup:
+// the engine installs itself on first pull or chat. Pulls land in an in-app
+// library with live progress and show up in the Installed list above.
 function MlxModels() {
   const [status, setStatus] = useState<{ installed: boolean; running: boolean; repo: string | null; apple_silicon: boolean } | null>(null);
   const [repo, setRepo] = useState("mlx-community/Qwen3-4B-4bit");
-  const [busy, setBusy] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [prog, setProg] = useState<{ file: string; index: number; files: number; pct: number } | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   async function refresh() {
     try { setStatus(await invoke("mlx_status")); } catch { /* best-effort */ }
   }
   useEffect(() => { refresh(); }, []);
-  async function install() {
-    setBusy("Installing the MLX engine (one-time, a few minutes)…"); setMsg(null);
-    try { await invoke("mlx_install_cmd", { channel: "mlx-setup" }); setMsg("✓ MLX engine installed"); await refresh(); }
-    catch (e) { setMsg("✗ " + String(e)); }
-    finally { setBusy(null); }
-  }
   async function pull() {
     const r = repo.trim();
     if (!r || busy) return;
-    setBusy(`Downloading ${r} (GBs, one-time)…`); setMsg(null);
-    try { await invoke("mlx_pull_cmd", { channel: "mlx-setup", repo: r }); setMsg(`✓ ${r} cached — pick it in any agent (provider: Local MLX)`); }
-    catch (e) { setMsg("✗ " + String(e)); }
-    finally { setBusy(null); }
+    const channel = `mlx-setup-${Date.now()}`;
+    setBusy(true); setMsg(null); setProg(null);
+    const un = await listen<any>(channel, (e) => {
+      const p = e.payload || {};
+      if (p.done) { setProg(null); return; }
+      const { file, index, files, got, total } = p;
+      setProg({ file: file || "", index: index || 0, files: files || 0, pct: total ? got / total : 0 });
+    });
+    try {
+      await invoke("mlx_pull_cmd", { channel, repo: r });
+      setMsg(`✓ ${r} cached — pick it in any agent (provider: Local MLX)`);
+      await refresh();
+    } catch (e) { setMsg(`✗ ${String(e)}`); }
+    finally { un(); setBusy(false); setProg(null); }
   }
   async function stop() {
     try { await invoke("mlx_stop_cmd"); setMsg(null); await refresh(); }
-    catch (e) { setMsg("✗ " + String(e)); }
+    catch (e) { setMsg(`✗ ${String(e)}`); }
   }
   return (
     <Card title="MLX Models">
-      <p style={hint}>Apple-silicon models (<b>mlx-community/*</b>) — the Mac-native fast lane for small quantized models. Runs fully offline after the one-time download.</p>
+      <p style={hint}>Apple-silicon models (<b>mlx-community/*</b>) — the Mac-native fast lane for small quantized models. No setup: pulling or chatting installs the engine automatically. Runs fully offline after the one-time download.</p>
       {status && !status.apple_silicon && (
-        <Pill tone="danger">MLX needs Apple Silicon — this Mac can’t run it</Pill>
+        <Pill tone="danger">MLX needs Apple Silicon — this Mac can't run it</Pill>
       )}
       <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
         {status == null ? <Pill tone="muted">checking…</Pill>
           : status.installed ? <Pill tone="ok">engine installed ✓</Pill>
-          : <Pill tone="muted">engine not installed</Pill>}
+          : <Pill tone="muted">engine installs itself on first use</Pill>}
         {status?.running && status.repo && <Pill tone="ok">serving {status.repo}</Pill>}
-        {!status?.installed && <Button variant="secondary" onClick={install} disabled={!!busy}>Install engine</Button>}
         {status?.running && <Button variant="secondary" onClick={stop}>Stop server</Button>}
       </div>
-      {status?.installed && (
-        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-          <Input mono value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="mlx-community/Qwen3-4B-4bit" />
-          <Button variant="secondary" onClick={pull} disabled={!!busy || !repo.trim()}>Pull</Button>
-        </div>
-      )}
-      {busy && <p style={{ ...hint, fontSize: 13 }}>{busy}</p>}
+      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <Input mono value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="mlx-community/Qwen3-4B-4bit" />
+        <Button variant="secondary" onClick={pull} disabled={busy || !repo.trim()}>Pull</Button>
+      </div>
+      {busy && <p style={{ ...hint, fontSize: 13 }}>{prog && prog.files ? `${prog.file} (${prog.index + 1}/${prog.files}) · ${Math.round(prog.pct * 100)}%` : "Starting download…"}</p>}
       {msg && <Pill tone={msg.startsWith("✗") ? "danger" : "ok"}>{msg}</Pill>}
-      <p style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>MLX agents are chat-only for now (no file tools) — best for fast Q&A, summaries, and ideas. Weights live inside the app; nothing is installed outside it.</p>
+      <p style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Pulled models appear in the Installed list above. MLX agents are chat-only (no file tools) — best for fast Q&A, summaries, and ideas. Weights live inside the app; nothing is installed outside it.</p>
     </Card>
   );
 }

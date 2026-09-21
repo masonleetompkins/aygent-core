@@ -491,6 +491,7 @@ export function AgentForm({
   // Locally-downloaded GGUF models (for provider === "local"): show a dropdown
   // of what's already on disk instead of forcing the user to type a path.
   const [localModels, setLocalModels] = useState<Array<{ filename: string; path: string; size_gb: number }>>([]);
+  const [mlxPulled, setMlxPulled] = useState<Array<{ repo: string }>>([]);
   const [localLoading, setLocalLoading] = useState(false);
   async function loadLocalModels(): Promise<void> {
     setLocalLoading(true);
@@ -552,7 +553,7 @@ export function AgentForm({
   useEffect(() => {
     if (provider === "local") void loadLocalModels();
     else if (provider !== "mlx") void loadModels(provider);
-    else { setModels([]); setModelsErr(null); }
+    else { setModels([]); setModelsErr(null); invoke<Array<{ repo: string }>>("mlx_downloaded").then((l) => setMlxPulled(l || [])).catch(() => {}); }
     /* eslint-disable-next-line */
   }, [provider]);
 
@@ -634,6 +635,13 @@ export function AgentForm({
           <label style={fieldLabel}>Model
             {provider === "mlx" ? (
               <>
+                {mlxPulled.length > 0 && (
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 6 }}>
+                    {mlxPulled.map((m) => (
+                      <button key={m.repo} type="button" onClick={() => setModel(m.repo)} title={m.repo} style={{ fontSize: 12, padding: "4px 10px", borderRadius: 999, cursor: "pointer", border: model === m.repo ? "var(--border-width) solid var(--accent)" : "var(--border-width) solid var(--line)", background: "var(--bg)", color: model === m.repo ? "var(--accent)" : "var(--text-muted)" }}>{m.repo.split("/")[1] || m.repo}</button>
+                    ))}
+                  </div>
+                )}
                 <Input value={model} onChange={(e) => setModel(e.target.value)} mono placeholder="mlx-community/Qwen3-4B-4bit" />
                 <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Hugging Face repo id — weights auto-download on first chat (GBs, one-time). Pull ahead in Settings to watch progress.</span>
               </>
