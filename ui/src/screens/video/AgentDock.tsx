@@ -22,7 +22,7 @@ import { useVideo, useChat, chatPush, chatReplaceLast, chatPersist, chatGetHisto
 import { fmtTime } from "./model";
 
 const QUICK: { l: string; p: string }[] = [
-  { l: "Rough cut", p: "Run video_auto_cut on the A-roll: drop silences and dead air, keep the LAST take when I repeat a line. Then tell me what you removed." },
+  { l: "Rough cut", p: "Rough-cut the FULL V1 A-roll track (it may hold many assets — the A-roll IS the whole V1 track, never ask which clip it is): call video_project to list the distinct video assets on V1, then run video_auto_cut on EACH one with drop silences/dead air + keep LAST take (drop_takes true). Then tell me what you removed per asset." },
   { l: "Transcribe", p: "Transcribe the A-roll (video_transcribe) and give me a 5-bullet summary of what I say with timestamps." },
   { l: "Captions", p: "Transcribe the A-roll if needed, then build the Hyperframes caption overlay (video_build_captions) with 6 key words to highlight. Style comes from my Graphics panel." },
   { l: "Graphics plan", p: "Read the transcript and my Graphics panel style, then write a PLAN for Hyperframes overlay graphics (title cards / callouts) where extra explanation helps: numbered list, one per line with timecode range, exact on-screen text, placement, and why. Do NOT build anything yet — wait for my approval or revision notes, then build with video_render_overlay." },

@@ -1,6 +1,8 @@
 // AYGENT — VIDEO v0.3 timeline. Multi-track, zoomable, snapping. Clip bars are
 // flat accent blocks (audio shows its cached waveform); drag body = move (with
-// track change), drag edges = trim (source in/out follow, rate-aware), razor tool
+// track change), drag edges = RIPPLE trim (source in/out follow, rate-aware;
+// R handle pushes/pulls everything downstream, L handle pushes/pulls everything
+// upstream so the timeline stays contiguous), razor tool
 // or K splits, marquee-select on empty lane, drag an asset from Media to place.
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Scissors, MousePointer2, MessageSquare, Magnet, ZoomIn, ZoomOut, Trash2, Copy, AlignHorizontalSpaceAround, Eye, EyeOff, Volume2, VolumeX, Lock, Unlock, Undo2, Redo2, X } from "lucide-react";
@@ -9,7 +11,7 @@ import { type Clip, TRACK_ORDER, TRACK_KIND, TRACK_LABEL, duration as durOf, fmt
 
 const LANE_H: Record<string, number> = { video: 56, text: 34, audio: 44, review: 44, keyframes: 46 };
 const KF_TOP_DB = 6, KF_BOT_DB = -40; // keyframe lane range
-const MIN_ZOOM = 6, MAX_ZOOM = 600;
+const MIN_ZOOM = 0.1, MAX_ZOOM = 600;
 
 export function Timeline() {
   const s = useVideo();
@@ -96,6 +98,9 @@ export function Timeline() {
     const startX = e.clientX, startY = e.clientY;
     const orig = new Map(get().comp.clips.filter((c) => sel.includes(c.id)).map((c) => [c.id, { ...c }]));
     const anchor = orig.get(clip.id)!;
+    // Full-timeline snapshot at dragstart so ripple shifts recompute from the
+    // original positions on every mousemove (no incremental drift).
+    const fullOrig = new Map(get().comp.clips.map((c) => [c.id, { start: c.start, end: c.end }]));
     const laneEls = Array.from(lanesRef.current!.querySelectorAll<HTMLElement>("[data-track]"));
     let began = false; let moved = false;
     const mv = (ev: MouseEvent) => {
@@ -117,21 +122,49 @@ export function Timeline() {
         if (lane) { const t = lane.dataset.track!; if (TRACK_KIND(t) === TRACK_KIND(anchor.track) && !locked[t]) newTrack = t; }
         patchClips(sel, (k) => { const o = orig.get(k.id)!; const d = clipDur(o); const ns = Math.max(0, o.start + dt); return { start: ns, end: ns + d, track: newTrack && sel.length === 1 ? newTrack : k.track }; }, { undo: false });
       } else if (mode === "l") {
+        // RIPPLE trim (head): the trimmed clip's end stays anchored; every
+        // non-review clip ending at/before the head (upstream) shifts by the
+        // same delta so lengthening makes space and shortening closes the gap.
         const o = anchor; const minStart = o.start - o.in / o.speed; // can't reveal before source 0
-        let ns = Math.max(minStart, Math.min(o.end - 1 / fps, o.start + dt));
-        const sn = snap(ns, excl); if (sn.hit !== null) ns = Math.max(minStart, Math.min(o.end - 1 / fps, sn.t)); setSnapLine(sn.hit);
+        const trimIds = new Set(withLinked([clip.id]));
+        const upstream = get().comp.clips.filter((k) => !trimIds.has(k.id) && k.type !== "review" && !k.track.startsWith("R") && !locked[k.track] && (fullOrig.get(k.id)?.end ?? k.end) <= o.start + 1e-6);
+        for (const u of upstream) { const fo = fullOrig.get(u.id); if (fo) { excl.add(fo.start); excl.add(fo.end); } }
+        const minUp = upstream.length ? Math.min(...upstream.map((k) => fullOrig.get(k.id)?.start ?? k.start)) : Infinity;
+        const floor = Number.isFinite(minUp) ? o.start - minUp : -Infinity; // keep earliest upstream clip >= 0
+        let ns = Math.max(Math.max(minStart, floor), Math.min(o.end - 1 / fps, o.start + dt));
+        const sn = snap(ns, excl); if (sn.hit !== null) ns = Math.max(Math.max(minStart, floor), Math.min(o.end - 1 / fps, sn.t)); setSnapLine(sn.hit);
         ns = frameQ(ns);
         const delta = ns - o.start;
-        patchClips(withLinked([clip.id]), () => ({ start: ns, in: o.type === "text" || o.type === "review" ? 0 : o.in + delta * o.speed }), { undo: false });
+        mutate((c) => {
+          for (const k of c.clips) {
+            if (trimIds.has(k.id)) { k.start = ns; if (!(k.type === "text" || k.type === "review")) k.in = o.in + delta * o.speed; else k.in = 0; }
+            else if (k.type !== "review" && !k.track.startsWith("R") && !locked[k.track] && (fullOrig.get(k.id)?.end ?? k.end) <= o.start + 1e-6) {
+              const fo = fullOrig.get(k.id)!; k.start = fo.start + delta; k.end = fo.end + delta;
+            }
+          }
+        }, { undo: false });
       } else {
+        // RIPPLE trim (tail): the trimmed clip's start stays anchored; every
+        // non-review clip starting at/after the tail (downstream, all tracks so
+        // V1+A1+overlays stay in sync) shifts by the same delta.
         const o = anchor;
         const asset = get().assets.find((a) => a.id === o.asset);
         const maxEnd = asset && o.type === "video" ? o.start + (asset.duration - o.in) / o.speed : Infinity;
+        const trimIds = new Set(withLinked([clip.id]));
+        const downstream = get().comp.clips.filter((k) => !trimIds.has(k.id) && k.type !== "review" && !k.track.startsWith("R") && !locked[k.track] && (fullOrig.get(k.id)?.start ?? k.start) >= o.end - 1e-6);
+        for (const d of downstream) { const fo = fullOrig.get(d.id); if (fo) { excl.add(fo.start); excl.add(fo.end); } }
         let ne = Math.min(maxEnd, Math.max(o.start + 1 / fps, o.end + dt));
         const sn = snap(ne, excl); if (sn.hit !== null) ne = Math.min(maxEnd, Math.max(o.start + 1 / fps, sn.t)); setSnapLine(sn.hit);
         ne = frameQ(ne);
         const delta = ne - o.end;
-        patchClips(withLinked([clip.id]), () => ({ end: ne, out: o.type === "text" || o.type === "review" ? ne - o.start : o.out + delta * o.speed }), { undo: false });
+        mutate((c) => {
+          for (const k of c.clips) {
+            if (trimIds.has(k.id)) { k.end = ne; if (!(k.type === "text" || k.type === "review")) k.out = o.out + delta * o.speed; else k.out = ne - k.start; }
+            else if (k.type !== "review" && !k.track.startsWith("R") && !locked[k.track] && (fullOrig.get(k.id)?.start ?? k.start) >= o.end - 1e-6) {
+              const fo = fullOrig.get(k.id)!; k.start = fo.start + delta; k.end = fo.end + delta;
+            }
+          }
+        }, { undo: false });
       }
     };
     const up = () => { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); setSnapLine(null); };

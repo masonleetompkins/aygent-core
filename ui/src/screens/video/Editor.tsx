@@ -115,8 +115,8 @@ export function Editor({ agentId, agentName, folder }: { agentId: string | null;
         case "s": case "S": set({ snap: !st.snap }); break;
         case "i": case "I": set({ dockOpen: true, dockTab: st.dockTab === "inspector" && st.dockOpen ? "agent" : "inspector" }); break;
         case "=": case "+": set({ zoom: Math.min(600, st.zoom * 1.3) }); break;
-        case "-": case "_": set({ zoom: Math.max(6, st.zoom / 1.3) }); break;
-        case "Z": { const el = rootRef.current?.querySelector<HTMLElement>(".ve-lanes"); if (el) set({ zoom: Math.max(6, (el.clientWidth - 40) / Math.max(1, durOf(st.comp))) }); break; }
+        case "-": case "_": set({ zoom: Math.max(0.1, st.zoom / 1.3) }); break;
+        case "Z": { const el = rootRef.current?.querySelector<HTMLElement>(".ve-lanes"); if (el) set({ zoom: Math.max(0.1, (el.clientWidth - 40) / Math.max(1, durOf(st.comp))) }); break; }
         case "Escape": set({ selection: [] }); break;
         case "[": { const c = st.comp.clips.filter((k) => k.end <= st.playhead - 1e-3).map((k) => k.end); if (c.length) seek(Math.max(...c)); else seek(0); break; }
         case "]": { const c = st.comp.clips.filter((k) => k.start >= st.playhead + 1e-3).map((k) => k.start); if (c.length) seek(Math.min(...c)); break; }
