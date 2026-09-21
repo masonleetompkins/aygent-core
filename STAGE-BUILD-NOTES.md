@@ -1,3 +1,28 @@
+# Stage build — 2026-09-21 ~afternoon PDT — v1.0.16 (MLX fail-fast: warm-up + watchdog)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit (on `staging`):**
+- `15a8959` — mlx: fail-fast warm-up + first-token watchdog (no more silent hangs)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg` (fresh mtime, verified)
+
+**What changed (Mason's hang report):**
+- Root cause: `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` declares `prism_hadamard_qwen35`, which stock mlx-lm cannot load (ValueError in server log). The HTTP server stays up, so readiness passed and the chat request hung forever — 10 min of "thinking".
+- Fix: `warm_up` sends a 1-token completion after the server answers and before the turn depends on it; load failures kill the server and surface the log tail in seconds. `not supported` in the logs adds the bundled-loader pointer (try a standard mlx-community quant).
+- Backstop: 10-minute first-byte watchdog on the SSE stream — a stuck server errors, never spins.
+- Verified end-to-end against a live sidecar (SmolLM2-135M): `choices[0]` + usage shape matches what warm_up parses.
+- Note: Bonsai 2 specifically needs its own bundled runtime (per its own model card — ordinary loaders return wrong output, not just errors). Not runnable via stock mlx-lm at any version checked.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA
+1. **Bonsai now fails fast** — chat on it errors within ~a minute with the log tail + standard-quant suggestion (no more endless thinking).
+2. **Supported model chats** — pull `mlx-community/Qwen3-4B-4bit`, chat a turn: warm-up loads once, streams $0.
+
+---
+
 # Stage build — 2026-09-21 ~evening PDT — v1.0.16 (MLX folded in: no section, picker, chat gate)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
