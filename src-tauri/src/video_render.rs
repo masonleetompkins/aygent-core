@@ -892,16 +892,21 @@ pub fn frame(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &
 // ---------------------------------------------------------------------------
 
 fn comp_from_project(broker: &Broker, agent_id: &str, project: &str) -> Result<Composition, String> {
-    let raw = video::read_json(broker, agent_id, &video::rel(project, "composition.json")).ok_or_else(|| format!("no such project: {project}"))?;
+    comp_from_project_seq(broker, agent_id, project, "")
+}
+fn comp_from_project_seq(broker: &Broker, agent_id: &str, project: &str, sequence: &str) -> Result<Composition, String> {
+    if !video::seq_ok(sequence) { return Err("invalid sequence name".into()); }
+    let raw = video::read_json(broker, agent_id, &video::seq_rel(project, sequence)).ok_or_else(|| format!("no such project: {project}"))?;
     let assets = video::load_manifest(broker, agent_id, project).assets;
     parse_composition(&raw, &assets)
 }
 
 #[tauri::command]
-pub async fn video_render(app: tauri::AppHandle, broker: tauri::State<'_, Arc<Broker>>, agent_id: String, project: String, preset: serde_json::Value, out_name: Option<String>) -> Result<serde_json::Value, String> {
+pub async fn video_render(app: tauri::AppHandle, broker: tauri::State<'_, Arc<Broker>>, agent_id: String, project: String, preset: serde_json::Value, out_name: Option<String>, sequence: Option<String>) -> Result<serde_json::Value, String> {
     let broker = broker.inner().clone();
     tokio::task::spawn_blocking(move || {
-        let comp = comp_from_project(&broker, &agent_id, &project)?;
+        let seq = sequence.unwrap_or_default();
+        let comp = comp_from_project_seq(&broker, &agent_id, &project, &seq)?;
         let p: ExportPreset = serde_json::from_value(preset).map_err(|e| format!("preset: {e}"))?;
         render(&app, &broker, &agent_id, &project, &comp, &p, out_name.as_deref())
     }).await.map_err(|e| format!("render task: {e}"))?
@@ -911,12 +916,12 @@ pub async fn video_render(app: tauri::AppHandle, broker: tauri::State<'_, Arc<Br
 pub fn video_render_cancel(agent_id: String, project: String) -> bool { cancel(&format!("{agent_id}/{project}")) }
 
 #[tauri::command]
-pub async fn video_frame(app: tauri::AppHandle, broker: tauri::State<'_, Arc<Broker>>, agent_id: String, project: String, time: f64, composition: Option<serde_json::Value>) -> Result<String, String> {
+pub async fn video_frame(app: tauri::AppHandle, broker: tauri::State<'_, Arc<Broker>>, agent_id: String, project: String, time: f64, composition: Option<serde_json::Value>, sequence: Option<String>) -> Result<String, String> {
     let broker = broker.inner().clone();
     tokio::task::spawn_blocking(move || {
         let comp = match composition {
             Some(c) => { let assets = video::load_manifest(&broker, &agent_id, &project).assets; parse_composition(&c, &assets)? }
-            None => comp_from_project(&broker, &agent_id, &project)?,
+            None => comp_from_project_seq(&broker, &agent_id, &project, &sequence.unwrap_or_default())?,
         };
         frame(&app, &broker, &agent_id, &project, &comp, time, 1280)
     }).await.map_err(|e| format!("frame task: {e}"))?

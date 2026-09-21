@@ -1,3 +1,78 @@
+# Stage build — 2026-09-10 ~13:30 PDT — v1.0.16 (rough-cut word-snap + sequences + drop-zone + composer)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, dead-code warnings only (incl. 2 new unused hyperframes load/save shims — kept as legacy wrappers). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `cec59d3` — fix(video): rough-cut word-snap — silence cuts expand to Whisper word edges
+- `17a7d12` — feat(video): sequences backend — per-edit composition files, sequence-aware tools
+- `4940aa3` — feat(video): sequences sidebar, drop-zone collapse, instant composer clear
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41737896 bytes), mtime **Sep 10 13:24**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **18080035 bytes (~17.2 MB)**, mtime **Sep 10 13:25**
+- verified: `video_create_sequence` + `ve-seqrow` + `Import media` in shipped `ui/dist` JS
+
+**What changed (all four of Mason's reports):**
+1. **Rough-cut accuracy** — energy-based silence cuts ate quiet word edges (plosive onsets, fricative tails sit ~10dB under the vowel core). Keeps now EXPAND to the nearest Whisper word boundaries (0.35s snap window, real pauses stay cut), transcribing first when needed. `video_auto_cut` schema documents it.
+2. **Drop zone collapses** — after footage is in, the big zone becomes one `Import media` toggle row instead of eating half the panel forever. Empty projects still show it.
+3. **Composer clears on send** — the Video dock cleared its input only when the turn *completed*; now it clears the moment the message is accepted (user bubble is already pushed). No more deleting your last message to write the next.
+4. **Sequences sidebar** — new `Seqs` rail tab: multiple edits, one footage pool. Main = legacy composition.json (old projects untouched); others live in sequences/<name>.json. Create blank/duplicated, rename, delete, drag sequences between bins (bins = localStorage, like media bins). Every video_* tool + render/frame/captions/overlay/style-guide takes `sequence` (default main); `video_sequence` tool manages them; `video_project` lists them; agent context names the active sequence.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~8 min)
+1. **Rough cut** — auto-cut A-roll with soft onsets → first/last words of clips survive; real pauses still cut.
+2. **Drop zone** — import footage → zone collapses to `Import media`; toggle re-opens it.
+3. **Composer** — send a dock message → box clears immediately, turn runs.
+4. **Sequences** — Seqs tab → new sequence (blank + duplicate), switch (timeline swaps, undo cleared), rename, delete (main protected); bins nest + persist per project.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
+# Stage build — 2026-09-10 ~11:10 PDT — v1.0.16 (media import rebuild: nested bins, folder import, progress)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, dead-code warnings only (same set + one new `import_one` unused — it now forwards to `import_one_in`). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commits (on `staging`, pushed to `origin/staging`):**
+- `9a46d69` — feat(video): nested bins, folder import as bin tree, import progress events, full picker filter
+- `e0c84e1` — feat(video): nested bins UI, folder import, import progress, fixed bin drag + lane drops
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41686008 bytes), mtime **Sep 10 11:08**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **18062025 bytes (~17.2 MB)**, mtime **Sep 10 11:08**
+- verified: `video_pick_folder` in shipped `ui/dist` JS
+
+**What changed (all six of Mason's media reports):**
+1. **Import progress bar** — backend emits `video-import-progress` per file (done/total/name); the Media panel shows a live bar (`3/20 · clip-04.mp4`), `scanning…` during enumeration, `finishing…` at the end. A 20-clip import never looks hung again.
+2. **No more silent failures** — per-file errors surface as toasts with a `linked N · M failed` count; one bad file no longer aborts the batch; an all-fail import says `import failed: <reason>` instead of nothing.
+3. **Import button picker fixed** — the dialog filter now lists EVERY supported ext (avi/mts/m2ts/mxf/ogg/aif/aiff/heic/tif/tiff were accepted backend-side but greyed out in the picker).
+4. **Finder drag-drop works** — the native Tauri drop event is the single import path again (it carries real OS paths). HTML5 hover only paints the target + records it; drop-zone, bins, and timeline lanes all participate. Dropped folders become bin trees.
+5. **Bin-to-bin drag works** — headers are draggable on a separate `BIN_MIME` (the old code set the same asset mime on a header nobody could drag, and drops read the wrong key). Drop nests, cycle-guarded; Unfiled accepts back to top level.
+6. **Folder import + Nested Bins capability** — Folder button, per-bin import-here, and `video_pick_folder` command; directory walks mirror structure (hidden skipped, depth ≤ 8, symlink-cycle guard, 200-file cap). Bins carry `parent`; delete promotes children/assets up; agent tools (`video_media_folder` + move op, `video_media_move`, `video_project` folder listing) all know about nesting.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~8 min)
+1. **Progress** — import 10+ clips → live `N/M · name` bar, completes with `linked N` toast.
+2. **Picker** — Import button selects .mts/.avi/.heic (previously greyed out).
+3. **Drop zone** — drag files + a folder onto Drop footage here → files land, folder becomes a bin with nested sub-bins.
+4. **Bin drag** — drag a bin header into another bin → nests (indented); drag back to Unfiled → top level; self-nesting refused.
+5. **Folder import** — Folder button / bin import-here → whole directory as a bin tree.
+6. **Lane drop** — drag a Finder file onto a timeline lane → imports and places the clip at the drop time.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
 # Stage build — 2026-09-08 ~21:15 PDT — v1.0.16 (streaming diff view + drag-drop attach)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0, dead-code warnings only (same set). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
@@ -972,3 +1047,20 @@ debug-assert that migrations end at `SCHEMA_VERSION`.
 1. **Download voice model** — works standalone with Blender MCP off; toolchain + model land under `runtime/voice/`.
 2. **Clean A-roll** — neural isolation, toast names engine.
 3. **Blend live** — Cleanup amount 0/50/100, preview + export match.
+
+---
+
+# Stage build — 2026-09-10 — v1.0.16 (Muse reasoning replay)
+
+**Status:** ✅ Built clean (`cargo tauri build` exit 0, dead-code warnings only). Unsigned stage build.
+
+**Commit (staging):** `c5dde25` — muse: replay encrypted reasoning items across tool rounds (fixes re-plan loop).
+
+**What changed:** `meta_provider.rs` sends `store:false` + `include:[reasoning.encrypted_content]`, captures Muse reasoning items, stores them on the assistant message (`reasoning`, `reasoning_model`), and replays them verbatim in `build_muse_input` (same model id only). Fixes the Muse tool-loop where every round re-planned from scratch (identical preambles, re-reading the same files).
+
+**Artifacts:** `src-tauri/target/release/bundle/macos/AYGENT.app`, `dmg/AYGENT_1.0.16_aarch64.dmg`. Binary contains `reasoning.encrypted_content` (verified via strings).
+
+## Smoke QA
+1. Quit running AYGENT. Launch stage app, pick a Muse agent in Pro Mode.
+2. Give a multi-step task (read 2-3 files, edit one). Expect distinct/absent preambles per round, no repeated reads of the same file, edit lands.
+3. First Muse call must not 400 (would mean Meta rejected `include`/`store`).

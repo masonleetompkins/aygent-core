@@ -77,12 +77,20 @@ fn lint_comp(path_env: &str, hf_bin: &Path, comp: &Path, workdir: &Path) -> Resu
 }
 
 fn load_comp(broker: &Broker, agent_id: &str, project: &str) -> Result<Composition, String> {
-    let raw = video::read_json(broker, agent_id, &video::rel(project, "composition.json")).ok_or_else(|| format!("no such project: {project}"))?;
+    load_comp_seq(broker, agent_id, project, "")
+}
+fn load_comp_seq(broker: &Broker, agent_id: &str, project: &str, sequence: &str) -> Result<Composition, String> {
+    if !video::seq_ok(sequence) { return Err("invalid sequence name".into()); }
+    let raw = video::read_json(broker, agent_id, &video::seq_rel(project, sequence)).ok_or_else(|| format!("no such project: {project}"))?;
     let assets = video::load_manifest(broker, agent_id, project).assets;
     crate::video_render::parse_composition(&raw, &assets)
 }
 fn save_comp(broker: &Broker, agent_id: &str, project: &str, comp: &Composition) -> Result<(), String> {
-    video::write_json(broker, agent_id, &video::rel(project, "composition.json"), &serde_json::to_value(comp).map_err(|e| e.to_string())?).map(|_| ())
+    save_comp_seq(broker, agent_id, project, "", comp)
+}
+fn save_comp_seq(broker: &Broker, agent_id: &str, project: &str, sequence: &str, comp: &Composition) -> Result<(), String> {
+    if !video::seq_ok(sequence) { return Err("invalid sequence name".into()); }
+    video::write_json(broker, agent_id, &video::seq_rel(project, sequence), &serde_json::to_value(comp).map_err(|e| e.to_string())?).map(|_| ())
 }
 fn load_transcript(proj: &Path) -> Option<Transcript> {
     serde_json::from_str(&std::fs::read_to_string(proj.join("transcript.json")).ok()?).ok()
@@ -266,10 +274,11 @@ fn overlay_clip(asset: &Asset, track: &str, start: f64, end: f64, link_to: Optio
 // video_build_captions — transcript → transparent T1 overlay (Hyperframes)
 // ---------------------------------------------------------------------------
 
-pub fn build_captions(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, key_words: Vec<String>) -> Result<Value, String> {
+pub fn build_captions(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, sequence: &str, key_words: Vec<String>) -> Result<Value, String> {
     let proj = video::project_dir(broker, agent_id, project)?;
     toolchain(app)?; // fail fast before touching anything
-    let mut comp = load_comp(broker, agent_id, project)?;
+    let seq: &str = sequence;
+    let mut comp = load_comp_seq(broker, agent_id, project, &seq)?;
     let mut tr = load_transcript(&proj).ok_or("no transcript yet — run video_transcribe first")?;
     if tr.asset.is_empty() { if let Some(c) = comp.clips.iter().find(|c| c.track == "V1" && c.kind == "video") { tr.asset = c.asset.clone(); } }
     if !comp.captions.source_asset.is_empty() { tr.asset = comp.captions.source_asset.clone(); }
@@ -315,7 +324,7 @@ pub fn build_captions(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, p
     comp.captions.enabled = true;
     comp.captions.key_words = key_words.clone();
     if comp.captions.source_asset.is_empty() { comp.captions.source_asset = tr.asset.clone(); }
-    save_comp(broker, agent_id, project, &comp)?;
+    save_comp_seq(broker, agent_id, project, &seq, &comp)?;
     let _ = tauri::Emitter::emit(app, "video-project-changed", json!({ "project": project, "tool": "video_build_captions" }));
     Ok(json!({ "ok": true, "asset": asset.id, "clip": clip_id, "lines": lines.len(), "duration": (dur * 100.0).round() / 100.0, "note": "caption overlay on T1 — toggle Captions → On to show/hide it in preview + export" }))
 }
@@ -325,14 +334,15 @@ pub fn build_captions(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, p
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-pub fn render_overlay(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, name: &str, start: f64, end: f64, comp_html: &str, behind_subject: bool) -> Result<Value, String> {
+pub fn render_overlay(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &str, sequence: &str, name: &str, start: f64, end: f64, comp_html: &str, behind_subject: bool) -> Result<Value, String> {
     let proj = video::project_dir(broker, agent_id, project)?;
     toolchain(app)?;
     if end <= start + 0.05 { return Err("overlay needs start < end (≥ 0.05s apart)".into()); }
     if !(comp_html.contains("data-composition-id") && comp_html.contains("class=\"clip\"") && comp_html.contains("window.__timelines")) {
         return Err("comp_html must be a Hyperframes composition (data-composition-id, class=\"clip\" elements, window.__timelines)".into());
     }
-    let mut comp = load_comp(broker, agent_id, project)?;
+    let seq: &str = sequence;
+    let mut comp = load_comp_seq(broker, agent_id, project, &seq)?;
     let dur = comp.duration();
     if start < 0.0 || start >= dur.max(end) { return Err(format!("start {start} is outside the timeline (duration {dur:.2}s)")); }
 
@@ -349,7 +359,7 @@ pub fn render_overlay(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, p
     clip.behind_subject = behind_subject;
     let clip_id = clip.id.clone();
     comp.clips.push(clip);
-    save_comp(broker, agent_id, project, &comp)?;
+    save_comp_seq(broker, agent_id, project, &seq, &comp)?;
     let _ = tauri::Emitter::emit(app, "video-project-changed", json!({ "project": project, "tool": "video_render_overlay" }));
     Ok(json!({ "ok": true, "asset": asset.id, "clip": clip_id, "track": "V3", "start": start, "end": end }))
 }
@@ -359,22 +369,24 @@ pub fn render_overlay(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, p
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub async fn video_build_captions(app: tauri::AppHandle, broker: tauri::State<'_, Arc<Broker>>, agent_id: String, project: String, key_words: Option<Vec<String>>) -> Result<Value, String> {
+pub async fn video_build_captions(app: tauri::AppHandle, broker: tauri::State<'_, Arc<Broker>>, agent_id: String, project: String, key_words: Option<Vec<String>>, sequence: Option<String>) -> Result<Value, String> {
     let broker = broker.inner().clone();
-    tokio::task::spawn_blocking(move || build_captions(&app, &broker, &agent_id, &project, key_words.unwrap_or_default())).await.map_err(|e| format!("captions task: {e}"))?
+    let seq = sequence.unwrap_or_default();
+    tokio::task::spawn_blocking(move || build_captions(&app, &broker, &agent_id, &project, &seq, key_words.unwrap_or_default())).await.map_err(|e| format!("captions task: {e}"))?
 }
 
 #[tauri::command]
-pub async fn video_render_overlay_cmd(app: tauri::AppHandle, broker: tauri::State<'_, Arc<Broker>>, agent_id: String, project: String, name: String, start: f64, end: f64, comp_html: String, behind_subject: Option<bool>) -> Result<Value, String> {
+pub async fn video_render_overlay_cmd(app: tauri::AppHandle, broker: tauri::State<'_, Arc<Broker>>, agent_id: String, project: String, name: String, start: f64, end: f64, comp_html: String, behind_subject: Option<bool>, sequence: Option<String>) -> Result<Value, String> {
     let broker = broker.inner().clone();
-    tokio::task::spawn_blocking(move || render_overlay(&app, &broker, &agent_id, &project, &name, start, end, &comp_html, behind_subject.unwrap_or(false))).await.map_err(|e| format!("overlay task: {e}"))?
+    let seq = sequence.unwrap_or_default();
+    tokio::task::spawn_blocking(move || render_overlay(&app, &broker, &agent_id, &project, &seq, &name, start, end, &comp_html, behind_subject.unwrap_or(false))).await.map_err(|e| format!("overlay task: {e}"))?
 }
 
 /// Style-guide picker: text extraction for .md/.txt/.rtf/.pdf/.docx → saved on
 /// composition.graphics (so the agent always builds in-style). Audio/video
 /// uploads are refused — a style guide is TEXT.
 #[tauri::command]
-pub async fn video_pick_style_guide(app: tauri::AppHandle, broker: tauri::State<'_, Arc<Broker>>, agent_id: String, project: String) -> Result<Value, String> {
+pub async fn video_pick_style_guide(app: tauri::AppHandle, broker: tauri::State<'_, Arc<Broker>>, agent_id: String, project: String, sequence: Option<String>) -> Result<Value, String> {
     use tauri_plugin_dialog::DialogExt;
     video::project_dir(&broker, &agent_id, &project)?;
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<tauri_plugin_dialog::FilePath>>();
@@ -394,10 +406,11 @@ pub async fn video_pick_style_guide(app: tauri::AppHandle, broker: tauri::State<
     let text = text.trim().chars().take(24_000).collect::<String>();
     if text.trim().is_empty() { return Err("no readable text in that file".into()); }
 
-    let mut comp = load_comp(&broker, &agent_id, &project)?;
+    let seq = sequence.clone().unwrap_or_default();
+    let mut comp = load_comp_seq(&broker, &agent_id, &project, &seq)?;
     comp.graphics.style_guide = text.clone();
     comp.graphics.style_guide_name = name.clone();
-    save_comp(&broker, &agent_id, &project, &comp)?;
+    save_comp_seq(&broker, &agent_id, &project, &seq, &comp)?;
     let _ = tauri::Emitter::emit(&app, "video-project-changed", json!({ "project": project, "tool": "video_pick_style_guide" }));
     Ok(json!({ "ok": true, "name": name, "chars": text.len() }))
 }
@@ -659,7 +672,8 @@ pub fn exec(broker: &Broker, agent_id: &str, name: &str, input: &Value) -> Resul
     match name {
         "video_build_captions" => {
             let kw: Vec<String> = input.get("keyWords").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(|y| y.trim().to_string())).filter(|x| !x.is_empty()).collect()).unwrap_or_default();
-            build_captions(&app, broker, agent_id, &project, kw)
+            let seq = s("sequence").unwrap_or_default();
+            build_captions(&app, broker, agent_id, &project, &seq, kw)
         }
         "video_render_overlay" => {
             let (name, start, end, html) = (
@@ -669,7 +683,8 @@ pub fn exec(broker: &Broker, agent_id: &str, name: &str, input: &Value) -> Resul
                 input.get("comp_html").and_then(|v| v.as_str()).ok_or("comp_html is required")?.to_string(),
             );
             let behind = input.get("behindSubject").and_then(|v| v.as_bool()).unwrap_or(false);
-            render_overlay(&app, broker, agent_id, &project, &name, start, end, &html, behind)
+            let seq = s("sequence").unwrap_or_default();
+            render_overlay(&app, broker, agent_id, &project, &seq, &name, start, end, &html, behind)
         }
         other => Err(format!("unknown hyperframes tool: {other}")),
     }
