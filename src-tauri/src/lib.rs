@@ -6124,7 +6124,7 @@ pub fn run() {
             agent_stream, reveal_in_finder, get_selected_model, set_selected_model,
             get_selection, set_selection, detect_hardware, local_catalog, local_search, local_lookup, local_downloaded,
             local_download, local_delete, local_tool_capability,
-            mlx::mlx_status, mlx::mlx_install_cmd, mlx::mlx_pull_cmd, mlx::mlx_stop_cmd, mlx::mlx_downloaded, mlx::mlx_delete_cmd, restore_agent_folder,
+            mlx::mlx_status, mlx::mlx_install_cmd, mlx::mlx_pull_cmd, mlx::mlx_stop_cmd, mlx::mlx_downloaded, mlx::mlx_delete_cmd, mlx::mlx_allow_code_cmd, mlx::mlx_code_status_cmd, restore_agent_folder,
             browser::browser_status, browser::browser_install, browser::browser_launch_probe,
             browser::browser_navigate, browser::browser_shutdown, browser::browser_uninstall, browser::browser_start_view, browser::browser_set_viewport,
             browser::browser_click, browser::browser_scroll, browser::browser_type, browser::browser_key,

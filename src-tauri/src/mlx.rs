@@ -22,6 +22,11 @@ use crate::provider::StreamEvent;
 
 /// Localhost port for the sidecar. Fixed in v1 (one model at a time).
 pub const MLX_PORT: u16 = 18789;
+
+/// OUR OpenAI-compatible server for custom-loader packs (the pack contributes
+/// only artifact.load_model). Embedded at compile time, written to the runtime
+/// dir at serve time - no bundling config needed.
+const PACK_SERVER_PY: &str = include_str!("mlx_pack_server.py");
 struct ServerState {
     repo: String,
     child: std::process::Child,
@@ -182,6 +187,13 @@ pub async fn ensure_server(
     if warm.as_deref() == Some(&repo) && healthy().await {
         return Ok(base_url());
     }
+    // Custom-loader packs EXECUTE repo code: refuse before touching anything
+    // (including the currently running server) unless explicitly allowed.
+    let local_dir = local_repo_dir(app, &repo).ok().filter(|d| dir_has_weights(d));
+    let is_pack = local_dir.as_ref().map(|d| pack_loader_dir(d).is_some()).unwrap_or(false);
+    if is_pack && !code_consented(app, &repo) {
+        return Err(format!("{repo} ships its own loader code, which stays blocked until you allow it (Settings, Local Models, Installed MLX row, Allow). Pulling is safe; only RUNNING repo code needs consent."));
+    }
     mlx_stop();
     let py = ensure_mlx(app, channel).await?;
     let cache = hf_cache(app)?;
@@ -192,8 +204,17 @@ pub async fn ensure_server(
     let log = std::fs::File::create(&log_path).map_err(|e| format!("server log: {e}"))?;
     let err_log = log.try_clone().map_err(|e| format!("server log: {e}"))?;
     emit(app, channel, &format!("mlx: starting {repo} (first boot downloads weights)…"));
-    let mut child = std::process::Command::new(&py)
-        .args(["-m", "mlx_lm.server", "--model", &target, "--port", &MLX_PORT.to_string()])
+    let mut cmd = std::process::Command::new(&py);
+    if is_pack {
+        let dir = local_dir.clone().unwrap_or_else(|| local_repo_dir(app, &repo).unwrap());
+        ensure_pack_deps(app, channel, &dir).await?;
+        let script = write_pack_server(app)?;
+        emit(app, channel, &format!("mlx: starting {repo} with its bundled loader..."));
+        cmd.arg(&script).arg("--pack").arg(&dir).arg("--port").arg(MLX_PORT.to_string()).arg("--repo").arg(&repo);
+    } else {
+        cmd.args(["-m", "mlx_lm.server", "--model", &target, "--port", &MLX_PORT.to_string()]);
+    }
+    let mut child = cmd
         .env("HF_HOME", &cache)
         .env("HF_HUB_CACHE", &cache)
         .env("HF_HUB_OFFLINE", "0")
@@ -509,6 +530,109 @@ fn dir_size(dir: &std::path::Path) -> u64 {
     total
 }
 
+/// A pulled model dir is a custom-loader pack when it ships its own loader
+/// (runtime/artifact.py). Serving one EXECUTES third-party code from the
+/// model repo - allowed only with explicit per-repo consent.
+fn pack_loader_dir(dir: &std::path::Path) -> Option<PathBuf> {
+    let rt = dir.join("runtime").join("artifact.py");
+    if rt.is_file() { Some(dir.to_path_buf()) } else { None }
+}
+
+/// Per-repo code-execution consent (pulling never needs it; serving a custom
+/// pack does). One tiny JSON file in the MLX home dir.
+fn consent_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(mlx_home(app)?.join("code-consent.json"))
+}
+
+fn code_consented(app: &AppHandle, repo: &str) -> bool {
+    consent_path(app).ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("repos").and_then(|r| r.as_array()).map(|a| a.iter().any(|x| x.as_str() == Some(repo.trim()))))
+        .unwrap_or(false)
+}
+
+fn set_code_consent(app: &AppHandle, repo: &str, allow: bool) -> Result<(), String> {
+    let p = consent_path(app)?;
+    let mut repos: Vec<String> = std::fs::read_to_string(&p).ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("repos").and_then(|r| r.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()))
+        .unwrap_or_default();
+    let repo = repo.trim().to_string();
+    if allow {
+        if !repos.contains(&repo) { repos.push(repo); }
+    } else {
+        repos.retain(|r| r != &repo);
+    }
+    std::fs::write(&p, serde_json::to_string_pretty(&serde_json::json!({ "repos": repos })).unwrap_or_default())
+        .map_err(|e| format!("write consent: {e}"))
+}
+
+/// Write OUR pack server script to the runtime dir (refreshed every serve so
+/// it always matches this build).
+fn write_pack_server(app: &AppHandle) -> Result<PathBuf, String> {
+    let dest = mlx_home(app)?.join("pack_server.py");
+    std::fs::write(&dest, PACK_SERVER_PY).map_err(|e| format!("write pack server: {e}"))?;
+    Ok(dest)
+}
+
+/// Install a custom pack's loader deps into the shared MLX venv (filtered:
+/// the vision stack is excluded - packs like Bonsai are text-only). The
+/// pack's own pins win; the venv is MLX-dedicated so nothing else is at risk.
+async fn ensure_pack_deps(app: &AppHandle, channel: &str, pack_dir: &std::path::Path) -> Result<(), String> {
+    let req = pack_dir.join("runtime").join("requirements.txt");
+    if !req.is_file() {
+        return Ok(());
+    }
+    let py = ensure_mlx(app, channel).await?;
+    let text = std::fs::read_to_string(&req).map_err(|e| format!("read requirements: {e}"))?;
+    let mut kept: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let low = t.to_lowercase();
+        if low.starts_with("mlx-vlm") || low.starts_with("pillow") {
+            continue;
+        }
+        kept.push(t.to_string());
+    }
+    if kept.is_empty() {
+        return Ok(());
+    }
+    let dest = mlx_home(app)?.join("pack-requirements.txt");
+    std::fs::write(&dest, kept.join("
+")).map_err(|e| format!("write requirements: {e}"))?;
+    emit(app, channel, "mlx: installing pack loader deps (one-time)...");
+    let uv = ensure_uv(app, channel).await?;
+    let out = std::process::Command::new(&uv)
+        .args(["pip", "install", "--python"])
+        .arg(&py)
+        .args(["-r"])
+        .arg(&dest)
+        .output()
+        .map_err(|e| format!("uv pip: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("pack deps failed: {}", capped(&out.stderr)));
+    }
+    // Prove the loader imports against the installed versions.
+    let rt = pack_dir.join("runtime");
+    let prog = format!("import sys; sys.path.insert(0, {:?}); import artifact; print('loader ok')", rt.to_string_lossy());
+    let probe = std::process::Command::new(&py)
+        .args(["-c", &prog])
+        .output()
+        .map_err(|e| format!("probe spawn: {e}"))?;
+    if !probe.status.success() {
+        return Err(format!("pack loader import failed: {}", capped(&probe.stderr)));
+    }
+    Ok(())
+}
+
+fn capped(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).chars().rev().take(600).collect::<String>().chars().rev().collect()
+}
+
 /// What to hand `mlx_lm.server --model`: the pulled directory when it's
 /// complete, else the repo id (the server auto-downloads into the HF cache).
 fn serve_target(app: &AppHandle, repo: &str) -> String {
@@ -532,10 +656,13 @@ fn pulled_models(app: &AppHandle) -> Vec<serde_json::Value> {
             if !r.path().is_dir() { continue; }
             let name = r.file_name().to_string_lossy().to_string();
             if !dir_has_weights(&r.path()) { continue; }
+            let repo_id = format!("{author}/{name}");
             out.push(serde_json::json!({
-                "repo": format!("{author}/{name}"),
+                "repo": repo_id,
                 "path": r.path().to_string_lossy(),
                 "size_gb": dir_size(&r.path()) as f64 / 1_073_741_824.0,
+                "custom_code": pack_loader_dir(&r.path()).is_some(),
+                "consented": code_consented(app, &repo_id),
             }));
         }
     }
@@ -685,4 +812,22 @@ pub fn mlx_delete_cmd(app: AppHandle, repo: String) -> Result<(), String> {
         let _ = std::fs::remove_dir(parent); // prune empty author dir
     }
     Ok(())
+}
+
+/// Allow (or revoke) running a custom-loader pack's repo code. Pulling never
+/// needs consent - only execution does.
+#[tauri::command]
+pub fn mlx_allow_code_cmd(app: AppHandle, repo: String, allow: bool) -> Result<bool, String> {
+    local_repo_dir(&app, &repo)?;
+    set_code_consent(&app, &repo, allow)?;
+    Ok(allow)
+}
+
+/// { custom_code, consented } for one repo - drives the Allow UI.
+#[tauri::command]
+pub fn mlx_code_status_cmd(app: AppHandle, repo: String) -> Result<serde_json::Value, String> {
+    let custom = local_repo_dir(&app, &repo).ok()
+        .and_then(|d| if dir_has_weights(&d) { pack_loader_dir(&d) } else { None })
+        .is_some();
+    Ok(serde_json::json!({ "custom_code": custom, "consented": code_consented(&app, &repo) }))
 }

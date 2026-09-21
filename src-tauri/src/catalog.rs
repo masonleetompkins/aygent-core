@@ -58,6 +58,7 @@ pub struct CatalogModel {
     pub quants: Vec<QuantOption>,
     pub downloads: u64,
     pub updated: String,
+    pub custom_code: bool, // repo ships its own loader code (serve needs consent)
 }
 
 /// Fetch the catalog: for each family, query HF, filter, and assemble entries
@@ -123,6 +124,7 @@ async fn fetch_family(
             quants,
             downloads: repo.get("downloads").and_then(|d| d.as_u64()).unwrap_or(0),
             updated: repo.get("lastModified").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+            custom_code: has_custom_loader(repo),
         });
     }
     Ok(models)
@@ -385,6 +387,7 @@ pub async fn search(query: String, limit: usize) -> Result<Vec<CatalogModel>, St
             quants,
             downloads: repo.get("downloads").and_then(|d| d.as_u64()).unwrap_or(0),
             updated: repo.get("lastModified").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+            custom_code: has_custom_loader(repo),
         });
     }
     // MLX pass (Apple-silicon weights): same query WITHOUT the gguf filter,
@@ -453,6 +456,7 @@ pub async fn lookup(repo_id: String) -> Result<CatalogModel, String> {
         quants,
         downloads: repo.get("downloads").and_then(|d| d.as_u64()).unwrap_or(0),
         updated: repo.get("lastModified").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+        custom_code: has_custom_loader(&repo),
     })
 }
 
@@ -508,7 +512,20 @@ fn mlx_entry(repo: &serde_json::Value, id: &str, lower: &str, params: f32) -> Op
         }],
         downloads: repo.get("downloads").and_then(|d| d.as_u64()).unwrap_or(0),
         updated: repo.get("lastModified").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+        custom_code: has_custom_loader(repo),
     })
+}
+
+/// A repo ships custom loader code when it carries its own runtime Python
+/// (runtime/*.py) or the pack contract doc. Serving those repos executes
+/// third-party code - allowed only with explicit per-repo consent.
+fn has_custom_loader(repo: &serde_json::Value) -> bool {
+    repo.get("siblings").and_then(|v| v.as_array()).map(|sibs| {
+        sibs.iter().filter_map(|s| s.get("rfilename").and_then(|f| f.as_str())).any(|f| {
+            let l = f.to_lowercase();
+            (l.starts_with("runtime/") && l.ends_with(".py")) || l == "pack-runtime.md"
+        })
+    }).unwrap_or(false)
 }
 
 fn infer_family(lower: &str) -> (&'static str, &'static str) {

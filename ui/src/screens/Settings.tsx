@@ -276,7 +276,7 @@ function quantBlurb(quant: string): { title: string; sub: string } {
   }
   return { title: "Recommended", sub: "nearly identical quality · smaller file · best for most people" };
 }
-type CatModel = { family: string; family_label: string; repo: string; name: string; params_billions: number; context_tokens: number; downloads: number; quants: Quant[] };
+type CatModel = { family: string; family_label: string; repo: string; name: string; params_billions: number; context_tokens: number; downloads: number; quants: Quant[]; custom_code: boolean };
 type HW = { summary: string };
 type Downloaded = { filename: string; path: string; size_gb: number };
 
@@ -305,8 +305,9 @@ function LocalModels({ folder, activePath, onChoose }: {
   const [highlight, setHighlight] = useState(-1);
   const [pulling, setPulling] = useState<string | null>(null);
   const [pullProg, setPullProg] = useState<{ file: string; index: number; files: number; pct: number } | null>(null);
-  const [mlxPulled, setMlxPulled] = useState<Array<{ repo: string; path: string; size_gb: number }>>([]);
+  const [mlxPulled, setMlxPulled] = useState<Array<{ repo: string; path: string; size_gb: number; custom_code: boolean; consented: boolean }>>([]);
   const [mlxServe, setMlxServe] = useState<{ running: boolean; repo: string | null } | null>(null);
+  const [codeOk, setCodeOk] = useState<Record<string, boolean>>({});
   const [pullMsg, setPullMsg] = useState<string | null>(null);
   const seqRef = useRef(0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -379,6 +380,7 @@ function LocalModels({ folder, activePath, onChoose }: {
   }, [query, selected]);
 
   async function pickModel(m: CatModel) {
+    if (m.custom_code) void refreshCodeOk(m.repo);
     setSelected(m);
     setQuery(m.repo);
     setResults([]);
@@ -398,6 +400,7 @@ function LocalModels({ folder, activePath, onChoose }: {
       // Some backends return { ...model } directly, others may wrap — handle both
       const model = (m as any).repo ? (m as CatModel) : (m as any).model as CatModel;
       if (model && (model as any).repo) {
+        if (model.custom_code) void refreshCodeOk(model.repo);
         setSelected(model);
         setQuery((model as any).repo);
         setResults([]);
@@ -406,6 +409,7 @@ function LocalModels({ folder, activePath, onChoose }: {
       }
       // fallback: if lookup returned wrapper, try to use it
       if ((m as any).repo) {
+        if ((m as CatModel).custom_code) void refreshCodeOk((m as CatModel).repo);
         setSelected(m as CatModel);
         setQuery((m as any).repo);
         setResults([]);
@@ -475,7 +479,7 @@ function LocalModels({ folder, activePath, onChoose }: {
   }
 
   async function refreshMlxPulled() {
-    try { setMlxPulled(await invoke<Array<{ repo: string; path: string; size_gb: number }>>("mlx_downloaded")); }
+    try { setMlxPulled(await invoke<Array<{ repo: string; path: string; size_gb: number; custom_code: boolean; consented: boolean }>>("mlx_downloaded")); }
     catch { /* best-effort */ }
   }
   async function refreshMlxServe() {
@@ -487,6 +491,19 @@ function LocalModels({ folder, activePath, onChoose }: {
   async function mlxStopServing() {
     try { await invoke("mlx_stop_cmd"); await refreshMlxServe(); }
     catch (e) { setErr(String(e)); }
+  }
+  async function refreshCodeOk(repo: string) {
+    try {
+      const st = await invoke<{ custom_code: boolean; consented: boolean }>('mlx_code_status_cmd', { repo });
+      setCodeOk((m) => ({ ...m, [repo]: !!st?.consented }));
+    } catch { /* best-effort */ }
+  }
+  async function allowCode(repo: string, allow: boolean) {
+    try {
+      await invoke('mlx_allow_code_cmd', { repo, allow });
+      setCodeOk((m) => ({ ...m, [repo]: allow }));
+      await refreshMlxPulled();
+    } catch (e) { setErr(String(e)); }
   }
   async function mlxDel(repo: string) {
     try { await invoke("mlx_delete_cmd", { repo }); await refreshMlxPulled(); }
@@ -516,6 +533,15 @@ function LocalModels({ folder, activePath, onChoose }: {
             {busy && pullProg ? <span style={{ fontSize: 12, fontFamily: "ui-monospace, monospace", color: "var(--text-muted)" }}>{pullProg.file} ({pullProg.index + 1}/{pullProg.files}) · {Math.round(pullProg.pct * 100)}%</span> : <Button variant="secondary" onClick={() => void mlxPull(m.repo)} disabled={!!pulling}>{busy ? "Pulling…" : "Pull"}</Button>}
           </div>
           {pullMsg && <div style={{ fontSize: 13, fontWeight: 600, color: pullMsg.startsWith("✗") ? "var(--danger)" : "var(--ok)", overflowWrap: "anywhere" }}>{pullMsg}</div>}
+          {m.custom_code && codeOk[m.repo] !== true && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <Pill tone="muted">ships its own loader code</Pill>
+              <Button variant="secondary" onClick={() => void allowCode(m.repo, true)}>Allow</Button>
+            </div>
+          )}
+          {m.custom_code && codeOk[m.repo] === true && (
+            <span style={{ fontSize: 12, color: "var(--ok)" }}>custom loader allowed ✓ — serving this model will run repo code</span>
+          )}
           <span style={{ fontSize: 12, color: "var(--text-faint)" }}>MLX models run chat-only (no file tools) via the Local (MLX) provider — pick this repo in any agent’s setup after pulling.</span>
         </div>
       );
@@ -611,6 +637,15 @@ function LocalModels({ folder, activePath, onChoose }: {
                   <span style={{ ...hint, fontFamily: "ui-monospace, monospace", fontSize: 12 }}>{m.size_gb.toFixed(1)}GB · MLX</span>
                 </div>
                 <span style={{ ...hint, fontSize: 12 }}>chat only — no file tools</span>
+                {m.custom_code && !m.consented && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 12, color: "var(--text-muted)" }}>ships its own loader code — blocked until allowed</span>
+                    <Button variant="secondary" onClick={() => void allowCode(m.repo, true)}>Allow</Button>
+                  </div>
+                )}
+                {m.custom_code && m.consented && (
+                  <span style={{ fontSize: 12, color: "var(--ok)" }}>custom loader allowed ✓</span>
+                )}
               </div>
               <Button variant="secondary" onClick={() => void mlxDel(m.repo)}>Delete</Button>
             </div>
