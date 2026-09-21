@@ -226,8 +226,12 @@ pub async fn ensure_server(
                 *slot = Some(ServerState { repo: repo.clone(), child });
             } else {
                 let _ = child.kill();
+                return Err("mlx server state unavailable".into());
             }
-            emit(app, channel, &format!("mlx: {repo} serving"));
+            // Prove it serves: mlx_lm lazy-loads weights on FIRST request, so a
+            // reachable server with an unloadable model would otherwise hang the
+            // user's turn forever. Warm-up fails fast with the real error.
+            warm_up(app, channel, &repo, &target).await?;
             return Ok(base_url());
         }
         n += 1;
@@ -238,6 +242,65 @@ pub async fn ensure_server(
     }
     let _ = child.kill();
     Err(format!("mlx server for {repo} never became ready (see {})", log_path.display()))
+}
+
+/// Prove the server can produce a token for this model before the user's
+/// turn depends on it. One tiny non-streaming completion; any failure kills
+/// the server and surfaces the log tail (fast, honest error — never a hang).
+async fn warm_up(app: &AppHandle, channel: &str, repo: &str, target: &str) -> Result<(), String> {
+    emit(app, channel, &format!("mlx: loading {repo} into memory (one-time, GBs from SSD)…"));
+    let body = serde_json::json!({
+        "model": target,
+        "messages": [{ "role": "user", "content": "hi" }],
+        "stream": false,
+        "max_tokens": 1,
+    });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15 * 60))
+        .build()
+        .map_err(|e| format!("mlx http: {e}"))?;
+    let resp = client
+        .post(format!("{}/v1/chat/completions", base_url()))
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .map_err(|e| format!("mlx warm-up request failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(warm_fail(app, repo, &format!("HTTP {status}"), &detail));
+    }
+    let v: serde_json::Value = resp.json().await.map_err(|e| format!("mlx warm-up parse: {e}"))?;
+    if v.get("choices").and_then(|c| c.as_array()).map(|a| !a.is_empty()).unwrap_or(false) {
+        emit(app, channel, &format!("mlx: {repo} serving"));
+        return Ok(());
+    }
+    Err(warm_fail(app, repo, "empty choices", &v.to_string()))
+}
+
+/// Kill a failed server and build the honest error: log tail + the
+/// not-supported pointer when the repo needs its own bundled loader.
+fn warm_fail(app: &AppHandle, repo: &str, reason: &str, detail: &str) -> String {
+    mlx_stop();
+    let tail: String = server_log(app)
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default()
+        .chars()
+        .rev()
+        .take(900)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    let mut msg = format!("mlx couldn't load {repo} ({reason}). Server log tail:
+{tail}
+{detail}");
+    if tail.contains("not supported") || detail.contains("not supported") {
+        msg.push_str(" NOTE: not-supported means this repo needs its own bundled loader (see its model card). Stock mlx-lm cannot run it; try a standard mlx-community quant instead.");
+    }
+    msg.chars().take(2000).collect()
 }
 
 // ---- chat --------------------------------------------------------------------
@@ -340,7 +403,20 @@ pub async fn mlx_stream_turn<F: FnMut(StreamEvent)>(
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     let mut full = String::new();
-    while let Some(chunk) = stream.next().await {
+    // First-byte watchdog: a hung load must ERROR, never spin the UI forever.
+    // (Post-warm-up chats should stream promptly; 10 silent minutes = stuck.)
+    loop {
+        let chunk = match tokio::time::timeout(Duration::from_secs(600), stream.next()).await {
+            Err(_) => {
+                return Err(if full.trim().is_empty() {
+                    "mlx sent nothing for 10 minutes — the server is stuck (still loading, or a failed load). Stop it in Settings → Local Models and retry; runtime/mlx/server.log has the details.".into()
+                } else {
+                    "mlx stalled mid-reply (no tokens for 10 minutes). Retry.".into()
+                });
+            }
+            Ok(None) => break,
+            Ok(Some(c)) => c,
+        };
         let bytes = chunk.map_err(|e| format!("mlx stream: {e}"))?;
         buf.push_str(&String::from_utf8_lossy(&bytes));
         while let Some(pos) = buf.find('\n') {
