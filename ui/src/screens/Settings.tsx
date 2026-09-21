@@ -136,6 +136,7 @@ export function Settings({
 
       {/* LOCAL MODELS — OpenRouter-style search (replaces the old Browse button) */}
       <LocalModels folder={folder} activePath="" onChoose={() => {}} />
+      <MlxModels />
 
       {/* MEMORY (M1.7) */}
       <Card title="Memory">
@@ -639,6 +640,63 @@ function LocalModels({ folder, activePath, onChoose }: {
 
 // ---------------------------------------------------------------------------
 
+
+// ---- MLX MODELS (Apple Silicon) ------------------------------------------------
+// mlx-community/* weights via a uv-managed mlx_lm.server sidecar. v1: chat-only
+// turns (no file tools); weights auto-download on first chat or prefetched here.
+function MlxModels() {
+  const [status, setStatus] = useState<{ installed: boolean; running: boolean; repo: string | null; apple_silicon: boolean } | null>(null);
+  const [repo, setRepo] = useState("mlx-community/Qwen3-4B-4bit");
+  const [busy, setBusy] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+  async function refresh() {
+    try { setStatus(await invoke("mlx_status")); } catch { /* best-effort */ }
+  }
+  useEffect(() => { refresh(); }, []);
+  async function install() {
+    setBusy("Installing the MLX engine (one-time, a few minutes)…"); setMsg(null);
+    try { await invoke("mlx_install_cmd", { channel: "mlx-setup" }); setMsg("✓ MLX engine installed"); await refresh(); }
+    catch (e) { setMsg("✗ " + String(e)); }
+    finally { setBusy(null); }
+  }
+  async function pull() {
+    const r = repo.trim();
+    if (!r || busy) return;
+    setBusy(`Downloading ${r} (GBs, one-time)…`); setMsg(null);
+    try { await invoke("mlx_pull_cmd", { channel: "mlx-setup", repo: r }); setMsg(`✓ ${r} cached — pick it in any agent (provider: Local MLX)`); }
+    catch (e) { setMsg("✗ " + String(e)); }
+    finally { setBusy(null); }
+  }
+  async function stop() {
+    try { await invoke("mlx_stop_cmd"); setMsg(null); await refresh(); }
+    catch (e) { setMsg("✗ " + String(e)); }
+  }
+  return (
+    <Card title="MLX Models">
+      <p style={hint}>Apple-silicon models (<b>mlx-community/*</b>) — the Mac-native fast lane for small quantized models. Runs fully offline after the one-time download.</p>
+      {status && !status.apple_silicon && (
+        <Pill tone="danger">MLX needs Apple Silicon — this Mac can’t run it</Pill>
+      )}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        {status == null ? <Pill tone="muted">checking…</Pill>
+          : status.installed ? <Pill tone="ok">engine installed ✓</Pill>
+          : <Pill tone="muted">engine not installed</Pill>}
+        {status?.running && status.repo && <Pill tone="ok">serving {status.repo}</Pill>}
+        {!status?.installed && <Button variant="secondary" onClick={install} disabled={!!busy}>Install engine</Button>}
+        {status?.running && <Button variant="secondary" onClick={stop}>Stop server</Button>}
+      </div>
+      {status?.installed && (
+        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+          <Input mono value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="mlx-community/Qwen3-4B-4bit" />
+          <Button variant="secondary" onClick={pull} disabled={!!busy || !repo.trim()}>Pull</Button>
+        </div>
+      )}
+      {busy && <p style={{ ...hint, fontSize: 13 }}>{busy}</p>}
+      {msg && <Pill tone={msg.startsWith("✗") ? "danger" : "ok"}>{msg}</Pill>}
+      <p style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>MLX agents are chat-only for now (no file tools) — best for fast Q&A, summaries, and ideas. Weights live inside the app; nothing is installed outside it.</p>
+    </Card>
+  );
+}
 
 // One provider key row: shows key status, save/replace, and a live Test that
 // hits that provider's /models endpoint. Keys go straight to Keychain.

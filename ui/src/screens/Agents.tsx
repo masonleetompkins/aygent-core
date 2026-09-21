@@ -521,7 +521,7 @@ export function AgentForm({
   // We retry a few times with backoff, and also expose a manual refetch that the
   // dropdown fires on focus — so it can never come up permanently empty.
   async function loadModels(prov: string): Promise<void> {
-    if (prov === "local") { setModels([]); setModelsErr(null); return; }
+    if (prov === "local" || prov === "mlx") { setModels([]); setModelsErr(null); return; }
     setModelsLoading(true); setModelsErr(null);
     const attempt = () =>
       prov === "anthropic"
@@ -551,7 +551,8 @@ export function AgentForm({
 
   useEffect(() => {
     if (provider === "local") void loadLocalModels();
-    else void loadModels(provider);
+    else if (provider !== "mlx") void loadModels(provider);
+    else { setModels([]); setModelsErr(null); }
     /* eslint-disable-next-line */
   }, [provider]);
 
@@ -626,11 +627,17 @@ export function AgentForm({
               <option value="openai">OpenAI</option>
               <option value="openrouter">OpenRouter</option>
               <option value="meta">Muse (Meta)</option>
-              <option value="local">Local</option>
+              <option value="local">Local (GGUF)</option>
+              <option value="mlx">Local (MLX)</option>
             </select>
           </label>
           <label style={fieldLabel}>Model
-            {provider === "local" ? (
+            {provider === "mlx" ? (
+              <>
+                <Input value={model} onChange={(e) => setModel(e.target.value)} mono placeholder="mlx-community/Qwen3-4B-4bit" />
+                <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Hugging Face repo id — weights auto-download on first chat (GBs, one-time). Pull ahead in Settings to watch progress.</span>
+              </>
+            ) : provider === "local" ? (
               localModels.length > 0 ? (
                 <select
                   value={model}
@@ -676,7 +683,7 @@ export function AgentForm({
               </select>
             )}
             {modelsErr && <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Couldn’t load {provider} models: {modelsErr}. Using “Auto” — click the menu to retry.</span>}
-            {!modelsErr && !modelsLoading && provider !== "local" && models.length > 0 && (
+            {!modelsErr && !modelsLoading && provider !== "local" && provider !== "mlx" && models.length > 0 && (
               <span style={{ ...hint, fontSize: 12, color: "var(--text-faint)" }}>Most capable first.</span>
             )}
             {provider === "local" && !localLoading && localModels.length === 0 && (
