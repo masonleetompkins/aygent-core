@@ -1,3 +1,36 @@
+# Stage build — 2026-09-21 ~12:40 PDT — v1.0.16 (Apple MLX runner)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, 17 warnings (dead-code only, incl. 1 pre-existing `save_comp` shim in video_hyperframes — untouched). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit (on `staging`):**
+- `f64bd2e` — feat(local): Apple MLX runner — mlx-community models via uv-managed mlx_lm.server sidecar (chat turns, Settings pull, Agents provider)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app`, mtime **Sep 21 12:37**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **18152217 bytes (~17.3 MB)**, mtime **Sep 21 12:37**
+- verified: `mlx_` symbols in shipped binary (7); `mlx_status/mlx_install_cmd/mlx_pull_cmd/mlx_stop_cmd` + `mlx-community/*` in shipped `ui/dist` JS
+
+**What changed:** Apple-silicon agents. New `provider: "mlx"` (GGUF path renamed "Local (GGUF)", MLX = "Local (MLX)") served by a `mlx_lm.server` sidecar on 127.0.0.1, managed exactly like the HF/voice/matte engines: `uv run --with mlx-lm` out of `~/Library/Application Support/build.masonlee.aygent/runtime/mlx` (pinned to your in-app uv, inherited proxy env, nothing outside the app). Weights auto-download on first chat (HF cache under the same runtime dir) or prefetch via the new Settings → MLX Models card (Install engine / Pull / Stop). Chat-only turns (no file tools — banner + honest errors); same OpenAI wire + stream contract as GGUF chat path (usage/ctx/cost all flow; MLX bills $0). Non-Apple-Silicon gets a clear refusal in backend + UI. Includes: video ripple-trim/linked-sync fix, rough-cut word-snap, sequences, drop-zone, composer-clear (prior stage commits).
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~10 min, needs network once)
+1. **Install** — Settings → MLX Models → Install engine (one-time, a few minutes).
+2. **Pull** — paste `mlx-community/Qwen3-4B-4bit` → Pull (GBs, one-time). Status pill shows `serving <repo>` after first chat.
+3. **Chat** — Agents → new agent, provider Local (MLX), model `mlx-community/Qwen3-4B-4bit` → chat a turn. Streams, no $.
+4. **File tools refuse honestly** — ask it to write a file → says it can't yet, doesn't fake it.
+5. **GGUF still fine** — existing Local (GGUF) agent chats + tools unchanged.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Browser** — open a page in the in-app browser, agent read of the page.
+6. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
 # Stage build — 2026-09-10 ~13:30 PDT — v1.0.16 (rough-cut word-snap + sequences + drop-zone + composer)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0, dead-code warnings only (incl. 2 new unused hyperframes load/save shims — kept as legacy wrappers). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
