@@ -1,3 +1,30 @@
+# Stage build — 2026-09-21 ~evening PDT — v1.0.16 (MLX folded in: no section, picker, chat gate)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit (on `staging`):**
+- `87a5ea6` — fix(local): fold MLX into Local Models, GGUF-style picker, chat gate
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg` (fresh mtime, verified)
+- verified: no `MlxModels` in shipped `ui/dist` JS (separate section gone)
+
+**What changed (Mason's four reports):**
+1. **Separate MLX section deleted** — search, pulls, and Installed (incl. MLX rows + Delete) all live in the one Local Models card. The only MLX chrome left is a `serving <repo>` + Stop row that appears while the server runs.
+2. **No more overflow** — pull status is a wrapping line, not a nowrap pill; GGUF quant explainer hidden on MLX info cards.
+3. **Agents picker matches GGUFs** — Local (MLX) model is a dropdown of pulled repos with sizes + "Paste another repo id…" fallback. No more typing blind.
+4. **Chat works for MLX agents** — the ready gate treated `mlx` as key-gated ("add a key" blocked the pane, incl. history). MLX is keyless like GGUF now: full chat + history sidebar, new/delete chats.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA
+1. **Settings** — one Local Models card; Bonsai under Installed · MLX; no MLX section below.
+2. **Agents** — Local (MLX) → dropdown shows `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit (8.0 GB)`; select it (no typing).
+3. **Chat** — switch to that agent → history sidebar present, new chat works, streams $0.
+4. **Serving row** — after a chat, Settings shows `MLX serving …` + Stop.
+
+---
+
 # Stage build — 2026-09-21 ~afternoon PDT — v1.0.16 (MLX auto-install + pull progress + library)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
