@@ -339,6 +339,7 @@ pub fn context_window(lower: &str) -> u32 {
 }
 
 /// Search Hugging Face for GGUF repos matching an arbitrary query (power-user path).
+/// MLX (Apple-silicon safetensors) hits are appended after the GGUF results.
 /// Unlike the curated `fetch`, this does NOT restrict to trusted authors — so a user
 /// can find any model they know exists on HF (e.g. a DeepSeek or Gemma GGUF pack).
 /// Still filters junk + requires at least one usable single-file GGUF quant.
@@ -386,11 +387,41 @@ pub async fn search(query: String, limit: usize) -> Result<Vec<CatalogModel>, St
             updated: repo.get("lastModified").and_then(|d| d.as_str()).unwrap_or("").to_string(),
         });
     }
+    // MLX pass (Apple-silicon weights): same query WITHOUT the gguf filter,
+    // keeping only repos that look like MLX + carry safetensors. Appended after
+    // GGUF hits so existing behavior is unchanged.
+    if out.len() < limit {
+        let seen: std::collections::HashSet<String> = out.iter().map(|m| m.repo.clone()).collect();
+        let url = format!(
+            "{HF_API}?search={}&sort=downloads&direction=-1&limit=40&full=true",
+            urlencoding(q)
+        );
+        if let Ok(resp) = client.get(&url).send().await {
+            if let Ok(arr) = resp.json::<serde_json::Value>().await {
+                if let Some(list) = arr.as_array() {
+                    for repo in list {
+                        if out.len() >= limit { break; }
+                        let id = repo.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                        if id.is_empty() || seen.contains(id) { continue; }
+                        let lower = id.to_lowercase();
+                        if is_unusable(&lower) { continue; }
+                        // Skip repos the GGUF pass already claimed (dual-format).
+                        let params = parse_params(&lower);
+                        if !extract_quants(repo, id, params).is_empty() { continue; }
+                        if let Some(entry) = mlx_entry(repo, id, &lower, params) {
+                            out.push(entry);
+                        }
+                    }
+                }
+            }
+        }
+    }
     Ok(out)
 }
 
-/// Lookup one exact HF repo by id (e.g. "bartowski/Qwen3-14B-GGUF") and return its
-/// catalog entry. Used for the paste-a-repo-ID power-user path.
+/// Lookup one exact HF repo by id (e.g. "bartowski/Qwen3-14B-GGUF" or
+/// "mlx-community/Qwen3-4B-4bit") and return its catalog entry. Used for the
+/// paste-a-repo-ID power-user path.
 pub async fn lookup(repo_id: String) -> Result<CatalogModel, String> {
     let id = repo_id.trim().trim_matches('/').to_string();
     if !id.contains('/') { return Err("repo id should be 'author/name' (e.g. bartowski/Qwen3-14B-GGUF)".into()); }
@@ -403,10 +434,14 @@ pub async fn lookup(repo_id: String) -> Result<CatalogModel, String> {
     if !resp.status().is_success() { return Err(format!("hf {} — repo not found?", resp.status())); }
     let repo: serde_json::Value = resp.json().await.map_err(|e| format!("json: {e}"))?;
     let lower = id.to_lowercase();
-    // Allow even junk-tagged lookups to surface (user asked for it explicitly) — but still require a GGUF quant.
+    // Allow even junk-tagged lookups to surface (user asked for it explicitly).
     let params = parse_params(&lower);
     let quants = extract_quants(&repo, &id, params);
-    if quants.is_empty() { return Err("no usable single-file GGUF found in that repo (maybe sharded or no Q4/Q6 quant)".into()); }
+    if quants.is_empty() {
+        // No GGUF — maybe an MLX (safetensors) repo pasted for the MLX runner.
+        if let Some(entry) = mlx_entry(&repo, &id, &lower, params) { return Ok(entry); }
+        return Err("no usable weights found in that repo (needs a single-file GGUF quant or MLX safetensors)".into());
+    }
     let (family, family_label) = infer_family(&lower);
     Ok(CatalogModel {
         family: family.to_string(),
@@ -416,6 +451,61 @@ pub async fn lookup(repo_id: String) -> Result<CatalogModel, String> {
         params_billions: params,
         context_tokens: context_window(&lower),
         quants,
+        downloads: repo.get("downloads").and_then(|d| d.as_u64()).unwrap_or(0),
+        updated: repo.get("lastModified").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+    })
+}
+
+/// Is this repo plausibly Apple-MLX weights? Signal = "mlx" in the id (the
+/// community convention: mlx-community/*, *-mlx-4bit) or the mlx-community
+/// author — PLUS actual .safetensors weight files. AWQ/GPTQ/EXL2 (CUDA-only)
+/// repos don't carry the mlx marker, so they stay out.
+fn is_mlx_repo(id_lower: &str, repo: &serde_json::Value) -> bool {
+    let author = id_lower.split('/').next().unwrap_or("");
+    let marked = id_lower.contains("mlx") || author == "mlx-community";
+    if !marked { return false; }
+    repo.get("siblings").and_then(|s| s.as_array()).map(|sibs| {
+        sibs.iter().any(|sib| sib.get("rfilename").and_then(|f| f.as_str())
+            .map(|f| f.to_lowercase().ends_with(".safetensors")).unwrap_or(false))
+    }).unwrap_or(false)
+}
+
+/// Bits-per-weight parsed from an MLX repo name ("2bit" in `...-mlx-2bit`,
+/// "int4", "fp16"/"bf16"). Defaults to 4.0 (the community's standard MLX
+/// quant) when the name doesn't say.
+fn parse_mlx_bits(lower: &str) -> f32 {
+    for (tag, bits) in [("8bit", 8.0), ("6bit", 6.0), ("5bit", 5.0), ("4bit", 4.0),
+                        ("3bit", 3.0), ("2bit", 2.0), ("int8", 8.0), ("int4", 4.0),
+                        ("fp16", 16.0), ("bf16", 16.0)] {
+        if lower.contains(tag) { return bits; }
+    }
+    4.0
+}
+
+/// Build a catalog entry for an MLX repo: ONE "quant" = the whole repo (MLX
+/// weights download as a set via `mlx_pull`, not a single file). filename and
+/// download_url stay empty — the UI pulls by repo id when family == "mlx".
+fn mlx_entry(repo: &serde_json::Value, id: &str, lower: &str, params: f32) -> Option<CatalogModel> {
+    if !is_mlx_repo(lower, repo) { return None; }
+    let bits = parse_mlx_bits(lower);
+    let size_gb = ((params as f64) * 1e9 * (bits as f64 / 8.0) * 1.02 / 1_073_741_824.0) as f32;
+    let label = match bits as i32 {
+        2 => "2-bit", 3 => "3-bit", 4 => "4-bit", 5 => "5-bit",
+        6 => "6-bit", 8 => "8-bit", 16 => "FP16", _ => "MLX",
+    };
+    let tail = id.split('/').last().unwrap_or(id);
+    let name = tail.replace("-mlx-", "-").trim_end_matches("-mlx").replace('-', " ");
+    Some(CatalogModel {
+        family: "mlx".to_string(),
+        family_label: "MLX".to_string(),
+        repo: id.to_string(),
+        name,
+        params_billions: params,
+        context_tokens: context_window(lower),
+        quants: vec![QuantOption {
+            tier: "MLX".into(), quant: label.into(), filename: String::new(),
+            size_gb, download_url: String::new(),
+        }],
         downloads: repo.get("downloads").and_then(|d| d.as_u64()).unwrap_or(0),
         updated: repo.get("lastModified").and_then(|d| d.as_str()).unwrap_or("").to_string(),
     })

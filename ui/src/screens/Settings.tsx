@@ -304,6 +304,8 @@ function LocalModels({ folder, activePath, onChoose }: {
   const [results, setResults] = useState<CatModel[]>([]);
   const [selected, setSelected] = useState<CatModel | null>(null);
   const [highlight, setHighlight] = useState(-1);
+  const [pulling, setPulling] = useState<string | null>(null);
+  const [pullMsg, setPullMsg] = useState<string | null>(null);
   const seqRef = useRef(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -450,6 +452,15 @@ function LocalModels({ folder, activePath, onChoose }: {
     finally { un(); setProgress((p) => { const n = { ...p }; delete n[q.filename]; return n; }); }
   }
 
+  async function mlxPull(repo: string) {
+    setPulling(repo); setPullMsg(null); setErr(null);
+    try {
+      await invoke("mlx_pull_cmd", { channel: `mlx-pull-${Date.now()}`, repo });
+      setPullMsg(`✓ ${repo} cached — select it in any agent (provider: Local MLX)`);
+    } catch (e) { setPullMsg(`✗ ${String(e)}`); }
+    finally { setPulling(null); }
+  }
+
   async function del(d: Downloaded) {
     try { await invoke("local_delete", { filename: d.filename }); await refreshDownloaded(); if (selected && d.filename && selected.quants.some(q => q.filename === d.filename)) { /* keep card */ } }
     catch (e) { setErr(String(e)); }
@@ -459,6 +470,25 @@ function LocalModels({ folder, activePath, onChoose }: {
   const showDropdown = focused && results.length > 0;
 
   function renderModelCard(m: CatModel) {
+    if (m.family === "mlx") {
+      const q = m.quants[0];
+      const busy = pulling === m.repo;
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 6, paddingTop: 12, borderTop: "var(--border-width) solid var(--line)" }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+            <span style={{ fontWeight: 800, fontSize: 15 }}>{m.name}</span>
+            <Pill tone="ok">MLX · Apple silicon</Pill>
+            <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 11, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.repo}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <span style={{ fontSize: 13, color: "var(--text-muted)", flex: 1 }}>~{q ? q.size_gb.toFixed(1) : "?"}GB download · {q ? q.quant : ""} · whole repo (safetensors)</span>
+            <Button variant="secondary" onClick={() => void mlxPull(m.repo)} disabled={!!pulling}>{busy ? "Pulling…" : "Pull"}</Button>
+          </div>
+          {pullMsg && <Pill tone={pullMsg.startsWith("✗") ? "danger" : "ok"}>{pullMsg}</Pill>}
+          <span style={{ fontSize: 12, color: "var(--text-faint)" }}>MLX models run chat-only (no file tools) via the Local (MLX) provider — pick this repo in any agent’s setup after pulling.</span>
+        </div>
+      );
+    }
     const rec = m.quants[0];
     const perf = rec?.perf;
     const ctx = contextWords(m.context_tokens);
@@ -556,7 +586,7 @@ function LocalModels({ folder, activePath, onChoose }: {
                 else if (e.key === "Enter") { e.preventDefault(); void handleSubmit(); }
                 else if (e.key === "Escape") { setFocused(false); setHighlight(-1); }
               }}
-              placeholder="Search Hugging Face — type 'Qwen', 'Mistral 7B', or paste a repo like bartowski/Qwen3-14B-GGUF"
+              placeholder="Search Hugging Face — 'Qwen', 'Bonsai', or paste a repo like bartowski/Qwen3-14B-GGUF or mlx-community/Qwen3-4B-4bit"
               style={{
                 width: "100%", padding: "10px 36px 10px 32px",
                 background: "var(--bg)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)",
@@ -615,7 +645,7 @@ function LocalModels({ folder, activePath, onChoose }: {
         {searching && !showDropdown && <div style={{ fontSize: 12, color: "var(--text-faint)", marginTop: 6 }}>Searching Hugging Face…</div>}
         {err && <Pill tone="danger">✗ {err}</Pill>}
         {!searching && focused && !showDropdown && query.trim().length >= 2 && results.length === 0 && !selected && (
-          <div style={{ fontSize: 12, color: "var(--text-faint)", marginTop: 6 }}>No GGUF models found. Try a broader term or paste an exact repo id like <code>bartowski/Qwen3-14B-GGUF</code> and press Go.</div>
+          <div style={{ fontSize: 12, color: "var(--text-faint)", marginTop: 6 }}>No models found. Try a broader term or paste an exact repo id like <code>bartowski/Qwen3-14B-GGUF</code> and press Go.</div>
         )}
       </div>
 
