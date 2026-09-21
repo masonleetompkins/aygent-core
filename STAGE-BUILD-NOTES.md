@@ -1,3 +1,26 @@
+# Stage build — 2026-09-21 ~13:00 PDT — v1.0.16 (MLX search fix)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit (on `staging`):**
+- `839a132` — feat(local): HF search + lookup surface MLX repos (mlx_entry, MLX pass in search, Pull card in Settings)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg` (fresh mtime, verified)
+- verified: `mlx_pull_cmd` in shipped `ui/dist` JS (MLX Pull card reachable)
+
+**What changed:** the Settings → Local Models search was GGUF-only by construction (`filter=gguf` + single-file `.gguf` requirement), so MLX repos were invisible. Now: `search` runs an MLX pass (same query, no gguf filter, keeps repos with an mlx marker + safetensors) appended after GGUF hits; `lookup` falls back to an MLX entry when no GGUF quant exists; MLX entries render a dedicated card (size est. from params × bits, e.g. 27B 2-bit ≈ 6.4GB) with a Pull button wired to `mlx_pull_cmd`. Verified at API level: `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` resolves (23 siblings, 1 safetensors, 36k downloads) → surfaces via search "Bonsai" or repo-ID paste.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~10 min, needs network once)
+1. **Search** — Settings → Local Models → search `Bonsai` → Ternary-Bonsai MLX card appears (~6.4GB, 2-bit). Or paste `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` directly.
+2. **Pull** — Pull button on the MLX card (GBs, one-time; needs the engine installed from the MLX Models card first).
+3. **Chat** — Agents → provider Local (MLX), model `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` → chat a turn. Streams, $0.
+4. **GGUF unchanged** — normal GGUF search/download still works as before.
+
+---
+
 # Stage build — 2026-09-21 ~12:40 PDT — v1.0.16 (Apple MLX runner)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0, 17 warnings (dead-code only, incl. 1 pre-existing `save_comp` shim in video_hyperframes — untouched). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
