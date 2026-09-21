@@ -1,3 +1,28 @@
+# Stage build — 2026-09-21 ~afternoon PDT — v1.0.16 (MLX auto-install + pull progress + library)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit (on `staging`):**
+- `42af0b9` — feat(local): MLX auto-install, pull progress, downloaded library
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg` (fresh mtime, verified)
+- verified: `mlx_downloaded` in shipped `ui/dist` JS (pulls visible in Installed + Agents chips)
+
+**What changed (Mason's two reports):**
+1. **No manual engine step** — the Install button is gone. The venv + mlx-lm provision themselves on first pull or first chat (progress streams in the turn / busy line). Card shows auto status only.
+2. **Pulls show progress + land in the library** — `mlx_pull` rewritten: downloads the repo's full file set into `runtime/mlx/models/<author>/<name>/` with per-file `file (i/N) · %` events, skips completed files (interrupted pulls resume), and refuses to finish without config + weights. New `mlx_downloaded` / `mlx_delete_cmd`: pulls appear under Installed · MLX (with Delete) and as quick-pick chips in Agents → Local (MLX). Serve prefers the pulled dir (instant/offline), else HF auto-download fallback.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA
+1. **Pull with progress** — search `Bonsai` → Pull → live `model.safetensors (i/N) · %` readout.
+2. **Installed** — pull completes → `Installed · MLX` row with size + Delete.
+3. **Agents chips** — new agent, Local (MLX) → pulled repo appears as a chip; click to select.
+4. **Chat** — chat a turn on the pulled model. Streams, $0, no manual setup.
+
+---
+
 # Stage build — 2026-09-21 ~13:00 PDT — v1.0.16 (MLX search fix)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
