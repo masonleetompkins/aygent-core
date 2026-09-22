@@ -1,3 +1,30 @@
+# Stage build — 2026-09-22 ~16:20 PDT — v1.0.17 (MERGED REBUILD: ui-pro design + tool fixes)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit (on `staging`, pushed to `origin/staging`):**
+- `f0de3c2` — merge ui-command-pro into staging (ui-pro design work + tool-wiring fixes)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41997368 bytes), mtime **Sep 22 16:12**
+- dmg: `dmg/AYGENT_1.0.17_aarch64.dmg`, **18180450 bytes (~17.3 MB)**, mtime **Sep 22 16:12**
+- verified: dist rebuilt from the merged tree (16:11); binary carries the tool fixes
+
+**What changed:** the 16:05 tool-only build + the full ui-command-pro design line (Command Pro reskin + mock, Cmd+K palette, thread slots/tabs, density pass, dark default, ding-only alerts) in one bundle. Linux resolutions do not apply here — staging keeps Browser.tsx and light-mode fallback intact. **This entry supersedes the 16:05 tool-only build; promote from this bundle.**
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA — see the 16:05 entry (tool checks) + design pass: Cmd+K opens the palette, threads/tabs behave, dark default lands, ding-only alerts (no toasts).
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
 # Stage build — 2026-09-22 ~16:05 PDT — v1.0.17 (tool-wiring audit fixes)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
