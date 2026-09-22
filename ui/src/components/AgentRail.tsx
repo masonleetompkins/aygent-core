@@ -137,9 +137,9 @@ export function AgentRail({
     <div
       style={{
         display: "flex", flexDirection: "column", alignItems: "center", gap: 10,
-        width: 64, padding: "16px 0", flexShrink: 0,
+        width: 56, padding: "12px 0", flexShrink: 0,
         borderRight: "var(--border-width) solid var(--line)",
-        background: "var(--bg-elevated, var(--bg))",
+        background: "var(--surface)",
       }}
       title="Your agents — all run in parallel"
     >
@@ -156,15 +156,15 @@ export function AgentRail({
             title={`${a.name}${a.model ? ` · ${a.model}` : ""}${busy ? " · working…" : ""}`}
             style={{
               position: "relative",
-              width: 42, height: 42, borderRadius: "var(--radius-control)",
+              width: 36, height: 36, borderRadius: "var(--radius-control)",
               // NO background color fill — the SF-symbol itself carries the
               // accent color (flat, no glow — Mason's call). Viewing = accent
               // outline + accent-tinted icon; idle = quiet muted icon.
               border: viewing ? "var(--border-width) solid var(--accent)" : "var(--border-width) solid transparent",
               background: "transparent",
               color: viewing ? "var(--accent)" : "var(--text-muted)",
-              boxShadow: viewing ? "var(--elevation)" : "none",
-              animation: busy ? "aygentPulse 1.1s ease-in-out infinite" : "none",
+              boxShadow: "none",
+              animation: busy ? "thread-working 1.2s ease-in-out infinite" : "none",
               cursor: "pointer",
               display: "flex", alignItems: "center", justifyContent: "center",
               transition: "border .15s ease, color .15s ease, box-shadow .15s ease",
@@ -241,7 +241,7 @@ export function AgentRail({
       )}
 
       {/* keyframes for the working pulse (scoped-ish via a style tag) */}
-      <style>{`@keyframes aygentPulse { 0%,100% { box-shadow: 0 0 0 3px var(--pulse-a, rgba(91,140,255,.3)); } 50% { box-shadow: 0 0 0 6px rgba(91,140,255,.12); } }`}</style>
+      <style>{`@keyframes thread-working { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }`}</style>
     </div>
   );
 }
