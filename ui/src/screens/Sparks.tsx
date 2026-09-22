@@ -95,7 +95,7 @@ export function Sparks({ agentId, onNavigate }: { agentId: string | null; onNavi
     <div style={{ display: "flex", flexDirection: "column", gap: 16, height: "100%", minHeight: 0 }}>
       <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12 }}>
         <div>
-          <h2 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>Sparks</h2>
+          <h2 style={{ fontSize: 15, fontWeight: 700, margin: 0 }}>Sparks <kbd className="pro-kbd">⌘3</kbd></h2>
           <p style={{ ...hint, marginTop: 6 }}>
             Little interactive apps your agent builds for you — a calculator, a chart of your data,
             a tool, a game. Ask in <b>Chat</b> ("make me a Spark that…") and it appears here, live.

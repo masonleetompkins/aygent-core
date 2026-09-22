@@ -143,7 +143,7 @@ export function Connections({ agentId }: { agentId: string | null }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: 780 }}>
-      <h2 style={{ fontSize: "var(--text-h1)", fontWeight: "var(--weight-heading)", margin: 0 }}>Connections</h2>
+      <h2 style={{ fontSize: 15, fontWeight: 700, margin: 0 }}>Connections</h2>
       <p style={{ ...hint, marginTop: -8 }}>
         Accounts your agents can use. Credentials live in your macOS keychain — never in files, never
         sent anywhere by us. Each agent uses <b>one account per service</b>, so a work agent and a

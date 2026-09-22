@@ -100,7 +100,7 @@ function ToolInventory({ folder, agentId }: { folder: string | null; agentId: st
   return (
     <>
       <div>
-        <h2 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>Tools</h2>
+        <h2 style={{ fontSize: 15, fontWeight: 700, margin: 0 }}>Tools</h2>
         <p style={{ ...hint, marginTop: 6 }}>
           Everything this agent can actually call, and where it came from. Connection tools appear
           here automatically when you enable a service in <b>Connections</b> — there's nothing to add.
@@ -283,7 +283,7 @@ function SkillList({ folder, agentId }: { folder: string | null; agentId: string
     <>
       <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12 }}>
         <div>
-          <h2 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>Skills</h2>
+          <h2 style={{ fontSize: 15, fontWeight: 700, margin: 0 }}>Skills</h2>
           <p style={{ ...hint, marginTop: 6 }}>
             A skill is a way of working you've taught the agent — saved instructions plus the tools
             it may use. No credentials, and it can't do anything the agent couldn't already do.

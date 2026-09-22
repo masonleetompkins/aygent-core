@@ -289,7 +289,7 @@ export function Browser() {
   if (installed === false) {
     return (
       <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 14 }}>
-        <h2 style={{ fontSize: 20, fontWeight: 800, margin: 0 }}>AYGENT Browser</h2>
+        <h2 style={{ fontSize: 15, fontWeight: 700, margin: 0 }}>AYGENT Browser</h2>
         <p style={{ color: "var(--text-muted)", fontSize: 14, maxWidth: 420, textAlign: "center", margin: 0 }}>
           A real Chromium your agents can drive — downloaded on demand so the app stays small.
           One download (~180 MB), then the browser just works.

@@ -8,7 +8,8 @@ import { Button } from "../components/ui";
 import { Icon, type IconName } from "../components/Icon";
 import { Markdown } from "../components/Markdown";
 import { useSparkBlobUrl, useSparkThemeSync, isSparkStateMsg } from "../lib/sparkChrome";
-import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion, stopTurn } from "../lib/turns";
+import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion, stopTurn, turnSlotKey } from "../lib/turns";
+import { notifyThread } from "../lib/notify";
 import type { TurnItem, TurnUsage } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
 import { DiffView, DiffCounts, countDiff, isDiffable } from "../components/DiffView";
@@ -97,6 +98,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   multi: boolean; closable: boolean; onClose: () => void;
 }) {
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyCollapsed, setHistoryCollapsed] = useState(false);
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   // `busy` is now DERIVED from the per-agent turn store (see `running` below),
@@ -110,6 +112,59 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // otherwise capture a STALE convId (the save-bug that dropped the first
   // chat). The ref is always the current thread id.
   const convIdRef = useRef<string | null>(null);
+
+  // COMMAND PRO threads (B1-B6): N parallel sessions per agent. Tabs are conv
+  // ids; each thread streams in its own store slot (turnSlotKey) on its own
+  // backend lane (sessionId = convId), so there is no cap. Disk is the source
+  // of truth for finalized msgs; the store holds only in-flight turns.
+  const [tabs, setTabs] = useState<string[]>([]);
+  const [, forceTabs] = useState(0);
+  // Per-thread model override (B1): {provider, model} or null = agent default.
+  // Persisted in localStorage per conv so it survives reloads without a DB migration.
+  const [threadModels, setThreadModels] = useState<Record<string, { provider: string; model: string }>>({});
+  const prevRunningRef = useRef<Record<string, boolean>>({});
+  function threadTitle(id: string | null): string {
+    if (!id) return "New thread";
+    return convs.find((c) => c.id === id)?.title || "New thread";
+  }
+  function openThread(id: string) {
+    setTabs((t) => (t.includes(id) ? t : [...t, id]));
+    void openConv(id);
+  }
+  function closeTab(id: string) {
+    setTabs((t) => {
+      if (!t.includes(id) || t.length <= 1) return t;
+      const next = t.filter((x) => x !== id);
+      if (id === convIdRef.current) {
+        const idx = t.indexOf(id);
+        const fallback = next[Math.min(idx, next.length - 1)];
+        if (fallback) setTimeout(() => void openConv(fallback), 0);
+      }
+      return next;
+    });
+  }
+  function threadModelKey(id: string | null) { return `aygent.threadModel.${agentId ?? "?"}.${id ?? "?"}`; }
+  function getThreadModel(id: string | null): { provider: string; model: string } | null {
+    if (!id) return null;
+    const m = threadModels[id];
+    if (m) return m;
+    try {
+      const raw = localStorage.getItem(threadModelKey(id));
+      if (raw) return JSON.parse(raw);
+    } catch { /* ignore */ }
+    return null;
+  }
+  function setThreadModel(id: string, v: { provider: string; model: string } | null) {
+    setThreadModels((prev) => {
+      const next = { ...prev };
+      if (v) next[id] = v; else delete next[id];
+      return next;
+    });
+    try {
+      if (v) localStorage.setItem(threadModelKey(id), JSON.stringify(v));
+      else localStorage.removeItem(threadModelKey(id));
+    } catch { /* ignore */ }
+  }
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -312,7 +367,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // Reset to auto first so it can SHRINK too; when empty, scrollHeight collapses
   // to one line. Cap ~200px (~8 lines), not 50vh (that let an empty box balloon
   // to half the window inside the flex column). Mason 07-28.
-  const prevTaHeightRef = useRef<number>(44);
+  const prevTaHeightRef = useRef<number>(38);
   useLayoutEffect(() => {
     const ta = taRef.current; if (!ta) return;
     const prev = prevTaHeightRef.current;
@@ -444,14 +499,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
   // On folder change: load the list and open the most recent one (or a fresh one).
   useEffect(() => {
-    if (!folder) { setConvs([]); setConv(null); setMessages([]); historyRef.current = []; return; }
+    if (!folder) { setConvs([]); setConv(null); setTabs([]); setMessages([]); historyRef.current = []; return; }
     invoke<{ provider: string; model: string }>("get_selection", { folder })
       .then((s) => { providerRef.current = s.provider; modelRef.current = s.model; setIsLocal(s.provider === "local" || s.provider === "mlx"); }).catch(() => {});
     (async () => {
       try {
         const list = await invoke<ConvMeta[]>("conv_list", { folder });
         setConvs(list);
-        if (list.length > 0) await openConv(list[0].id);
+        if (list.length > 0) { setTabs([list[0].id]); await openConv(list[0].id); }
         else newConv();
       } catch { newConv(); }
     })();
@@ -465,6 +520,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
   function newConv() {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setTabs((t) => (t.includes(id) ? t : [...t, id]));
     // CONTEXT MODE (2026-08-03): "isolated" (default) starts a truly fresh
     // session — empty provider history, zero cross-chat token cost.
     // "continuous" carries the CURRENT chat's provider history into the new
@@ -476,6 +532,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   }
 
   async function openConv(id: string) {
+    setTabs((t) => (t.includes(id) ? t : [...t, id]));
     // VIEWING is never blocked by `busy` — you can always read any conversation,
     // even while an agent is mid-turn. `busy` only gates SENDING (the lane
     // serializes turns; it must not lock the whole pane). This was bug #2.
@@ -493,6 +550,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     try { await invoke("conv_delete", { folder, id }); } catch { /* ignore */ }
     const list = await invoke<ConvMeta[]>("conv_list", { folder }).catch(() => [] as ConvMeta[]);
     setConvs(list);
+    setTabs((t) => t.filter((x) => x !== id));
     if (id === convIdRef.current) { if (list.length > 0) openConv(list[0].id); else newConv(); }
   }
 
@@ -634,7 +692,8 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     }
     // Gate on THIS agent's status (per-agent), not a global pane flag — so you
     // can send to a second agent while the first still runs (Atlas #2).
-    if (!prompt || !agentId || isRunning(agentId)) return;
+    const gateSlot = agentId ? turnSlotKey(agentId, convIdRef.current || "fresh") : "";
+    if (!prompt || !agentId || (gateSlot && isRunning(gateSlot))) return;
     setInput("");
 
     const myAgent = agentId;
@@ -653,10 +712,15 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
     // Seed the store's per-agent history from this conversation so a follow-up
     // continues the thread.
-    setHistory(myAgent, historyRef.current);
+    const mySlot = turnSlotKey(myAgent, myConvId);
+    setHistory(mySlot, historyRef.current);
 
-    // Refresh model/provider selection just before the call.
-    if (folder) {
+    // Per-thread model override (B1) wins; else the agent default.
+    const override = getThreadModel(myConvId);
+    if (override) {
+      providerRef.current = override.provider; modelRef.current = override.model;
+      setIsLocal(override.provider === "local" || override.provider === "mlx");
+    } else if (folder) {
       try {
         const s = await invoke<{ provider: string; model: string }>("get_selection", { folder });
         providerRef.current = s.provider; modelRef.current = s.model; setIsLocal(s.provider === "local" || s.provider === "mlx");
@@ -670,7 +734,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       // final history. The live text/tools render via the subscribed `turn`
       // slice below (see the streaming bubble), so no local mirror needed.
       const updated = await runTurn({
-        agentId: myAgent, channel, prompt,
+        agentId: myAgent, channel, prompt, slot: mySlot,
         model: modelRef.current || null,
         provider: providerRef.current || null,
         folder: folder || null,
@@ -679,7 +743,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       });
       historyRef.current = updated;
       // Compose the final saved msgs from the store's completed live slice.
-      const done = getAgentTurnSnapshot(myAgent);
+      const done = getAgentTurnSnapshot(mySlot);
       // Attach the 🧠 auto-capture note to the USER message that triggered it, so
       // it renders as a small badge under that bubble AND persists (the live
       // turn.memory is discarded on finalize otherwise). Mason 07-28.
@@ -726,10 +790,15 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
   const blocked = !folder || !keySet;
 
+  // COMMAND PRO threads: live state is keyed per (agent, conv) so N threads on
+  // the SAME agent stream independently (backend lanes are already per-session).
+  const slotKey = agentId && convId ? turnSlotKey(agentId, convId) : (agentId ?? "");
+  const inbound = (slotKey && getInbound(slotKey)) || (agentId && getInbound(agentId)) || undefined;
+
   // Per-agent live turn (from the App-level store). This is what makes switching
   // TO a running agent show its live stream + thinking dots — the store never
   // unmounts, so the stream is always captured and any pane can reattach.
-  const turn = useAgentTurn(agentId);
+  const turn = useAgentTurn(slotKey || null);
   const running = turn.status === "running";
   // Follow the live stream: msgs is static mid-turn now, so scroll on liveText + tools + timeline.
   // Respects user scroll: if they've scrolled up to read, don't yank them to bottom.
@@ -747,10 +816,50 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // persists, so the report STAYS on screen instead of vanishing.
   const convVersion = useConvVersion();
   useEffect(() => {
-    if (convVersion > 0 && convIdRef.current && !isRunning(agentId)) { void openConv(convIdRef.current); }
+    if (convVersion > 0 && convIdRef.current && agentId && !isRunning(turnSlotKey(agentId, convIdRef.current))) { void openConv(convIdRef.current); }
     // eslint-disable-next-line
   }, [convVersion]);
-
+  // Palette events: new thread / compact active thread.
+  useEffect(() => {
+    function onNew() { newConv(); }
+    function onCompact() { void compactContext(); }
+    window.addEventListener("aygent-new-thread", onNew);
+    window.addEventListener("aygent-compact", onCompact);
+    return () => { window.removeEventListener("aygent-new-thread", onNew); window.removeEventListener("aygent-compact", onCompact); };
+    // eslint-disable-next-line
+  }, [folder, agent]);
+  // Tab status dots: re-render cheaply so background-thread activity shows.
+  useEffect(() => {
+    const t = setInterval(() => forceTabs((n) => n + 1), 2000);
+    return () => clearInterval(t);
+  }, []);
+  // Herdr-style done/needs-input (B3): active thread + background tabs.
+  const prevActiveRunning = useRef(false);
+  useEffect(() => {
+    const was = prevActiveRunning.current;
+    prevActiveRunning.current = running;
+    if (was && !running && agent) {
+      notifyThread();
+    }
+    // eslint-disable-next-line
+  }, [running]);
+  useEffect(() => {
+    if (!agentId) return;
+    const prev = prevRunningRef.current;
+    let changed = false;
+    for (const id of tabs) {
+      if (id === convId) continue;
+      const r = isRunning(turnSlotKey(agentId, id));
+      if (prev[id] && !r) {
+        notifyThread();
+        changed = true;
+      }
+      prev[id] = r;
+    }
+    if (agentId && convId) prev[`${agentId}:${convId}`] = running;
+    if (changed) forceTabs((n) => n + 1);
+    // eslint-disable-next-line
+  }, [convVersion, tabs.join(",")]);
   // ---- CONTEXT METER + $ COST (Mason, this session) -----------------------
   // The model's context window + price, fetched Rust-side (pricing.rs). Refetch
   // when the selected model changes so the % + cost track the real model.
@@ -851,7 +960,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     try {
       const seed = await invoke<unknown[]>("conv_compact", { id: convId });
       historyRef.current = seed;
-      if (agentId) setHistory(agentId, seed);
+      if (slotKey) setHistory(slotKey, seed);
       // Mark it in the transcript so the user sees it happened, then persist the
       // shrunk history against the (unchanged) visible transcript.
       const note: Msg = { role: "assistant", text: "\u{1F5DC}\uFE0F Context compacted \u2014 earlier turns summarized to free up the window. The visible chat is unchanged; I kept the gist.", tools: [], streaming: false, at: Date.now() };
@@ -906,6 +1015,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               disabled={!folder || !convId}
               onRename={(next) => renameCurrent(next)}
             />
+            {/* COMMAND PRO per-thread model override (B1): null = agent default. */}
+            {!!folder && !!convId && (
+              <ThreadModelPicker
+                agentDefault={{ provider: providerRef.current || agent?.provider || "anthropic", model: modelRef.current || agent?.model || "" }}
+                value={getThreadModel(convId)}
+                onChange={(v) => { if (convId) setThreadModel(convId, v); }}
+              />
+            )}
             {/* CONTEXT METER + $ COST (Mason, this session): a compact row under
                the chat title showing how full the model's context window is and
                the running cost of this session, so you SEE the wall coming and
@@ -952,6 +1069,13 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
             )}
           </div>
           <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          {!multi && !blocked && (
+            <button
+              onClick={() => setHistoryCollapsed((v) => !v)}
+              title={historyCollapsed ? "Show history" : "Hide history"}
+              style={{ background: historyCollapsed ? "var(--surface)" : "none", border: "1px solid var(--line)", cursor: "pointer", padding: 4, display: "flex", color: "var(--text-muted)", borderRadius: 7 }}
+            ><Icon name="chat" size={14} /></button>
+          )}
           {multi && !blocked && (
             <button
               onClick={() => setHistoryOpen((o) => !o)}
@@ -969,6 +1093,31 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           </div>
         </div>
 
+        {/* COMMAND PRO threads: parallel sessions, one tab per conv. */}
+        {!blocked && tabs.length > 0 && (
+          <div className="aygent-scroll" style={{ display: "flex", gap: 6, overflowX: "auto", padding: "2px 0 8px", flexShrink: 0 }}>
+            {tabs.map((id) => {
+              const active = id === convId;
+              const title = threadTitle(id);
+              const r = agentId ? isRunning(turnSlotKey(agentId, id)) : false;
+              const om = getThreadModel(id);
+              return (
+                <span key={id} onClick={() => { if (id !== convId) void openConv(id); }}
+                  title={title + (om ? " - " + om.model : "")}
+                  style={{ display: "inline-flex", alignItems: "center", gap: 6, maxWidth: 220, padding: "5px 6px 5px 10px", borderRadius: 999, fontSize: 12.5, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0, border: active ? "1px solid var(--accent)" : "1px solid var(--line)", background: active ? "var(--surface)" : "transparent", color: "var(--text)", fontWeight: active ? 700 : 500 }}>
+                  <span style={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: r ? "var(--accent)" : "var(--text-faint)", animation: r ? "aygentPulse 1.1s ease-in-out infinite" : "none" }} />
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{title}</span>
+                  {tabs.length > 1 && (
+                    <button onClick={(e) => { e.stopPropagation(); closeTab(id); }} title="Close thread"
+                      style={{ background: "none", border: "none", cursor: "pointer", padding: "0 2px", color: "var(--text-faint)", display: "flex" }}><Icon name="close" size={12} /></button>
+                  )}
+                </span>
+              );
+            })}
+            <button onClick={() => newConv()} title="New thread (parallel session)"
+              style={{ flexShrink: 0, borderRadius: 999, fontSize: 12.5, fontWeight: 600, padding: "5px 12px", cursor: "pointer", border: "1px dashed var(--line)", background: "transparent", color: "var(--text-muted)" }}>+ New</button>
+          </div>
+        )}
         {blocked && (
           <p style={{ ...hint, marginBottom: 12 }}>
             {!folder ? "Pick an Agent Folder in Settings, " : ""}{!keySet ? `add ${providerLabel(providerRef.current)} key in Settings (or switch this agent to a local model)` : ""} to start.
@@ -977,8 +1126,8 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
         {/* Messages bottom-align: newest sits just above the input, older scroll
            up (justifyContent flex-end + margin-top auto on the list wrapper). */}
-        <div ref={scrollRef} className="aygent-scroll" style={{ flex: 1, overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", padding: "6px 8px 36px 8px" }}>
-          <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 14 }}>
+        <div ref={scrollRef} className="aygent-scroll" style={{ flex: 1, overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", padding: "4px 6px 24px 2px" }}>
+          <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 10 }}>
           {msgs.length === 0 && !running && !blocked && (
             <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
           )}
@@ -986,8 +1135,8 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           {/* LIVE inter-agent inbound message: when a peer dispatches a message
               to the agent you're viewing, show it as a user bubble immediately
               (before the reply streams) so you WATCH the conversation arrive. */}
-          {running && getInbound(agentId) && (
-            <Bubble agentId={agentId} m={{ role: "user", text: `from ${getInbound(agentId)!.fromName}: ${getInbound(agentId)!.text}` }} />
+          {running && inbound && (
+            <Bubble agentId={agentId} m={{ role: "user", text: `from ${inbound.fromName}: ${inbound.text}` }} />
           )}
           {/* LIVE turn for the agent being viewed: render a trailing streaming
               bubble fed by the store, so switching to a running agent shows its
@@ -1046,7 +1195,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           {/* Task #7: mic — record voice, Whisper transcribes into the input */}
           <button onClick={toggleMic} disabled={blocked} title={rec === "recording" ? "Stop recording" : "Record voice"}
             style={{
-              width: 40, height: 44, flexShrink: 0, cursor: "pointer",
+              width: 36, height: 38, flexShrink: 0, cursor: "pointer",
               // center the SVG glyph (Mason's screenshot: it sat top-left; a raw
               // button only centers TEXT, not inline SVG).
               display: "flex", alignItems: "center", justifyContent: "center", padding: 0,
@@ -1059,7 +1208,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
             onChange={(e) => { void onFilesPicked(e.target.files); e.target.value = ""; }} />
           <button onClick={() => fileRef.current?.click()} disabled={blocked} title="Attach files as context"
             style={{
-              width: 40, height: 44, flexShrink: 0, cursor: "pointer",
+              width: 36, height: 38, flexShrink: 0, cursor: "pointer",
               display: "flex", alignItems: "center", justifyContent: "center", padding: 0,
               background: "var(--bg)", border: "var(--border-width) solid var(--line)",
               borderRadius: "var(--radius-control)", color: "var(--text-muted)", fontSize: 20,
@@ -1097,7 +1246,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               // fixed single-line start; JS auto-grow adjusts height up to 200px.
               // NO flex-stretch on height: alignItems:flex-end on the row + a set
               // height keep it compact instead of filling the column.
-              height: 44, maxHeight: 200, lineHeight: 1.5,
+              height: 38, maxHeight: 200, lineHeight: 1.45,
               boxSizing: "border-box",
               background: "var(--bg)", border: "var(--border-width) solid var(--line)",
               borderRadius: "var(--radius-control)", color: "var(--text)", padding: "10px 12px",
@@ -1108,7 +1257,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       </div>
 
       {/* HISTORY SIDEBAR — in multi-pane, behind hamburger to save space; solo, always visible */}
-      {!blocked && !multi && (
+      {!blocked && !multi && !historyCollapsed && (
         <HistorySidebar
           multi={multi}
           convs={convs} activeId={convId} busy={running} dragId={dragId} overId={overId}
@@ -1120,7 +1269,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
         />
       )}
       {!blocked && multi && historyOpen && (
-        <div style={{ position: "absolute", top: 0, right: 0, bottom: 0, width: 230, background: "var(--bg)", borderLeft: "var(--border-width) solid var(--line)", zIndex: 5, padding: "12px 0 12px 14px", display: "flex", flexDirection: "column" }}>
+        <div style={{ position: "absolute", top: 0, right: 0, bottom: 0, width: 216, background: "var(--bg)", borderLeft: "var(--border-width) solid var(--line)", zIndex: 5, padding: "12px 0 12px 14px", display: "flex", flexDirection: "column" }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, paddingRight: 8 }}>
             <span style={{ fontSize: 12, fontWeight: 800, color: "var(--text-faint)" }}>CHATS</span>
             <button onClick={() => setHistoryOpen(false)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)" }}><Icon name="close" size={14} /></button>
@@ -1168,13 +1317,13 @@ function HistorySidebar({
       ...(multi
         ? { height: "100%", minHeight: 0, width: "100%", paddingRight: 8 }
         : {
-            width: 230, flexShrink: 0,
+            width: 216, flexShrink: 0,
             height: "calc(100% + 56px)",
             marginTop: -28, marginBottom: -28, paddingTop: 28, paddingBottom: 28,
             borderLeft: "var(--border-width) solid var(--line)", paddingLeft: 14,
           }),
     }}>
-      <Button onClick={onNew} disabled={busy}>+ New chat</Button>
+      <Button onClick={onNew} disabled={false}>+ New thread</Button>
       <div ref={listElRef} className="aygent-scroll" style={{ overflowY: "auto", display: "flex", flexDirection: "column", gap: 4, marginTop: 4, flex: 1, minHeight: 0 }}>
         {convs.length === 0 && (
           <p style={{ ...hint, fontSize: 13, color: "var(--text-faint)" }}>No chats yet.</p>
@@ -1213,7 +1362,7 @@ function HistoryItem({
       title={c.title || "Untitled"}
       style={{
         display: "flex", alignItems: "center", gap: 6, cursor: "pointer",
-        padding: "8px 10px", borderRadius: "var(--radius-control)", fontSize: 13,
+        padding: "6px 9px", borderRadius: 7, fontSize: 12.5,
         userSelect: "none", touchAction: "none",
         border: `var(--border-width) solid ${isOver ? "var(--accent)" : active ? "var(--line)" : "transparent"}`,
         background: active ? "var(--bg)" : hover ? "var(--surface)" : "transparent",
@@ -1310,6 +1459,45 @@ function ChatTitle({ title, disabled, onRename }: { title: string; disabled: boo
   );
 }
 
+const THREAD_PROVIDERS = ["anthropic", "openai", "openrouter", "meta", "local", "mlx"];
+function ThreadModelPicker({ agentDefault, value, onChange }: {
+  agentDefault: { provider: string; model: string };
+  value: { provider: string; model: string } | null;
+  onChange: (v: { provider: string; model: string } | null) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [prov, setProv] = useState(value?.provider || agentDefault.provider);
+  const [mod, setMod] = useState(value?.model || agentDefault.model);
+  useEffect(() => { setProv(value?.provider || agentDefault.provider); setMod(value?.model || agentDefault.model); }, [value?.provider, value?.model, agentDefault.provider, agentDefault.model]);
+  if (!editing) {
+    const label = value ? (value.model || value.provider) + " (thread)" : (agentDefault.model || agentDefault.provider) + " (agent)";
+    return (
+      <button onClick={() => setEditing(true)} title="Override model for this thread only — other threads keep the agent default"
+        style={{ marginTop: 4, display: "inline-flex", alignItems: "center", gap: 6, background: "transparent", border: "1px solid var(--line)", borderRadius: 999, cursor: "pointer", padding: "3px 10px", color: "var(--text-muted)", fontSize: 12, fontFamily: "ui-monospace, monospace", maxWidth: 360 }}>
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span>
+        <span style={{ opacity: 0.6 }}>▾</span>
+      </button>
+    );
+  }
+  return (
+    <span style={{ marginTop: 4, display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+      <select value={prov} onChange={(e) => setProv(e.target.value)}
+        style={{ background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, color: "var(--text)", padding: "3px 6px", fontSize: 12 }}>
+        {THREAD_PROVIDERS.map((x) => <option key={x} value={x}>{x}</option>)}
+      </select>
+      <input value={mod} onChange={(e) => setMod(e.target.value)} placeholder="model id (blank = auto)"
+        spellCheck={false}
+        style={{ background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, color: "var(--text)", padding: "3px 8px", fontSize: 12, fontFamily: "ui-monospace, monospace", width: 200 }} />
+      <button onClick={() => { onChange(mod.trim() || prov !== agentDefault.provider ? { provider: prov, model: mod.trim() } : null); setEditing(false); }}
+        style={{ background: "var(--accent)", color: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, padding: "3px 10px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Set</button>
+      {value && <button onClick={() => { onChange(null); setEditing(false); }} title="Back to agent default"
+        style={{ background: "transparent", border: "1px solid var(--line)", borderRadius: 7, padding: "3px 10px", fontSize: 12, cursor: "pointer", color: "var(--text-muted)" }}>Reset</button>}
+      <button onClick={() => setEditing(false)}
+        style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-faint)", fontSize: 12 }}>✕</button>
+    </span>
+  );
+}
+
 /** Format a $ cost compactly: sub-cent shows more digits so it isn't just $0.00. */
 function fmtCost(usd: number): string {
   if (!usd || usd <= 0) return "$0.00";
@@ -1352,30 +1540,23 @@ function fmtClock(ms?: number): string {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
-/** Fixed-width gutter stamp. Reserves its width even when empty so bubbles
- *  don't shift horizontally between stamped and unstamped messages. */
-function Stamp({ at, usage, price }: { at?: number; usage?: TurnUsage; price?: ModelPrice }) {
-  // Under the timestamp: tokens used + $ cost for THIS turn (Mason, this
-  // session). Tokens = input+output for the turn; cost from the model price.
+/** One-line meta stamp UNDER the message: clock · tokens · cost. Renders
+ *  nothing when there is nothing to show, so rows never shift. */
+function MetaStamp({ at, usage, price, align }: { at?: number; usage?: TurnUsage; price?: ModelPrice; align: "left" | "right" }) {
   const cost = usage ? turnCost(usage, price) : 0;
-  // Tokens this turn = the model's real INPUT (fresh + cached) + output, so it
-  // matches the top meter for the latest turn (was input+output, missing cache).
   const ctxIn = usage ? ((usage.contextInput ?? 0) || (usage.input + usage.cacheRead + usage.cacheWrite)) : 0;
   const toks = usage ? ctxIn + usage.output : 0;
+  const parts: string[] = [];
+  const clock = fmtClock(at);
+  if (clock) parts.push(clock);
+  if (usage && toks > 0) parts.push(fmtTokens(toks) + " tok");
+  if (cost > 0) parts.push(fmtCost(cost));
+  if (parts.length === 0) return null;
   return (
-    <span style={{
-      width: 62, flexShrink: 0, textAlign: "center", display: "flex",
-      flexDirection: "column", alignItems: "center", gap: 1,
-      fontSize: 11, lineHeight: "16px", color: "var(--text-faint)",
-      fontVariantNumeric: "tabular-nums", userSelect: "none",
-    }}>
-      <span style={{ lineHeight: "18px" }}>{fmtClock(at)}</span>
-      {usage && toks > 0 && (
-        <span title={`${ctxIn.toLocaleString()} in (incl. cache) + ${(usage.output).toLocaleString()} out tokens`}
-          style={{ fontSize: 9.5, lineHeight: "12px", opacity: 0.85 }}>
-          {fmtTokens(toks)} tok{cost > 0 ? <><br/>{fmtCost(cost)}</> : null}
-        </span>
-      )}
+    <span
+      title={usage ? ctxIn.toLocaleString() + " in (incl. cache) + " + (usage.output).toLocaleString() + " out tokens" : undefined}
+      style={{ fontSize: 11, lineHeight: "16px", color: "var(--text-faint)", fontVariantNumeric: "tabular-nums", userSelect: "none", textAlign: align }}>
+      {parts.join(" · ")}
     </span>
   );
 }
@@ -1383,31 +1564,42 @@ function Stamp({ at, usage, price }: { at?: number; usage?: TurnUsage; price?: M
 function Bubble({ m, agentId, price, local }: { m: Msg; agentId?: string | null; price?: ModelPrice; local?: boolean }) {
   const isUser = m.role === "user";
   const memory = isUser && m.role === "user" ? m.memory : undefined;
-  // The stamp lives OUTSIDE the bubble column, in the margin: to the LEFT of
-  // the agent's replies and to the RIGHT of the user's prompts.
+  // Full-bleed rows: no margin gutters. Clock/tokens/cost ride as one faint
+  // line UNDER the message (MetaStamp, rendered in BubbleBody).
   return (
-    <div style={{ display: "flex", alignItems: "flex-start", justifyContent: isUser ? "flex-end" : "flex-start", gap: 2, width: "100%" }}>
-      {!isUser && <Stamp at={m.at} usage={m.role === "assistant" ? m.usage : undefined} price={price} />}
-      <BubbleBody m={m} isUser={isUser} local={local} memory={memory} agentId={agentId} />
-      {isUser && <Stamp at={m.at} />}
+    <div style={{ display: "flex", alignItems: "flex-start", width: "100%" }}>
+      <BubbleBody m={m} isUser={isUser} local={local} memory={memory} agentId={agentId} price={price} />
     </div>
   );
 }
 
-function BubbleBody({ m, isUser, memory, agentId, local }: { m: Msg; isUser: boolean; memory?: string; agentId?: string | null; local?: boolean }) {
+function BubbleBody({ m, isUser, memory, agentId, local, price }: { m: Msg; isUser: boolean; memory?: string; agentId?: string | null; local?: boolean; price?: ModelPrice }) {
+  const usage = !isUser && m.role === "assistant" ? m.usage : undefined;
   return (
-    <div style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start", minWidth: 0, flex: 1 }}>
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "stretch", minWidth: 0, flex: 1 }}>
       <div style={{
-        maxWidth: "88%",
+        width: "auto",
         minWidth: 0,
         overflowWrap: "anywhere",
-        background: isUser ? "var(--accent)" : "var(--surface)",
-        color: isUser ? "var(--bg)" : "var(--text)",
-        border: "var(--border-width) solid var(--line)",
-        borderRadius: "var(--radius-card)",
-        boxShadow: "var(--elevation)",
-        padding: "12px 15px",
-        display: "flex", flexDirection: "column", gap: 8,
+        background: isUser
+          ? "color-mix(in srgb, var(--accent) 12%, transparent)"
+          : "color-mix(in srgb, var(--text) 5%, transparent)",
+        color: "var(--text)",
+        border: "none",
+        ...(isUser
+          ? {
+              margin: "0 2px 0 48px",
+              borderRight: "2px solid var(--accent)",
+              borderRadius: "8px 0 0 8px",
+              padding: "8px 12px",
+            }
+          : {
+              margin: "0 2px",
+              borderLeft: "2px solid color-mix(in srgb, var(--text) 25%, transparent)",
+              borderRadius: "0 8px 8px 0",
+              padding: "8px 48px 8px 12px",
+            }),
+        display: "flex", flexDirection: "column", gap: 6,
       }}>
         {/* ORDERED RENDER (Mason 08-04): when a timeline exists, draw tool cards
             and prose in the order they actually happened, so each note sits with
@@ -1437,14 +1629,15 @@ function BubbleBody({ m, isUser, memory, agentId, local }: { m: Msg; isUser: boo
           <>
             {!isUser && m.role === "assistant" && m.tools.map((t, i) => <ToolCard key={i} t={t} agentId={agentId} />)}
             {m.text && (isUser
-              ? <span style={{ whiteSpace: "pre-wrap", lineHeight: 1.55, fontSize: 15 }}>{m.text}</span>
+              ? <span style={{ display: "block", textAlign: "left", whiteSpace: "pre-wrap", lineHeight: 1.55, fontSize: 14 }}>{m.text}</span>
               : <TextWithThoughts text={m.text} streaming={(m as { streaming?: boolean }).streaming} enabled={local} />)}
           </>
         )}
         {!isUser && m.role === "assistant" && m.streaming && !m.text && <Thinking />}
       </div>
+      <MetaStamp at={m.at} usage={usage} price={price} align={isUser ? "right" : "left"} />
       {memory && (
-        <span style={{ marginTop: 3, marginRight: 4, fontSize: 12, color: "#3fa46a" }}>{memory}</span>
+        <span style={{ marginTop: 3, alignSelf: isUser ? "flex-end" : "flex-start", fontSize: 12, color: "#3fa46a" }}>{memory}</span>
       )}
     </div>
   );

@@ -1,6 +1,5 @@
-// AYGENT UI primitives — themed entirely via tokens (DESIGN.md). No hardcoded
-// hex or shadows here; everything references the CSS variables through Tailwind
-// token classes, so light/dark/accent flow automatically.
+// AYGENT UI primitives — Command Pro (branch ui-command-pro).
+// Dense, hairline, muted accent. Everything reads CSS vars; no hardcoded hex.
 import type { ReactNode, CSSProperties } from "react";
 
 export function Card({ title, children, style }: { title?: string; children: ReactNode; style?: CSSProperties }) {
@@ -10,7 +9,7 @@ export function Card({ title, children, style }: { title?: string; children: Rea
       style={{ padding: "var(--card-pad)", display: "flex", flexDirection: "column", gap: "var(--card-gap)", ...style }}
     >
       {title && (
-        <div style={{ fontSize: "var(--text-caption)", letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 700, color: "var(--text-muted)" }}>
+        <div style={{ fontSize: "var(--text-caption)", letterSpacing: "0.06em", textTransform: "uppercase", fontWeight: 700, color: "var(--text-faint)" }}>
           {title}
         </div>
       )}
@@ -24,25 +23,25 @@ export function Button({
 }: { children: ReactNode; onClick?: () => void; disabled?: boolean; variant?: "primary" | "secondary"; style?: CSSProperties }) {
   const base: CSSProperties = {
     borderRadius: "var(--radius-control)",
-    padding: "9px 16px",
+    padding: "6px 12px",
     fontWeight: 600,
-    fontSize: 14,
+    fontSize: 13,
     cursor: disabled ? "default" : "pointer",
     opacity: disabled ? 0.5 : 1,
-    transition: "box-shadow 150ms ease, transform 150ms ease",
+    transition: "border-color 120ms ease, box-shadow 120ms ease",
     border: "var(--border-width) solid var(--line)",
   };
   const variantStyle: CSSProperties =
     variant === "primary"
-      ? { background: "var(--accent)", color: "var(--bg)", boxShadow: "var(--elevation)" }
+      ? { background: "var(--accent)", borderColor: "var(--accent)", color: "#fff", boxShadow: "none" }
       : { background: "var(--surface)", color: "var(--text)", boxShadow: "var(--elevation)" };
   return (
     <button
       onClick={onClick}
       disabled={disabled}
       style={{ ...base, ...variantStyle, ...style }}
-      onMouseEnter={(e) => { if (!disabled) e.currentTarget.style.boxShadow = "var(--elevation-hover)"; }}
-      onMouseLeave={(e) => { e.currentTarget.style.boxShadow = "var(--elevation)"; }}
+      onFocus={(e) => { e.currentTarget.style.boxShadow = "0 0 0 3px var(--focus-ring)"; }}
+      onBlur={(e) => { e.currentTarget.style.boxShadow = variant === "primary" ? "none" : "var(--elevation)"; }}
     >
       {children}
     </button>
@@ -60,12 +59,15 @@ export function Input(props: React.InputHTMLAttributes<HTMLInputElement> & { mon
         border: "var(--border-width) solid var(--line)",
         borderRadius: "var(--radius-control)",
         color: "var(--text)",
-        padding: "9px 12px",
-        fontSize: 14,
-        fontFamily: mono ? "var(--font-mono, ui-monospace, monospace)" : "inherit",
-        boxShadow: "var(--elevation)",
+        padding: "7px 10px",
+        fontSize: 13,
+        fontFamily: mono ? "ui-monospace, SFMono-Regular, Menlo, monospace" : "inherit",
+        boxShadow: "none",
+        outline: "none",
         ...style,
       }}
+      onFocus={(e) => { e.currentTarget.style.borderColor = "var(--accent)"; e.currentTarget.style.boxShadow = "0 0 0 3px var(--focus-ring)"; props.onFocus?.(e as any); }}
+      onBlur={(e) => { e.currentTarget.style.borderColor = "var(--line)"; e.currentTarget.style.boxShadow = "none"; props.onBlur?.(e as any); }}
     />
   );
 }
@@ -74,11 +76,11 @@ export function Pill({ children, tone = "muted" }: { children: ReactNode; tone?:
   const color = tone === "ok" ? "var(--ok)" : tone === "danger" ? "var(--danger)" : "var(--text-muted)";
   return (
     <span style={{
-      display: "inline-flex", alignItems: "center", gap: 5,
+      display: "inline-flex", alignItems: "center", gap: 4,
       whiteSpace: "nowrap", width: "fit-content", alignSelf: "flex-start",
-      border: `var(--border-width) solid ${color}`, color,
-      borderRadius: "var(--radius-pill)", padding: "4px 12px", fontSize: 13, fontWeight: 600,
-      lineHeight: 1.4, boxShadow: "var(--elevation)", background: "var(--surface)",
+      border: "var(--border-width) solid var(--line)", color,
+      borderRadius: "var(--radius-pill)", padding: "2px 9px", fontSize: 11.5, fontWeight: 600,
+      lineHeight: 1.4, background: "var(--bg)",
     }}>
       {children}
     </span>
@@ -89,11 +91,11 @@ export function Transcript({ text, error }: { text: string; error?: boolean }) {
   return (
     <pre style={{
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-      fontSize: 13, lineHeight: 1.5, margin: 0,
+      fontSize: 12, lineHeight: 1.5, margin: 0,
       background: "var(--bg)", color: error ? "var(--danger)" : "var(--text)",
       border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-card)",
-      padding: "14px 16px", maxHeight: 340, overflowY: "auto",
-      whiteSpace: "pre-wrap", wordBreak: "break-word", boxShadow: "var(--elevation)",
+      padding: "10px 12px", maxHeight: 340, overflowY: "auto",
+      whiteSpace: "pre-wrap", wordBreak: "break-word",
     }}>{text}</pre>
   );
 }

@@ -20,6 +20,8 @@ import { Onboarding } from "./screens/Onboarding";
 import { initTheme, saveTheme, type Mode } from "./lib/theme";
 import { startHeadlessWatcher } from "./lib/turns";
 import { ContinuePicker } from "./components/ContinuePicker";
+import { CmdPalette } from "./components/CmdPalette";
+import { notifyEnabled, setNotifyEnabled } from "./lib/notify";
 
 // Phase 1: app shell (sidebar nav + content pane) on the design system.
 
@@ -90,6 +92,11 @@ export function App() {
   // boot, after initTheme populates these). Fire-and-forget — a themed Dock
   // icon is a nicety and must never block or break startup.
   useEffect(() => { void applyAppIcon(mode, accent); }, [mode, accent]);
+  useEffect(() => {
+    function onToggleNotify() { setNotifyEnabled(!notifyEnabled()); }
+    window.addEventListener("aygent-toggle-notify", onToggleNotify);
+    return () => window.removeEventListener("aygent-toggle-notify", onToggleNotify);
+  }, []);
   // Start the standing watcher for inter-agent (headless) turns so their live
   // stream is captured into the per-agent store even though the UI didn't start
   // them — this is what makes you WATCH agents talk to each other.
@@ -129,6 +136,24 @@ export function App() {
     invoke<AgentProfile | null>("agents_get_active").then((a) => { if (a) setActiveAgent(a); }).catch(() => {});
   }, [screen]);
   function onTheme(m: Mode, a: string) { setMode(m); setAccent(a); saveTheme(m, a); }
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const k = e.key.toLowerCase();
+      if (k === "1") { e.preventDefault(); setScreen("chat"); }
+      else if (k === "2") { e.preventDefault(); setScreen("agents"); }
+      else if (k === ",") { e.preventDefault(); setScreen("settings"); }
+      else if (k === "3") { e.preventDefault(); setScreen("sparks"); }
+      else if (k === "4") { e.preventDefault(); setScreen("video"); }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  useEffect(() => {
+    function onToggleTheme() { setMode((m) => { const next = m === "dark" ? "light" : "dark"; saveTheme(next, accent); return next; }); }
+    window.addEventListener("aygent-toggle-theme", onToggleTheme);
+    return () => window.removeEventListener("aygent-toggle-theme", onToggleTheme);
+  }, [accent]);
 
   useEffect(() => {
     let socket: WebSocket | null = null;
@@ -288,6 +313,7 @@ export function App() {
         </div>
       </div>
       <ContinuePicker />
+      <CmdPalette onNavigate={(sc) => setScreen(sc)} />
     </div>
   );
 }
