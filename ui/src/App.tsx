@@ -21,7 +21,7 @@ import { initTheme, saveTheme, type Mode } from "./lib/theme";
 import { startHeadlessWatcher } from "./lib/turns";
 import { ContinuePicker } from "./components/ContinuePicker";
 import { CmdPalette } from "./components/CmdPalette";
-import { ensureNotifyPermission } from "./lib/notify";
+import { notifyEnabled, setNotifyEnabled } from "./lib/notify";
 
 // Phase 1: app shell (sidebar nav + content pane) on the design system.
 
@@ -92,7 +92,11 @@ export function App() {
   // boot, after initTheme populates these). Fire-and-forget — a themed Dock
   // icon is a nicety and must never block or break startup.
   useEffect(() => { void applyAppIcon(mode, accent); }, [mode, accent]);
-  useEffect(() => { void ensureNotifyPermission(); }, []);
+  useEffect(() => {
+    function onToggleNotify() { setNotifyEnabled(!notifyEnabled()); }
+    window.addEventListener("aygent-toggle-notify", onToggleNotify);
+    return () => window.removeEventListener("aygent-toggle-notify", onToggleNotify);
+  }, []);
   // Start the standing watcher for inter-agent (headless) turns so their live
   // stream is captured into the per-agent store even though the UI didn't start
   // them — this is what makes you WATCH agents talk to each other.

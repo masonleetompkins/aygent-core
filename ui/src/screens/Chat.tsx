@@ -9,7 +9,7 @@ import { Icon, type IconName } from "../components/Icon";
 import { Markdown } from "../components/Markdown";
 import { useSparkBlobUrl, useSparkThemeSync, isSparkStateMsg } from "../lib/sparkChrome";
 import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion, stopTurn, turnSlotKey } from "../lib/turns";
-import { notifyThread, kindFor } from "../lib/notify";
+import { notifyThread } from "../lib/notify";
 import type { TurnItem, TurnUsage } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
 import { DiffView, DiffCounts, countDiff, isDiffable } from "../components/DiffView";
@@ -122,8 +122,6 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // Per-thread model override (B1): {provider, model} or null = agent default.
   // Persisted in localStorage per conv so it survives reloads without a DB migration.
   const [threadModels, setThreadModels] = useState<Record<string, { provider: string; model: string }>>({});
-  // Herdr-style toasts (B3): done / needs-input for background threads.
-  const [toasts, setToasts] = useState<Array<{ id: number; agentName: string; threadTitle: string; kind: "done" | "needs-input"; body: string }>>([]);
   const prevRunningRef = useRef<Record<string, boolean>>({});
   function threadTitle(id: string | null): string {
     if (!id) return "New thread";
@@ -841,10 +839,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     const was = prevActiveRunning.current;
     prevActiveRunning.current = running;
     if (was && !running && agent) {
-      const snap = slotKey ? getAgentTurnSnapshot(slotKey) : null;
-      const text = snap?.liveText || "";
-      const kind = kindFor(text);
-      notifyThread(agent.name || "Agent", threadTitle(convId), kind, text);
+      notifyThread();
     }
     // eslint-disable-next-line
   }, [running]);
@@ -856,9 +851,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       if (id === convId) continue;
       const r = isRunning(turnSlotKey(agentId, id));
       if (prev[id] && !r) {
-        const snap = getAgentTurnSnapshot(turnSlotKey(agentId, id));
-        const text = snap?.liveText || "";
-        notifyThread(agent?.name || "Agent", threadTitle(id), kindFor(text), text);
+        notifyThread();
         changed = true;
       }
       prev[id] = r;
@@ -867,18 +860,6 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     if (changed) forceTabs((n) => n + 1);
     // eslint-disable-next-line
   }, [convVersion, tabs.join(",")]);
-  // In-app toasts for thread notifications.
-  useEffect(() => {
-    function onNotify(e: Event) {
-      const d = (e as CustomEvent).detail;
-      const id = Date.now() + Math.random();
-      setToasts((t) => [...t.slice(-3), { id, agentName: d.agentName, threadTitle: d.threadTitle, kind: d.kind, body: d.body }]);
-      setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 6000);
-    }
-    window.addEventListener("aygent-thread-notify", onNotify);
-    return () => window.removeEventListener("aygent-thread-notify", onNotify);
-  }, []);
-
   // ---- CONTEXT METER + $ COST (Mason, this session) -----------------------
   // The model's context window + price, fetched Rust-side (pricing.rs). Refetch
   // when the selected model changes so the % + cost track the real model.
@@ -1174,17 +1155,6 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           <div ref={bottomRef} aria-hidden style={{ height: 8, flexShrink: 0 }} />
         </div>
 
-        {/* COMMAND PRO toasts: background-thread done / needs-input. */}
-        {toasts.length > 0 && (
-          <div style={{ position: "absolute", right: 12, bottom: 76, display: "flex", flexDirection: "column", gap: 8, zIndex: 40, maxWidth: 340 }}>
-            {toasts.map((t) => (
-              <div key={t.id} style={{ background: "var(--surface)", border: t.kind === "needs-input" ? "1px solid var(--warn)" : "1px solid var(--line)", borderRadius: 10, padding: "9px 12px", boxShadow: "0 8px 28px rgba(0,0,0,0.3)", fontSize: 12.5 }}>
-                <div style={{ fontWeight: 700 }}>{t.agentName} - {t.threadTitle} - {t.kind === "needs-input" ? "needs you" : "done"}</div>
-                <div style={{ color: "var(--text-muted)", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.body}</div>
-              </div>
-            ))}
-          </div>
-        )}
         {/* Task #5: attachment chips above the input */}
         {attachments.length > 0 && (
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8, padding: "0 8px" }}>
