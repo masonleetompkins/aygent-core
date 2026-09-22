@@ -8,7 +8,8 @@ import { Button } from "../components/ui";
 import { Icon, type IconName } from "../components/Icon";
 import { Markdown } from "../components/Markdown";
 import { useSparkBlobUrl, useSparkThemeSync, isSparkStateMsg } from "../lib/sparkChrome";
-import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion, stopTurn } from "../lib/turns";
+import { runTurn, isRunning, setHistory, getAgentTurnSnapshot, useAgentTurn, getInbound, useConvVersion, stopTurn, turnSlotKey } from "../lib/turns";
+import { notifyThread, kindFor } from "../lib/notify";
 import type { TurnItem, TurnUsage } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
 import { DiffView, DiffCounts, countDiff, isDiffable } from "../components/DiffView";
@@ -110,6 +111,61 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // otherwise capture a STALE convId (the save-bug that dropped the first
   // chat). The ref is always the current thread id.
   const convIdRef = useRef<string | null>(null);
+
+  // COMMAND PRO threads (B1-B6): N parallel sessions per agent. Tabs are conv
+  // ids; each thread streams in its own store slot (turnSlotKey) on its own
+  // backend lane (sessionId = convId), so there is no cap. Disk is the source
+  // of truth for finalized msgs; the store holds only in-flight turns.
+  const [tabs, setTabs] = useState<string[]>([]);
+  const [, forceTabs] = useState(0);
+  // Per-thread model override (B1): {provider, model} or null = agent default.
+  // Persisted in localStorage per conv so it survives reloads without a DB migration.
+  const [threadModels, setThreadModels] = useState<Record<string, { provider: string; model: string }>>({});
+  // Herdr-style toasts (B3): done / needs-input for background threads.
+  const [toasts, setToasts] = useState<Array<{ id: number; agentName: string; threadTitle: string; kind: "done" | "needs-input"; body: string }>>([]);
+  const prevRunningRef = useRef<Record<string, boolean>>({});
+  function threadTitle(id: string | null): string {
+    if (!id) return "New thread";
+    return convs.find((c) => c.id === id)?.title || "New thread";
+  }
+  function openThread(id: string) {
+    setTabs((t) => (t.includes(id) ? t : [...t, id]));
+    void openConv(id);
+  }
+  function closeTab(id: string) {
+    setTabs((t) => {
+      if (!t.includes(id) || t.length <= 1) return t;
+      const next = t.filter((x) => x !== id);
+      if (id === convIdRef.current) {
+        const idx = t.indexOf(id);
+        const fallback = next[Math.min(idx, next.length - 1)];
+        if (fallback) setTimeout(() => void openConv(fallback), 0);
+      }
+      return next;
+    });
+  }
+  function threadModelKey(id: string | null) { return `aygent.threadModel.${agentId ?? "?"}.${id ?? "?"}`; }
+  function getThreadModel(id: string | null): { provider: string; model: string } | null {
+    if (!id) return null;
+    const m = threadModels[id];
+    if (m) return m;
+    try {
+      const raw = localStorage.getItem(threadModelKey(id));
+      if (raw) return JSON.parse(raw);
+    } catch { /* ignore */ }
+    return null;
+  }
+  function setThreadModel(id: string, v: { provider: string; model: string } | null) {
+    setThreadModels((prev) => {
+      const next = { ...prev };
+      if (v) next[id] = v; else delete next[id];
+      return next;
+    });
+    try {
+      if (v) localStorage.setItem(threadModelKey(id), JSON.stringify(v));
+      else localStorage.removeItem(threadModelKey(id));
+    } catch { /* ignore */ }
+  }
   const scrollRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -444,14 +500,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
   // On folder change: load the list and open the most recent one (or a fresh one).
   useEffect(() => {
-    if (!folder) { setConvs([]); setConv(null); setMessages([]); historyRef.current = []; return; }
+    if (!folder) { setConvs([]); setConv(null); setTabs([]); setMessages([]); historyRef.current = []; return; }
     invoke<{ provider: string; model: string }>("get_selection", { folder })
       .then((s) => { providerRef.current = s.provider; modelRef.current = s.model; setIsLocal(s.provider === "local" || s.provider === "mlx"); }).catch(() => {});
     (async () => {
       try {
         const list = await invoke<ConvMeta[]>("conv_list", { folder });
         setConvs(list);
-        if (list.length > 0) await openConv(list[0].id);
+        if (list.length > 0) { setTabs([list[0].id]); await openConv(list[0].id); }
         else newConv();
       } catch { newConv(); }
     })();
@@ -465,6 +521,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
   function newConv() {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setTabs((t) => (t.includes(id) ? t : [...t, id]));
     // CONTEXT MODE (2026-08-03): "isolated" (default) starts a truly fresh
     // session — empty provider history, zero cross-chat token cost.
     // "continuous" carries the CURRENT chat's provider history into the new
@@ -476,6 +533,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   }
 
   async function openConv(id: string) {
+    setTabs((t) => (t.includes(id) ? t : [...t, id]));
     // VIEWING is never blocked by `busy` — you can always read any conversation,
     // even while an agent is mid-turn. `busy` only gates SENDING (the lane
     // serializes turns; it must not lock the whole pane). This was bug #2.
@@ -493,6 +551,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     try { await invoke("conv_delete", { folder, id }); } catch { /* ignore */ }
     const list = await invoke<ConvMeta[]>("conv_list", { folder }).catch(() => [] as ConvMeta[]);
     setConvs(list);
+    setTabs((t) => t.filter((x) => x !== id));
     if (id === convIdRef.current) { if (list.length > 0) openConv(list[0].id); else newConv(); }
   }
 
@@ -634,7 +693,8 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     }
     // Gate on THIS agent's status (per-agent), not a global pane flag — so you
     // can send to a second agent while the first still runs (Atlas #2).
-    if (!prompt || !agentId || isRunning(agentId)) return;
+    const gateSlot = agentId ? turnSlotKey(agentId, convIdRef.current || "fresh") : "";
+    if (!prompt || !agentId || (gateSlot && isRunning(gateSlot))) return;
     setInput("");
 
     const myAgent = agentId;
@@ -653,10 +713,15 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
     // Seed the store's per-agent history from this conversation so a follow-up
     // continues the thread.
-    setHistory(myAgent, historyRef.current);
+    const mySlot = turnSlotKey(myAgent, myConvId);
+    setHistory(mySlot, historyRef.current);
 
-    // Refresh model/provider selection just before the call.
-    if (folder) {
+    // Per-thread model override (B1) wins; else the agent default.
+    const override = getThreadModel(myConvId);
+    if (override) {
+      providerRef.current = override.provider; modelRef.current = override.model;
+      setIsLocal(override.provider === "local" || override.provider === "mlx");
+    } else if (folder) {
       try {
         const s = await invoke<{ provider: string; model: string }>("get_selection", { folder });
         providerRef.current = s.provider; modelRef.current = s.model; setIsLocal(s.provider === "local" || s.provider === "mlx");
@@ -670,7 +735,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       // final history. The live text/tools render via the subscribed `turn`
       // slice below (see the streaming bubble), so no local mirror needed.
       const updated = await runTurn({
-        agentId: myAgent, channel, prompt,
+        agentId: myAgent, channel, prompt, slot: mySlot,
         model: modelRef.current || null,
         provider: providerRef.current || null,
         folder: folder || null,
@@ -679,7 +744,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       });
       historyRef.current = updated;
       // Compose the final saved msgs from the store's completed live slice.
-      const done = getAgentTurnSnapshot(myAgent);
+      const done = getAgentTurnSnapshot(mySlot);
       // Attach the 🧠 auto-capture note to the USER message that triggered it, so
       // it renders as a small badge under that bubble AND persists (the live
       // turn.memory is discarded on finalize otherwise). Mason 07-28.
@@ -726,10 +791,15 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
   const blocked = !folder || !keySet;
 
+  // COMMAND PRO threads: live state is keyed per (agent, conv) so N threads on
+  // the SAME agent stream independently (backend lanes are already per-session).
+  const slotKey = agentId && convId ? turnSlotKey(agentId, convId) : (agentId ?? "");
+  const inbound = (slotKey && getInbound(slotKey)) || (agentId && getInbound(agentId)) || undefined;
+
   // Per-agent live turn (from the App-level store). This is what makes switching
   // TO a running agent show its live stream + thinking dots — the store never
   // unmounts, so the stream is always captured and any pane can reattach.
-  const turn = useAgentTurn(agentId);
+  const turn = useAgentTurn(slotKey || null);
   const running = turn.status === "running";
   // Follow the live stream: msgs is static mid-turn now, so scroll on liveText + tools + timeline.
   // Respects user scroll: if they've scrolled up to read, don't yank them to bottom.
@@ -747,9 +817,66 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // persists, so the report STAYS on screen instead of vanishing.
   const convVersion = useConvVersion();
   useEffect(() => {
-    if (convVersion > 0 && convIdRef.current && !isRunning(agentId)) { void openConv(convIdRef.current); }
+    if (convVersion > 0 && convIdRef.current && agentId && !isRunning(turnSlotKey(agentId, convIdRef.current))) { void openConv(convIdRef.current); }
     // eslint-disable-next-line
   }, [convVersion]);
+  // Palette events: new thread / compact active thread.
+  useEffect(() => {
+    function onNew() { newConv(); }
+    function onCompact() { void compactContext(); }
+    window.addEventListener("aygent-new-thread", onNew);
+    window.addEventListener("aygent-compact", onCompact);
+    return () => { window.removeEventListener("aygent-new-thread", onNew); window.removeEventListener("aygent-compact", onCompact); };
+    // eslint-disable-next-line
+  }, [folder, agent]);
+  // Tab status dots: re-render cheaply so background-thread activity shows.
+  useEffect(() => {
+    const t = setInterval(() => forceTabs((n) => n + 1), 2000);
+    return () => clearInterval(t);
+  }, []);
+  // Herdr-style done/needs-input (B3): active thread + background tabs.
+  const prevActiveRunning = useRef(false);
+  useEffect(() => {
+    const was = prevActiveRunning.current;
+    prevActiveRunning.current = running;
+    if (was && !running && agent) {
+      const snap = slotKey ? getAgentTurnSnapshot(slotKey) : null;
+      const text = snap?.liveText || "";
+      const kind = kindFor(text);
+      notifyThread(agent.name || "Agent", threadTitle(convId), kind, text);
+    }
+    // eslint-disable-next-line
+  }, [running]);
+  useEffect(() => {
+    if (!agentId) return;
+    const prev = prevRunningRef.current;
+    let changed = false;
+    for (const id of tabs) {
+      if (id === convId) continue;
+      const r = isRunning(turnSlotKey(agentId, id));
+      if (prev[id] && !r) {
+        const snap = getAgentTurnSnapshot(turnSlotKey(agentId, id));
+        const text = snap?.liveText || "";
+        notifyThread(agent?.name || "Agent", threadTitle(id), kindFor(text), text);
+        changed = true;
+      }
+      prev[id] = r;
+    }
+    if (agentId && convId) prev[`${agentId}:${convId}`] = running;
+    if (changed) forceTabs((n) => n + 1);
+    // eslint-disable-next-line
+  }, [convVersion, tabs.join(",")]);
+  // In-app toasts for thread notifications.
+  useEffect(() => {
+    function onNotify(e: Event) {
+      const d = (e as CustomEvent).detail;
+      const id = Date.now() + Math.random();
+      setToasts((t) => [...t.slice(-3), { id, agentName: d.agentName, threadTitle: d.threadTitle, kind: d.kind, body: d.body }]);
+      setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 6000);
+    }
+    window.addEventListener("aygent-thread-notify", onNotify);
+    return () => window.removeEventListener("aygent-thread-notify", onNotify);
+  }, []);
 
   // ---- CONTEXT METER + $ COST (Mason, this session) -----------------------
   // The model's context window + price, fetched Rust-side (pricing.rs). Refetch
@@ -851,7 +978,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     try {
       const seed = await invoke<unknown[]>("conv_compact", { id: convId });
       historyRef.current = seed;
-      if (agentId) setHistory(agentId, seed);
+      if (slotKey) setHistory(slotKey, seed);
       // Mark it in the transcript so the user sees it happened, then persist the
       // shrunk history against the (unchanged) visible transcript.
       const note: Msg = { role: "assistant", text: "\u{1F5DC}\uFE0F Context compacted \u2014 earlier turns summarized to free up the window. The visible chat is unchanged; I kept the gist.", tools: [], streaming: false, at: Date.now() };
@@ -986,8 +1113,8 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           {/* LIVE inter-agent inbound message: when a peer dispatches a message
               to the agent you're viewing, show it as a user bubble immediately
               (before the reply streams) so you WATCH the conversation arrive. */}
-          {running && getInbound(agentId) && (
-            <Bubble agentId={agentId} m={{ role: "user", text: `from ${getInbound(agentId)!.fromName}: ${getInbound(agentId)!.text}` }} />
+          {running && inbound && (
+            <Bubble agentId={agentId} m={{ role: "user", text: `from ${inbound.fromName}: ${inbound.text}` }} />
           )}
           {/* LIVE turn for the agent being viewed: render a trailing streaming
               bubble fed by the store, so switching to a running agent shows its
