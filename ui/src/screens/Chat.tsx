@@ -1291,7 +1291,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
         />
       )}
       {!blocked && multi && historyOpen && (
-        <div style={{ position: "absolute", top: 0, right: 0, bottom: 0, width: 230, background: "var(--bg)", borderLeft: "var(--border-width) solid var(--line)", zIndex: 5, padding: "12px 0 12px 14px", display: "flex", flexDirection: "column" }}>
+        <div style={{ position: "absolute", top: 0, right: 0, bottom: 0, width: 216, background: "var(--bg)", borderLeft: "var(--border-width) solid var(--line)", zIndex: 5, padding: "12px 0 12px 14px", display: "flex", flexDirection: "column" }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, paddingRight: 8 }}>
             <span style={{ fontSize: 12, fontWeight: 800, color: "var(--text-faint)" }}>CHATS</span>
             <button onClick={() => setHistoryOpen(false)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)" }}><Icon name="close" size={14} /></button>
@@ -1339,7 +1339,7 @@ function HistorySidebar({
       ...(multi
         ? { height: "100%", minHeight: 0, width: "100%", paddingRight: 8 }
         : {
-            width: 230, flexShrink: 0,
+            width: 216, flexShrink: 0,
             height: "calc(100% + 56px)",
             marginTop: -28, marginBottom: -28, paddingTop: 28, paddingBottom: 28,
             borderLeft: "var(--border-width) solid var(--line)", paddingLeft: 14,
@@ -1384,7 +1384,7 @@ function HistoryItem({
       title={c.title || "Untitled"}
       style={{
         display: "flex", alignItems: "center", gap: 6, cursor: "pointer",
-        padding: "8px 10px", borderRadius: "var(--radius-control)", fontSize: 13,
+        padding: "6px 9px", borderRadius: 7, fontSize: 12.5,
         userSelect: "none", touchAction: "none",
         border: `var(--border-width) solid ${isOver ? "var(--accent)" : active ? "var(--line)" : "transparent"}`,
         background: active ? "var(--bg)" : hover ? "var(--surface)" : "transparent",
@@ -1608,16 +1608,15 @@ function BubbleBody({ m, isUser, memory, agentId, local }: { m: Msg; isUser: boo
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start", minWidth: 0, flex: 1 }}>
       <div style={{
-        maxWidth: "88%",
+        maxWidth: "90%",
         minWidth: 0,
         overflowWrap: "anywhere",
         background: isUser ? "var(--accent)" : "var(--surface)",
         color: isUser ? "var(--bg)" : "var(--text)",
-        border: "var(--border-width) solid var(--line)",
-        borderRadius: "var(--radius-card)",
-        boxShadow: "var(--elevation)",
-        padding: "12px 15px",
-        display: "flex", flexDirection: "column", gap: 8,
+        border: "1px solid var(--line)",
+        borderRadius: 10,
+        padding: "9px 12px",
+        display: "flex", flexDirection: "column", gap: 6,
       }}>
         {/* ORDERED RENDER (Mason 08-04): when a timeline exists, draw tool cards
             and prose in the order they actually happened, so each note sits with
@@ -1647,7 +1646,7 @@ function BubbleBody({ m, isUser, memory, agentId, local }: { m: Msg; isUser: boo
           <>
             {!isUser && m.role === "assistant" && m.tools.map((t, i) => <ToolCard key={i} t={t} agentId={agentId} />)}
             {m.text && (isUser
-              ? <span style={{ whiteSpace: "pre-wrap", lineHeight: 1.55, fontSize: 15 }}>{m.text}</span>
+              ? <span style={{ whiteSpace: "pre-wrap", lineHeight: 1.55, fontSize: 14 }}>{m.text}</span>
               : <TextWithThoughts text={m.text} streaming={(m as { streaming?: boolean }).streaming} enabled={local} />)}
           </>
         )}

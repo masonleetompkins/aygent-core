@@ -755,7 +755,7 @@ export function AgentForm({
           display: "flex", flexDirection: "column", gap: 8,
           background: proMode ? "color-mix(in srgb, var(--danger, #ef4444) 8%, var(--surface))" : "var(--surface)",
           border: `var(--border-width) solid ${proMode ? "color-mix(in srgb, var(--danger, #ef4444) 40%, transparent)" : "var(--line)"}`,
-          borderRadius: "var(--radius-control)", padding: "12px 14px",
+          borderRadius: "var(--radius-control)", padding: "10px 12px",
         }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
             <div style={{ fontSize: 13, fontWeight: 600 }}>⚡ Pro Mode — run shell commands</div>
@@ -785,7 +785,7 @@ export function AgentForm({
         </label>
 
         {/* M1.4 #5: Generate a Soul.md — the agent authors its own personality. */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "12px 14px" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "10px 12px" }}>
           <div style={{ fontSize: 13, fontWeight: 600 }}>✨ Generate a Soul</div>
           <span style={{ ...hint, fontSize: 12 }}>Let the agent write its own personality &amp; values. It fills the field above — you can edit before saving.</span>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -800,7 +800,7 @@ export function AgentForm({
         </div>
 
         {/* M1.4 #4: Per-agent context documents. */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "12px 14px" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "10px 12px" }}>
           <div style={{ fontSize: 13, fontWeight: 600 }}>Context documents</div>
           <span style={{ ...hint, fontSize: 12 }}>Reference files this agent always has in mind (text, markdown, code, JSON…). Stored privately — never inside your folder.</span>
           {ctxDocs.length > 0 && (
@@ -825,7 +825,7 @@ export function AgentForm({
         </div>
 
         {/* SHARED CONTEXT — read-only mounts of other agents' folders. */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "12px 14px" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "10px 12px" }}>
           <div style={{ fontSize: 13, fontWeight: 600 }}>Shared context</div>
           <span style={{ ...hint, fontSize: 12 }}>
             Let this agent <strong>read</strong> another agent’s folder — its memory, notes and project
@@ -881,7 +881,7 @@ export function AgentForm({
         </div>
 
         {/* IMPORT MEMORY — bring an existing memory vault into this agent + ingest. */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "12px 14px" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "10px 12px" }}>
           <div style={{ fontSize: 13, fontWeight: 600 }}>Import memory</div>
           <span style={{ ...hint, fontSize: 12 }}>
             Bring an existing memory vault (Memory/ + Daily/ notes) into this agent’s folder and
@@ -960,7 +960,7 @@ function TelegramCard({ agentId, initial, onSaved }: { agentId: string | null; i
     try { await invoke("telegram_set_token", { agentId, token: "" }); setStatus((s) => s ? { ...s, has_token: false, enabled: false, bot_username: "" } : s); setMsg("Telegram disconnected."); } catch (e) { setMsg(String(e)); }
   }
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "12px 14px" }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 8, background: "var(--surface)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)", padding: "10px 12px" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
         <div style={{ fontSize: 13, fontWeight: 600 }}>Telegram — message this agent</div>
         {status?.has_token && (

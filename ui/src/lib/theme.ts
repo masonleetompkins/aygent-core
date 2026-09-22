@@ -41,7 +41,7 @@ export function applyTheme(mode: Mode, accentHex: string) {
 
 export function loadTheme(): { mode: Mode; accent: string } {
   const raw = localStorage.getItem(LS_MODE) as Mode | null;
-  const mode: Mode = (raw === "dark" || raw === "neutral" || raw === "matrix") ? raw : "light";
+  const mode: Mode = (raw === "light" || raw === "neutral" || raw === "matrix") ? raw : "dark";
   const accent = localStorage.getItem(LS_ACCENT) || "";
   return { mode, accent };
 }
