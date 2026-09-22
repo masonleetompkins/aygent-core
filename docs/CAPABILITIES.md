@@ -1,4 +1,4 @@
-# AYGENT — Capabilities (v1.0.16)
+# AYGENT — Capabilities (v1.0.17)
 
 _The canonical reference for what AYGENT can do, as shipped in the signed,
 notarized release. This is the source-of-truth capability doc: keep it in
@@ -71,6 +71,14 @@ $20 one-time. macOS 13+. Developer ID signed + Apple-notarized.
   offload to GPU instead of dropping to CPU. Switching models frees the old
   one's memory. Power-user HF search is unfiltered — any GGUF you can find,
   you can run.
+- **MLX (Apple-silicon, 1.0.17):** Mac-native local models (`mlx-community/*`)
+  via an in-app sidecar server (uv-managed Python, nothing outside the app).
+  Search finds MLX repos, pulls stream per-file progress into a local library
+  (resume included), the Agents picker lists pulled models with sizes, chat
+  streams at $0. Chat-only for now (no file tools). A fail-fast warm-up turns
+  unloadable models into a clear error instead of a hang, and a stream
+  watchdog guards stalled replies. Repos that ship their own loader code run
+  only with your explicit per-model Allow in Settings.
 
 ## 4. Chat — context meter, cost, and compaction (new in 1.0.1)
 - **Live context-window meter:** the chat header shows how full the model's
@@ -230,6 +238,7 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 ---
 
 ## Changelog
+- **1.0.17** (2026-09-21): **Apple MLX local models** — Mac-native `mlx-community/*` weights via an in-app sidecar: HF search surfaces MLX repos, pulls stream per-file progress into a local library with resume, the Agents picker lists pulled models, chat streams at $0 with fail-fast warm-up plus stream watchdog. Chat-only for now; packs shipping their own loader code require explicit per-model Allow.
 - **1.0.16** (2026-09-09): **Video Editor tab + chat upgrades** — a new Video tab: agentic NLE with real playback, hardlink media import, timeline (linked V+A clips, razor/review lanes), transcript + Hyperframes captions/graphics overlays, color grade + LUTs, local neural dialogue cleanup (DeepFilterNet3, live blend) with per-selection Clean Audio, Premiere-style media bins, review notes the agent can see and act on, and canvas vision (`video_look`). Still new and rough around the edges — under active polish. Chat: **streaming side-by-side diff view** on every code edit (before/red left, after/green right, live +N/-N counts), **drag-and-drop file attach**, long-task **timer picker** (1/3/5/10/15 min), OpenCode-parity usage billing + accent context pill, per-agent Muse Spark variant knob. Fixes along the way: Muse image budget (no more 400s), sidebar overflow, Create-button clipping, Clean Audio static master + audible-only counts.
 - **1.0.12** (2026-09-04): **Local-only setups no longer blocked by a phantom Anthropic-key check** — the chat "ready" gate was hardwired to `has_provider_key("anthropic")`, so an agent on a **local model** (or OpenAI/OpenRouter/Muse-only) saw "add an Anthropic key in Settings" and a disabled composer even though the backend needed no such key. The gate is now per-agent: `local` is always ready, cloud providers check **their own** key, and the hint names the real provider. Active-agent profile is re-read on screen change so switching provider in Settings takes effect immediately.
 - **1.0.11** (2026-09-03): **Web search + Brave + Playwright** — `web_search` builtin (no-key DuckDuckGo search, wired on every provider path incl. local models and dashboard buttons); **Brave Search connector** (keyed web/news/image/video search); **Playwright MCP** one-click browser automation (isolated Chromium, provisioned Node, no system installs).
@@ -261,4 +270,4 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 - **1.0.0** (2026-08-10): Signed/notarized launch — whoami tool, GFM tables,
   dashboards, sparks, remote.
 
-_Last updated 2026-09-09 for 1.0.16. If you add a capability, add it here._
+_Last updated 2026-09-21 for 1.0.17. If you add a capability, add it here._
