@@ -1096,6 +1096,31 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           </div>
         </div>
 
+        {/* COMMAND PRO threads: parallel sessions, one tab per conv. */}
+        {!blocked && tabs.length > 0 && (
+          <div className="aygent-scroll" style={{ display: "flex", gap: 6, overflowX: "auto", padding: "2px 0 8px", flexShrink: 0 }}>
+            {tabs.map((id) => {
+              const active = id === convId;
+              const title = threadTitle(id);
+              const r = agentId ? isRunning(turnSlotKey(agentId, id)) : false;
+              const om = getThreadModel(id);
+              return (
+                <span key={id} onClick={() => { if (id !== convId) void openConv(id); }}
+                  title={title + (om ? " - " + om.model : "")}
+                  style={{ display: "inline-flex", alignItems: "center", gap: 6, maxWidth: 220, padding: "5px 6px 5px 10px", borderRadius: 999, fontSize: 12.5, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0, border: active ? "1px solid var(--accent)" : "1px solid var(--line)", background: active ? "var(--surface)" : "transparent", color: "var(--text)", fontWeight: active ? 700 : 500 }}>
+                  <span style={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: r ? "var(--accent)" : "var(--text-faint)", animation: r ? "aygentPulse 1.1s ease-in-out infinite" : "none" }} />
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{title}</span>
+                  {tabs.length > 1 && (
+                    <button onClick={(e) => { e.stopPropagation(); closeTab(id); }} title="Close thread"
+                      style={{ background: "none", border: "none", cursor: "pointer", padding: "0 2px", color: "var(--text-faint)", display: "flex" }}><Icon name="close" size={12} /></button>
+                  )}
+                </span>
+              );
+            })}
+            <button onClick={() => newConv()} title="New thread (parallel session)"
+              style={{ flexShrink: 0, borderRadius: 999, fontSize: 12.5, fontWeight: 600, padding: "5px 12px", cursor: "pointer", border: "1px dashed var(--line)", background: "transparent", color: "var(--text-muted)" }}>+ New</button>
+          </div>
+        )}
         {blocked && (
           <p style={{ ...hint, marginBottom: 12 }}>
             {!folder ? "Pick an Agent Folder in Settings, " : ""}{!keySet ? `add ${providerLabel(providerRef.current)} key in Settings (or switch this agent to a local model)` : ""} to start.
@@ -1133,6 +1158,17 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           <div ref={bottomRef} aria-hidden style={{ height: 8, flexShrink: 0 }} />
         </div>
 
+        {/* COMMAND PRO toasts: background-thread done / needs-input. */}
+        {toasts.length > 0 && (
+          <div style={{ position: "absolute", right: 12, bottom: 76, display: "flex", flexDirection: "column", gap: 8, zIndex: 40, maxWidth: 340 }}>
+            {toasts.map((t) => (
+              <div key={t.id} style={{ background: "var(--surface)", border: t.kind === "needs-input" ? "1px solid var(--warn)" : "1px solid var(--line)", borderRadius: 10, padding: "9px 12px", boxShadow: "0 8px 28px rgba(0,0,0,0.3)", fontSize: 12.5 }}>
+                <div style={{ fontWeight: 700 }}>{t.agentName} - {t.threadTitle} - {t.kind === "needs-input" ? "needs you" : "done"}</div>
+                <div style={{ color: "var(--text-muted)", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.body}</div>
+              </div>
+            ))}
+          </div>
+        )}
         {/* Task #5: attachment chips above the input */}
         {attachments.length > 0 && (
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8, padding: "0 8px" }}>
@@ -1301,7 +1337,7 @@ function HistorySidebar({
             borderLeft: "var(--border-width) solid var(--line)", paddingLeft: 14,
           }),
     }}>
-      <Button onClick={onNew} disabled={busy}>+ New chat</Button>
+      <Button onClick={onNew} disabled={false}>+ New thread</Button>
       <div ref={listElRef} className="aygent-scroll" style={{ overflowY: "auto", display: "flex", flexDirection: "column", gap: 4, marginTop: 4, flex: 1, minHeight: 0 }}>
         {convs.length === 0 && (
           <p style={{ ...hint, fontSize: 13, color: "var(--text-faint)" }}>No chats yet.</p>
