@@ -92,7 +92,7 @@ export function Settings({
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: 620 }}>
-      <h2 style={{ fontSize: "var(--text-h1)", fontWeight: "var(--weight-heading)", margin: 0 }}>Settings</h2>
+      <h2 style={{ fontSize: 15, fontWeight: 700, margin: 0 }}>Settings <kbd className="pro-kbd">⌘,</kbd></h2>
 
       {/* APPEARANCE — at the top. */}
       <Card title="Appearance">

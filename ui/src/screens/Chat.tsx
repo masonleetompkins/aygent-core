@@ -1033,6 +1033,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               disabled={!folder || !convId}
               onRename={(next) => renameCurrent(next)}
             />
+            {/* COMMAND PRO per-thread model override (B1): null = agent default. */}
+            {!!folder && !!convId && (
+              <ThreadModelPicker
+                agentDefault={{ provider: providerRef.current || agent?.provider || "anthropic", model: modelRef.current || agent?.model || "" }}
+                value={getThreadModel(convId)}
+                onChange={(v) => { if (convId) setThreadModel(convId, v); }}
+              />
+            )}
             {/* CONTEXT METER + $ COST (Mason, this session): a compact row under
                the chat title showing how full the model's context window is and
                the running cost of this session, so you SEE the wall coming and
@@ -1470,6 +1478,45 @@ function ChatTitle({ title, disabled, onRename }: { title: string; disabled: boo
       <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{title || "Untitled"}</span>
       <Icon name="pencil" size={13} style={{ opacity: 0.6 }} />
     </button>
+  );
+}
+
+const THREAD_PROVIDERS = ["anthropic", "openai", "openrouter", "meta", "local", "mlx"];
+function ThreadModelPicker({ agentDefault, value, onChange }: {
+  agentDefault: { provider: string; model: string };
+  value: { provider: string; model: string } | null;
+  onChange: (v: { provider: string; model: string } | null) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [prov, setProv] = useState(value?.provider || agentDefault.provider);
+  const [mod, setMod] = useState(value?.model || agentDefault.model);
+  useEffect(() => { setProv(value?.provider || agentDefault.provider); setMod(value?.model || agentDefault.model); }, [value?.provider, value?.model, agentDefault.provider, agentDefault.model]);
+  if (!editing) {
+    const label = value ? (value.model || value.provider) + " (thread)" : (agentDefault.model || agentDefault.provider) + " (agent)";
+    return (
+      <button onClick={() => setEditing(true)} title="Override model for this thread only — other threads keep the agent default"
+        style={{ marginTop: 4, display: "inline-flex", alignItems: "center", gap: 6, background: "transparent", border: "1px solid var(--line)", borderRadius: 999, cursor: "pointer", padding: "3px 10px", color: "var(--text-muted)", fontSize: 12, fontFamily: "ui-monospace, monospace", maxWidth: 360 }}>
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span>
+        <span style={{ opacity: 0.6 }}>▾</span>
+      </button>
+    );
+  }
+  return (
+    <span style={{ marginTop: 4, display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+      <select value={prov} onChange={(e) => setProv(e.target.value)}
+        style={{ background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, color: "var(--text)", padding: "3px 6px", fontSize: 12 }}>
+        {THREAD_PROVIDERS.map((x) => <option key={x} value={x}>{x}</option>)}
+      </select>
+      <input value={mod} onChange={(e) => setMod(e.target.value)} placeholder="model id (blank = auto)"
+        spellCheck={false}
+        style={{ background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, color: "var(--text)", padding: "3px 8px", fontSize: 12, fontFamily: "ui-monospace, monospace", width: 200 }} />
+      <button onClick={() => { onChange(mod.trim() || prov !== agentDefault.provider ? { provider: prov, model: mod.trim() } : null); setEditing(false); }}
+        style={{ background: "var(--accent)", color: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, padding: "3px 10px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Set</button>
+      {value && <button onClick={() => { onChange(null); setEditing(false); }} title="Back to agent default"
+        style={{ background: "transparent", border: "1px solid var(--line)", borderRadius: 7, padding: "3px 10px", fontSize: 12, cursor: "pointer", color: "var(--text-muted)" }}>Reset</button>}
+      <button onClick={() => setEditing(false)}
+        style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-faint)", fontSize: 12 }}>✕</button>
+    </span>
   );
 }
 

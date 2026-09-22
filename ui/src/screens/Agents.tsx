@@ -205,7 +205,7 @@ export function Agents({
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: 720 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <h2 style={{ margin: 0, fontSize: "var(--text-h1)", fontWeight: "var(--weight-heading)" }}>Agents</h2>
+        <h2 style={{ margin: 0, fontSize: 15, fontWeight: 700 }}>Agents <kbd className="pro-kbd">⌘2</kbd></h2>
         <Button onClick={() => setCreating(true)}>+ New Agent</Button>
       </div>
       <p style={hint}>
@@ -252,10 +252,12 @@ export function Agents({
             }}><Icon name={(a.icon as IconName) || "sparkles"} size={26} /></div>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span style={{ fontWeight: 700, fontSize: 16 }}>{a.name}</span>
+                <span style={{ fontWeight: 700, fontSize: 14 }}>{a.name}</span>
+                <span className="pro-pill">{a.provider || "anthropic"}</span>
+                <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{a.context_mode}</span>
               </div>
               <div style={{ fontSize: 12, color: "var(--text-faint)", fontFamily: "ui-monospace, monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {a.folder_path || "no folder"} · {a.model || "auto"}{a.model_variant ? ` · ${a.model_variant}` : ""} · {a.provider || "anthropic"} · {a.context_mode}
+                {a.folder_path || "no folder"} · {a.model || "auto"}{a.model_variant ? ` · ${a.model_variant}` : ""}
               </div>
             </div>
             <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>

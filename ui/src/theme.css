@@ -144,6 +144,7 @@ body {
   background: var(--bg); border: 1px solid var(--line);
   border-radius: 5px; padding: 1px 6px; white-space: nowrap;
 }
+.pro-pill { font-size: 11px; padding: 2px 9px; border-radius: 999px; background: var(--bg); border: 1px solid var(--line); color: var(--text-muted); white-space: nowrap; }
 .pro-row-active {
   background: var(--surface) !important;
   border-color: var(--line) !important;
