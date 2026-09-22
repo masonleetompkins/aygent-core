@@ -1578,7 +1578,7 @@ function BubbleBody({ m, isUser, memory, agentId, local, price }: { m: Msg; isUs
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "stretch", minWidth: 0, flex: 1 }}>
       <div style={{
-        width: "100%",
+        width: "auto",
         minWidth: 0,
         overflowWrap: "anywhere",
         background: isUser
