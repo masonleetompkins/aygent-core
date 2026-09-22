@@ -178,7 +178,7 @@ export function Dashboard({
       {/* ---- header ---- */}
       <div style={{ display: "flex", alignItems: "flex-end", gap: 12, flexWrap: "wrap" }}>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 26, fontWeight: 700, letterSpacing: "-0.01em" }}>
+          <div style={{ fontSize: 17, fontWeight: 700, letterSpacing: "-0.01em" }}>
             {view?.title ?? "Dashboard"}
           </div>
           <div style={{ fontSize: 13, color: "var(--text-muted)", marginTop: 2 }}>
