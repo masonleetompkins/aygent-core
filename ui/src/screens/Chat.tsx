@@ -1570,30 +1570,23 @@ function fmtClock(ms?: number): string {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
-/** Fixed-width gutter stamp. Reserves its width even when empty so bubbles
- *  don't shift horizontally between stamped and unstamped messages. */
-function Stamp({ at, usage, price }: { at?: number; usage?: TurnUsage; price?: ModelPrice }) {
-  // Under the timestamp: tokens used + $ cost for THIS turn (Mason, this
-  // session). Tokens = input+output for the turn; cost from the model price.
+/** One-line meta stamp UNDER the message: clock · tokens · cost. Renders
+ *  nothing when there is nothing to show, so rows never shift. */
+function MetaStamp({ at, usage, price, align }: { at?: number; usage?: TurnUsage; price?: ModelPrice; align: "left" | "right" }) {
   const cost = usage ? turnCost(usage, price) : 0;
-  // Tokens this turn = the model's real INPUT (fresh + cached) + output, so it
-  // matches the top meter for the latest turn (was input+output, missing cache).
   const ctxIn = usage ? ((usage.contextInput ?? 0) || (usage.input + usage.cacheRead + usage.cacheWrite)) : 0;
   const toks = usage ? ctxIn + usage.output : 0;
+  const parts: string[] = [];
+  const clock = fmtClock(at);
+  if (clock) parts.push(clock);
+  if (usage && toks > 0) parts.push(fmtTokens(toks) + " tok");
+  if (cost > 0) parts.push(fmtCost(cost));
+  if (parts.length === 0) return null;
   return (
-    <span style={{
-      width: 62, flexShrink: 0, textAlign: "center", display: "flex",
-      flexDirection: "column", alignItems: "center", gap: 1,
-      fontSize: 11, lineHeight: "16px", color: "var(--text-faint)",
-      fontVariantNumeric: "tabular-nums", userSelect: "none",
-    }}>
-      <span style={{ lineHeight: "18px" }}>{fmtClock(at)}</span>
-      {usage && toks > 0 && (
-        <span title={`${ctxIn.toLocaleString()} in (incl. cache) + ${(usage.output).toLocaleString()} out tokens`}
-          style={{ fontSize: 9.5, lineHeight: "12px", opacity: 0.85 }}>
-          {fmtTokens(toks)} tok{cost > 0 ? <><br/>{fmtCost(cost)}</> : null}
-        </span>
-      )}
+    <span
+      title={usage ? ctxIn.toLocaleString() + " in (incl. cache) + " + (usage.output).toLocaleString() + " out tokens" : undefined}
+      style={{ fontSize: 11, lineHeight: "16px", color: "var(--text-faint)", fontVariantNumeric: "tabular-nums", userSelect: "none", textAlign: align }}>
+      {parts.join(" · ")}
     </span>
   );
 }
@@ -1601,20 +1594,19 @@ function Stamp({ at, usage, price }: { at?: number; usage?: TurnUsage; price?: M
 function Bubble({ m, agentId, price, local }: { m: Msg; agentId?: string | null; price?: ModelPrice; local?: boolean }) {
   const isUser = m.role === "user";
   const memory = isUser && m.role === "user" ? m.memory : undefined;
-  // The stamp lives OUTSIDE the bubble column, in the margin: to the LEFT of
-  // the agent's replies and to the RIGHT of the user's prompts.
+  // Full-bleed rows: no margin gutters. Clock/tokens/cost ride as one faint
+  // line UNDER the message (MetaStamp, rendered in BubbleBody).
   return (
-    <div style={{ display: "flex", alignItems: "flex-start", justifyContent: isUser ? "flex-end" : "flex-start", gap: 2, width: "100%" }}>
-      {!isUser && <Stamp at={m.at} usage={m.role === "assistant" ? m.usage : undefined} price={price} />}
-      <BubbleBody m={m} isUser={isUser} local={local} memory={memory} agentId={agentId} />
-      {isUser && <Stamp at={m.at} />}
+    <div style={{ display: "flex", alignItems: "flex-start", width: "100%" }}>
+      <BubbleBody m={m} isUser={isUser} local={local} memory={memory} agentId={agentId} price={price} />
     </div>
   );
 }
 
-function BubbleBody({ m, isUser, memory, agentId, local }: { m: Msg; isUser: boolean; memory?: string; agentId?: string | null; local?: boolean }) {
+function BubbleBody({ m, isUser, memory, agentId, local, price }: { m: Msg; isUser: boolean; memory?: string; agentId?: string | null; local?: boolean; price?: ModelPrice }) {
+  const usage = !isUser && m.role === "assistant" ? m.usage : undefined;
   return (
-    <div style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start", minWidth: 0, flex: 1 }}>
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "stretch", minWidth: 0, flex: 1 }}>
       <div style={{
         width: "100%",
         minWidth: 0,
@@ -1672,8 +1664,9 @@ function BubbleBody({ m, isUser, memory, agentId, local }: { m: Msg; isUser: boo
         )}
         {!isUser && m.role === "assistant" && m.streaming && !m.text && <Thinking />}
       </div>
+      <MetaStamp at={m.at} usage={usage} price={price} align={isUser ? "right" : "left"} />
       {memory && (
-        <span style={{ marginTop: 3, marginRight: 4, fontSize: 12, color: "#3fa46a" }}>{memory}</span>
+        <span style={{ marginTop: 3, alignSelf: isUser ? "flex-end" : "flex-start", fontSize: 12, color: "#3fa46a" }}>{memory}</span>
       )}
     </div>
   );
