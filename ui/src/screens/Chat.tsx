@@ -98,6 +98,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   multi: boolean; closable: boolean; onClose: () => void;
 }) {
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyCollapsed, setHistoryCollapsed] = useState(false);
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   // `busy` is now DERIVED from the per-agent turn store (see `running` below),
@@ -368,7 +369,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // Reset to auto first so it can SHRINK too; when empty, scrollHeight collapses
   // to one line. Cap ~200px (~8 lines), not 50vh (that let an empty box balloon
   // to half the window inside the flex column). Mason 07-28.
-  const prevTaHeightRef = useRef<number>(44);
+  const prevTaHeightRef = useRef<number>(38);
   useLayoutEffect(() => {
     const ta = taRef.current; if (!ta) return;
     const prev = prevTaHeightRef.current;
@@ -1087,6 +1088,13 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
             )}
           </div>
           <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          {!multi && !blocked && (
+            <button
+              onClick={() => setHistoryCollapsed((v) => !v)}
+              title={historyCollapsed ? "Show history" : "Hide history"}
+              style={{ background: historyCollapsed ? "var(--surface)" : "none", border: "1px solid var(--line)", cursor: "pointer", padding: 4, display: "flex", color: "var(--text-muted)", borderRadius: 7 }}
+            ><Icon name="chat" size={14} /></button>
+          )}
           {multi && !blocked && (
             <button
               onClick={() => setHistoryOpen((o) => !o)}
@@ -1137,8 +1145,8 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
         {/* Messages bottom-align: newest sits just above the input, older scroll
            up (justifyContent flex-end + margin-top auto on the list wrapper). */}
-        <div ref={scrollRef} className="aygent-scroll" style={{ flex: 1, overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", padding: "6px 8px 36px 8px" }}>
-          <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 14 }}>
+        <div ref={scrollRef} className="aygent-scroll" style={{ flex: 1, overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", padding: "4px 6px 24px 2px" }}>
+          <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 10 }}>
           {msgs.length === 0 && !running && !blocked && (
             <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
           )}
@@ -1217,7 +1225,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
           {/* Task #7: mic — record voice, Whisper transcribes into the input */}
           <button onClick={toggleMic} disabled={blocked} title={rec === "recording" ? "Stop recording" : "Record voice"}
             style={{
-              width: 40, height: 44, flexShrink: 0, cursor: "pointer",
+              width: 36, height: 38, flexShrink: 0, cursor: "pointer",
               // center the SVG glyph (Mason's screenshot: it sat top-left; a raw
               // button only centers TEXT, not inline SVG).
               display: "flex", alignItems: "center", justifyContent: "center", padding: 0,
@@ -1230,7 +1238,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
             onChange={(e) => { void onFilesPicked(e.target.files); e.target.value = ""; }} />
           <button onClick={() => fileRef.current?.click()} disabled={blocked} title="Attach files as context"
             style={{
-              width: 40, height: 44, flexShrink: 0, cursor: "pointer",
+              width: 36, height: 38, flexShrink: 0, cursor: "pointer",
               display: "flex", alignItems: "center", justifyContent: "center", padding: 0,
               background: "var(--bg)", border: "var(--border-width) solid var(--line)",
               borderRadius: "var(--radius-control)", color: "var(--text-muted)", fontSize: 20,
@@ -1268,7 +1276,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               // fixed single-line start; JS auto-grow adjusts height up to 200px.
               // NO flex-stretch on height: alignItems:flex-end on the row + a set
               // height keep it compact instead of filling the column.
-              height: 44, maxHeight: 200, lineHeight: 1.5,
+              height: 38, maxHeight: 200, lineHeight: 1.45,
               boxSizing: "border-box",
               background: "var(--bg)", border: "var(--border-width) solid var(--line)",
               borderRadius: "var(--radius-control)", color: "var(--text)", padding: "10px 12px",
@@ -1279,7 +1287,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       </div>
 
       {/* HISTORY SIDEBAR — in multi-pane, behind hamburger to save space; solo, always visible */}
-      {!blocked && !multi && (
+      {!blocked && !multi && !historyCollapsed && (
         <HistorySidebar
           multi={multi}
           convs={convs} activeId={convId} busy={running} dragId={dragId} overId={overId}
@@ -1608,14 +1616,20 @@ function BubbleBody({ m, isUser, memory, agentId, local }: { m: Msg; isUser: boo
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start", minWidth: 0, flex: 1 }}>
       <div style={{
-        maxWidth: "90%",
+        maxWidth: "100%",
         minWidth: 0,
         overflowWrap: "anywhere",
-        background: isUser ? "var(--accent)" : "var(--surface)",
-        color: isUser ? "var(--bg)" : "var(--text)",
-        border: "1px solid var(--line)",
-        borderRadius: 10,
-        padding: "9px 12px",
+        ...(isUser ? { marginLeft: "auto", maxWidth: "92%" } : {}),
+        background: isUser
+          ? "color-mix(in srgb, var(--accent) 12%, transparent)"
+          : "color-mix(in srgb, var(--text) 5%, transparent)",
+        color: "var(--text)",
+        border: "none",
+        borderLeft: isUser
+          ? "2px solid var(--accent)"
+          : "2px solid color-mix(in srgb, var(--text) 25%, transparent)",
+        borderRadius: "0 8px 8px 0",
+        padding: "8px 12px",
         display: "flex", flexDirection: "column", gap: 6,
       }}>
         {/* ORDERED RENDER (Mason 08-04): when a timeline exists, draw tool cards
@@ -1646,7 +1660,7 @@ function BubbleBody({ m, isUser, memory, agentId, local }: { m: Msg; isUser: boo
           <>
             {!isUser && m.role === "assistant" && m.tools.map((t, i) => <ToolCard key={i} t={t} agentId={agentId} />)}
             {m.text && (isUser
-              ? <span style={{ whiteSpace: "pre-wrap", lineHeight: 1.55, fontSize: 14 }}>{m.text}</span>
+              ? <span style={{ display: "block", textAlign: "right", whiteSpace: "pre-wrap", lineHeight: 1.55, fontSize: 14 }}>{m.text}</span>
               : <TextWithThoughts text={m.text} streaming={(m as { streaming?: boolean }).streaming} enabled={local} />)}
           </>
         )}

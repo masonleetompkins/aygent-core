@@ -195,7 +195,7 @@ export function AgentRail({
         onClick={onManage}
         title="Manage agents"
         style={{
-          width: 42, height: 42, borderRadius: "var(--radius-pill)", border: "var(--border-width) dashed var(--line)",
+          width: 36, height: 36, borderRadius: "var(--radius-pill)", border: "var(--border-width) dashed var(--line)",
           background: "transparent", color: "var(--text-muted)", cursor: "pointer",
           display: "flex", alignItems: "center", justifyContent: "center",
         }}
@@ -212,7 +212,7 @@ export function AgentRail({
             : "Remote: offline (still paired). Click to go online."}
           style={{
             position: "relative",
-            width: 42, height: 42, borderRadius: "var(--radius-pill)",
+            width: 36, height: 36, borderRadius: "var(--radius-pill)",
             border: "var(--border-width) solid transparent",
             background: "transparent", cursor: "pointer",
             color: remote.enabled && remote.running ? "var(--accent)" : "var(--text-muted)",
