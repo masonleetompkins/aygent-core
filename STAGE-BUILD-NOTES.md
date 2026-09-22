@@ -1,3 +1,42 @@
+# Stage build — 2026-09-22 ~16:05 PDT — v1.0.17 (tool-wiring audit fixes)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit (on `staging`, pushed to `origin/staging`):**
+- `1a5cdde` — fix(tools): always expose dashboard/video/sparks; page read_file; append_file; raise connector caps; OpenAI output budget
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app` (`Contents/MacOS/aygent` 41980856 bytes), mtime **Sep 22 15:53**
+- dmg: `dmg/AYGENT_1.0.17_aarch64.dmg`, **18181469 bytes (~17.3 MB)**, mtime **Sep 22 15:53**
+- verified: `append_file` (x8) + `max_completion_tokens` + `re-read with a smaller limit` in shipped binary
+
+**What changed (tool audit vs the Mac repo):**
+1. **Agents with no connections get their tools back** — dashboard, all 18 video tools, `spark_preview`, whoami, + Sparks skill were gated on `conn_ctx.is_some()`. Now gated on `agent_id.is_some()`. This was the "agent narrates bash commands" symptom: with no enabled connections the model had no tool for the job.
+2. **Shell/browser gating uses the live folder** — resolves `folder_path` from the agent profile first, falling back to the UI legacy `folder` string (which can be None/stale and silently dropped to Folder Mode / no browsing).
+3. **Local models can rename/delete** — `rename_file`/`delete_file` added to the local parser allowlist + prompt (executor already handled them).
+4. **`read_file` pages** — `offset`/`limit` (2000-line default, small files byte-identical); over-limit reads name the exact next offset instead of blowing context and truncating mid-JSON in transit.
+5. **New `append_file` tool** — jailed, atomic tmp+rename, same durability as `write_file`. First chunk: `write_file`; following chunks: `append_file`. Write descriptions carry the ~15k/call guidance.
+6. **Connector caps raised 4KB to 12KB** with honest "narrow the request" notices; list renders say "showing 50 of N".
+7. **OpenAI/OpenRouter output budget** — `max_tokens: 16384` (`max_completion_tokens: 64000` for reasoning models), tool turns only.
+8. **`whoami` lists `append_file`** so the inventory cannot drift from the registry.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~8 min)
+1. **No-connection agent** — new agent, no connections, ask for a dashboard stat + a video project overview → both tools fire, no narrated bash.
+2. **Paging** — read a 5000-line file → returns lines 1-2000 + exact resume offset; `offset: 2001` continues.
+3. **Append** — write a big file in 3 chunks (write + 2 appends) → single complete file, no truncation error.
+4. **whoami** — "what can you do?" lists `append_file` under Built-in.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
 # Stage build — 2026-09-21 ~afternoon PDT — v1.0.16 (MLX fail-fast: warm-up + watchdog)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
