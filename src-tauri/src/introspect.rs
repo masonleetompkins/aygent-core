@@ -27,6 +27,7 @@ use tauri::AppHandle;
 const CORE_TOOLS: &[(&str, &str)] = &[
     ("read_file", "Read a UTF-8 text file inside the agent folder."),
     ("write_file", "Create or overwrite a text file inside the agent folder."),
+    ("append_file", "Add text to the end of a file without rewriting it."),
     ("list_files", "List directory entries inside the agent folder."),
     ("rename_file", "Rename or move a file inside the agent folder."),
     ("delete_file", "Delete a file inside the agent folder."),

@@ -2486,6 +2486,7 @@ fn local_tool_capability(path: String) -> gguf::ToolCapability {
 const CORE_TOOLS: &[(&str, &str, &str)] = &[
     ("read_file", "Read files", "Read a UTF-8 text file inside the agent folder."),
     ("write_file", "Write files", "Create or overwrite a text file inside the agent folder."),
+    ("append_file", "Append to files", "Add text to the end of a file without rewriting it (for content too large for one write)."),
     ("list_files", "List files", "List directory entries inside the agent folder."),
     ("rename_file", "Rename / move files", "Rename or move a file inside the agent folder."),
     ("delete_file", "Delete files", "Delete a file inside the agent folder."),
@@ -3371,7 +3372,9 @@ async fn agent_run(
                                 use std::io::Read;
                                 let mut s = String::new();
                                 match f.read_to_string(&mut s) {
-                                    Ok(_) => (s, false),
+                                    // PAGED (2026-09-22): whole-file returns blew the context
+                                    // on large files and truncated mid-JSON in transit.
+                                    Ok(_) => paged_read(&s, input),
                                     Err(e) => (format!("io error: {e}"), true),
                                 }
                             }
@@ -3626,6 +3629,29 @@ fn exec_tool(
     exec_tool_cfg(broker, agent_id, name, input, &serde_json::json!({}))
 }
 
+/// Page a file's text for the model (2026-09-22): default the first 2000 lines,
+/// `offset`/`limit` page through, hard char cap as a backstop. Small files pass
+/// through byte-identical (no notice, no behavior change).
+fn paged_read(s: &str, input: &serde_json::Value) -> (String, bool) {
+    let total_lines = s.lines().count();
+    let offset = input.get("offset").and_then(|o| o.as_u64()).unwrap_or(1).max(1) as usize;
+    let limit = input.get("limit").and_then(|l| l.as_u64()).unwrap_or(2000).clamp(1, 5000) as usize;
+    if offset == 1 && total_lines <= limit && s.chars().count() <= 30_000 {
+        return (s.to_string(), false);
+    }
+    let start = (offset - 1).min(total_lines);
+    let end = (start + limit).min(total_lines);
+    let mut out: String = s.lines().skip(start).take(end - start).collect::<Vec<_>>().join("\n");
+    if end < total_lines {
+        out.push_str(&format!("\n\n[… lines {}–{} of {} — read more with read_file(path, offset: {}, limit: N)]", start + 1, end, total_lines, end + 1));
+    }
+    if out.chars().count() > 30_000 {
+        let cut: String = out.chars().take(30_000).collect();
+        out = format!("{cut}\n\n[… output capped at 30000 chars — re-read with a smaller limit]");
+    }
+    (out, false)
+}
+
 /// Same as exec_tool, but with the PDF tool's per-folder config (font/colors/
 /// page-size/margins). `pdf_config` is {} when unavailable.
 fn exec_tool_cfg(
@@ -3649,7 +3675,9 @@ fn exec_tool_cfg(
                 use std::io::Read;
                 let mut s = String::new();
                 match f.read_to_string(&mut s) {
-                    Ok(_) => (s, false),
+                    // PAGED (2026-09-22): whole-file returns blew the context
+                    // on large files and truncated mid-JSON in transit.
+                    Ok(_) => paged_read(&s, input),
                     Err(e) => (format!("io error: {e}"), true),
                 }
             }
@@ -3682,6 +3710,56 @@ fn exec_tool_cfg(
                             match (t, d) {
                                 (Ok(t), Ok(d)) => match std::fs::rename(&t, &d) {
                                     Ok(_) => (format!("wrote {} bytes to {path}", cnt.len()), false),
+                                    Err(e) => { let _ = std::fs::remove_file(&t); (format!("io error: {e}"), true) }
+                                },
+                                (Ok(t), Err(e)) => { let _ = std::fs::remove_file(&t); (format!("refused by jail: {e:?}"), true) }
+                                (Err(e), _) => (format!("refused by jail: {e:?}"), true),
+                            }
+                        }
+                        Err(e) => {
+                            if let Ok(t) = broker.resolve(agent_id, &tmp_rel, broker::Mode::Write) { let _ = std::fs::remove_file(&t); }
+                            (format!("io error: {e}"), true)
+                        }
+                    }
+                }
+                Err(e) => (format!("refused by jail: {e:?}"), true),
+            }
+        }
+        // APPEND (2026-09-22): add to the end of a file WITHOUT resending its
+        // whole content — the actionable answer to "split a big write into
+        // chunks". First chunk: write_file; following chunks: append_file.
+        // Same jail + atomic tmp+rename durability as write_file.
+        "append_file" => {
+            let cnt = input.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            if cnt.is_empty() { return ("append_file needs `content`".into(), true); }
+            let target = match broker.resolve(agent_id, path, broker::Mode::Write) {
+                Ok(p) => p, Err(e) => return (format!("refused by jail: {e:?}"), true),
+            };
+            let mut cur = String::new();
+            if target.is_file() {
+                match std::fs::read_to_string(&target) {
+                    Ok(t) => cur = t,
+                    Err(_) => return (format!("'{path}' is not a text file — append_file only appends to text"), true),
+                }
+            } else if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            cur.push_str(cnt);
+            let tmp_rel = format!("{path}.aygent-tmp-{}",
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos()).unwrap_or(0));
+            match broker.resolve_and_open(agent_id, &tmp_rel, broker::Mode::Write) {
+                Ok(mut f) => {
+                    use std::io::Write as _;
+                    match f.write_all(cur.as_bytes()).and_then(|_| f.flush()) {
+                        Ok(_) => {
+                            let _ = f.sync_all();
+                            drop(f);
+                            let t = broker.resolve(agent_id, &tmp_rel, broker::Mode::Write);
+                            let d = broker.resolve(agent_id, path, broker::Mode::Write);
+                            match (t, d) {
+                                (Ok(t), Ok(d)) => match std::fs::rename(&t, &d) {
+                                    Ok(_) => (format!("appended {} bytes to {path} (now {} bytes)", cnt.len(), cur.len()), false),
                                     Err(e) => { let _ = std::fs::remove_file(&t); (format!("io error: {e}"), true) }
                                 },
                                 (Ok(t), Err(e)) => { let _ = std::fs::remove_file(&t); (format!("refused by jail: {e:?}"), true) }
@@ -3922,9 +4000,11 @@ fn exec_shell_tool(agent_id: &str, name: &str, input: &serde_json::Value) -> (St
 /// — see base_tools_with_peers. This bare version is the file-only fallback.
 fn base_tools() -> Vec<serde_json::Value> {
     vec![
-        serde_json::json!({ "name": "read_file", "description": "Read a UTF-8 text file inside the agent folder. Path relative to folder root.",
-          "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } }),
-        serde_json::json!({ "name": "write_file", "description": "Write a UTF-8 text file inside the agent folder. Path relative to folder root.",
+        serde_json::json!({ "name": "read_file", "description": "Read a UTF-8 text file inside the agent folder. Path relative to folder root. Large files are PAGED (first 2000 lines by default) — pass offset (1-based line) + limit to read more; the reply says how many lines exist.",
+          "input_schema": { "type": "object", "properties": { "path": { "type": "string" }, "offset": { "type": "number", "description": "1-based line number to start from (default 1)" }, "limit": { "type": "number", "description": "max lines to return (default 2000, max 5000)" } }, "required": ["path"] } }),
+        serde_json::json!({ "name": "write_file", "description": "Write a UTF-8 text file inside the agent folder. Path relative to folder root. Keep each write under ~15000 chars of content — larger payloads risk truncation in transit (reported as a parse error). For bigger content: first chunk via write_file, the rest via append_file.",
+          "input_schema": { "type": "object", "properties": { "path": { "type": "string" }, "content": { "type": "string" } }, "required": ["path", "content"] } }),
+        serde_json::json!({ "name": "append_file", "description": "Add text to the END of a file inside the agent folder without rewriting it. Creates the file if missing. Use after write_file when content is too large for one call: first chunk via write_file, following chunks via append_file.",
           "input_schema": { "type": "object", "properties": { "path": { "type": "string" }, "content": { "type": "string" } }, "required": ["path", "content"] } }),
         serde_json::json!({ "name": "list_files", "description": "List entries in a directory inside the agent folder. Path relative to root; '.' for root.",
           "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } }),
@@ -4059,11 +4139,14 @@ fn agent_tools_for_full(
     if has_peers { tools.push(send_message_tool()); }
     let mut extra_instructions = String::new();
 
-    // CONNECTION TOOLS (M1.9): if GitHub is connected + enabled for this agent,
-    // surface its read tools. Token is attached Rust-side at call time.
-    // DASHBOARD TOOLS (M2): always available when we have an agent identity —
-    // every agent owns exactly one dashboard, so there is nothing to enable.
-    if conn_ctx.is_some() {
+    // DASHBOARD / VIDEO / SPARKS (M2/v0.3): ALWAYS offered when we have an agent
+    // identity — they need no connection and no credential (each agent owns its
+    // dashboard 1:1, video tools are jailed to the folder, spark_preview writes
+    // jailed HTML). These used to sit behind `conn_ctx.is_some()`, which silently
+    // stripped them from every agent with zero connections enabled — leaving the
+    // model with no tool for the job, narrating bash commands instead.
+    // (Connector tools below still need conn_ctx = a db + agent identity.)
+    if agent_id.is_some() {
         for schema in dashboard::tool_schemas() { tools.push(schema); }
         extra_instructions.push_str(dashboard::tool_instructions());
         // VIDEO v0.3: frame-accurate edit helpers (jailed; provisioned ffmpeg only).
@@ -4115,6 +4198,19 @@ fn agent_tools_for_full(
         }
     }
 
+    // EFFECTIVE FOLDER (2026-09-22): the UI's `folder` param is a legacy
+    // contract — it can be None or stale (folder moved since). Browser + shell
+    // gating must resolve the agent's LIVE folder from its profile (via
+    // conn_ctx's db) instead of silently dropping to no-browsing / Folder Mode,
+    // which left the model with no tool and narrating bash commands instead.
+    let live_folder: String = match conn_ctx {
+        Some((db, aid)) => crate::repo::get_agent(db, aid).ok().flatten()
+            .map(|a| a.folder_path).filter(|f| !f.is_empty())
+            .or_else(|| folder.map(String::from)).unwrap_or_default(),
+        None => folder.unwrap_or_default().to_string(),
+    };
+    let eff_folder: Option<&str> = if live_folder.is_empty() { None } else { Some(&live_folder) };
+
     // MCP TOOLS: every enabled+running MCP server contributes its tools,
     // namespaced mcp__<server>__<tool>. Start enabled servers first so their
     // tool lists are known. App-wide (not folder-scoped).
@@ -4129,7 +4225,7 @@ fn agent_tools_for_full(
     // has at least one allowed browsing domain, expose the browser_* tools.
     // Fails closed — no allowed domains => no agent browsing.
     if browser::is_installed(app) {
-        if let Some(f) = folder {
+        if let Some(f) = eff_folder {
             let domains = agent_browser_domains(app, f);
             if !domains.is_empty() {
                 for schema in browser::agent_tool_schemas() { tools.push(schema); }
@@ -4149,7 +4245,7 @@ fn agent_tools_for_full(
     // Fails closed: no flag => no shell tools => Folder Mode (zero-shell). The
     // Rust exec broker ALSO cap-gates at the WS boundary, so this is the UX
     // gate; the broker is the authoritative one.
-    if let Some(f) = folder {
+    if let Some(f) = eff_folder {
         if pro_mode_enabled(app, f) {
             for schema in shell_tool_schemas() { tools.push(schema); }
             extra_instructions.push_str(
@@ -4165,7 +4261,7 @@ fn agent_tools_for_full(
     }
 
     if let (Ok(ad), Some(aid)) = (app_data(app), agent_id) {
-        let scope = tools_registry::Scope::new(aid, folder);
+        let scope = tools_registry::Scope::new(aid, eff_folder);
         for t in tools_registry::enabled_tools(&ad, &scope) {
             match t.kind.as_str() {
                 "builtin" => {
@@ -4598,7 +4694,7 @@ const AGENT_SYSTEM: &str = "You are AYGENT, a helpful, concise, friendly assista
     context'; act only on what was asked. When a task DOES need a tool: use read_file/write_file/\
     list_files for files in the user's chosen folder (you cannot run shell commands). To RENAME or \
     MOVE a file use rename_file (NEVER write a copy under the new name and leave the old file — \
-    rename it); to remove a file use delete_file. Use web_search to search the web, fetch_url to \
+    rename it); to remove a file use delete_file. For content too large for one write, use write_file for the first chunk then append_file for the rest. Use web_search to search the web, fetch_url to \
     read a web page/API over HTTPS, and any connected-service tools (e.g. github_list_prs) for \
     that service. Prefer the smallest number of tool calls that gets the job done.";
 

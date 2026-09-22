@@ -307,26 +307,42 @@ pub fn fill(tpl: &str, ctx: &serde_json::Value) -> String {
     out
 }
 
+/// Truncated-JSON escape hatch with an HONEST notice (2026-09-22): the old bare
+/// 4000-char cut silently shredded diffs/patches/logs into useless fragments.
+/// 12000 chars carries a full diff in most cases; beyond that we say so instead
+/// of silently cutting, so the model narrows the request instead of failing.
+fn capped_json(body: &serde_json::Value, cap: usize) -> String {
+    let s = serde_json::to_string_pretty(body).unwrap_or_default();
+    if s.chars().count() > cap {
+        let cut: String = s.chars().take(cap).collect();
+        format!("{cut}\n\n[… output capped at {cap} chars of {} — narrow the request (fewer items, one file/sha) and read again]", s.chars().count())
+    } else {
+        s
+    }
+}
+
 /// Render a reply per the tool's Render spec.
 pub fn render(r: &Render, body: &serde_json::Value) -> String {
     match r {
         Render::GithubContent => render_github_content(body),
-        Render::Json => {
-            let s = serde_json::to_string_pretty(body).unwrap_or_default();
-            s.chars().take(4000).collect()
-        }
+        Render::Json => capped_json(body, 12_000),
         Render::One { line } => fill(line, body),
         Render::Items { root, line, empty } => {
             let arr = dig(body, root).and_then(|v| v.as_array().cloned()).unwrap_or_default();
             if arr.is_empty() {
                 return empty.to_string();
             }
+            let total = arr.len();
             let mut out = String::new();
             for item in arr.iter().take(50) {
                 out.push_str(&fill(line, item));
                 out.push('\n');
             }
-            out.trim_end().to_string()
+            let mut out = out.trim_end().to_string();
+            if total > 50 {
+                out.push_str(&format!("\n\n[… showing 50 of {total} — narrow the query to see more]"));
+            }
+            out
         }
     }
 }
@@ -341,8 +357,7 @@ fn render_github_content(body: &serde_json::Value) -> String {
     use base64::Engine;
     // A directory listing is a JSON ARRAY, not a file object -> fall back to JSON.
     if body.is_array() {
-        let s = serde_json::to_string_pretty(body).unwrap_or_default();
-        return s.chars().take(4000).collect();
+        return capped_json(body, 12_000);
     }
     let encoding = body.get("encoding").and_then(|e| e.as_str()).unwrap_or("");
     let content_b64 = body.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -356,8 +371,7 @@ fn render_github_content(body: &serde_json::Value) -> String {
             return format!("{path} is {size} bytes (>1MB), which the GitHub Contents API will not inline. Read it via its git blob sha ({sha}) instead.");
         }
         // Unknown shape (symlink, submodule, or an error object) -> raw JSON.
-        let s = serde_json::to_string_pretty(body).unwrap_or_default();
-        return s.chars().take(4000).collect();
+        return capped_json(body, 12_000);
     }
     // GitHub base64 has embedded newlines; strip all whitespace before decoding.
     let clean: String = content_b64.chars().filter(|c| !c.is_whitespace()).collect();

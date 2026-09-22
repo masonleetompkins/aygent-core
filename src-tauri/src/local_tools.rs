@@ -25,8 +25,11 @@ pub struct ToolCall {
 /// so even smaller models follow them; the CALL SYNTAX is family-specific below.
 fn tools_description() -> &'static str {
     "You have these tools to work with files in the user's folder:\n\
-     - read_file(path): read a UTF-8 text file (path relative to the folder root)\n\
-     - write_file(path, content): create/overwrite a UTF-8 text file\n\
+     - read_file(path, offset?, limit?): read a UTF-8 text file (path relative to the folder root; big files are paged — first 2000 lines by default, pass offset/limit for more)\n\
+     - write_file(path, content): create/overwrite a UTF-8 text file (keep one call under ~15000 chars; continue a big file with append_file)\n\
+     - append_file(path, content): add text to the END of a file (creates it if missing)\n\
+     - rename_file(from, to): rename or move a file (never copy-and-orphan)\n\
+     - delete_file(path): delete a file (files only, not folders)\n\
      - list_files(path): list a directory ('.' for the folder root)\n\
      - recall(query): search your long-term MEMORY (the user's notes and things \
      you were told to remember) — use it when asked about your memory, past \
@@ -184,7 +187,7 @@ fn call_from_json(s: &str) -> Option<ToolCall> {
 fn call_from_value(v: &serde_json::Value) -> Option<ToolCall> {
     let name = v.get("name").and_then(|n| n.as_str())?.to_string();
     // Only accept our known tools \u2014 ignore hallucinated tool names.
-    if !matches!(name.as_str(), "read_file" | "write_file" | "list_files" | "whoami" | "recall" | "fetch_url" | "web_search") { return None; }
+    if !matches!(name.as_str(), "read_file" | "write_file" | "append_file" | "rename_file" | "delete_file" | "list_files" | "whoami" | "recall" | "fetch_url" | "web_search") { return None; }
     let mut input = v.get("arguments")
         .or_else(|| v.get("parameters"))
         .or_else(|| v.get("input"))

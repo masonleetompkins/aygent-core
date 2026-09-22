@@ -359,6 +359,16 @@ pub async fn openai_stream_turn<F: FnMut(StreamEvent)>(
         }
     }
 
+    // OUTPUT BUDGET (2026-09-22): with no explicit cap the provider default can
+    // truncate long replies AND large tool-call arguments mid-JSON (surfacing as
+    // __harness_parse_error). Reasoning models take the newer key; all others
+    // take max_tokens. Mirrors the Anthropic path's room for big tool payloads.
+    // Gated on has_tools so plain chat turns keep their current behavior.
+    if has_tools && needs_reasoning_none(provider, model) {
+        body["max_completion_tokens"] = json!(64000);
+    } else if has_tools {
+        body["max_tokens"] = json!(16384);
+    }
     // No-redirect client (see list_models): keeps the bearer token attached so
     // OpenRouter doesn't 401 with "Missing Authentication header" on a redirect.
     let client = reqwest::Client::builder()
