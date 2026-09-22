@@ -276,7 +276,7 @@ function quantBlurb(quant: string): { title: string; sub: string } {
   }
   return { title: "Recommended", sub: "nearly identical quality · smaller file · best for most people" };
 }
-type CatModel = { family: string; family_label: string; repo: string; name: string; params_billions: number; context_tokens: number; downloads: number; quants: Quant[] };
+type CatModel = { family: string; family_label: string; repo: string; name: string; params_billions: number; context_tokens: number; downloads: number; quants: Quant[]; custom_code: boolean };
 type HW = { summary: string };
 type Downloaded = { filename: string; path: string; size_gb: number };
 
@@ -303,6 +303,12 @@ function LocalModels({ folder, activePath, onChoose }: {
   const [results, setResults] = useState<CatModel[]>([]);
   const [selected, setSelected] = useState<CatModel | null>(null);
   const [highlight, setHighlight] = useState(-1);
+  const [pulling, setPulling] = useState<string | null>(null);
+  const [pullProg, setPullProg] = useState<{ file: string; index: number; files: number; pct: number } | null>(null);
+  const [mlxPulled, setMlxPulled] = useState<Array<{ repo: string; path: string; size_gb: number; custom_code: boolean; consented: boolean }>>([]);
+  const [mlxServe, setMlxServe] = useState<{ running: boolean; repo: string | null } | null>(null);
+  const [codeOk, setCodeOk] = useState<Record<string, boolean>>({});
+  const [pullMsg, setPullMsg] = useState<string | null>(null);
   const seqRef = useRef(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -322,6 +328,8 @@ function LocalModels({ folder, activePath, onChoose }: {
   useEffect(() => {
     invoke<HW>("detect_hardware").then(setHw).catch(() => {});
     refreshDownloaded();
+    refreshMlxPulled();
+    refreshMlxServe();
   }, []);
 
   // click outside to close dropdown
@@ -372,6 +380,7 @@ function LocalModels({ folder, activePath, onChoose }: {
   }, [query, selected]);
 
   async function pickModel(m: CatModel) {
+    if (m.custom_code) void refreshCodeOk(m.repo);
     setSelected(m);
     setQuery(m.repo);
     setResults([]);
@@ -391,6 +400,7 @@ function LocalModels({ folder, activePath, onChoose }: {
       // Some backends return { ...model } directly, others may wrap — handle both
       const model = (m as any).repo ? (m as CatModel) : (m as any).model as CatModel;
       if (model && (model as any).repo) {
+        if (model.custom_code) void refreshCodeOk(model.repo);
         setSelected(model);
         setQuery((model as any).repo);
         setResults([]);
@@ -399,6 +409,7 @@ function LocalModels({ folder, activePath, onChoose }: {
       }
       // fallback: if lookup returned wrapper, try to use it
       if ((m as any).repo) {
+        if ((m as CatModel).custom_code) void refreshCodeOk((m as CatModel).repo);
         setSelected(m as CatModel);
         setQuery((m as any).repo);
         setResults([]);
@@ -449,6 +460,55 @@ function LocalModels({ folder, activePath, onChoose }: {
     finally { un(); setProgress((p) => { const n = { ...p }; delete n[q.filename]; return n; }); }
   }
 
+  async function mlxPull(repo: string) {
+    const channel = `mlx-pull-${Date.now()}`;
+    setPulling(repo); setPullMsg(null); setErr(null); setPullProg(null);
+    const un = await listen<any>(channel, (e) => {
+      const pl = e.payload || {};
+      if (pl.done) { setPullProg(null); return; }
+      const { file, index, files, got, total } = pl;
+      setPullProg({ file: file || "", index: index || 0, files: files || 0, pct: total ? got / total : 0 });
+    });
+    try {
+      await invoke("mlx_pull_cmd", { channel, repo });
+      setPullMsg(`✓ ${repo} cached — pick it in Agents (Local MLX)`);
+      await refreshMlxPulled();
+      await refreshMlxServe();
+    } catch (e) { setPullMsg(`✗ ${String(e)}`); }
+    finally { un(); setPulling(null); setPullProg(null); }
+  }
+
+  async function refreshMlxPulled() {
+    try { setMlxPulled(await invoke<Array<{ repo: string; path: string; size_gb: number; custom_code: boolean; consented: boolean }>>("mlx_downloaded")); }
+    catch { /* best-effort */ }
+  }
+  async function refreshMlxServe() {
+    try {
+      const st = await invoke<{ running: boolean; repo: string | null }>("mlx_status");
+      setMlxServe({ running: !!st?.running, repo: st?.repo ?? null });
+    } catch { /* best-effort */ }
+  }
+  async function mlxStopServing() {
+    try { await invoke("mlx_stop_cmd"); await refreshMlxServe(); }
+    catch (e) { setErr(String(e)); }
+  }
+  async function refreshCodeOk(repo: string) {
+    try {
+      const st = await invoke<{ custom_code: boolean; consented: boolean }>('mlx_code_status_cmd', { repo });
+      setCodeOk((m) => ({ ...m, [repo]: !!st?.consented }));
+    } catch { /* best-effort */ }
+  }
+  async function allowCode(repo: string, allow: boolean) {
+    try {
+      await invoke('mlx_allow_code_cmd', { repo, allow });
+      setCodeOk((m) => ({ ...m, [repo]: allow }));
+      await refreshMlxPulled();
+    } catch (e) { setErr(String(e)); }
+  }
+  async function mlxDel(repo: string) {
+    try { await invoke("mlx_delete_cmd", { repo }); await refreshMlxPulled(); }
+    catch (e) { setErr(String(e)); }
+  }
   async function del(d: Downloaded) {
     try { await invoke("local_delete", { filename: d.filename }); await refreshDownloaded(); if (selected && d.filename && selected.quants.some(q => q.filename === d.filename)) { /* keep card */ } }
     catch (e) { setErr(String(e)); }
@@ -458,6 +518,34 @@ function LocalModels({ folder, activePath, onChoose }: {
   const showDropdown = focused && results.length > 0;
 
   function renderModelCard(m: CatModel) {
+    if (m.family === "mlx") {
+      const q = m.quants[0];
+      const busy = pulling === m.repo;
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 6, paddingTop: 12, borderTop: "var(--border-width) solid var(--line)" }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+            <span style={{ fontWeight: 800, fontSize: 15 }}>{m.name}</span>
+            <Pill tone="ok">MLX · Apple silicon</Pill>
+            <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 11, color: "var(--text-faint)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.repo}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <span style={{ fontSize: 13, color: "var(--text-muted)", flex: 1 }}>~{q ? q.size_gb.toFixed(1) : "?"}GB download · {q ? q.quant : ""} · whole repo (safetensors)</span>
+            {busy && pullProg ? <span style={{ fontSize: 12, fontFamily: "ui-monospace, monospace", color: "var(--text-muted)" }}>{pullProg.file} ({pullProg.index + 1}/{pullProg.files}) · {Math.round(pullProg.pct * 100)}%</span> : <Button variant="secondary" onClick={() => void mlxPull(m.repo)} disabled={!!pulling}>{busy ? "Pulling…" : "Pull"}</Button>}
+          </div>
+          {pullMsg && <div style={{ fontSize: 13, fontWeight: 600, color: pullMsg.startsWith("✗") ? "var(--danger)" : "var(--ok)", overflowWrap: "anywhere" }}>{pullMsg}</div>}
+          {m.custom_code && codeOk[m.repo] !== true && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <Pill tone="muted">ships its own loader code</Pill>
+              <Button variant="secondary" onClick={() => void allowCode(m.repo, true)}>Allow</Button>
+            </div>
+          )}
+          {m.custom_code && codeOk[m.repo] === true && (
+            <span style={{ fontSize: 12, color: "var(--ok)" }}>custom loader allowed ✓ — serving this model will run repo code</span>
+          )}
+          <span style={{ fontSize: 12, color: "var(--text-faint)" }}>MLX models run chat-only (no file tools) via the Local (MLX) provider — pick this repo in any agent’s setup after pulling.</span>
+        </div>
+      );
+    }
     const rec = m.quants[0];
     const perf = rec?.perf;
     const ctx = contextWords(m.context_tokens);
@@ -538,7 +626,39 @@ function LocalModels({ folder, activePath, onChoose }: {
           a Save Point, so you can always rewind.
         </p>
       )}
+      {mlxPulled.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text-muted)" }}>Installed · MLX</span>
+          {mlxPulled.map((m) => (
+            <div key={m.repo} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ flex: 1, border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-card)", padding: "10px 14px", background: "var(--bg)", boxShadow: "var(--elevation)" }}>
+                <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+                  <b style={{ fontSize: 14 }}>{m.repo}</b>
+                  <span style={{ ...hint, fontFamily: "ui-monospace, monospace", fontSize: 12 }}>{m.size_gb.toFixed(1)}GB · MLX</span>
+                </div>
+                <span style={{ ...hint, fontSize: 12 }}>chat only — no file tools</span>
+                {m.custom_code && !m.consented && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 12, color: "var(--text-muted)" }}>ships its own loader code — blocked until allowed</span>
+                    <Button variant="secondary" onClick={() => void allowCode(m.repo, true)}>Allow</Button>
+                  </div>
+                )}
+                {m.custom_code && m.consented && (
+                  <span style={{ fontSize: 12, color: "var(--ok)" }}>custom loader allowed ✓</span>
+                )}
+              </div>
+              <Button variant="secondary" onClick={() => void mlxDel(m.repo)}>Delete</Button>
+            </div>
+          ))}
+        </div>
+      )}
 
+      {mlxServe?.running && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <Pill tone="ok">MLX serving {mlxServe.repo}</Pill>
+          <Button variant="secondary" onClick={() => void mlxStopServing()}>Stop</Button>
+        </div>
+      )}
       {/* OpenRouter-style search */}
       <div ref={wrapRef} style={{ position: "relative", marginTop: 6 }}>
         <div style={{ display: "flex", gap: 8 }}>
@@ -555,7 +675,7 @@ function LocalModels({ folder, activePath, onChoose }: {
                 else if (e.key === "Enter") { e.preventDefault(); void handleSubmit(); }
                 else if (e.key === "Escape") { setFocused(false); setHighlight(-1); }
               }}
-              placeholder="Search Hugging Face — type 'Qwen', 'Mistral 7B', or paste a repo like bartowski/Qwen3-14B-GGUF"
+              placeholder="Search Hugging Face — 'Qwen', 'Bonsai', or paste a repo like bartowski/Qwen3-14B-GGUF or mlx-community/Qwen3-4B-4bit"
               style={{
                 width: "100%", padding: "10px 36px 10px 32px",
                 background: "var(--bg)", border: "var(--border-width) solid var(--line)", borderRadius: "var(--radius-control)",
@@ -614,14 +734,14 @@ function LocalModels({ folder, activePath, onChoose }: {
         {searching && !showDropdown && <div style={{ fontSize: 12, color: "var(--text-faint)", marginTop: 6 }}>Searching Hugging Face…</div>}
         {err && <Pill tone="danger">✗ {err}</Pill>}
         {!searching && focused && !showDropdown && query.trim().length >= 2 && results.length === 0 && !selected && (
-          <div style={{ fontSize: 12, color: "var(--text-faint)", marginTop: 6 }}>No GGUF models found. Try a broader term or paste an exact repo id like <code>bartowski/Qwen3-14B-GGUF</code> and press Go.</div>
+          <div style={{ fontSize: 12, color: "var(--text-faint)", marginTop: 6 }}>No models found. Try a broader term or paste an exact repo id like <code>bartowski/Qwen3-14B-GGUF</code> and press Go.</div>
         )}
       </div>
 
       {/* selected info card — same data as before */}
       {selected && renderModelCard(selected)}
 
-      {selected && (
+      {selected && selected.family !== "mlx" && (
         <div style={{ ...hint, fontSize: 12, color: "var(--text-faint)", marginTop: 8, display: "flex", flexDirection: "column", gap: 3 }}>
           <span><b>Which download should I pick?</b> They're the exact same model at different compression. “Recommended” is nearly identical quality in a smaller file; “Efficient” squeezes big models onto modest memory with a slight quality dip; “Higher quality” needs the most memory. A 🟡 badge means it runs split across GPU + CPU — it works, but the Efficient file will feel much faster.</span>
           <span><b>Speed</b> (“tok/s” = tokens per second) is how fast the AI types. ~15+ feels quick; under ~8 feels sluggish. <b>Memory</b> is how much conversation the model can keep in mind at once. Estimates, not benchmarks.</span>
@@ -639,6 +759,8 @@ function LocalModels({ folder, activePath, onChoose }: {
 
 // ---------------------------------------------------------------------------
 
+
+// (MLX lives inside Local Models above — no separate section.)
 
 // One provider key row: shows key status, save/replace, and a live Test that
 // hits that provider's /models endpoint. Keys go straight to Keychain.

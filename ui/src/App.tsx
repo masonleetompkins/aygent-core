@@ -114,12 +114,12 @@ export function App() {
     if (a.folder_path) setFolder(a.folder_path);
   }
   // Chat "ready" gate is per-agent: check the key for the provider THIS agent
-  // uses. Local (in-process GGUF) needs no key at all. Previously this was
+  // uses. Local models (in-process GGUF and Apple-silicon MLX) need no key at all. Previously this was
   // hardwired to "anthropic", so a local-only (or OpenAI/OpenRouter/Meta-only)
   // setup was blocked with "add an Anthropic key" even though the backend was fine.
   useEffect(() => {
     const p = activeAgent?.provider || "anthropic";
-    if (p === "local") { setKeySet(true); return; }
+    if (p === "local" || p === "mlx") { setKeySet(true); return; }
     invoke<boolean>("has_provider_key", { provider: p }).then(setKeySet).catch(() => {});
   }, [screen, activeAgent?.id, activeAgent?.provider]);
   // Settings can change the active agent's provider/model (set_selection) without

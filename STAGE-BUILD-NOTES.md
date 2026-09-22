@@ -1,3 +1,136 @@
+# Stage build — 2026-09-21 ~afternoon PDT — v1.0.16 (MLX fail-fast: warm-up + watchdog)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit (on `staging`):**
+- `15a8959` — mlx: fail-fast warm-up + first-token watchdog (no more silent hangs)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg` (fresh mtime, verified)
+
+**What changed (Mason's hang report):**
+- Root cause: `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` declares `prism_hadamard_qwen35`, which stock mlx-lm cannot load (ValueError in server log). The HTTP server stays up, so readiness passed and the chat request hung forever — 10 min of "thinking".
+- Fix: `warm_up` sends a 1-token completion after the server answers and before the turn depends on it; load failures kill the server and surface the log tail in seconds. `not supported` in the logs adds the bundled-loader pointer (try a standard mlx-community quant).
+- Backstop: 10-minute first-byte watchdog on the SSE stream — a stuck server errors, never spins.
+- Verified end-to-end against a live sidecar (SmolLM2-135M): `choices[0]` + usage shape matches what warm_up parses.
+- Note: Bonsai 2 specifically needs its own bundled runtime (per its own model card — ordinary loaders return wrong output, not just errors). Not runnable via stock mlx-lm at any version checked.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA
+1. **Bonsai now fails fast** — chat on it errors within ~a minute with the log tail + standard-quant suggestion (no more endless thinking).
+2. **Supported model chats** — pull `mlx-community/Qwen3-4B-4bit`, chat a turn: warm-up loads once, streams $0.
+
+---
+
+# Stage build — 2026-09-21 ~evening PDT — v1.0.16 (MLX folded in: no section, picker, chat gate)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit (on `staging`):**
+- `87a5ea6` — fix(local): fold MLX into Local Models, GGUF-style picker, chat gate
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg` (fresh mtime, verified)
+- verified: no `MlxModels` in shipped `ui/dist` JS (separate section gone)
+
+**What changed (Mason's four reports):**
+1. **Separate MLX section deleted** — search, pulls, and Installed (incl. MLX rows + Delete) all live in the one Local Models card. The only MLX chrome left is a `serving <repo>` + Stop row that appears while the server runs.
+2. **No more overflow** — pull status is a wrapping line, not a nowrap pill; GGUF quant explainer hidden on MLX info cards.
+3. **Agents picker matches GGUFs** — Local (MLX) model is a dropdown of pulled repos with sizes + "Paste another repo id…" fallback. No more typing blind.
+4. **Chat works for MLX agents** — the ready gate treated `mlx` as key-gated ("add a key" blocked the pane, incl. history). MLX is keyless like GGUF now: full chat + history sidebar, new/delete chats.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA
+1. **Settings** — one Local Models card; Bonsai under Installed · MLX; no MLX section below.
+2. **Agents** — Local (MLX) → dropdown shows `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit (8.0 GB)`; select it (no typing).
+3. **Chat** — switch to that agent → history sidebar present, new chat works, streams $0.
+4. **Serving row** — after a chat, Settings shows `MLX serving …` + Stop.
+
+---
+
+# Stage build — 2026-09-21 ~afternoon PDT — v1.0.16 (MLX auto-install + pull progress + library)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit (on `staging`):**
+- `42af0b9` — feat(local): MLX auto-install, pull progress, downloaded library
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg` (fresh mtime, verified)
+- verified: `mlx_downloaded` in shipped `ui/dist` JS (pulls visible in Installed + Agents chips)
+
+**What changed (Mason's two reports):**
+1. **No manual engine step** — the Install button is gone. The venv + mlx-lm provision themselves on first pull or first chat (progress streams in the turn / busy line). Card shows auto status only.
+2. **Pulls show progress + land in the library** — `mlx_pull` rewritten: downloads the repo's full file set into `runtime/mlx/models/<author>/<name>/` with per-file `file (i/N) · %` events, skips completed files (interrupted pulls resume), and refuses to finish without config + weights. New `mlx_downloaded` / `mlx_delete_cmd`: pulls appear under Installed · MLX (with Delete) and as quick-pick chips in Agents → Local (MLX). Serve prefers the pulled dir (instant/offline), else HF auto-download fallback.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA
+1. **Pull with progress** — search `Bonsai` → Pull → live `model.safetensors (i/N) · %` readout.
+2. **Installed** — pull completes → `Installed · MLX` row with size + Delete.
+3. **Agents chips** — new agent, Local (MLX) → pulled repo appears as a chip; click to select.
+4. **Chat** — chat a turn on the pulled model. Streams, $0, no manual setup.
+
+---
+
+# Stage build — 2026-09-21 ~13:00 PDT — v1.0.16 (MLX search fix)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit (on `staging`):**
+- `839a132` — feat(local): HF search + lookup surface MLX repos (mlx_entry, MLX pass in search, Pull card in Settings)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg` (fresh mtime, verified)
+- verified: `mlx_pull_cmd` in shipped `ui/dist` JS (MLX Pull card reachable)
+
+**What changed:** the Settings → Local Models search was GGUF-only by construction (`filter=gguf` + single-file `.gguf` requirement), so MLX repos were invisible. Now: `search` runs an MLX pass (same query, no gguf filter, keeps repos with an mlx marker + safetensors) appended after GGUF hits; `lookup` falls back to an MLX entry when no GGUF quant exists; MLX entries render a dedicated card (size est. from params × bits, e.g. 27B 2-bit ≈ 6.4GB) with a Pull button wired to `mlx_pull_cmd`. Verified at API level: `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` resolves (23 siblings, 1 safetensors, 36k downloads) → surfaces via search "Bonsai" or repo-ID paste.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~10 min, needs network once)
+1. **Search** — Settings → Local Models → search `Bonsai` → Ternary-Bonsai MLX card appears (~6.4GB, 2-bit). Or paste `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` directly.
+2. **Pull** — Pull button on the MLX card (GBs, one-time; needs the engine installed from the MLX Models card first).
+3. **Chat** — Agents → provider Local (MLX), model `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` → chat a turn. Streams, $0.
+4. **GGUF unchanged** — normal GGUF search/download still works as before.
+
+---
+
+# Stage build — 2026-09-21 ~12:40 PDT — v1.0.16 (Apple MLX runner)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0, 17 warnings (dead-code only, incl. 1 pre-existing `save_comp` shim in video_hyperframes — untouched). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit (on `staging`):**
+- `f64bd2e` — feat(local): Apple MLX runner — mlx-community models via uv-managed mlx_lm.server sidecar (chat turns, Settings pull, Agents provider)
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app`, mtime **Sep 21 12:37**
+- dmg: `dmg/AYGENT_1.0.16_aarch64.dmg`, **18152217 bytes (~17.3 MB)**, mtime **Sep 21 12:37**
+- verified: `mlx_` symbols in shipped binary (7); `mlx_status/mlx_install_cmd/mlx_pull_cmd/mlx_stop_cmd` + `mlx-community/*` in shipped `ui/dist` JS
+
+**What changed:** Apple-silicon agents. New `provider: "mlx"` (GGUF path renamed "Local (GGUF)", MLX = "Local (MLX)") served by a `mlx_lm.server` sidecar on 127.0.0.1, managed exactly like the HF/voice/matte engines: `uv run --with mlx-lm` out of `~/Library/Application Support/build.masonlee.aygent/runtime/mlx` (pinned to your in-app uv, inherited proxy env, nothing outside the app). Weights auto-download on first chat (HF cache under the same runtime dir) or prefetch via the new Settings → MLX Models card (Install engine / Pull / Stop). Chat-only turns (no file tools — banner + honest errors); same OpenAI wire + stream contract as GGUF chat path (usage/ctx/cost all flow; MLX bills $0). Non-Apple-Silicon gets a clear refusal in backend + UI. Includes: video ripple-trim/linked-sync fix, rough-cut word-snap, sequences, drop-zone, composer-clear (prior stage commits).
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA (~10 min, needs network once)
+1. **Install** — Settings → MLX Models → Install engine (one-time, a few minutes).
+2. **Pull** — paste `mlx-community/Qwen3-4B-4bit` → Pull (GBs, one-time). Status pill shows `serving <repo>` after first chat.
+3. **Chat** — Agents → new agent, provider Local (MLX), model `mlx-community/Qwen3-4B-4bit` → chat a turn. Streams, no $.
+4. **File tools refuse honestly** — ask it to write a file → says it can't yet, doesn't fake it.
+5. **GGUF still fine** — existing Local (GGUF) agent chats + tools unchanged.
+
+## Regression pass (carry-over)
+1. **Launch** — agents + conversations all present.
+2. **One chat turn with tools** — read/write a file in the agent folder.
+3. **Context meter** — cloud turn shows context% + $; local turn tracks context, no $.
+4. **whoami** — tools list renders as a clean table.
+5. **Browser** — open a page in the in-app browser, agent read of the page.
+6. **Cmd+Q** — quits cleanly, daemon gone from Activity Monitor.
+
+---
+
 # Stage build — 2026-09-10 ~13:30 PDT — v1.0.16 (rough-cut word-snap + sequences + drop-zone + composer)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0, dead-code warnings only (incl. 2 new unused hyperframes load/save shims — kept as legacy wrappers). Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.

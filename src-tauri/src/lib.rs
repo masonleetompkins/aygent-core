@@ -58,6 +58,7 @@ mod local_provider;
 mod local_tools;
 mod openai_provider;
 mod meta_provider; // Muse (Meta): api.meta.ai/v1 /responses (OpenAI Responses API shape) — own module.
+mod mlx; // MLX local runner (Apple Silicon): mlx-community/* via uv-managed mlx_lm.server sidecar.
 mod pdf_tool;
 mod provider;
 mod pricing; // CLOUD model context windows + $/Mtok (context meter + cost).
@@ -4908,6 +4909,34 @@ async fn agent_stream(
         return Ok(messages);
     }
 
+        // ---- MLX MODEL PATH (Apple Silicon, mlx-community/* via sidecar) ---------
+    // `model` here is the Hugging Face repo id (e.g. mlx-community/Qwen3-4B-4bit).
+    // v1 is a SINGLE chat turn (no tools) — same honest shape as a chat-only GGUF.
+    // The sidecar (mlx_lm.server on localhost) auto-downloads weights on first
+    // boot into the in-app HF cache; switching repos restarts the server.
+    if provider_kind == "mlx" {
+        let repo = model.filter(|m| !m.trim().is_empty())
+            .ok_or_else(|| "no MLX model selected — pull one in Settings > Local Models".to_string())?;
+        let mut messages = if history.is_array() { history } else { serde_json::json!([]) };
+        messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "user", "content": prompt }));
+        let _ = app.emit(&channel, &provider::StreamEvent::Info {
+            text: format!("mlx · {repo}"),
+        });
+        // System prompt rides as leading context (mlx.rs flattens it into the
+        // OpenAI message list); stored history keeps just the user prompt.
+        let mut send = serde_json::json!([{ "role": "user", "content": AGENT_SYSTEM_LOCAL }]);
+        for m in messages.as_array().unwrap() { send.as_array_mut().unwrap().push(m.clone()); }
+        let content = mlx::mlx_stream_turn(
+            &app, &channel, &repo, &send, 2048,
+            |ev| { let _ = app.emit(&channel, &ev); },
+        ).await?;
+        messages.as_array_mut().unwrap().push(serde_json::json!({
+            "role": "assistant", "content": content
+        }));
+        run_auto_capture(&app, &db, &broker, &scope_id, &prompt, &channel).await;
+        return Ok(messages);
+    }
+
     // ---- OPENAI / OPENROUTER PATH ------------------------------------------
     // Shared Chat Completions wire format; one impl, two base URLs. Full tool-
     // use: same jailed exec_tool + broker + SAVE POINTs as every other provider.
@@ -6094,7 +6123,8 @@ pub fn run() {
             set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
             agent_stream, reveal_in_finder, get_selected_model, set_selected_model,
             get_selection, set_selection, detect_hardware, local_catalog, local_search, local_lookup, local_downloaded,
-            local_download, local_delete, local_tool_capability, restore_agent_folder,
+            local_download, local_delete, local_tool_capability,
+            mlx::mlx_status, mlx::mlx_install_cmd, mlx::mlx_pull_cmd, mlx::mlx_stop_cmd, mlx::mlx_downloaded, mlx::mlx_delete_cmd, mlx::mlx_allow_code_cmd, mlx::mlx_code_status_cmd, restore_agent_folder,
             browser::browser_status, browser::browser_install, browser::browser_launch_probe,
             browser::browser_navigate, browser::browser_shutdown, browser::browser_uninstall, browser::browser_start_view, browser::browser_set_viewport,
             browser::browser_click, browser::browser_scroll, browser::browser_type, browser::browser_key,

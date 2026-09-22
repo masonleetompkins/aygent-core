@@ -446,7 +446,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   useEffect(() => {
     if (!folder) { setConvs([]); setConv(null); setMessages([]); historyRef.current = []; return; }
     invoke<{ provider: string; model: string }>("get_selection", { folder })
-      .then((s) => { providerRef.current = s.provider; modelRef.current = s.model; setIsLocal(s.provider === "local"); }).catch(() => {});
+      .then((s) => { providerRef.current = s.provider; modelRef.current = s.model; setIsLocal(s.provider === "local" || s.provider === "mlx"); }).catch(() => {});
     (async () => {
       try {
         const list = await invoke<ConvMeta[]>("conv_list", { folder });
@@ -659,7 +659,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     if (folder) {
       try {
         const s = await invoke<{ provider: string; model: string }>("get_selection", { folder });
-        providerRef.current = s.provider; modelRef.current = s.model; setIsLocal(s.provider === "local");
+        providerRef.current = s.provider; modelRef.current = s.model; setIsLocal(s.provider === "local" || s.provider === "mlx");
       } catch { /* keep last */ }
     }
 
