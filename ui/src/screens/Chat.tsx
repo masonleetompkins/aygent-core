@@ -1616,20 +1616,26 @@ function BubbleBody({ m, isUser, memory, agentId, local }: { m: Msg; isUser: boo
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start", minWidth: 0, flex: 1 }}>
       <div style={{
-        maxWidth: "100%",
+        width: "100%",
         minWidth: 0,
         overflowWrap: "anywhere",
-        ...(isUser ? { marginLeft: "auto", maxWidth: "92%" } : {}),
+        margin: "0 2px",
         background: isUser
           ? "color-mix(in srgb, var(--accent) 12%, transparent)"
           : "color-mix(in srgb, var(--text) 5%, transparent)",
         color: "var(--text)",
         border: "none",
-        borderLeft: isUser
-          ? "2px solid var(--accent)"
-          : "2px solid color-mix(in srgb, var(--text) 25%, transparent)",
-        borderRadius: "0 8px 8px 0",
-        padding: "8px 12px",
+        ...(isUser
+          ? {
+              borderRight: "2px solid var(--accent)",
+              borderRadius: "8px 0 0 8px",
+              padding: "8px 12px 8px 48px",
+            }
+          : {
+              borderLeft: "2px solid color-mix(in srgb, var(--text) 25%, transparent)",
+              borderRadius: "0 8px 8px 0",
+              padding: "8px 48px 8px 12px",
+            }),
         display: "flex", flexDirection: "column", gap: 6,
       }}>
         {/* ORDERED RENDER (Mason 08-04): when a timeline exists, draw tool cards
@@ -1660,7 +1666,7 @@ function BubbleBody({ m, isUser, memory, agentId, local }: { m: Msg; isUser: boo
           <>
             {!isUser && m.role === "assistant" && m.tools.map((t, i) => <ToolCard key={i} t={t} agentId={agentId} />)}
             {m.text && (isUser
-              ? <span style={{ display: "block", textAlign: "right", whiteSpace: "pre-wrap", lineHeight: 1.55, fontSize: 14 }}>{m.text}</span>
+              ? <span style={{ display: "block", textAlign: "left", whiteSpace: "pre-wrap", lineHeight: 1.55, fontSize: 14 }}>{m.text}</span>
               : <TextWithThoughts text={m.text} streaming={(m as { streaming?: boolean }).streaming} enabled={local} />)}
           </>
         )}
