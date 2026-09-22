@@ -1621,7 +1621,7 @@ function BubbleBody({ m, isUser, memory, agentId, local, price }: { m: Msg; isUs
           ? {
               borderRight: "2px solid var(--accent)",
               borderRadius: "8px 0 0 8px",
-              padding: "8px 12px 8px 48px",
+              padding: "8px 12px 8px 24px",
             }
           : {
               borderLeft: "2px solid color-mix(in srgb, var(--text) 25%, transparent)",
