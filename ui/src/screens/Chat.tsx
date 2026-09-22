@@ -1611,7 +1611,6 @@ function BubbleBody({ m, isUser, memory, agentId, local, price }: { m: Msg; isUs
         width: "100%",
         minWidth: 0,
         overflowWrap: "anywhere",
-        margin: "0 2px",
         background: isUser
           ? "color-mix(in srgb, var(--accent) 12%, transparent)"
           : "color-mix(in srgb, var(--text) 5%, transparent)",
@@ -1619,11 +1618,13 @@ function BubbleBody({ m, isUser, memory, agentId, local, price }: { m: Msg; isUs
         border: "none",
         ...(isUser
           ? {
+              margin: "0 2px 0 48px",
               borderRight: "2px solid var(--accent)",
               borderRadius: "8px 0 0 8px",
-              padding: "8px 12px 8px 24px",
+              padding: "8px 12px",
             }
           : {
+              margin: "0 2px",
               borderLeft: "2px solid color-mix(in srgb, var(--text) 25%, transparent)",
               borderRadius: "0 8px 8px 0",
               padding: "8px 48px 8px 12px",
