@@ -43,7 +43,7 @@ export function Sidebar({ active, onSelect, showBrowser }: { active: ScreenId; o
       background: "var(--surface)", boxShadow: "var(--elevation)",
       display: "flex", flexDirection: "column", padding: "12px 8px", gap: 1,
     }}>
-      <div style={{ padding: "6px 10px 16px", fontWeight: 800, letterSpacing: "0.12em", fontSize: 12 }}>
+      <div style={{ padding: "8px 10px 14px", fontWeight: 800, letterSpacing: "0.04em", fontSize: 22, color: "var(--text)" }}>
         AYGENT
       </div>
       <SectionLabel>This Agent</SectionLabel>

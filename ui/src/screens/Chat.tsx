@@ -586,10 +586,16 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // them exercised. Inline editing works in every webview.
   const [renamingId, setRenamingId] = useState<string | null>(null);
   function renameConv(id: string) { setRenamingId(id); }
-  // Rename the CURRENTLY OPEN chat (from the inline header field).
-  async function renameCurrent(next: string) {
-    if (!convId) return;
-    await saveConvTitle(convId, next);
+  // TAB HOVER RENAME (Mason 09-22): the header title is gone (it duplicated
+  // the tab) — renaming lives on the tab itself. Hover reveals pencil +
+  // close; pencil swaps the label for an inline input (Enter/blur commits).
+  const [hoverTab, setHoverTab] = useState<string | null>(null);
+  const [editingTab, setEditingTab] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState("");
+  async function commitTabRename(id: string) {
+    const t = editDraft.trim();
+    setEditingTab(null);
+    if (t) await saveConvTitle(id, t);
   }
 
   // Persist a drop: move `srcId` to `targetId`'s slot, recompute a dense order
@@ -1010,12 +1016,6 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               <span style={{ color: "var(--accent)", display: "flex" }}><Icon name={(agent?.icon as IconName) || "sparkles"} size={20} /></span>
               <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent?.name || "Agent"}</span>
             </h2>
-            <ChatTitle
-              title={convs.find((c) => c.id === convId)?.title || ""}
-              disabled={!folder || !convId}
-              onRename={(next) => renameCurrent(next)}
-            />
-            <span style={{ flex: "1 1 auto" }} />
             {/* COMMAND PRO per-thread model override (B1): null = agent default. */}
             {!!folder && !!convId && (
               <ThreadModelPicker
@@ -1024,6 +1024,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
                 onChange={(v) => { if (convId) setThreadModel(convId, v); }}
               />
             )}
+            <span style={{ flex: "1 1 auto" }} />
             {/* CONTEXT METER + $ COST (Mason, this session): a compact row under
                the chat title showing how full the model's context window is and
                the running cost of this session, so you SEE the wall coming and
@@ -1104,10 +1105,23 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               const om = getThreadModel(id);
               return (
                 <span key={id} onClick={() => { if (id !== convId) void openConv(id); }}
+                  onMouseEnter={() => setHoverTab(id)} onMouseLeave={() => setHoverTab((h) => (h === id ? null : h))}
                   title={title + (om ? " - " + om.model : "")}
                   style={{ display: "inline-flex", alignItems: "center", gap: 6, maxWidth: 220, padding: "5px 6px 5px 10px", borderRadius: 999, fontSize: 12.5, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0, border: active ? "1px solid var(--accent)" : "1px solid var(--line)", background: active ? "var(--surface)" : "transparent", color: "var(--text)", fontWeight: active ? 700 : 500 }}>
                   <span style={{ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: r ? "var(--accent)" : "var(--text-faint)", animation: r ? "aygentPulse 1.1s ease-in-out infinite" : "none" }} />
-                  <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{title}</span>
+                  {editingTab === id ? (
+                    <input autoFocus value={editDraft} onChange={(e) => setEditDraft(e.target.value)}
+                      onClick={(e) => e.stopPropagation()}
+                      onBlur={() => void commitTabRename(id)}
+                      onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void commitTabRename(id); } else if (e.key === "Escape") { setEditingTab(null); } }}
+                      style={{ fontSize: 12.5, fontFamily: "inherit", color: "var(--text)", background: "var(--bg)", border: "var(--border-width) solid var(--accent)", borderRadius: 6, padding: "1px 6px", width: 130, outline: "none" }} />
+                  ) : (
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{title}</span>
+                  )}
+                  {(hoverTab === id || editingTab === id) && (
+                    <button onClick={(e) => { e.stopPropagation(); setEditDraft(title); setEditingTab(id); }} title="Rename thread"
+                      style={{ background: "none", border: "none", cursor: "pointer", padding: "0 2px", color: "var(--text-faint)", display: "flex" }}><Icon name="pencil" size={12} /></button>
+                  )}
                   {tabs.length > 1 && (
                     <button onClick={(e) => { e.stopPropagation(); closeTab(id); }} title="Close thread"
                       style={{ background: "none", border: "none", cursor: "pointer", padding: "0 2px", color: "var(--text-faint)", display: "flex" }}><Icon name="close" size={12} /></button>
@@ -1419,47 +1433,6 @@ function HistoryItem({
 
 // Inline-editable chat name shown under the "Chat" header. Click to edit; Enter
 // or blur commits, Escape cancels. Empty renders a muted "Untitled" prompt.
-function ChatTitle({ title, disabled, onRename }: { title: string; disabled: boolean; onRename: (next: string) => void; }) {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(title);
-  const inRef = useRef<HTMLInputElement>(null);
-  useEffect(() => { if (!editing) setDraft(title); }, [title, editing]);
-  useEffect(() => { if (editing) inRef.current?.focus(); }, [editing]);
-  function commit() { const t = draft.trim(); if (t && t !== title) onRename(t); setEditing(false); }
-  if (disabled) return null;
-  if (editing) {
-    return (
-      <input
-        ref={inRef}
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={commit}
-        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); commit(); } else if (e.key === "Escape") { setDraft(title); setEditing(false); } }}
-        placeholder="Untitled"
-        style={{
-          marginTop: 2, background: "var(--bg)", border: "var(--border-width) solid var(--accent)",
-          borderRadius: "var(--radius-control)", color: "var(--text)", padding: "2px 8px",
-          fontSize: "var(--text-body)", fontFamily: "inherit", maxWidth: 360, width: "100%",
-        }}
-      />
-    );
-  }
-  return (
-    <button
-      onClick={() => setEditing(true)}
-      title="Rename this chat"
-      style={{
-        display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", minWidth: 0, flexShrink: 1,
-        cursor: "text", padding: "2px 0", color: title ? "var(--text-muted)" : "var(--text-faint)",
-        fontSize: "var(--text-body)", fontFamily: "inherit", maxWidth: 360,
-      }}
-    >
-      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{title || "Untitled"}</span>
-      <Icon name="pencil" size={13} style={{ opacity: 0.6 }} />
-    </button>
-  );
-}
-
 const THREAD_PROVIDERS = ["anthropic", "openai", "openrouter", "meta", "local", "mlx"];
 function ThreadModelPicker({ agentDefault, value, onChange }: {
   agentDefault: { provider: string; model: string };
