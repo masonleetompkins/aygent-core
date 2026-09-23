@@ -1004,9 +1004,9 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
         {/* Header: agent name (multi) or "Chat" + editable chat name underneath.
            In multi-pane, each pane is labeled with its AGENT so you always know
            who you're talking to; a close button removes just this pane. */}
-        <div style={{ margin: "0 0 var(--space-3)", flexShrink: 0, display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
-          <div style={{ minWidth: 0 }}>
-            <h2 style={{ fontSize: "var(--text-h1)", fontWeight: "var(--weight-heading)", margin: 0, display: "flex", alignItems: "center", gap: 8, overflow: "hidden" }}>
+        <div style={{ margin: "0 0 var(--space-2)", flexShrink: 0, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <div style={{ minWidth: 0, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", flex: "1 1 auto" }}>
+            <h2 style={{ fontSize: "var(--text-h1)", fontWeight: "var(--weight-heading)", margin: 0, display: "flex", alignItems: "center", gap: 8, overflow: "hidden", flexShrink: 0 }}>
               <span style={{ color: "var(--accent)", display: "flex" }}><Icon name={(agent?.icon as IconName) || "sparkles"} size={20} /></span>
               <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent?.name || "Agent"}</span>
             </h2>
@@ -1015,6 +1015,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
               disabled={!folder || !convId}
               onRename={(next) => renameCurrent(next)}
             />
+            <span style={{ flex: "1 1 auto" }} />
             {/* COMMAND PRO per-thread model override (B1): null = agent default. */}
             {!!folder && !!convId && (
               <ThreadModelPicker
@@ -1028,7 +1029,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
                the running cost of this session, so you SEE the wall coming and
                can Compact before you hit it. Only shows once we have a window. */}
             {!!folder && !!convId && ctxWindow > 0 && (
-              <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6, flexWrap: "wrap" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
                 <div title={`${ctxTokens.toLocaleString()} / ${ctxWindow.toLocaleString()} tokens in context`}
                   style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   {/* accent outline pill: fills with the accent as context climbs */}
@@ -1095,7 +1096,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
         {/* COMMAND PRO threads: parallel sessions, one tab per conv. */}
         {!blocked && tabs.length > 0 && (
-          <div className="aygent-scroll" style={{ display: "flex", gap: 6, overflowX: "auto", padding: "2px 0 8px", flexShrink: 0 }}>
+          <div className="aygent-scroll" style={{ display: "flex", gap: 6, overflowX: "auto", padding: "2px 0 4px", flexShrink: 0 }}>
             {tabs.map((id) => {
               const active = id === convId;
               const title = threadTitle(id);
@@ -1448,7 +1449,7 @@ function ChatTitle({ title, disabled, onRename }: { title: string; disabled: boo
       onClick={() => setEditing(true)}
       title="Rename this chat"
       style={{
-        marginTop: 2, display: "flex", alignItems: "center", gap: 6, background: "none", border: "none",
+        display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", minWidth: 0, flexShrink: 1,
         cursor: "text", padding: "2px 0", color: title ? "var(--text-muted)" : "var(--text-faint)",
         fontSize: "var(--text-body)", fontFamily: "inherit", maxWidth: 360,
       }}
@@ -1473,14 +1474,14 @@ function ThreadModelPicker({ agentDefault, value, onChange }: {
     const label = value ? (value.model || value.provider) + " (thread)" : (agentDefault.model || agentDefault.provider) + " (agent)";
     return (
       <button onClick={() => setEditing(true)} title="Override model for this thread only — other threads keep the agent default"
-        style={{ marginTop: 4, display: "inline-flex", alignItems: "center", gap: 6, background: "transparent", border: "1px solid var(--line)", borderRadius: 999, cursor: "pointer", padding: "3px 10px", color: "var(--text-muted)", fontSize: 12, fontFamily: "ui-monospace, monospace", maxWidth: 360 }}>
+        style={{ display: "inline-flex", alignItems: "center", gap: 6, background: "transparent", border: "1px solid var(--line)", borderRadius: 999, cursor: "pointer", flexShrink: 0, padding: "3px 10px", color: "var(--text-muted)", fontSize: 12, fontFamily: "ui-monospace, monospace", maxWidth: 360 }}>
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span>
         <span style={{ opacity: 0.6 }}>▾</span>
       </button>
     );
   }
   return (
-    <span style={{ marginTop: 4, display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "wrap", flexShrink: 0 }}>
       <select value={prov} onChange={(e) => setProv(e.target.value)}
         style={{ background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, color: "var(--text)", padding: "3px 6px", fontSize: 12 }}>
         {THREAD_PROVIDERS.map((x) => <option key={x} value={x}>{x}</option>)}
