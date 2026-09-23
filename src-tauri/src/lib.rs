@@ -18,11 +18,11 @@ mod cef_engine;
 mod cef_geometry;
 #[cfg(all(target_os = "macos", feature = "engine-cef"))]
 pub mod cef_app_mac;
-mod broker;
+pub mod broker;
 mod dock_icon;
 mod broker_ws;
-mod exec;      // PRO MODE: the process-spawn broker (shell.exec). Only Rust spawns.
-mod paths;     // CONFIG RELOCATION: root-folder pointer + state-dir seam + onboarding paths.
+pub mod exec;      // PRO MODE: the process-spawn broker (shell.exec). Only Rust spawns.
+pub mod paths;     // CONFIG RELOCATION: root-folder pointer + state-dir seam + onboarding paths.
 mod history;
 mod introspect; // Agent self-introspection: the read-only `whoami` tool.
 mod catalog;
@@ -33,12 +33,12 @@ pub mod savepoint; // pub for examples/savepoint_diag
 mod context_docs;
 mod dashboard_data; // DASHBOARDS M3: pull-only data resolution (bindings/http/exec).
 mod dashboard; // DASHBOARDS: prompt-built, spec-driven, pull-only (never auto-runs a model).
-mod db;
+pub mod db;
 mod drainer;
 mod lanes;
 mod mailbox;
 mod memory;
-mod scheduler;
+pub mod scheduler;
 mod vault_write;
 mod web;
 mod whisper;
@@ -53,7 +53,7 @@ mod writer;
 mod gguf;
 mod google_auth; // GOOGLE service accounts: RS256 JWT -> access token (the one credential we must MINT, not paste).
 mod hardware;
-mod keychain;
+pub mod keychain;
 mod omarchy; // LINUX: Omarchy theme adapter, portable returns not-available off Linux.
 mod local_provider;
 mod local_tools;
@@ -63,10 +63,10 @@ mod mlx; // MLX local runner (Apple Silicon): mlx-community/* via uv-managed mlx
 mod pdf_tool;
 mod provider;
 mod pricing; // CLOUD model context windows + $/Mtok (context meter + cost).
-mod provision;
+pub mod provision;
 mod mcp_client;
 mod mcp; // MCP manager: registry + catalog + agent-loop bridge + install/uninstall. // MCP client: spawn stdio JSON-RPC servers, discover + route their tools. // Level A: bundle portable node+ffmpeg+hyperframes into app-data (no system installs).
-mod supervisor;
+pub mod supervisor;
 mod telegram;
 mod tools_registry;
 mod spark_state; // SPARKS: jailed KV persistence (Sparks/<slug>/state.json) for interactive Sparks.
