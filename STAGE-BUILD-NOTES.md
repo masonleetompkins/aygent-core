@@ -1,3 +1,31 @@
+# Stage build — 2026-09-22 ~19:00 PDT — v1.0.17 (task_continue v2: timer picker gone)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit (on `staging`, pushed to `origin/staging`):**
+- `3ea154c` — fix(task-continue): rip out timer picker — poll-30s or inline Continue; resume paused turns; composer pin+jump
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app`, mtime **Sep 22 18:56**
+- dmg: `dmg/AYGENT_1.0.17_aarch64.dmg`, **18190408 bytes (~17.4 MB)**, mtime **Sep 22 18:56**
+- verified: `cargo check` + `tsc --noEmit` clean; ContinuePicker.tsx deleted from the tree
+
+**What changed (all four of Mason's reports):**
+1. **Timer picker deleted** — `task_continue` has two modes now: `poll` (woken automatically every 30s, no modal, no picking; parks for the human after ~24 auto-checks ≈ 12 min, with a plain-language handoff) and `wait` (pauses until the human clicks an inline ▶ Continue button under the message; the button disappears when clicked and survives reloads).
+2. **Paused turns resumable** — non-pro round cap 20 → 60 (stall detector still brakes real loops), and every stall/cap pause gets the same inline Continue button, so resuming is one click instead of typing "continue".
+3. **Newest message stays visible** — composer growth compensation replaced with a full re-pin at the bottom, plus a floating ↓ Latest pill whenever the newest message is out of view. Typing a long message can't bury the chat.
+4. Tool cards show `⏳ recheck in 30s` / `⏸ paused — waiting for Continue` instead of the old timer-pick summary.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA
+1. **Poll** — ask the agent to watch something slow (e.g. a build) → it rechecks on its own every ~30s, no modal pops.
+2. **Wait** — agent parks a question for you → ▶ Continue button under the message; click → it resumes with context intact.
+3. **Paused resume** — a long job hits the cap → pause warning + Continue button; click → keeps going.
+4. **Composer** — type a 10-line message at the bottom of a chat → newest message stays pinned; scroll up mid-typing → ↓ Latest pill appears.
+
+---
+
 # Stage build — 2026-09-22 ~18:08 PDT — v1.0.17 (chat header rework + wordmark)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
