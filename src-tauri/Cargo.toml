@@ -20,6 +20,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # `engine-cef` feature is on; a plain build never compiles it. bundle metadata
 # below tells `bundle-cef-app` its name.
 [[bin]]
+name = "aygent_runner"
+path = "src/bin/aygent_runner.rs"
+required-features = ["headless"]
+
+[[bin]]
 name = "aygent_helper"
 path = "src/bin/aygent_helper.rs"
 required-features = ["engine-cef"]
@@ -109,6 +114,7 @@ custom-protocol = ["tauri/custom-protocol"]
 # is excluded and the WKWebView path is used verbatim. This is the instant
 # revert: drop the feature flag and the old engine is back.
 engine-cef = ["dep:cef"]
+headless = []  # 1.1.0 M4: headless worker (no Tauri shell)
 # CEF macOS sandbox participation. cfg-checked in cef_engine.rs + the helper
 # bin; OFF today (matches shipped behavior: Settings.no_sandbox=1). Flip by
 # building with --features engine-cef,sandbox.
