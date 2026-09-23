@@ -107,10 +107,39 @@ pub fn delete_key(provider: &str) -> Result<(), String> {
 mod tests {
     // NOTE: these hit the real login keychain when run locally; they use a
     // dedicated test name and clean up after themselves.
+    // On headless CI (no Secret Service on Linux) the platform store is
+    // unreachable — probe first and skip gracefully instead of failing the
+    // whole suite. A broken store on a machine that HAS one still fails loud.
     use super::*;
+
+    fn store_available() -> bool {
+        const PROBE: &str = "test:store-availability-probe";
+        match set_key(PROBE, "x") {
+            Ok(()) => {
+                let _ = delete_key(PROBE);
+                true
+            }
+            Err(e) => {
+                let eu = e.to_lowercase();
+                if eu.contains("dbus")
+                    || eu.contains("secret service")
+                    || eu.contains("platform secure storage")
+                    || eu.contains("no such")
+                {
+                    eprintln!("keychain tests SKIPPED: no platform store ({e})");
+                    false
+                } else {
+                    true
+                }
+            }
+        }
+    }
 
     #[test]
     fn vault_roundtrip_and_delete() {
+        if !store_available() {
+            return;
+        }
         let name = "test:vault-roundtrip";
         set_key(name, "s3cret").expect("set");
         assert_eq!(get_key(name).expect("get"), "s3cret");
@@ -121,6 +150,9 @@ mod tests {
 
     #[test]
     fn cache_survives_multiple_reads() {
+        if !store_available() {
+            return;
+        }
         let name = "test:vault-cache";
         set_key(name, "v1").unwrap();
         for _ in 0..5 {
