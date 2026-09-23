@@ -19,7 +19,6 @@ import { Connections } from "./screens/Connections";
 import { Onboarding } from "./screens/Onboarding";
 import { initTheme, saveTheme, type Mode } from "./lib/theme";
 import { startHeadlessWatcher } from "./lib/turns";
-import { ContinuePicker } from "./components/ContinuePicker";
 import { CmdPalette } from "./components/CmdPalette";
 import { notifyEnabled, setNotifyEnabled } from "./lib/notify";
 
@@ -312,7 +311,6 @@ export function App() {
           {screen === "browser" && <Browser />}
         </div>
       </div>
-      <ContinuePicker />
       <CmdPalette onNavigate={(sc) => setScreen(sc)} />
     </div>
   );

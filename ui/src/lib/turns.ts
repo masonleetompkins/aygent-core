@@ -114,7 +114,10 @@ export function describeToolUse(name: string, input: any): { summary: string; bo
     case "web_search": return { summary: `🔍 ${(inp.query ?? "?").slice(0, 160)}` };
     case "generate_pdf": return { summary: `📕 ${inp.output_path ?? inp.path ?? "document.pdf"}`, body: capBody(typeof inp.content === "string" ? inp.content : undefined) };
     case "send_message": return { summary: `✉ → ${inp.to_agent ?? "?"}`, body: capBody(typeof inp.message === "string" ? inp.message : undefined) };
-    case "task_continue": return { summary: `⏰ timer pick (suggested ${inp.delay_secs ?? 60}s)`, body: capBody(typeof inp.note === "string" ? inp.note : undefined) };
+    case "task_continue": {
+      const tcMode = inp.mode === "wait" ? "wait" : "poll";
+      return { summary: tcMode === "wait" ? `⏸ paused — waiting for Continue` : `⏳ recheck in 30s`, body: capBody(typeof inp.note === "string" ? inp.note : undefined) };
+    }
     case "shell_poll": return { summary: `⟳ poll ${inp.proc_handle ?? "?"}` };
     case "shell_kill": return { summary: `⏹ kill ${inp.proc_handle ?? "?"}` };
     case "shell_write": return { summary: `⌨ stdin → ${inp.proc_handle ?? "?"}`, body: capBody(typeof inp.data === "string" ? inp.data : undefined) };

@@ -74,7 +74,7 @@ mod video_render; // VIDEO v0.3: composition.json -> ffmpeg filter graph -> MP4/
 mod video_media; // VIDEO v0.3: aygent-media:// jailed range-capable media serving for the editor.
 mod video_tools; // VIDEO v0.3: video_* agent tools (frame-accurate edit helpers).
 mod video_hyperframes; // VIDEO: Hyperframes transparent overlays — graphics + captions (T1/V3 clips).
-mod continue_gate; // task_continue TIMER PICKER (Mason 09-08): human picks 1/3/5/10/15 min via chat modal.
+mod continue_gate; // task_continue v2 (Mason 09-22): poll-every-30s or wait-for-Continue, no timer picker.
 
 use std::sync::Arc;
 use rand::Rng;
@@ -4034,10 +4034,10 @@ fn send_message_tool() -> serde_json::Value {
 fn task_continue_tool() -> serde_json::Value {
     serde_json::json!({
         "name": "task_continue",
-        "description": "Schedule YOURSELF a follow-up turn after a delay, so you can end this turn and still continue the work later (e.g. poll a long build, wait for a render, check a process). You will be woken with your note in a fresh continuation turn that streams live to your chat and has ALL your tools — you keep working there (shell_poll, read files, edit, call task_continue again), not just report. RULE: whenever you would otherwise write 'I'll check back', 'I'll continue later', 'once X finishes' or 'give me a few minutes', you MUST call this tool instead of saying it — words alone never wake you up. Put everything the next turn needs in the note (proc handles, paths, what to check, next step). Calling this pops a timer picker in chat (1/3/5/10/15 min) — the human chooses; your delay_secs is only the no-answer fallback.",
+        "description": "Pause this turn and arrange to CONTINUE the work later — then END YOUR TURN. Two modes, pick one per call. Mode \"poll\": you are woken AUTOMATICALLY in 30 seconds with your note; check the process and either keep working or call task_continue again (mode poll) and end your turn — repeat until done, then give your final summary. Use poll for waiting on builds, renders, downloads, anything that finishes on its own. Mode \"wait\": you pause until the HUMAN clicks an inline Continue button under your message (it disappears when clicked); use it when you need the human (a decision, credentials, eyes on something). RULE: whenever you would otherwise write 'I'll check back', 'I'll continue later', 'once X finishes' or 'give me a few minutes', you MUST call this tool instead of saying it — words alone never wake you up. With either mode, end the turn right after the call with a one-line status (what's open, what happens next). After ~24 automatic checks on one thread the poll chain parks for the human on its own.",
         "input_schema": { "type": "object", "properties": {
-            "delay_secs": { "type": "integer", "description": "SUGGESTED seconds until wake-up (5-3600, default 60) — the human picks the real duration (1/3/5/10/15 min) in a chat modal; your value is the fallback if they do not answer" },
-            "note": { "type": "string", "description": "note to self: exactly what to check/continue on wake-up (include proc handles, file paths, next steps)" }
+            "mode": { "type": "string", "description": "\"poll\" (default): wake automatically in 30s, repeat until done. \"wait\": pause until the human clicks Continue." },
+            "note": { "type": "string", "description": "note to self: exactly what to check/continue on wake-up or resume (include proc handles, file paths, next steps)" }
         }, "required": ["note"] }
     })
 }
@@ -5080,7 +5080,7 @@ async fn agent_stream(
         // no round cap in Pro Mode; the stall detector replaces it. Non-Pro
         // keeps the 20-round cap.
         let pro_uncapped = folder.as_deref().map(|f| pro_mode_enabled(&app, f)).unwrap_or(false);
-        let max_rounds: usize = if pro_uncapped { usize::MAX } else { 20 };
+        let max_rounds: usize = if pro_uncapped { usize::MAX } else { 60 };
         let mut rounds: usize = 0;
         let mut tool_calls_total: usize = 0;
         let mut last_action: String = String::new();
@@ -5336,7 +5336,7 @@ async fn agent_stream(
     // long work; a stall detector catches actual degenerate loops). Non-Pro
     // keeps the 20-round cap. This is the fix for the "20 continues" session.
     let pro_uncapped = folder.as_deref().map(|f| pro_mode_enabled(&app, f)).unwrap_or(false);
-    let max_rounds: usize = if pro_uncapped { usize::MAX } else { 20 };
+    let max_rounds: usize = if pro_uncapped { usize::MAX } else { 60 };
     let mut rounds: usize = 0;
     let mut tool_calls_total: usize = 0;
     let mut last_action: String = String::new();
@@ -6266,7 +6266,7 @@ pub fn run() {
             agent_context_add, agent_context_list, agent_context_remove,
             agent_generate_soul,
             mailbox_pending_counts, mailbox_take_next, mailbox_roster,
-            continue_gate::task_continue_answer,
+            continue_gate::task_continue_pending, continue_gate::task_continue_consume,
             get_app_knobs, set_app_knobs,
             memory_ingest, memory_retrieve, memory_stats,
             memory_append_daily, memory_gate_check, memory_remember,

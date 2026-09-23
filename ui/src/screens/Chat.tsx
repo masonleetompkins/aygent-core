@@ -4,6 +4,7 @@
 // Tauri event channel. Falls back to a thinking animation if no text streams.
 import { useEffect, useMemo, useRef, useState, useLayoutEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Button } from "../components/ui";
 import { Icon, type IconName } from "../components/Icon";
 import { Markdown } from "../components/Markdown";
@@ -379,17 +380,27 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     ta.style.height = next + "px";
     if (next === prev) return;
     prevTaHeightRef.current = next;
-    // GROWTH COMPENSATION (Mason 09-04): the composer sits below the message
-    // list, so every extra line steals that many px from the list's viewport
-    // and covered the newest message. Shift the list's scrollTop by EXACTLY the
-    // delta, synchronously (useLayoutEffect — before paint), so the messages
-    // appear to move up one line per line typed. No rAF, no full re-pin, no
-    // "jump to bottom": nothing visible moves except the new line, so there's
-    // nothing to stutter. Skipped when the user has scrolled up to read history.
+    // PIN WHILE TYPING (Mason 09-22, replaces the 09-04 delta shift): the
+    // composer steals viewport as it grows. If the reader is at the bottom,
+    // re-pin FULLY (scrollHeight, not a delta) so the newest message can never
+    // slide under the fold mid-keystroke. Skipped when scrolled up reading.
     const el = scrollRef.current; if (!el) return;
-    const wasNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160 + Math.max(0, next - prev);
-    if (wasNearBottom) el.scrollTop = el.scrollTop + (next - prev);
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 160) el.scrollTop = el.scrollHeight;
   }, [input]);
+
+  // JUMP-TO-LATEST (Mason 09-22): when the newest message is out of view
+  // (tall composer, scrolled-up reading), a pill offers one tap back — the
+  // standard chat pattern and the fix for "hidden by my text field".
+  const [showJump, setShowJump] = useState(false);
+  function onListScroll() {
+    const el = scrollRef.current; if (!el) return;
+    setShowJump(el.scrollHeight - el.scrollTop - el.clientHeight > 120);
+  }
+  function jumpToLatest() {
+    const el = scrollRef.current; if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    setShowJump(false);
+  }
 
   // #4 detect an @mention token at the caret and surface matching agents.
   function onInputChange(value: string, caret: number) {
@@ -528,7 +539,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     // cost in the Agents pane). The visible transcript always starts clean
     // either way — only the model-facing context differs.
     const carry = agent?.context_mode === "continuous" ? historyRef.current : [];
-    setConv(id); setMessages([]); historyRef.current = carry;
+    setConv(id); setMessages([]); historyRef.current = carry; setContinueNote(null);
   }
 
   async function openConv(id: string) {
@@ -542,6 +553,10 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       setConv(c.id);
       setMessages(Array.isArray(c.msgs) ? c.msgs : []);
       historyRef.current = Array.isArray(c.history) ? c.history : [];
+      setContinueNote(null);
+      void invoke<string | null>("task_continue_pending", { conv: c.id })
+        .then((n) => { if (convIdRef.current === c.id) setContinueNote(n); })
+        .catch(() => {});
     } catch { newConv(); }
   }
 
@@ -596,6 +611,68 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     const t = editDraft.trim();
     setEditingTab(null);
     if (t) await saveConvTitle(id, t);
+  }
+  // CONTINUE (task_continue v2, Mason 09-22): two resume paths share one
+  // button rendered under the messages. (a) The model parked mode "wait" on
+  // this conv: the backend holds the note (survives reloads) until consumed.
+  // (b) The last turn PAUSED itself (round cap / stall detector): the warning
+  // text is the signal, no backend state. Either way the button fires a full
+  // working turn on this conv and hides while it runs.
+  const [continueNote, setContinueNote] = useState<string | null>(null);
+  const [resuming, setResuming] = useState(false);
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    listen<{ conv: string; agentId: string; note: string }>("task-continue-waiting", (ev) => {
+      if (ev.payload?.conv && ev.payload.conv === convIdRef.current) setContinueNote(ev.payload.note ?? "");
+    }).then((f) => { un = f; }).catch(() => {});
+    return () => { un?.(); };
+  }, []);
+  // RESUME: same finalize/persist as send(), minus input/attachments. The
+  // slot history is already current (the paused turn wrote it back), so the
+  // resume continues the thread coherently.
+  async function resumeTurn() {
+    if (!agentId || !convIdRef.current) return;
+    const myAgent = agentId;
+    const myConvId = convIdRef.current;
+    const mySlot = turnSlotKey(myAgent, myConvId);
+    if (isRunning(mySlot)) return;
+    setResuming(true);
+    try {
+      const note = await invoke<string | null>("task_continue_consume", { conv: myConvId }).catch(() => null);
+      const override = getThreadModel(myConvId);
+      if (override) {
+        providerRef.current = override.provider; modelRef.current = override.model;
+        setIsLocal(override.provider === "local" || override.provider === "mlx");
+      }
+      const prompt = `Continue working where you left off.${note ? `\n\nYour parked note to self:\n${note}` : ""}`;
+      const channel = myConvId;
+      runningChannelRef.current = channel;
+      const updated = await runTurn({
+        agentId: myAgent, channel, prompt, slot: mySlot,
+        model: modelRef.current || null,
+        provider: providerRef.current || null,
+        folder: folder || null,
+        sessionId: myConvId,
+        attachments: [],
+      });
+      historyRef.current = updated;
+      const done = getAgentTurnSnapshot(mySlot);
+      const finalMsgs: Msg[] = [
+        ...msgsRef.current,
+        { role: "assistant", text: done.liveText || "(continued — no written reply this round)", tools: done.liveTools as ToolLine[], timeline: done.timeline, streaming: false, at: Date.now(), usage: done.usage },
+      ];
+      if (agentId === myAgent && convIdRef.current === myConvId) {
+        msgsRef.current = finalMsgs; setMsgs(finalMsgs);
+      }
+      void persistFor(myConvId, finalMsgs, historyRef.current);
+      setContinueNote(null);
+    } catch (err) {
+      const errMsgs: Msg[] = [...msgsRef.current, { role: "assistant", text: `✗ ${String(err)}`, tools: [], streaming: false, at: Date.now() }];
+      if (agentId === myAgent && convIdRef.current === myConvId) { msgsRef.current = errMsgs; setMsgs(errMsgs); }
+      void persistFor(myConvId, errMsgs, historyRef.current);
+    }
+    runningChannelRef.current = null;
+    setResuming(false);
   }
 
   // Persist a drop: move `srcId` to `targetId`'s slot, recompute a dense order
@@ -806,6 +883,13 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // unmounts, so the stream is always captured and any pane can reattach.
   const turn = useAgentTurn(slotKey || null);
   const running = turn.status === "running";
+  // Pause signal: the backend's stall/cap warning. Natural endings and error
+  // bubbles never match, so the button appears only on real pauses.
+  const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
+  const pausedHere = !running && !!convId && !continueNote &&
+    !!lastAssistant && typeof lastAssistant.text === "string" &&
+    lastAssistant.text.startsWith("⚠️ paused after");
+  const showContinue = !blocked && !running && !resuming && !!convId && (!!continueNote || pausedHere);
   // Follow the live stream: msgs is static mid-turn now, so scroll on liveText + tools + timeline.
   // Respects user scroll: if they've scrolled up to read, don't yank them to bottom.
   useEffect(() => { if (running && isNearBottom(160)) pinToBottom(); }, [turn.liveText, turn.liveTools, turn.timeline, running]);
@@ -1141,7 +1225,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
         {/* Messages bottom-align: newest sits just above the input, older scroll
            up (justifyContent flex-end + margin-top auto on the list wrapper). */}
-        <div ref={scrollRef} className="aygent-scroll" style={{ flex: 1, overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", padding: "4px 6px 24px 2px" }}>
+        <div ref={scrollRef} onScroll={onListScroll} className="aygent-scroll" style={{ flex: 1, overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", padding: "4px 6px 24px 2px" }}>
           <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 10 }}>
           {msgs.length === 0 && !running && !blocked && (
             <p style={hint}>Say hello, or ask your agent to work with files in your folder.</p>
@@ -1188,7 +1272,19 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
             ))}
           </div>
         )}
+        {showContinue && (
+          <div style={{ display: "flex", justifyContent: "center", padding: "6px 0 2px", flexShrink: 0 }}>
+            <button onClick={() => void resumeTurn()} title="Resume this turn with full tools"
+              style={{ borderRadius: 999, border: "1px solid var(--accent)", background: "var(--surface)", color: "var(--text)", fontSize: 13, fontWeight: 600, padding: "6px 16px", cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6 }}>
+              ▶ Continue
+            </button>
+          </div>
+        )}
         <div style={{ display: "flex", gap: 8, marginTop: "var(--space-3)", flexShrink: 0, alignItems: "flex-end", position: "relative", padding: "0 8px" }}>
+          {showJump && !blocked && (
+            <button onClick={jumpToLatest} title="Jump to latest"
+              style={{ position: "absolute", bottom: "calc(100% + 8px)", right: 12, zIndex: 21, borderRadius: 999, border: "var(--border-width) solid var(--line)", background: "var(--surface)", color: "var(--text)", fontSize: 12, fontWeight: 600, padding: "4px 12px", cursor: "pointer", boxShadow: "var(--elevation)" }}>↓ Latest</button>
+          )}
           {/* Task #8: #tool picker (mirrors the @ picker) */}
           {toolTag && toolTag.matches.length > 0 && (
             <div style={{
@@ -1255,6 +1351,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
             rows={1}
             onChange={(e) => { setInput(e.target.value); onInputChange(e.target.value, e.target.selectionStart); }}
             onKeyDown={onInputKeyDown}
+            onFocus={() => { const el = scrollRef.current; if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 160) el.scrollTop = el.scrollHeight; }}
             placeholder={blocked ? "Set up folder + key in Settings first…" : "Message your agent…  (@ agent · # tool)"}
             style={{
               flex: 1, resize: "none", overflowY: "auto",
