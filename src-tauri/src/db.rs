@@ -283,13 +283,14 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     }
 
     if v < 15 {
-        // MODEL VARIANT (Mason 09-05): per-agent reasoning knob for Spark-style
-        // models (Muse Spark: minimal|low|medium|high|xhigh|max). The model id
-        // stays the selector; the variant rides as the per-request reasoning
-        // effort. Empty = provider default. ALTER ADD so existing rows keep it.
-        conn.execute_batch(
-            "ALTER TABLE agent ADD COLUMN model_variant TEXT NOT NULL DEFAULT '';"
-        ).map_err(|e| format!("migrate v15 (model_variant): {e}"))?;
+        // MODEL VARIANT (Mason 09-05, fixed 1.1.0): SCHEMA_V1 already includes
+        // model_variant for fresh DBs, so ADD COLUMN must be idempotent.
+        let has: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('agent') WHERE name='model_variant'", [], |r| r.get(0)).map_err(|e| format!("migrate v15 (check): {e}"))?;
+        if has == 0 {
+            conn.execute_batch(
+                "ALTER TABLE agent ADD COLUMN model_variant TEXT NOT NULL DEFAULT '';"
+            ).map_err(|e| format!("migrate v15 (model_variant): {e}"))?;
+        }
         set_version(conn, 15)?;
         v = 15;
     }
