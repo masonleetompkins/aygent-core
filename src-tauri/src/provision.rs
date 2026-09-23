@@ -25,12 +25,25 @@ const UV_VERSION: &str = "0.12.2";
 // -version probe), and we can fetch ffprobe too (HyperFrames needs BOTH). Fixed
 // after Mason's live test surfaced "FFmpeg cannot start" + a missing ffprobe.
 fn ffmpeg_base_url() -> &'static str {
-    // martin-riedl arch tokens: arm64 | amd64.
+    // martin-riedl arch tokens: arm64 | amd64. (macOS only; linux/win below.)
     if cfg!(target_arch = "aarch64") {
         "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release"
     } else {
         "https://ffmpeg.martin-riedl.de/redirect/latest/macos/amd64/release"
     }
+}
+/// 1.1.0 linux: johnvansickle static tar.xz (ffmpeg+ffprobe in one tarball).
+/// Rolling "release" build; arch tokens amd64 | arm64.
+#[cfg(target_os = "linux")]
+fn ffmpeg_linux_url() -> String {
+    let a = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
+    format!("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-{a}-static.tar.xz")
+}
+/// 1.1.0 win: gyan.dev essentials zip (ffmpeg.exe+ffprobe.exe under bin/).
+/// gyan publishes x64 only; ARM64 Windows runs it under emulation.
+#[cfg(target_os = "windows")]
+fn ffmpeg_win_url() -> &'static str {
+    "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 }
 // HyperFrames npm package (the CLI + engine). Installed into runtime/hyperframes.
 const HYPERFRAMES_PKG: &str = "hyperframes";
@@ -53,9 +66,14 @@ fn node_dir(app: &AppHandle) -> Result<PathBuf, String> { Ok(runtime_dir(app)?.j
 fn ffmpeg_dir(app: &AppHandle) -> Result<PathBuf, String> { Ok(runtime_dir(app)?.join("ffmpeg")) }
 fn hyperframes_dir(app: &AppHandle) -> Result<PathBuf, String> { Ok(runtime_dir(app)?.join("hyperframes")) }
 
-/// Abs path to the provisioned `node` binary (…/node/bin/node). None if absent.
+/// Abs path to the provisioned `node` binary (…/node/bin/node, …/node/node.exe on win).
 pub fn node_bin(app: &AppHandle) -> Option<PathBuf> {
-    let p = node_dir(app).ok()?.join("bin").join("node");
+    let nd = node_dir(app).ok()?;
+    // Windows portable zip lays node.exe at the dir root; unix has bin/node.
+    #[cfg(target_os = "windows")]
+    let p = nd.join("node.exe");
+    #[cfg(not(target_os = "windows"))]
+    let p = nd.join("bin").join("node");
     p.is_file().then_some(p)
 }
 /// Abs path to the provisioned `npm` cli.js (run via node). None if absent.
@@ -63,15 +81,20 @@ pub fn npm_cli(app: &AppHandle) -> Option<PathBuf> {
     let p = node_dir(app).ok()?.join("lib").join("node_modules").join("npm").join("bin").join("npm-cli.js");
     p.is_file().then_some(p)
 }
+/// ".exe" on Windows, "" elsewhere — provisioned binary names differ per OS.
+fn exe_suffix() -> &'static str {
+    #[cfg(target_os = "windows")] { ".exe" }
+    #[cfg(not(target_os = "windows"))] { "" }
+}
 /// Abs path to the provisioned `ffmpeg` binary. None if absent.
 pub fn ffmpeg_bin(app: &AppHandle) -> Option<PathBuf> {
-    let p = ffmpeg_dir(app).ok()?.join("ffmpeg");
+    let p = ffmpeg_dir(app).ok()?.join(format!("ffmpeg{}", exe_suffix()));
     p.is_file().then_some(p)
 }
 /// Abs path to the provisioned `ffprobe` binary. None if absent. HyperFrames
 /// probes media with ffprobe, so both must be present for a render to work.
 pub fn ffprobe_bin(app: &AppHandle) -> Option<PathBuf> {
-    let p = ffmpeg_dir(app).ok()?.join("ffprobe");
+    let p = ffmpeg_dir(app).ok()?.join(format!("ffprobe{}", exe_suffix()));
     p.is_file().then_some(p)
 }
 
@@ -129,23 +152,42 @@ pub async fn ensure_node(app: &AppHandle, channel: &str) -> Result<PathBuf, Stri
     #[cfg(target_os = "windows")]
     let (stem, url) = { let wa = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" }; let s = format!("node-{NODE_VERSION}-win-{wa}"); let u = format!("https://nodejs.org/dist/{NODE_VERSION}/{s}.zip"); (s, u) };
     let rt = runtime_dir(app)?;
-    let tarball = rt.join(format!("{stem}.tar.gz"));
-    download_to(app, channel, "node", &format!("Node {NODE_VERSION} ({a})"), &url, &tarball).await?;
+    // Ext matches the URL above: mac .tar.gz / linux .tar.xz / win .zip.
+    #[cfg(target_os = "macos")]
+    let archive = rt.join(format!("{stem}.tar.gz"));
+    #[cfg(target_os = "linux")]
+    let archive = rt.join(format!("{stem}.tar.xz"));
+    #[cfg(target_os = "windows")]
+    let archive = rt.join(format!("{stem}.zip"));
+    download_to(app, channel, "node", &format!("Node {NODE_VERSION} ({a})"), &url, &archive).await?;
 
     emit(app, channel, "node", "Unpacking Node…", None);
-    // Extract with the system `tar` (present on every macOS). Extract into rt,
-    // then rename the versioned dir to runtime/node.
-    let out = std::process::Command::new("tar")
-        .arg("-xzf").arg(&tarball).arg("-C").arg(&rt)
-        .output().map_err(|e| format!("tar node: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("unpack node failed: {}", String::from_utf8_lossy(&out.stderr)));
+    // Extract into rt, then rename the versioned dir to runtime/node.
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("tar")
+            .arg("-xzf").arg(&archive).arg("-C").arg(&rt)
+            .output().map_err(|e| format!("tar node: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("unpack node failed: {}", String::from_utf8_lossy(&out.stderr)));
+        }
     }
+    #[cfg(target_os = "linux")]
+    {
+        let out = std::process::Command::new("tar")
+            .arg("-xJf").arg(&archive).arg("-C").arg(&rt)
+            .output().map_err(|e| format!("tar node: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("unpack node failed: {}", String::from_utf8_lossy(&out.stderr)));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    expand_archive(&archive, &rt).await?;
     let extracted = rt.join(&stem);
     let node_home = node_dir(app)?;
     if node_home.exists() { let _ = std::fs::remove_dir_all(&node_home); }
     std::fs::rename(&extracted, &node_home).map_err(|e| format!("place node: {e}"))?;
-    let _ = std::fs::remove_file(&tarball);
+    let _ = std::fs::remove_file(&archive);
     node_bin(app).ok_or_else(|| "node binary missing after unpack".into())
 }
 
@@ -158,36 +200,117 @@ pub async fn ensure_ffmpeg(app: &AppHandle, channel: &str) -> Result<PathBuf, St
     if let (Some(mp), Some(_)) = (ffmpeg_bin(app), ffprobe_bin(app)) { return Ok(mp); }
     let dir = ffmpeg_dir(app)?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir ffmpeg: {e}"))?;
-    let base = ffmpeg_base_url();
-    let a = arch();
-
-    // Each binary ships as its own zip containing a bare executable.
-    for name in ["ffmpeg", "ffprobe"] {
-        let bin = dir.join(name);
-        if bin.is_file() { continue; } // idempotent per-binary
-        let url = format!("{base}/{name}.zip");
-        download_to(app, channel, "ffmpeg", &format!("{name} (macOS {a})"), &url, &dir.join(format!("{name}.zip"))).await?;
-        emit(app, channel, "ffmpeg", &format!("Unpacking {name}…"), None);
-        let zip = dir.join(format!("{name}.zip"));
-        let out = std::process::Command::new("unzip")
-            .arg("-o").arg(&zip).arg("-d").arg(&dir)
-            .output().map_err(|e| format!("unzip {name}: {e}"))?;
+    #[cfg(target_os = "macos")]
+    {
+        let base = ffmpeg_base_url();
+        let a = arch();
+        // Each binary ships as its own zip containing a bare executable.
+        for name in ["ffmpeg", "ffprobe"] {
+            let bin = dir.join(name);
+            if bin.is_file() { continue; } // idempotent per-binary
+            let url = format!("{base}/{name}.zip");
+            download_to(app, channel, "ffmpeg", &format!("{name} (macOS {a})"), &url, &dir.join(format!("{name}.zip"))).await?;
+            emit(app, channel, "ffmpeg", &format!("Unpacking {name}…"), None);
+            let zip = dir.join(format!("{name}.zip"));
+            let out = std::process::Command::new("unzip")
+                .arg("-o").arg(&zip).arg("-d").arg(&dir)
+                .output().map_err(|e| format!("unzip {name}: {e}"))?;
+            if !out.status.success() {
+                return Err(format!("unpack {name} failed: {}", String::from_utf8_lossy(&out.stderr)));
+            }
+            if !bin.is_file() { return Err(format!("{name} binary missing after unpack")); }
+            chmod_x(&bin, name)?;
+            let _ = std::process::Command::new("xattr").arg("-dr").arg("com.apple.quarantine").arg(&bin).output();
+            let _ = std::fs::remove_file(&zip);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // johnvansickle: one tar.xz -> ffmpeg-<ver>-<arch>-static/ with ffmpeg+ffprobe.
+        let url = ffmpeg_linux_url();
+        let tarball = dir.join("ffmpeg-static.tar.xz");
+        download_to(app, channel, "ffmpeg", "ffmpeg static (Linux)", &url, &tarball).await?;
+        emit(app, channel, "ffmpeg", "Unpacking ffmpeg…", None);
+        let out = std::process::Command::new("tar")
+            .arg("-xJf").arg(&tarball).arg("-C").arg(&dir)
+            .output().map_err(|e| format!("tar ffmpeg: {e}"))?;
         if !out.status.success() {
-            return Err(format!("unpack {name} failed: {}", String::from_utf8_lossy(&out.stderr)));
+            return Err(format!("unpack ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr)));
         }
-        if !bin.is_file() { return Err(format!("{name} binary missing after unpack")); }
-        // chmod +x + strip quarantine so it launches without a Gatekeeper prompt.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perm = std::fs::metadata(&bin).map_err(|e| format!("stat {name}: {e}"))?.permissions();
-            perm.set_mode(0o755);
-            std::fs::set_permissions(&bin, perm).map_err(|e| format!("chmod {name}: {e}"))?;
+        // Find the extracted dir (name embeds the version) and lift the binaries.
+        let extracted = std::fs::read_dir(&dir).map_err(|e| format!("list ffmpeg: {e}"))?
+            .filter_map(|e| e.ok()).map(|e| e.path())
+            .find(|q| q.is_dir() && q.file_name().map(|n| n.to_string_lossy().starts_with("ffmpeg-")).unwrap_or(false))
+            .ok_or("ffmpeg dir missing after unpack")?;
+        for name in ["ffmpeg", "ffprobe"] {
+            let from = extracted.join(name);
+            let to = dir.join(name);
+            if !to.is_file() {
+                std::fs::rename(&from, &to).map_err(|e| format!("place {name}: {e}"))?;
+            }
+            chmod_x(&to, name)?;
         }
-        let _ = std::process::Command::new("xattr").arg("-dr").arg("com.apple.quarantine").arg(&bin).output();
+        let _ = std::fs::remove_dir_all(&extracted);
+        let _ = std::fs::remove_file(&tarball);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // gyan: essentials zip -> ffmpeg-<ver>-essentials_build/bin/{ffmpeg,ffprobe}.exe
+        let url = ffmpeg_win_url();
+        let zip = dir.join("ffmpeg-essentials.zip");
+        download_to(app, channel, "ffmpeg", "ffmpeg (Windows)", url, &zip).await?;
+        emit(app, channel, "ffmpeg", "Unpacking ffmpeg…", None);
+        expand_archive(&zip, &dir).await?;
+        let bindir = std::fs::read_dir(&dir).map_err(|e| format!("list ffmpeg: {e}"))?
+            .filter_map(|e| e.ok()).map(|e| e.path())
+            .find(|q| q.is_dir() && q.file_name().map(|n| n.to_string_lossy().contains("essentials")).unwrap_or(false))
+            .map(|d| d.join("bin"))
+            .ok_or("ffmpeg bin dir missing after unpack")?;
+        for name in ["ffmpeg.exe", "ffprobe.exe"] {
+            let from = bindir.join(name);
+            let to = dir.join(name);
+            if !to.is_file() {
+                std::fs::rename(&from, &to).map_err(|e| format!("place {name}: {e}"))?;
+            }
+        }
+        // Remove the bulky extracted tree + zip; keep just the two binaries.
+        for q in std::fs::read_dir(&dir).map_err(|e| format!("list ffmpeg: {e}"))?.filter_map(|e| e.ok()).map(|e| e.path()) {
+            if q.is_dir() { let _ = std::fs::remove_dir_all(&q); }
+        }
         let _ = std::fs::remove_file(&zip);
     }
     ffmpeg_bin(app).ok_or_else(|| "ffmpeg missing after provisioning".into())
+}
+
+/// chmod +x (unix only). Factored so all three OS branches share it.
+#[cfg(unix)]
+fn chmod_x(path: &Path, name: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perm = std::fs::metadata(path).map_err(|e| format!("stat {name}: {e}"))?.permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(path, perm).map_err(|e| format!("chmod {name}: {e}"))?;
+    Ok(())
+}
+
+/// Unzip on Windows: PowerShell Expand-Archive (present on every Win10+),
+/// falling back to `tar -xf` (bsdtar ships with Windows). Async only because
+/// the caller is async; the work itself is a blocking child process.
+#[cfg(target_os = "windows")]
+async fn expand_archive(zip: &Path, dest: &Path) -> Result<(), String> {
+    let ps = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command",
+            &format!("Expand-Archive -Force '{}' '{}'", zip.display(), dest.display())])
+        .output();
+    if let Ok(out) = ps {
+        if out.status.success() { return Ok(()); }
+    }
+    let out = std::process::Command::new("tar")
+        .arg("-xf").arg(zip).arg("-C").arg(dest)
+        .output().map_err(|e| format!("expand archive: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("unpack archive failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(())
 }
 
 /// A PATH string with our provisioned node + ffmpeg dirs FIRST, so any npm/npx
@@ -195,11 +318,28 @@ pub async fn ensure_ffmpeg(app: &AppHandle, channel: &str) -> Result<PathBuf, St
 /// pass this into the exec broker env when running hyperframes.
 pub fn provisioned_path(app: &AppHandle) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Ok(nd) = node_dir(app) { parts.push(nd.join("bin").to_string_lossy().to_string()); }
+    if let Ok(nd) = node_dir(app) {
+        // Win: node.exe at root AND npm lives beside it; unix: bin/.
+        #[cfg(target_os = "windows")]
+        parts.push(nd.to_string_lossy().to_string());
+        #[cfg(not(target_os = "windows"))]
+        parts.push(nd.join("bin").to_string_lossy().to_string());
+    }
     if let Ok(fd) = ffmpeg_dir(app) { parts.push(fd.to_string_lossy().to_string()); }
-    parts.push("/usr/bin".into());
-    parts.push("/bin".into());
-    parts.join(":")
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(sys) = std::env::var("SystemRoot") {
+            parts.push(format!("{sys}\\System32"));
+            parts.push(sys);
+        }
+        return parts.join(";");
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        parts.push("/usr/bin".into());
+        parts.push("/bin".into());
+        parts.join(":")
+    }
 }
 
 /// Run `node <npm-cli> <args…>` in `cwd`, with our provisioned PATH, capturing
@@ -305,7 +445,7 @@ fn uv_dir(app: &AppHandle) -> Result<PathBuf, String> { Ok(runtime_dir(app)?.joi
 
 /// Abs path to the provisioned `uv` binary (…/uv/bin/uv). None if absent.
 pub fn uv_bin(app: &AppHandle) -> Option<PathBuf> {
-    let p = uv_dir(app).ok()?.join("bin").join("uv");
+    let p = uv_dir(app).ok()?.join("bin").join(format!("uv{}", exe_suffix()));
     p.is_file().then_some(p)
 }
 
@@ -334,31 +474,45 @@ pub fn uv_env(app: &AppHandle) -> Vec<(String, String)> {
 /// system uv/python.
 pub async fn ensure_uv(app: &AppHandle, channel: &str) -> Result<PathBuf, String> {
     if let Some(p) = uv_bin(app) { return Ok(p); }
-    // uv's darwin arch tokens: aarch64 | x86_64 (NOT arm64/x64 like Node).
+    // uv arch tokens: aarch64 | x86_64 (NOT arm64/x64 like Node). Triple:
+    // mac apple-darwin .tar.gz / linux unknown-linux-gnu .tar.gz / win msvc .zip.
     let a = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
-    let stem = format!("uv-{a}-apple-darwin");
-    let url = format!("https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/{stem}.tar.gz");
+    #[cfg(target_os = "macos")]
+    let (stem, ext) = (format!("uv-{a}-apple-darwin"), "tar.gz");
+    #[cfg(target_os = "linux")]
+    let (stem, ext) = (format!("uv-{a}-unknown-linux-gnu"), "tar.gz");
+    #[cfg(target_os = "windows")]
+    let (stem, ext): (String, &str) = {
+        let wa = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
+        (format!("uv-{wa}-pc-windows-msvc"), "zip")
+    };
+    let url = format!("https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/{stem}.{ext}");
     let rt = runtime_dir(app)?;
-    let tarball = rt.join(format!("{stem}.tar.gz"));
-    download_to(app, channel, "uv", &format!("uv {UV_VERSION} ({a})"), &url, &tarball).await?;
+    let archive = rt.join(format!("{stem}.{ext}"));
+    download_to(app, channel, "uv", &format!("uv {UV_VERSION} ({a})"), &url, &archive).await?;
 
     emit(app, channel, "uv", "Unpacking uv…", None);
-    // The tarball extracts to a dir `uv-<arch>-apple-darwin/` containing the
-    // `uv` and `uvx` binaries. Extract into rt, then place bin/ under runtime/uv.
-    let out = std::process::Command::new("tar")
-        .arg("-xzf").arg(&tarball).arg("-C").arg(&rt)
-        .output().map_err(|e| format!("tar uv: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("unpack uv failed: {}", String::from_utf8_lossy(&out.stderr)));
+    // The archive extracts to a dir `uv-<triple>/` containing uv(+x). Place
+    // bin/ under runtime/uv.
+    #[cfg(target_os = "windows")]
+    expand_archive(&archive, &rt).await?;
+    #[cfg(not(target_os = "windows"))]
+    {
+        let out = std::process::Command::new("tar")
+            .arg("-xzf").arg(&archive).arg("-C").arg(&rt)
+            .output().map_err(|e| format!("tar uv: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("unpack uv failed: {}", String::from_utf8_lossy(&out.stderr)));
+        }
     }
     let extracted = rt.join(&stem);
     let uv_home = uv_dir(app)?;
     let bin_dir = uv_home.join("bin");
     std::fs::create_dir_all(&bin_dir).map_err(|e| format!("mkdir uv/bin: {e}"))?;
-    for name in ["uv", "uvx"] {
-        let from = extracted.join(name);
+    for name in [format!("uv{}", exe_suffix()), format!("uvx{}", exe_suffix())] {
+        let from = extracted.join(&name);
         if from.is_file() {
-            let to = bin_dir.join(name);
+            let to = bin_dir.join(&name);
             std::fs::rename(&from, &to).map_err(|e| format!("place {name}: {e}"))?;
             #[cfg(unix)]
             {
@@ -374,7 +528,7 @@ pub async fn ensure_uv(app: &AppHandle, channel: &str) -> Result<PathBuf, String
         }
     }
     let _ = std::fs::remove_dir_all(&extracted);
-    let _ = std::fs::remove_file(&tarball);
+    let _ = std::fs::remove_file(&archive);
     uv_bin(app).ok_or_else(|| "uv binary missing after unpack".into())
 }
 
@@ -383,9 +537,20 @@ pub async fn ensure_uv(app: &AppHandle, channel: &str) -> Result<PathBuf, String
 pub fn provisioned_uv_path(app: &AppHandle) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Ok(ud) = uv_dir(app) { parts.push(ud.join("bin").to_string_lossy().to_string()); }
-    parts.push("/usr/bin".into());
-    parts.push("/bin".into());
-    parts.join(":")
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(sys) = std::env::var("SystemRoot") {
+            parts.push(format!("{sys}\\System32"));
+            parts.push(sys);
+        }
+        return parts.join(";");
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        parts.push("/usr/bin".into());
+        parts.push("/bin".into());
+        parts.join(":")
+    }
 }
 
 /// Remove the provisioned uv toolchain (binaries + cache + managed Pythons).
