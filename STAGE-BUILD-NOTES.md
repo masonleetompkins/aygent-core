@@ -1,3 +1,25 @@
+# Stage build — 2026-09-22 ~17:10 PDT — v1.0.17 (compact chat header)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit (on `staging`, pushed to `origin/staging`):**
+- `f0f83bf` — fix(ui): compact chat header — name, title, model, meter, compact share one row
+
+**Artifacts:** `AYGENT-Stage/src-tauri/target/release/bundle/`
+- app: `macos/AYGENT.app`, mtime **Sep 22 17:07**
+- dmg: `dmg/AYGENT_1.0.17_aarch64.dmg`, **18180473 bytes (~17.3 MB)**, mtime **Sep 22 17:08**
+- verified: `0 0 var(--space-2)` + `padding:"2px 0 4px"` header markers in shipped `ui/dist` JS; `tsc` clean
+
+**What changed:** the chat header went from 5 stacked rows to 2 — agent name, chat title (truncates inline), model pill, context meter, and Compact share one wrapping row with controls pushed right; thread tabs tightened underneath. Narrow panes wrap gracefully.
+
+**Prod is untouched.** Quit any running AYGENT first — an open window is still the OLD build. Relaunch from the Stage bundle.
+
+## Smoke QA
+1. **Header** — open any agent chat → name, title, model pill, meter, Compact all on one row; resize narrow → wraps without overlap.
+2. **Title** — long chat name truncates with ellipsis; pencil still renames inline.
+
+---
+
 # Stage build — 2026-09-22 ~16:20 PDT — v1.0.17 (MERGED REBUILD: ui-pro design + tool fixes)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
