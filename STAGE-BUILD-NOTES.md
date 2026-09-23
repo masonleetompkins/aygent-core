@@ -1,3 +1,17 @@
+# Stage build — 2026-09-22 ~18:08 PDT — v1.0.17 (chat header rework + wordmark)
+
+**Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
+
+**Commit (on `staging`, pushed to `origin/staging`):**
+- `993f68f` — fix(ui): model picker left by agent name; rename moves to tab hover; large AYGENT wordmark
+
+**UI deltas since the 17:10 build:**
+- Chat header: `⚡ Name` + model pill left, meter + Compact right. The inline chat-title field is gone (it duplicated the tab); renaming moved to the thread tabs — hover reveals a pencil, click to rename inline (Enter/blur commits, Esc cancels). Same `conv_rename` path, no revert bug.
+- Sidebar: AYGENT wordmark 12px eyebrow -> 22px wordmark.
+- `tsc --noEmit` clean; zero references to ChatTitle/renameCurrent remain.
+
+---
+
 # Stage build — 2026-09-22 ~17:10 PDT — v1.0.17 (compact chat header)
 
 **Status:** ✅ Built clean. `cargo tauri build` exit 0. Both bundles produced (.app + dmg). Unsigned stage build — sign/notarize at promotion.
