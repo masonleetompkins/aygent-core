@@ -10,13 +10,14 @@ import { build } from "esbuild";
 import { writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const out = join(mkdtempSync(join(tmpdir(), "grid-")), "grid.mjs");
 await build({
   entryPoints: ["src/components/dashboard/gridDrag.ts"],
   outfile: out, format: "esm", bundle: true, logLevel: "silent",
 });
-const g = await import(out);
+const g = await import(pathToFileURL(out).href);
 
 let failed = 0;
 function check(name, cond, detail = "") {
