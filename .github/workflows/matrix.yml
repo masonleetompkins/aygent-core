@@ -40,6 +40,8 @@ jobs:
           libayatana-appindicator3-dev librsvg2-dev patchelf
       - name: UI build
         run: npm ci --prefix ui && npm run build --prefix ui
+      - name: Daemon build
+        run: npm ci --prefix daemon && npm run build --prefix daemon
       - name: Rust checks
         run: cargo check --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
       - name: Rust tests (lib)
