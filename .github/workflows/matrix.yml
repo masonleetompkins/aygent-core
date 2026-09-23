@@ -14,12 +14,15 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             bundle: dmg
+            bundles: dmg
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             bundle: msi
+            bundles: msi
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             bundle: appimage
+            bundles: appimage
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -46,8 +49,10 @@ jobs:
         run: cargo check --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
       - name: Rust tests (lib)
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2" --locked
       - name: Tauri build (unsigned dev)
-        run: cargo tauri build --target ${{ matrix.target }}
+        run: cargo tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
         working-directory: src-tauri
       - name: sha256 + upload
         shell: bash

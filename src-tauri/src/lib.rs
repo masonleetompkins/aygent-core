@@ -6447,6 +6447,8 @@ pub fn run() {
                 }
             }
             // macOS Dock icon click when no windows visible => Reopen (show the window again).
+            // NOTE: Reopen only exists on macOS in Tauri v2 — unguarded use breaks Linux/Windows builds.
+            #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { .. } => {
                 for (_label, win) in app_handle.webview_windows() {
                     let _ = win.show();
