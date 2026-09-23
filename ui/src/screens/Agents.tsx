@@ -449,7 +449,7 @@ export function AgentForm({
     if (!folder) { setAllowShellAccess(false); return; }
     invoke<boolean>("allow_shell_access_get", { folder }).then(setAllowShellAccess).catch(() => setAllowShellAccess(false));
   }, [folder]);
-  async function toggleProMode(next: boolean) {
+  async function toggleAllowShellAccess(next: boolean) {
     if (!folder) return;
     if (next) {
       const ok = window.confirm(
@@ -761,7 +761,7 @@ export function AgentForm({
             <div style={{ fontSize: 13, fontWeight: 600 }}>⚡ Allow Shell Access — run shell commands</div>
             <label style={{ display: "inline-flex", alignItems: "center", gap: 8, cursor: folder ? "pointer" : "not-allowed", opacity: folder ? 1 : 0.5 }}>
               <input type="checkbox" checked={allowShellAccess} disabled={!folder || proBusy}
-                onChange={(e) => toggleProMode(e.target.checked)} />
+                onChange={(e) => toggleAllowShellAccess(e.target.checked)} />
               <span style={{ fontSize: 13 }}>{allowShellAccess ? "Enabled" : "Off"}</span>
             </label>
           </div>
