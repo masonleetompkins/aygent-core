@@ -23,7 +23,7 @@ export function AygentHyperFrames({ agentId, folder }: { agentId: string | null;
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [removing, setRemoving] = useState(false);
   const [toggling, setToggling] = useState(false);
-  const [proMode, setProMode] = useState(false);
+  const [allowShellAccess, setAllowShellAccess] = useState(false);
   const unlistenRef = useRef<null | (() => void)>(null);
 
   async function refresh() {
@@ -36,7 +36,7 @@ export function AygentHyperFrames({ agentId, folder }: { agentId: string | null;
   }
   useEffect(() => {
     refresh();
-    invoke<boolean>("pro_mode_get", { folder }).then(setProMode).catch(() => setProMode(false));
+    invoke<boolean>("allow_shell_access_get", { folder }).then(setAllowShellAccess).catch(() => setAllowShellAccess(false));
     return () => { unlistenRef.current?.(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [folder, agentId]);
@@ -111,15 +111,15 @@ export function AygentHyperFrames({ agentId, folder }: { agentId: string | null;
             <Pill tone="ok">installed ✓</Pill>
           </div>
 
-          {/* Row 2: Pro Mode dependency — only shown when it would actually block. */}
-          {skillOn && !proMode && (
+          {/* Row 2: Allow Shell Access dependency — only shown when it would actually block. */}
+          {skillOn && !allowShellAccess && (
             <div style={{
               fontSize: 12.5, color: "var(--warn, #b7791f)",
               border: "var(--border-width) solid var(--warn, #b7791f)",
               background: "var(--warn-bg, rgba(234,179,8,.10))",
               borderRadius: 8, padding: "8px 12px",
             }}>
-              ⚠️ Renders run shell commands, so this agent also needs <b>Pro Mode</b> ON — turn it on for
+              ⚠️ Renders run shell commands, so this agent also needs <b>Allow Shell Access</b> ON — turn it on for
               this agent in the <b>Agents</b> tab. Until then it has the skill but can’t run the render.
             </div>
           )}

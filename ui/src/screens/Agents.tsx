@@ -273,7 +273,7 @@ export function Agents({
 }
 
 // Exported so ONBOARDING reuses the EXACT same agent-creation form (Generate
-// Soul + context files + provider/model + Pro Mode) — one source of truth, no
+// Soul + context files + provider/model + Allow Shell Access) — one source of truth, no
 // slimmed duplicate that drifts out of 1:1 parity with the in-app screen.
 export function AgentForm({
   initial, pendingFolder, onPickFolder, onDone, onCancel, onRosterChange,
@@ -441,19 +441,19 @@ export function AgentForm({
 
   // PRO MODE (2026-07-31): shell.exec consent for THIS agent's folder. Scary-
   // honest — flips the folder from zero-shell Folder Mode to "can run programs."
-  // Backed by pro_mode_get/set (writes a per-folder flag; the Rust exec broker
+  // Backed by allow_shell_access_get/set (writes a per-folder flag; the Rust exec broker
   // cap-gates authoritatively). Keyed on folder, not agent id, matching the jail.
-  const [proMode, setProMode] = useState(false);
+  const [allowShellAccess, setAllowShellAccess] = useState(false);
   const [proBusy, setProBusy] = useState(false);
   useEffect(() => {
-    if (!folder) { setProMode(false); return; }
-    invoke<boolean>("pro_mode_get", { folder }).then(setProMode).catch(() => setProMode(false));
+    if (!folder) { setAllowShellAccess(false); return; }
+    invoke<boolean>("allow_shell_access_get", { folder }).then(setAllowShellAccess).catch(() => setAllowShellAccess(false));
   }, [folder]);
   async function toggleProMode(next: boolean) {
     if (!folder) return;
     if (next) {
       const ok = window.confirm(
-        "Enable Pro Mode for this agent?\n\n" +
+        "Enable Allow Shell Access for this agent?\n\n" +
         "This agent will be able to RUN PROGRAMS on your Mac — including build tools, " +
         "git, and anything on your PATH — rooted in this folder. Commands run from the " +
         "folder and cannot leave it, secrets are never shared with them, and you can kill " +
@@ -464,8 +464,8 @@ export function AgentForm({
     }
     setProBusy(true);
     try {
-      const saved = await invoke<boolean>("pro_mode_set", { folder, enabled: next });
-      setProMode(saved);
+      const saved = await invoke<boolean>("allow_shell_access_set", { folder, enabled: next });
+      setAllowShellAccess(saved);
     } catch { /* ignore */ }
     finally { setProBusy(false); }
   }
@@ -753,16 +753,16 @@ export function AgentForm({
         {/* PRO MODE consent (scary-honest). Only meaningful once a folder is set. */}
         <div style={{
           display: "flex", flexDirection: "column", gap: 8,
-          background: proMode ? "color-mix(in srgb, var(--danger, #ef4444) 8%, var(--surface))" : "var(--surface)",
-          border: `var(--border-width) solid ${proMode ? "color-mix(in srgb, var(--danger, #ef4444) 40%, transparent)" : "var(--line)"}`,
+          background: allowShellAccess ? "color-mix(in srgb, var(--danger, #ef4444) 8%, var(--surface))" : "var(--surface)",
+          border: `var(--border-width) solid ${allowShellAccess ? "color-mix(in srgb, var(--danger, #ef4444) 40%, transparent)" : "var(--line)"}`,
           borderRadius: "var(--radius-control)", padding: "10px 12px",
         }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-            <div style={{ fontSize: 13, fontWeight: 600 }}>⚡ Pro Mode — run shell commands</div>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>⚡ Allow Shell Access — run shell commands</div>
             <label style={{ display: "inline-flex", alignItems: "center", gap: 8, cursor: folder ? "pointer" : "not-allowed", opacity: folder ? 1 : 0.5 }}>
-              <input type="checkbox" checked={proMode} disabled={!folder || proBusy}
+              <input type="checkbox" checked={allowShellAccess} disabled={!folder || proBusy}
                 onChange={(e) => toggleProMode(e.target.checked)} />
-              <span style={{ fontSize: 13 }}>{proMode ? "Enabled" : "Off"}</span>
+              <span style={{ fontSize: 13 }}>{allowShellAccess ? "Enabled" : "Off"}</span>
             </label>
           </div>
           <span style={{ ...hint, fontSize: 12 }}>

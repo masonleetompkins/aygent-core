@@ -81,7 +81,7 @@ async fn handle_conn(
             }
             authed = true;
             // Bind the session's exec grant AT AUTH TIME. The daemon declares
-            // whether the active agent holds shell.exec (Pro Mode). The broker
+            // whether the active agent holds shell.exec (Allow Shell Access). The broker
             // records it here and refuses every exec.* if it's false — the daemon
             // cannot flip it mid-session.
             granted_exec = v.get("caps")
@@ -110,7 +110,7 @@ async fn handle_conn(
             let reply = if !granted_exec {
                 serde_json::json!({
                     "ok": false,
-                    "error": "shell.exec not granted — enable Pro Mode for this agent"
+                    "error": "shell.exec not granted — enable Allow Shell Access for this agent"
                 })
             } else {
                 handle_exec(&broker, &exec_broker, &v)

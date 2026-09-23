@@ -187,7 +187,7 @@ fn rel_future(ms: Option<i64>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Exec — Pro Mode only, and only the exact approved string
+// Exec — Allow Shell Access only, and only the exact approved string
 // ---------------------------------------------------------------------------
 
 fn resolve_exec(agent_id: &str, cmd: &str, approved: &Option<String>)
@@ -198,12 +198,12 @@ fn resolve_exec(agent_id: &str, cmd: &str, approved: &Option<String>)
         return Err("this command hasn't been approved yet — approve it on the module to let it run".into());
     }
     let Some(broker) = crate::exec::global() else {
-        return Err("Pro Mode isn't available (no exec broker)".into());
+        return Err("Allow Shell Access isn't available (no exec broker)".into());
     };
     let Some(root) = crate::exec::global_root(agent_id) else {
         return Err("no agent folder scope for this agent".into());
     };
-    // Run through the SAME broker as Pro Mode: cwd pinned to the jail, env
+    // Run through the SAME broker as Allow Shell Access: cwd pinned to the jail, env
     // scrubbed, GUI-launch denylist. We never spawn a shell ourselves.
     let out = broker
         .run(&root, "bash", &["-lc".to_string(), cmd.to_string()], 20_000)

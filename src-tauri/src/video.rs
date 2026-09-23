@@ -423,8 +423,8 @@ pub fn video_status(app: tauri::AppHandle, folder: Option<String>) -> Result<ser
     let hyperframes = crate::provision::hyperframes_installed(&app);
     let whisper = crate::keychain::has_key("openai");
     let uv = crate::provision::uv_bin(&app).is_some();
-    let pro = folder.as_deref().map(|f| crate::pro_mode_enabled_pub(&app, f)).unwrap_or(false);
-    Ok(serde_json::json!({ "ffmpeg": ffmpeg, "hyperframes": hyperframes, "whisper": whisper, "uv": uv, "proMode": pro }))
+    let pro = folder.as_deref().map(|f| crate::allow_shell_access_enabled_pub(&app, f)).unwrap_or(false);
+    Ok(serde_json::json!({ "ffmpeg": ffmpeg, "hyperframes": hyperframes, "whisper": whisper, "uv": uv, "allowShellAccess": pro }))
 }
 
 #[tauri::command]

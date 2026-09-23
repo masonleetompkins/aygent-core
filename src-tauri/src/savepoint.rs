@@ -113,7 +113,7 @@ fn stage_all(repo: &Repository) -> Result<git2::Oid, String> {
     // Return 0 = add this path, 1 = skip it. Skip our own shadow dir AND anything
     // the user's .gitignore excludes.
     //
-    // WHY .gitignore now (2026-07-31, Pro Mode / self-hosted build): once an agent
+    // WHY .gitignore now (2026-07-31, Allow Shell Access / self-hosted build): once an agent
     // runs `cargo build` in its folder, `target/` fills with HUNDREDS OF MB of
     // binary artifacts. Snapshotting that per turn is a disk disaster (Atlas
     // Risk 2). The user's repo already declares `target/`, `node_modules/`,

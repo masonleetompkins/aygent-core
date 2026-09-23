@@ -8,7 +8,7 @@ import { useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { type Asset, type Clip, type Composition, type Transcript, type MediaFolder, blankComposition, normalize, duration, clipDur, uid } from "./model";
 
-export type Status = { ffmpeg: string | null; hyperframes: boolean; whisper: boolean; uv: boolean; proMode: boolean };
+export type Status = { ffmpeg: string | null; hyperframes: boolean; whisper: boolean; uv: boolean; allowShellAccess: boolean };
 export type Project = { name: string; modified: number; assets: number };
 export type Panel = "media" | "sequences" | "graphics" | "captions" | "color" | "audio" | "export";
 

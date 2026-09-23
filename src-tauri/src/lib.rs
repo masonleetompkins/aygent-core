@@ -301,15 +301,15 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<us
 /// PRO MODE: read whether shell.exec is enabled for a folder's agent. GUI-only
 /// (no config files) — stored per-folder like browser-policy.
 #[tauri::command]
-fn pro_mode_get(app: tauri::AppHandle, folder: String) -> Result<bool, String> {
-    Ok(pro_mode_enabled(&app, &folder))
+fn allow_shell_access_get(app: tauri::AppHandle, folder: String) -> Result<bool, String> {
+    Ok(allow_shell_access_enabled(&app, &folder))
 }
 
 /// PRO MODE: enable/disable shell.exec for a folder's agent. Called by the
 /// scary-honest consent screen. Writes <app_data>/pro-mode/<folderkey>.json.
 /// This is the UX gate; the Rust exec broker cap-gates authoritatively at the WS.
 #[tauri::command]
-fn pro_mode_set(app: tauri::AppHandle, folder: String, enabled: bool) -> Result<bool, String> {
+fn allow_shell_access_set(app: tauri::AppHandle, folder: String, enabled: bool) -> Result<bool, String> {
     let ad = app_data(&app)?;
     let dir = ad.join("pro-mode");
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
@@ -2893,7 +2893,7 @@ async fn agent_run(
     // M0.2b: capability model. In Folder Mode (the M0.3 default) the granted
     // caps are {fs.read, fs.write, net.http, mcp.net}. The file tools below need
     // only fs.read/fs.write, so they're allowed. shell.exec / mcp.local-exec /
-    // hooks.script are NOT granted here — they belong to Pro Mode. The OS
+    // hooks.script are NOT granted here — they belong to Allow Shell Access. The OS
     // Seatbelt jail is the authoritative backstop; this is the explicit early gate.
     // (Full registry-driven gating + MCP transport split lands with the MCP
     // client in Phase 1; the enum + rule are frozen now — see
@@ -4241,12 +4241,12 @@ fn agent_tools_for_full(
     }
 
     // PRO MODE SHELL TOOLS (2026-07-31). Exposed ONLY when this folder's agent
-    // has Pro Mode enabled (the scary-honest consent screen writes the flag).
+    // has Allow Shell Access enabled (the scary-honest consent screen writes the flag).
     // Fails closed: no flag => no shell tools => Folder Mode (zero-shell). The
     // Rust exec broker ALSO cap-gates at the WS boundary, so this is the UX
     // gate; the broker is the authoritative one.
     if let Some(f) = eff_folder {
-        if pro_mode_enabled(app, f) {
+        if allow_shell_access_enabled(app, f) {
             for schema in shell_tool_schemas() { tools.push(schema); }
             extra_instructions.push_str(
                 "\n\nPRO MODE: you can run shell commands, rooted in this folder. Use shell_run \
@@ -4296,8 +4296,8 @@ fn agent_tools_for_full(
 /// PRO MODE: is shell.exec enabled for this folder's agent? GUI-managed (no
 /// config files) — the scary-honest consent screen writes a flag per folder,
 /// same scheme as browser-policy. Fails closed (missing => false => Folder Mode).
-pub fn pro_mode_enabled_pub(app: &tauri::AppHandle, folder: &str) -> bool { pro_mode_enabled(app, folder) }
-fn pro_mode_enabled(app: &tauri::AppHandle, folder: &str) -> bool {
+pub fn allow_shell_access_enabled_pub(app: &tauri::AppHandle, folder: &str) -> bool { allow_shell_access_enabled(app, folder) }
+fn allow_shell_access_enabled(app: &tauri::AppHandle, folder: &str) -> bool {
     let Ok(ad) = app_data(app) else { return false; };
     let path = ad.join("pro-mode").join(format!("{}.json", folder_key_fnv(folder)));
     std::fs::read_to_string(&path)
@@ -4307,7 +4307,7 @@ fn pro_mode_enabled(app: &tauri::AppHandle, folder: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// PRO MODE: the shell tool schemas exposed to the model when Pro Mode is on.
+/// PRO MODE: the shell tool schemas exposed to the model when Allow Shell Access is on.
 /// shell_run is the ergonomic 90% case; spawn/poll/write/kill drive long-lived
 /// processes. Output is bounded by the exec broker (digest + tail), never raw.
 fn shell_tool_schemas() -> Vec<serde_json::Value> {
@@ -4449,7 +4449,7 @@ fn upsert_hyperframes_skill(app: &tauri::AppHandle) -> Result<(), String> {
     let instructions = format!(
         "You can create videos, animations, and motion graphics with HyperFrames — an          HTML-to-MP4 renderer. It is ALREADY installed inside AYGENT (portable Node + FFmpeg +          the hyperframes CLI); you do NOT install anything.
 
-         HOW TO INVOKE (Pro Mode shell): always prefix the provisioned toolchain PATH so the          right node/ffmpeg are used, then call the hyperframes binary directly. Run commands with          shell_run like:
+         HOW TO INVOKE (Allow Shell Access shell): always prefix the provisioned toolchain PATH so the          right node/ffmpeg are used, then call the hyperframes binary directly. Run commands with          shell_run like:
            program: \"bash\"
            args: [\"-lc\", \"export PATH='{path_env}':$PATH && '{hf_bin}' <hyperframes args>\"]
 
@@ -5077,9 +5077,9 @@ async fn agent_stream(
         let _ = app.emit(&channel, &provider::StreamEvent::Info { text: if variant.trim().is_empty() { format!("model: {model}") } else { format!("model: {model} · {variant}") } });
 
         // PRO MODE UNCAPPED (Mason 08-03): same policy as the Anthropic path —
-        // no round cap in Pro Mode; the stall detector replaces it. Non-Pro
+        // no round cap in Allow Shell Access; the stall detector replaces it. Non-Pro
         // keeps the 20-round cap.
-        let pro_uncapped = folder.as_deref().map(|f| pro_mode_enabled(&app, f)).unwrap_or(false);
+        let pro_uncapped = folder.as_deref().map(|f| allow_shell_access_enabled(&app, f)).unwrap_or(false);
         let max_rounds: usize = if pro_uncapped { usize::MAX } else { 60 };
         let mut rounds: usize = 0;
         let mut tool_calls_total: usize = 0;
@@ -5330,12 +5330,12 @@ async fn agent_stream(
     let emit = |ev: &provider::StreamEvent| { let _ = app.emit(&channel, ev); };
     emit(&provider::StreamEvent::Info { text: format!("model: {model}") });
 
-    // PRO MODE UNCAPPED (Mason 08-03): in Pro Mode there is NO round cap — the
+    // PRO MODE UNCAPPED (Mason 08-03): in Allow Shell Access there is NO round cap — the
     // loop runs until the model stops calling tools, the user hits Stop, or the
     // STALL DETECTOR fires (the cap's replacement: a count cap punishes honest
     // long work; a stall detector catches actual degenerate loops). Non-Pro
     // keeps the 20-round cap. This is the fix for the "20 continues" session.
-    let pro_uncapped = folder.as_deref().map(|f| pro_mode_enabled(&app, f)).unwrap_or(false);
+    let pro_uncapped = folder.as_deref().map(|f| allow_shell_access_enabled(&app, f)).unwrap_or(false);
     let max_rounds: usize = if pro_uncapped { usize::MAX } else { 60 };
     let mut rounds: usize = 0;
     let mut tool_calls_total: usize = 0;
@@ -5465,7 +5465,7 @@ async fn agent_stream(
                     // STALL DETECTOR bookkeeping (Mason 08-03): identical-call streaks
                     // and all-errored rounds are what distinguish a degenerate loop
                     // from honest long work — this replaces the blunt 20-round cap
-                    // in Pro Mode.
+                    // in Allow Shell Access.
                     round_calls += 1;
                     if is_err { round_errs += 1; }
                     tool_calls_total += 1;
@@ -6280,7 +6280,7 @@ pub fn run() {
             connection_set_write, connection_set_tool_enabled, connection_tool_states,
             connection_set_read_only,
             memory_get_auto_remember, memory_set_auto_remember,
-            pro_mode_get, pro_mode_set, shell_procs, shell_kill_proc,
+            allow_shell_access_get, allow_shell_access_set, shell_procs, shell_kill_proc,
             github_git_auth,
             telegram_status, telegram_set_token, telegram_test_token,
             onboarding_status, onboarding_pick_root, onboarding_set_root,
@@ -6400,7 +6400,7 @@ pub fn run() {
             // daemon, handing it the broker-WS {port, token} so it can connect
             // as an authed client. jailed=false in dev; Seatbelt (jailed=true)
             // is finalized later in M0.2. The exec broker is passed in so exec.*
-            // ops (Pro Mode) resolve against the same privileged actor.
+            // ops (Allow Shell Access) resolve against the same privileged actor.
             let app_handle_for_daemon = _app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 match broker_ws::start(broker, exec_broker, broker_token.clone()).await {

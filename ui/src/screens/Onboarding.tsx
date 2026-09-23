@@ -18,7 +18,7 @@ import { Icon, AGENT_ICONS, type IconName } from "../components/Icon";
 //                Local: Hugging Face search via local_search/local_lookup with
 //                perf badges + download; picking local sets provider="local")
 //   3c Soul     (brief -> agent_generate_soul on a lazily-created draft agent)
-//   3d Superpowers (Pro Mode consent, scary-honest, default off)
+//   3d Superpowers (Allow Shell Access consent, scary-honest, default off)
 
 type Step = "welcome" | "home" | "agent" | "done";
 type Intent = "create" | "restore" | null;
@@ -76,8 +76,8 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   const [soulBusy, setSoulBusy] = useState(false);
   const [soulErr, setSoulErr] = useState<string | null>(null);
 
-  // 3d Pro Mode
-  const [proMode, setProMode] = useState(false);
+  // 3d Allow Shell Access
+  const [allowShellAccess, setAllowShellAccess] = useState(false);
   const [proBusy, setProBusy] = useState(false);
 
   // Draft agent — created lazily the first time an action needs an agent id
@@ -251,17 +251,17 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
     finally { setSoulBusy(false); }
   }
 
-  // 3d Pro Mode — keyed on the agent's home folder (matches the jail).
+  // 3d Allow Shell Access — keyed on the agent's home folder (matches the jail).
   useEffect(() => {
     if (step !== "agent" || sub !== 3 || !pendingHome) return;
-    invoke<boolean>("pro_mode_get", { folder: pendingHome }).then(setProMode).catch(() => setProMode(false));
+    invoke<boolean>("allow_shell_access_get", { folder: pendingHome }).then(setAllowShellAccess).catch(() => setAllowShellAccess(false));
   }, [step, sub, pendingHome]);
 
   async function toggleProMode(next: boolean) {
     if (!pendingHome) return;
     if (next) {
       const ok = window.confirm(
-        "Enable Pro Mode for this agent?\n\n" +
+        "Enable Allow Shell Access for this agent?\n\n" +
         "This agent will be able to RUN PROGRAMS on your Mac — including build tools, " +
         "git, and anything on your PATH — rooted in its folder. Commands run from the " +
         "folder and cannot leave it, secrets are never shared with them, and you can kill " +
@@ -271,7 +271,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
       if (!ok) return;
     }
     setProBusy(true);
-    try { setProMode(await invoke<boolean>("pro_mode_set", { folder: pendingHome, enabled: next })); }
+    try { setAllowShellAccess(await invoke<boolean>("allow_shell_access_set", { folder: pendingHome, enabled: next })); }
     catch { /* ignore */ }
     finally { setProBusy(false); }
   }
@@ -594,16 +594,16 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 <p style={hint}>One last choice — how much power this agent gets. You can change this any time in the agent's settings.</p>
                 <div style={{
                   display: "flex", flexDirection: "column", gap: 8,
-                  background: proMode ? "color-mix(in srgb, var(--danger, #ef4444) 8%, var(--surface))" : "var(--surface)",
-                  border: `var(--border-width) solid ${proMode ? "color-mix(in srgb, var(--danger, #ef4444) 40%, transparent)" : "var(--line)"}`,
+                  background: allowShellAccess ? "color-mix(in srgb, var(--danger, #ef4444) 8%, var(--surface))" : "var(--surface)",
+                  border: `var(--border-width) solid ${allowShellAccess ? "color-mix(in srgb, var(--danger, #ef4444) 40%, transparent)" : "var(--line)"}`,
                   borderRadius: "var(--radius-control)", padding: "12px 14px",
                 }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-                    <div style={{ fontSize: 13, fontWeight: 600 }}>⚡ Pro Mode — run shell commands</div>
+                    <div style={{ fontSize: 13, fontWeight: 600 }}>⚡ Allow Shell Access — run shell commands</div>
                     <label style={{ display: "inline-flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-                      <input type="checkbox" checked={proMode} disabled={proBusy || !pendingHome}
+                      <input type="checkbox" checked={allowShellAccess} disabled={proBusy || !pendingHome}
                         onChange={(e) => toggleProMode(e.target.checked)} />
-                      <span style={{ fontSize: 13 }}>{proMode ? "Enabled" : "Off"}</span>
+                      <span style={{ fontSize: 13 }}>{allowShellAccess ? "Enabled" : "Off"}</span>
                     </label>
                   </div>
                   <span style={{ ...hint, fontSize: 12 }}>

@@ -181,7 +181,7 @@ pub fn spawn_daemon(
         // PRO MODE (2026-07-31): grant the daemon session shell.exec so the exec
         // broker will accept exec.* ops. This is Mason's PERSONAL harness (not a
         // shipping user feature) — the daemon is allowed to exec; the REAL switch
-        // is the per-folder pro_mode flag, which decides whether the shell_* tools
+        // is the per-folder allow_shell_access flag, which decides whether the shell_* tools
         // are ever exposed to the model. Without this env the broker binds no exec
         // grant and every exec op is refused (the gap we flagged). The child-env
         // scrub in exec.rs still strips this from any SPAWNED process.

@@ -334,7 +334,7 @@ function SkillList({ folder, agentId }: { folder: string | null; agentId: string
 }
 
 // ---------------------------------------------------------------------------
-// SKILL EDITOR (+ Pro Mode drafting) and the per-tool CONFIG panel. Both carried
+// SKILL EDITOR (+ Allow Shell Access drafting) and the per-tool CONFIG panel. Both carried
 // over from the old Tools tab — the config panel is still schema-driven from the
 // backend, which is the pattern every future configurable tool inherits.
 // ---------------------------------------------------------------------------

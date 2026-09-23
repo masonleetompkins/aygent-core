@@ -50,7 +50,7 @@ export const PRESETS: Preset[] = [
   {
     id: "build-ops",
     name: "Build / Ops",
-    blurb: "Git state, build status, and a one-click build. Needs Pro Mode.",
+    blurb: "Git state, build status, and a one-click build. Needs Allow Shell Access.",
     modules: [
       {
         kind: "list", title: "Recent Commits", layout: { x: 0, y: 0, w: 7, h: 6 },

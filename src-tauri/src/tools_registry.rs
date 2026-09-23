@@ -14,7 +14,7 @@
 //
 // SCOPE KEY (shared-context fix): the key used to be FNV(folder_path), which
 // meant two agents pointed at the same folder silently SHARED tool enablement
-// and config — toggle Pro Mode on the cheap model and you toggled it on the
+// and config — toggle Allow Shell Access on the cheap model and you toggled it on the
 // other one. Identity is the AGENT, not the path (same class of bug as the
 // 08-03 ghost folder: identity keyed by path instead of by agent). Callers now
 // pass an agent id; a legacy folder-keyed file is read once and MIGRATED to the
