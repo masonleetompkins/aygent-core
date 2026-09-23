@@ -54,6 +54,7 @@ mod gguf;
 mod google_auth; // GOOGLE service accounts: RS256 JWT -> access token (the one credential we must MINT, not paste).
 mod hardware;
 mod keychain;
+mod omarchy; // LINUX: Omarchy theme adapter, portable returns not-available off Linux.
 mod local_provider;
 mod local_tools;
 mod openai_provider;
@@ -6203,6 +6204,7 @@ pub fn run() {
         .manage(continue_gate::ContinueGate::default())
         .manage(remote_runtime)
         .invoke_handler(tauri::generate_handler![
+            omarchy::omarchy_theme, omarchy::omarchy_available,
             whisper::transcribe_audio_b64,
             chat_attach_file,
             tool_file_before,

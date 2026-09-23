@@ -45,7 +45,7 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 crypto_box = { version = "0.9", features = ["chacha20"] }  # kept for examples/crypto_interop.rs (v1 asymmetric proof)
 chacha20poly1305 = "0.10"  # AYGENT REMOTE v2: XChaCha20-Poly1305 IETF AEAD with ONE account channel key (interop: libsodium crypto_aead_xchacha20poly1305_ietf) — any logged-in browser fetches the key over authed HTTPS
 futures-util = "0.3"
-keyring = { version = "=3.2.1", features = ["apple-native"] }  # API keys in macOS Keychain (M0.3; never touch JS/WebView). PINNED: later 3.x absorbed the keyring-core rewrite which tightened credential validation -> 'Attribute user is invalid: cannot be empty' + changed apple-native target mapping. Commit Cargo.lock so this never drifts.
+# keyring moved to per-OS targets (1.1.0 M0)
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "multipart"], default-features = false }  # Anthropic HTTP (M0.3)
 git2 = { version = "0.19", default-features = false }  # checkpoints (C4): git object model compiled IN — no system git, zero user setup
 llama-cpp-2 = "0.1"                 # LOCAL MODELS: llama.cpp compiled IN — download + run GGUF models in-app, zero user setup (Metal on mac / CUDA on PC via features below)
@@ -81,6 +81,7 @@ cef = { version = "=151.0.0", features = ["build-util"], optional = true }
 libc = "0.2"                        # atomic openat/O_NOFOLLOW fd layer (M0.2c)
 
 [target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "=3.2.1", features = ["apple-native"] }  # 1.1.0: mac Keychain
 # Direct AppKit access: the embedded browser webview is placed by setting its
 # NSView frame against the LIVE window contentView (ground truth), instead of
 # trusting wry's child-positioning math (titlebar/flip mismatches burned us).
@@ -116,6 +117,7 @@ sandbox = ["cef/sandbox"]
 # opt in. Kept as features so a headless/CI build can compile CPU-only.
 metal = ["llama-cpp-2/metal"]
 cuda = ["llama-cpp-2/cuda"]
+vulkan = ["llama-cpp-2/vulkan"]  # 1.1.0: Linux opt-in
 
 # On macOS, default to Metal so Mason's `cargo tauri dev` GPU-offloads out of the
 # box (this is where he builds/runs). Other targets stay CPU-only unless opted in.
@@ -129,3 +131,9 @@ features = ["metal"]
 # toolchain/dyld combo. Disable stripping to test/fix.
 [profile.release]
 strip = "none"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3" }  # 1.1.0: windows-native default (unsigned 1.1.0)
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }  # 1.1.0: Secret Service gnome-keyring

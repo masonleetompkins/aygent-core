@@ -18,6 +18,7 @@ const NODE_VERSION: &str = "v24.19.0";
 // Pinned uv (Python package/runtime manager) — a single static binary that can
 // bootstrap its own Python, so Python MCP servers need zero system Python.
 const UV_VERSION: &str = "0.12.2";
+// 1.1.0 multi-OS: mac (martin-riedl zip) / linux (johnvansickle tar.xz) / win (gyan essentials zip).
 // Static macOS FFmpeg + FFprobe, ARCH-NATIVE. martin-riedl.de publishes separate
 // arm64 and amd64 macOS static builds, each as a per-binary zip — so Apple Silicon
 // gets a real arm64 binary (NOT x86_64-through-Rosetta, which flaked the render's
@@ -120,8 +121,13 @@ async fn download_to(app: &AppHandle, channel: &str, phase: &str, label: &str, u
 pub async fn ensure_node(app: &AppHandle, channel: &str) -> Result<PathBuf, String> {
     if let Some(p) = node_bin(app) { return Ok(p); }
     let a = arch();
-    let stem = format!("node-{NODE_VERSION}-darwin-{a}");
-    let url = format!("https://nodejs.org/dist/{NODE_VERSION}/{stem}.tar.gz");
+    // 1.1.0: darwin .tar.gz / linux .tar.xz / win .zip
+    #[cfg(target_os = "macos")]
+    let (stem, url) = { let s = format!("node-{NODE_VERSION}-darwin-{a}"); let u = format!("https://nodejs.org/dist/{NODE_VERSION}/{s}.tar.gz"); (s, u) };
+    #[cfg(target_os = "linux")]
+    let (stem, url) = { let s = format!("node-{NODE_VERSION}-linux-{a}"); let u = format!("https://nodejs.org/dist/{NODE_VERSION}/{s}.tar.xz"); (s, u) };
+    #[cfg(target_os = "windows")]
+    let (stem, url) = { let wa = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" }; let s = format!("node-{NODE_VERSION}-win-{wa}"); let u = format!("https://nodejs.org/dist/{NODE_VERSION}/{s}.zip"); (s, u) };
     let rt = runtime_dir(app)?;
     let tarball = rt.join(format!("{stem}.tar.gz"));
     download_to(app, channel, "node", &format!("Node {NODE_VERSION} ({a})"), &url, &tarball).await?;
