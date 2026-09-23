@@ -1,4 +1,4 @@
-# AYGENT — Capabilities (v1.0.17)
+# AYGENT — Capabilities (v1.1.0)
 
 _The canonical reference for what AYGENT can do, as shipped in the signed,
 notarized release. This is the source-of-truth capability doc: keep it in
@@ -238,6 +238,7 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 ---
 
 ## Changelog
+- **1.1.0** (2026-09-23): **Cross-platform core + Allow Shell Access** — Pro Mode renamed to Allow Shell Access (OFF by default, per-agent + global kill, audit log); Omarchy theme adapter (Linux) portable; per-OS keychain (Keychain / Credential Manager / Secret Service) + multi-OS provisioner (Node/FFmpeg/uv mac+linux+win); shared security.policy.json; v15 migration idempotent (119 tests pass); version unified 1.1.0.
 - **1.0.17** (2026-09-21): **Apple MLX local models** — Mac-native `mlx-community/*` weights via an in-app sidecar: HF search surfaces MLX repos, pulls stream per-file progress into a local library with resume, the Agents picker lists pulled models, chat streams at $0 with fail-fast warm-up plus stream watchdog. Chat-only for now; packs shipping their own loader code require explicit per-model Allow.
 - **1.0.16** (2026-09-09): **Video Editor tab + chat upgrades** — a new Video tab: agentic NLE with real playback, hardlink media import, timeline (linked V+A clips, razor/review lanes), transcript + Hyperframes captions/graphics overlays, color grade + LUTs, local neural dialogue cleanup (DeepFilterNet3, live blend) with per-selection Clean Audio, Premiere-style media bins, review notes the agent can see and act on, and canvas vision (`video_look`). Still new and rough around the edges — under active polish. Chat: **streaming side-by-side diff view** on every code edit (before/red left, after/green right, live +N/-N counts), **drag-and-drop file attach**, long-task **timer picker** (1/3/5/10/15 min), OpenCode-parity usage billing + accent context pill, per-agent Muse Spark variant knob. Fixes along the way: Muse image budget (no more 400s), sidebar overflow, Create-button clipping, Clean Audio static master + audible-only counts.
 - **1.0.12** (2026-09-04): **Local-only setups no longer blocked by a phantom Anthropic-key check** — the chat "ready" gate was hardwired to `has_provider_key("anthropic")`, so an agent on a **local model** (or OpenAI/OpenRouter/Muse-only) saw "add an Anthropic key in Settings" and a disabled composer even though the backend needed no such key. The gate is now per-agent: `local` is always ready, cloud providers check **their own** key, and the hint names the real provider. Active-agent profile is re-read on screen change so switching provider in Settings takes effect immediately.
@@ -270,4 +271,4 @@ Base file tools (always on, jailed): `read_file`, `write_file`, `list_files`,
 - **1.0.0** (2026-08-10): Signed/notarized launch — whoami tool, GFM tables,
   dashboards, sparks, remote.
 
-_Last updated 2026-09-21 for 1.0.17. If you add a capability, add it here._
+_Last updated 2026-09-23 for 1.1.0. If you add a capability, add it here._
