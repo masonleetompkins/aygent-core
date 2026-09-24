@@ -58,7 +58,12 @@ jobs:
         shell: bash
         run: |
           cd src-tauri/target/${{ matrix.target }}/release/bundle
-          (shasum -a 256 */* 2>/dev/null || sha256sum */*) > sha256-${{ matrix.bundle }}.txt
+          # Hash files only (AppDir/.app are directories; macOS lacks sha256sum).
+          if command -v sha256sum >/dev/null; then
+            find . -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.exe' \) -exec sha256sum {} + > sha256-${{ matrix.bundle }}.txt
+          else
+            find . -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.exe' \) -exec shasum -a 256 {} + > sha256-${{ matrix.bundle }}.txt
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: aygent-${{ github.ref_name }}-${{ matrix.bundle }}

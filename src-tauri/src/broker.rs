@@ -531,6 +531,17 @@ mod tests {
     use super::*;
     use std::fs;
 
+    // Portable symlink creation for gate tests. Windows file symlinks need
+    // no elevation on CI runners (Developer Mode / admin token present).
+    #[cfg(unix)]
+    fn make_symlink(target: &std::path::Path, link: &std::path::Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+    #[cfg(windows)]
+    fn make_symlink(target: &std::path::Path, link: &std::path::Path) {
+        std::os::windows::fs::symlink_file(target, link).unwrap();
+    }
+
     fn tmp_root() -> PathBuf {
         let mut d = std::env::temp_dir();
         d.push(format!("aygent_test_{}", rand_suffix()));
@@ -596,7 +607,7 @@ mod tests {
         let root = tmp_root();
         // create a symlink inside root pointing OUT to /etc
         let link = root.join("escape");
-        std::os::unix::fs::symlink("/etc", &link).unwrap();
+        make_symlink(std::path::Path::new("/etc"), &link);
         let r = Broker::resolve_within(&root, "escape/passwd", Mode::Read);
         assert_eq!(r, Err(BrokerError::SymlinkEscape));
     }
@@ -607,7 +618,7 @@ mod tests {
         let target = root.join("real.md");
         fs::write(&target, b"x").unwrap();
         let link = root.join("link.md");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
+        make_symlink(&target, &link);
         let r = Broker::resolve_within(&root, "link.md", Mode::Read);
         assert_eq!(r, Err(BrokerError::SymlinkEscape));
     }
@@ -868,7 +879,7 @@ mod tests {
             let p = root2.join(name);
             while !stop2.load(Ordering::Relaxed) {
                 let _ = std::fs::remove_file(&p);
-                let _ = std::os::unix::fs::symlink("/etc/passwd", &p);
+                let _ = make_symlink(std::path::Path::new("/etc/passwd"), &p);
                 let _ = std::fs::remove_file(&p);
                 let _ = std::fs::write(&p, b"in-scope");
             }
