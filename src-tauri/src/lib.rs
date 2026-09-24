@@ -6207,6 +6207,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             omarchy::omarchy_theme, omarchy::omarchy_available,
             pro::pro_status, pro::pro_refresh,
+            pro::signin_start, pro::signin_complete, pro::signout,
             whisper::transcribe_audio_b64,
             chat_attach_file,
             tool_file_before,

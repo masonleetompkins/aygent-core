@@ -29,3 +29,54 @@ pub fn pro_status() -> serde_json::Value {
 pub async fn pro_refresh() -> bool {
     is_pro()
 }
+
+// Keychain slot for the site session token. The OVERLAY agrees on this exact
+// string (its own const) — sign-in writes here, entitlement reads here.
+pub const SESSION_KEY: &str = "session";
+
+/// Where the desktop sign-in code comes from (UI opens it in the browser).
+#[tauri::command]
+pub fn signin_start() -> serde_json::Value {
+    serde_json::json!({ "url": "https://masonlee.build/desktop-signin" })
+}
+
+/// Complete sign-in with the one-time code from /desktop-signin. Exchanges it
+/// for a virtual key and stores it in the OS keychain. Same code path in Pro
+/// builds (overlay keeps these commands; only refresh_entitlement differs).
+#[tauri::command]
+pub async fn signin_complete(code: String) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("http: {e}"))?;
+    let v: serde_json::Value = client
+        .post("https://masonlee.build/api/desktop-signin/exchange")
+        .json(&serde_json::json!({ "code": code }))
+        .send()
+        .await
+        .map_err(|e| format!("exchange: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("exchange body: {e}"))?;
+    if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+        return Err(v
+            .get("error")
+            .and_then(|s| s.as_str())
+            .unwrap_or("exchange rejected")
+            .to_string());
+    }
+    let key = v
+        .get("api_key")
+        .and_then(|s| s.as_str())
+        .ok_or("no api_key in response")?;
+    crate::keychain::set_key(SESSION_KEY, key)?;
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Sign out: forget the session token locally. (Server revocation = delete the
+/// key row; a revoke-all affordance belongs on the account page, post-launch.)
+#[tauri::command]
+pub fn signout() -> Result<serde_json::Value, String> {
+    crate::keychain::delete_key(SESSION_KEY)?;
+    Ok(serde_json::json!({ "ok": true }))
+}
