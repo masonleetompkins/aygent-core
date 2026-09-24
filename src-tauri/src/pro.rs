@@ -17,3 +17,15 @@ pub fn is_pro() -> bool {
 pub fn tier_label() -> &'static str {
     "Core"
 }
+
+/// UI-callable tier snapshot: `{ tier, pro }`. Always Core here.
+#[tauri::command]
+pub fn pro_status() -> serde_json::Value {
+    serde_json::json!({ "tier": tier_label(), "pro": is_pro() })
+}
+
+/// UI-callable refresh. Core has no backend: always false, never blocks.
+#[tauri::command]
+pub async fn pro_refresh() -> bool {
+    is_pro()
+}

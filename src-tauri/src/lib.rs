@@ -6206,6 +6206,7 @@ pub fn run() {
         .manage(remote_runtime)
         .invoke_handler(tauri::generate_handler![
             omarchy::omarchy_theme, omarchy::omarchy_available,
+            pro::pro_status, pro::pro_refresh,
             whisper::transcribe_audio_b64,
             chat_attach_file,
             tool_file_before,
