@@ -46,6 +46,42 @@ export function Settings({
   const [cpMsg, setCpMsg] = useState<string | null>(null);
   const [confirmPurge, setConfirmPurge] = useState(false);
 
+  // Account: tier badge + desktop sign-in (code from masonlee.build/desktop-signin).
+  const [tier, setTier] = useState("Core");
+  const [signedIn, setSignedIn] = useState(false);
+  const [signCode, setSignCode] = useState("");
+  const [signMsg, setSignMsg] = useState<string | null>(null);
+  useEffect(() => {
+    invoke<{ tier: string; pro: boolean }>("pro_status")
+      .then((s) => { setTier(s.tier); setSignedIn(s.pro); })
+      .catch(() => {});
+  }, []);
+  async function openSignin() {
+    setSignMsg(null);
+    try {
+      const r = await invoke<{ url: string }>("signin_start");
+      await invoke("open_url", { url: r.url });
+    } catch (e) { setSignMsg("✗ " + String(e)); }
+  }
+  async function completeSignin() {
+    const code = signCode.trim();
+    if (!code) return;
+    setSignMsg(null);
+    try {
+      await invoke("signin_complete", { code });
+      const s = await invoke<{ tier: string; pro: boolean }>("pro_status");
+      setTier(s.tier); setSignedIn(s.pro); setSignCode("");
+      setSignMsg(s.pro ? "✓ signed in — Pro unlocked" : "✓ signed in");
+    } catch (e) { setSignMsg("✗ " + String(e)); }
+  }
+  async function signOut() {
+    setSignMsg(null);
+    try {
+      await invoke("signout");
+      setTier("Core"); setSignedIn(false); setSignMsg("signed out");
+    } catch (e) { setSignMsg("✗ " + String(e)); }
+  }
+
   // M1.4 multi-agent knobs: inter-agent budget + max concurrency.
   const [budget, setBudget] = useState(6);
   const [concurrency, setConcurrency] = useState(6);
@@ -93,6 +129,28 @@ export function Settings({
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-4)", maxWidth: 620 }}>
       <h2 style={{ fontSize: 15, fontWeight: 700, margin: 0 }}>Settings <kbd className="pro-kbd">⌘,</kbd></h2>
+
+      {/* ACCOUNT — tier + desktop sign-in. */}
+      <Card title="Account">
+        <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
+          <Pill tone={signedIn ? "ok" : "muted"}>{tier}</Pill>
+          {signedIn ? (
+            <Button variant="secondary" onClick={signOut}>Sign out</Button>
+          ) : (
+            <Button variant="secondary" onClick={openSignin}>Sign in…</Button>
+          )}
+        </div>
+        {!signedIn && (
+          <>
+            <p style={hint}>Sign in on the site, then type the code here. Pro unlocks after purchase or trial.</p>
+            <div style={{ display: "flex", gap: "var(--space-2)", alignItems: "center" }}>
+              <Input value={signCode} onChange={(e: any) => setSignCode(e.target.value)} placeholder="XXXX-XXXX" />
+              <Button onClick={completeSignin} disabled={!signCode.trim()}>Link app</Button>
+            </div>
+          </>
+        )}
+        {signMsg && <Pill tone={signMsg.startsWith("✗") ? "danger" : "ok"}>{signMsg}</Pill>}
+      </Card>
 
       {/* APPEARANCE — at the top. */}
       <Card title="Appearance">

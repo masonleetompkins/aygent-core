@@ -80,3 +80,21 @@ pub fn signout() -> Result<serde_json::Value, String> {
     crate::keychain::delete_key(SESSION_KEY)?;
     Ok(serde_json::json!({ "ok": true }))
 }
+
+
+/// Open a URL in the system browser (used by sign-in; WebView must not navigate away).
+#[tauri::command]
+pub fn open_url(url: String) -> Result<(), String> {
+    if !(url.starts_with("https://masonlee.build/") || url.starts_with("https://aygent.masonlee.build/")) {
+        return Err("refusing to open off-site URL".into());
+    }
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg(&url).status();
+    #[cfg(target_os = "windows")]
+    let r = std::process::Command::new("cmd")
+        .args(["/C", "start", "", &url])
+        .status();
+    #[cfg(target_os = "linux")]
+    let r = std::process::Command::new("xdg-open").arg(&url).status();
+    r.map(|_| ()).map_err(|e| format!("open failed: {e}"))
+}
