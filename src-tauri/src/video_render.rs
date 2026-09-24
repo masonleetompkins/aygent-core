@@ -754,7 +754,21 @@ fn running() -> &'static Mutex<HashMap<String, u32>> { RUNNING.get_or_init(|| Mu
 
 pub fn cancel(key: &str) -> bool {
     let pid = running().lock().ok().and_then(|m| m.get(key).copied());
-    match pid { Some(p) => { unsafe { libc::kill(p as i32, libc::SIGTERM); } true } None => false }
+    match pid {
+        #[cfg(unix)]
+        Some(p) => {
+            unsafe { libc::kill(p as i32, libc::SIGTERM); }
+            true
+        }
+        // Windows: no libc signals — taskkill is the equivalent hammer.
+        #[cfg(windows)]
+        Some(p) => std::process::Command::new("taskkill")
+            .args(["/PID", &p.to_string(), "/F"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false),
+        None => false,
+    }
 }
 
 fn encoder_args(codec: &str, bitrate: &str, fps: f64, fallback: bool) -> Vec<String> {

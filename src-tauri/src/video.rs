@@ -383,7 +383,10 @@ pub fn import_one_in(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, pr
     // inside the agent folder is fine to link too (same volume by definition).
     let linked = match std::fs::hard_link(&src, &dst) {
         Ok(()) => true,
-        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => false,
+        #[cfg(unix)]
+    Err(e) if e.raw_os_error() == Some(libc::EXDEV) => false,
+    #[cfg(windows)]
+    Err(e) if e.raw_os_error() == Some(17) => false, // ERROR_NOT_SAME_DEVICE
         Err(e) => return Err(format!("hardlink failed: {e}")),
     };
 
@@ -701,7 +704,11 @@ pub fn import_lut(broker: &Broker, agent_id: &str, project: &str, src: &Path) ->
     let dst = dir.join(&name);
     if !dst.exists() {
         if let Err(e) = std::fs::hard_link(&src, &dst) {
-            if e.raw_os_error() == Some(libc::EXDEV) { std::fs::copy(&src, &dst).map_err(|e| format!("lut copy: {e}"))?; } // LUTs are tiny; a copy is fine here
+            #[cfg(unix)]
+            let xdev = e.raw_os_error() == Some(libc::EXDEV);
+            #[cfg(windows)]
+            let xdev = e.raw_os_error() == Some(17); // ERROR_NOT_SAME_DEVICE
+            if xdev { std::fs::copy(&src, &dst).map_err(|e| format!("lut copy: {e}"))?; } // LUTs are tiny; a copy is fine here
             else { return Err(format!("lut link: {e}")); }
         }
     }
@@ -742,7 +749,11 @@ pub async fn video_relink_asset(app: tauri::AppHandle, broker: tauri::State<'_, 
     let fname = format!("{}-{}", a.id, src.file_name().and_then(|n| n.to_str()).unwrap_or("media"));
     let dst = media.join(&fname);
     let _ = std::fs::remove_file(&dst);
-    let linked = match std::fs::hard_link(&src, &dst) { Ok(()) => true, Err(e) if e.raw_os_error() == Some(libc::EXDEV) => false, Err(e) => return Err(format!("hardlink failed: {e}")) };
+    let linked = match std::fs::hard_link(&src, &dst) { Ok(()) => true, #[cfg(unix)]
+    Err(e) if e.raw_os_error() == Some(libc::EXDEV) => false,
+    #[cfg(windows)]
+    Err(e) if e.raw_os_error() == Some(17) => false, // ERROR_NOT_SAME_DEVICE
+    Err(e) => return Err(format!("hardlink failed: {e}")) };
     a.path = src.to_string_lossy().to_string();
     a.linked = linked;
     a.rel = if linked { format!("media/{fname}") } else { String::new() };

@@ -22,6 +22,7 @@
 // that decides admit/refuse — and is fully unit-testable in Rust alone.
 
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -69,6 +70,7 @@ pub struct AgentScope {
 
 pub struct Broker {
     scopes: Mutex<HashMap<String, AgentScope>>,
+    #[cfg(unix)]
     #[allow(dead_code)] // used once the RPC fd bridge lands
     open_fds: Mutex<HashMap<String, RawFd>>,
 }
@@ -95,6 +97,7 @@ impl Broker {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             scopes: Mutex::new(HashMap::new()),
+            #[cfg(unix)]
             open_fds: Mutex::new(HashMap::new()),
         })
     }
@@ -305,9 +308,21 @@ impl Broker {
             // Rule 7: on write, refuse hardlinked files (nlink > 1) — a hardlink
             // can point an in-scope name at an out-of-scope inode.
             if mode.is_write() {
-                use std::os::unix::fs::MetadataExt;
-                if meta.nlink() > 1 {
-                    return Err(BrokerError::HardlinkRefused);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if meta.nlink() > 1 {
+                        return Err(BrokerError::HardlinkRefused);
+                    }
+                }
+                // Windows: same Rule 7 via link count (BY_HANDLE nNumberOfLinks).
+                // No new deps: std exposes it on MetadataExt.
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if meta.number_of_links() > 1 {
+                        return Err(BrokerError::HardlinkRefused);
+                    }
                 }
             }
         }
@@ -359,6 +374,36 @@ impl Broker {
         requested: &str,
         mode: Mode,
     ) -> Result<std::fs::File, BrokerError> {
+    /// Windows counterpart to resolve_and_open. No O_NOFOLLOW exists here, so
+    /// this is resolve() (which already refuses final-component symlinks per
+    /// Rule 3) + a plain open — a documented TOCTOU residual vs unix, accepted
+    /// because the jail owner (Mason/local user) is also the process owner.
+    /// Same signature/return so all call sites compile unchanged.
+    #[cfg(windows)]
+    pub fn resolve_and_open(
+        &self,
+        agent_id: &str,
+        requested: &str,
+        mode: Mode,
+    ) -> Result<std::fs::File, BrokerError> {
+        use std::fs::OpenOptions;
+        let admitted = self.resolve(agent_id, requested, mode)?;
+        let file = match mode {
+            Mode::Read => OpenOptions::new().read(true).open(&admitted),
+            Mode::Write => OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&admitted),
+            Mode::ReadWrite => OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&admitted),
+        };
+        file.map_err(|e| BrokerError::Io(format!("open failed: {e}")))
+    }
+
         let admitted = self.resolve(agent_id, requested, mode)?;
         open_nofollow(&admitted, mode)
     }
