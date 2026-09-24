@@ -315,12 +315,26 @@ impl Broker {
                         return Err(BrokerError::HardlinkRefused);
                     }
                 }
-                // Windows: same Rule 7 via link count (BY_HANDLE nNumberOfLinks).
-                // No new deps: std exposes it on MetadataExt.
+                // Windows: same Rule 7 via BY_HANDLE nNumberOfLinks.
+                // windows-sys is a Windows-only dep (see Cargo.toml); unix builds
+                // never compile this.
                 #[cfg(windows)]
                 {
-                    use std::os::windows::fs::MetadataExt;
-                    if meta.number_of_links() > 1 {
+                    use std::os::windows::io::AsRawHandle;
+                    use windows_sys::Win32::Storage::FileSystem::{
+                        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+                    };
+                    let f = std::fs::File::open(&candidate)
+                        .map_err(|_| BrokerError::NotFound)?;
+                    let mut info: BY_HANDLE_FILE_INFORMATION =
+                        unsafe { std::mem::zeroed() };
+                    let ok = unsafe {
+                        GetFileInformationByHandle(f.as_raw_handle() as isize, &mut info)
+                    };
+                    if ok == 0 {
+                        return Err(BrokerError::Io("link count query failed".into()));
+                    }
+                    if info.nNumberOfLinks > 1 {
                         return Err(BrokerError::HardlinkRefused);
                     }
                 }
@@ -374,6 +388,10 @@ impl Broker {
         requested: &str,
         mode: Mode,
     ) -> Result<std::fs::File, BrokerError> {
+        let admitted = self.resolve(agent_id, requested, mode)?;
+        open_nofollow(&admitted, mode)
+    }
+
     /// Windows counterpart to resolve_and_open. No O_NOFOLLOW exists here, so
     /// this is resolve() (which already refuses final-component symlinks per
     /// Rule 3) + a plain open — a documented TOCTOU residual vs unix, accepted
@@ -403,11 +421,7 @@ impl Broker {
         };
         file.map_err(|e| BrokerError::Io(format!("open failed: {e}")))
     }
-
-        let admitted = self.resolve(agent_id, requested, mode)?;
-        open_nofollow(&admitted, mode)
-    }
-}
+} // end impl Broker
 
 /// Open a path with O_NOFOLLOW on the final component (Atlas C2 rule 2/3).
 /// If the final component is a symlink, the OS itself refuses with ELOOP — the

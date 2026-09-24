@@ -213,6 +213,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "urlencoding",
+ "windows-sys 0.59.0",
  "zip",
 ]
 
