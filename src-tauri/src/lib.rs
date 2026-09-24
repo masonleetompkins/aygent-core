@@ -64,6 +64,7 @@ mod pdf_tool;
 mod provider;
 mod pricing; // CLOUD model context windows + $/Mtok (context meter + cost).
 pub mod provision;
+pub mod pro; // PRO HOOK: public stub (Core); replaced by real impl in Pro builds.
 mod mcp_client;
 mod mcp; // MCP manager: registry + catalog + agent-loop bridge + install/uninstall. // MCP client: spawn stdio JSON-RPC servers, discover + route their tools. // Level A: bundle portable node+ffmpeg+hyperframes into app-data (no system installs).
 pub mod supervisor;
