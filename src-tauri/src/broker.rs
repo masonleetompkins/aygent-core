@@ -393,10 +393,11 @@ impl Broker {
     }
 
     /// Windows counterpart to resolve_and_open. No O_NOFOLLOW exists here, so
-    /// this is resolve() (which already refuses final-component symlinks per
-    /// Rule 3) + a plain open — a documented TOCTOU residual vs unix, accepted
-    /// because the jail owner (Mason/local user) is also the process owner.
-    /// Same signature/return so all call sites compile unchanged.
+    /// instead of trusting the path between check and open, we verify the OPEN
+    /// HANDLE: GetFinalPathNameByHandle reports where the handle actually
+    /// landed, and we refuse unless that's inside root. A swap race can change
+    /// the path all day — it can't change what we verify. Same signature and
+    /// SymlinkEscape refusal as unix, so all call sites are unchanged.
     #[cfg(windows)]
     pub fn resolve_and_open(
         &self,
@@ -405,6 +406,10 @@ impl Broker {
         mode: Mode,
     ) -> Result<std::fs::File, BrokerError> {
         use std::fs::OpenOptions;
+        use std::os::windows::ffi::OsStringExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::MAX_PATH;
+        use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
         let admitted = self.resolve(agent_id, requested, mode)?;
         let file = match mode {
             Mode::Read => OpenOptions::new().read(true).open(&admitted),
@@ -418,8 +423,32 @@ impl Broker {
                 .write(true)
                 .create(true)
                 .open(&admitted),
+        }
+        .map_err(|e| BrokerError::Io(format!("open failed: {e}")))?;
+        // Verify the handle, not the path (race-free: the handle pins the file).
+        let mut len = MAX_PATH;
+        let landed = loop {
+            let mut buf = vec![0u16; len as usize];
+            // Returns chars written NOT counting NUL; == len means truncated.
+            let n =
+                unsafe { GetFinalPathNameByHandleW(file.as_raw_handle(), buf.as_mut_ptr(), len, 0) };
+            if n == 0 {
+                return Err(BrokerError::Io("final-path query failed".into()));
+            }
+            if n < len {
+                buf.truncate(n as usize);
+                break std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf));
+            }
+            len *= 2;
         };
-        file.map_err(|e| BrokerError::Io(format!("open failed: {e}")))
+        let scope = self.scope_for(agent_id)?;
+        let real_root =
+            std::fs::canonicalize(&scope.root).map_err(|_| BrokerError::NoScope)?;
+        if !is_within(&real_root, &landed) {
+            drop(file);
+            return Err(BrokerError::SymlinkEscape);
+        }
+        Ok(file)
     }
 } // end impl Broker
 
