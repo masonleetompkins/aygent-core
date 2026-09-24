@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../ui/dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "bash -c 'cd \"$(git rev-parse --show-toplevel)/ui\" && npm run dev'",
-    "beforeBuildCommand": "bash -c 'cd ../ui 2>/dev/null || cd \"$(git rev-parse --show-toplevel)/ui\"; npm run build'"
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
   },
   "app": {
     "windows": [
