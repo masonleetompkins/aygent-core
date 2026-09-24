@@ -595,6 +595,9 @@ mod tests {
         assert!(is_within(&root, &r));
     }
 
+    // Rule 8's forbidden list is Unix paths (/tmp, /var, /etc); the Windows
+    // temp-dir equivalent is an open TODO. Unix-only until then.
+    #[cfg(unix)]
     #[test]
     fn t10_tmp_forbidden() {
         let root = tmp_root();
@@ -605,9 +608,13 @@ mod tests {
     #[test]
     fn t_symlink_escape_refused() {
         let root = tmp_root();
-        // create a symlink inside root pointing OUT to /etc
+        // OUTSIDE target that exists on every OS (/etc is absent on Windows,
+        // which would make the link dangling and the test vacuous).
+        let outside_dir = tmp_root(); // separate root => "outside"
+        let outside = outside_dir.join("secret.md");
+        fs::write(&outside, b"secret").unwrap();
         let link = root.join("escape");
-        make_symlink(std::path::Path::new("/etc"), &link);
+        make_symlink(&outside, &link);
         let r = Broker::resolve_within(&root, "escape/passwd", Mode::Read);
         assert_eq!(r, Err(BrokerError::SymlinkEscape));
     }
@@ -856,12 +863,17 @@ mod tests {
     #[test]
     fn gate_toctou_symlink_swap() {
         // Rule 2/3 atomic: race resolve vs an attacker swapping a component for
-        // a symlink to /etc. With O_NOFOLLOW at the final component + the
+        // a symlink OUTSIDE root. With O_NOFOLLOW at the final component + the
         // canonicalized-ancestor check, the broker must NEVER open outside root,
         // no matter the interleaving. We hammer it in a loop while a thread
-        // flips a name between a real file and a symlink-to-/etc/passwd.
+        // flips a name between a real file and a symlink to an outside secret.
+        // (The outside file must EXIST on every OS — hence a scratch secret,
+        // not /etc/passwd.)
         use std::sync::atomic::{AtomicBool, Ordering};
         let root = tmp_root();
+        let outside_dir = tmp_root(); // separate root => "outside"
+        let outside = outside_dir.join("secret");
+        fs::write(&outside, b"OUTSIDE-SECRET-MARKER").unwrap();
         let name = "racy";
         let real = root.join("racy_real");
         fs::write(&real, b"in-scope").unwrap();
@@ -872,28 +884,28 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
 
         // Attacker thread: repeatedly swap `racy` between a real file and a
-        // symlink pointing OUT to /etc/passwd.
+        // symlink pointing OUT to the secret.
         let root2 = root.clone();
         let stop2 = stop.clone();
         let attacker = std::thread::spawn(move || {
             let p = root2.join(name);
             while !stop2.load(Ordering::Relaxed) {
                 let _ = std::fs::remove_file(&p);
-                let _ = make_symlink(std::path::Path::new("/etc/passwd"), &p);
+                let _ = make_symlink(&outside, &p);
                 let _ = std::fs::remove_file(&p);
                 let _ = std::fs::write(&p, b"in-scope");
             }
         });
 
-        // Victim loop: open many times; assert we NEVER read /etc/passwd content.
+        // Victim loop: open many times; assert we NEVER read outside content.
         for _ in 0..5000 {
             if let Ok(mut f) = b.resolve_and_open("default", name, Mode::Read) {
                 use std::io::Read;
                 let mut s = String::new();
                 let _ = f.read_to_string(&mut s);
                 assert!(
-                    !s.contains("root:") && !s.contains("/bin/"),
-                    "LEAK: opened /etc/passwd content through TOCTOU race"
+                    !s.contains("OUTSIDE-SECRET-MARKER"),
+                    "LEAK: opened outside content through TOCTOU race"
                 );
             }
         }
