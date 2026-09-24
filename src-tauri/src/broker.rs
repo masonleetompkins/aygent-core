@@ -329,7 +329,7 @@ impl Broker {
                     let mut info: BY_HANDLE_FILE_INFORMATION =
                         unsafe { std::mem::zeroed() };
                     let ok = unsafe {
-                        GetFileInformationByHandle(f.as_raw_handle() as isize, &mut info)
+                        GetFileInformationByHandle(f.as_raw_handle(), &mut info)
                     };
                     if ok == 0 {
                         return Err(BrokerError::Io("link count query failed".into()));
