@@ -18,10 +18,17 @@ pub fn tier_label() -> &'static str {
     "Core"
 }
 
-/// UI-callable tier snapshot: `{ tier, pro }`. Always Core here.
+/// Session presence for the UI: true when a site session token is stored in
+/// the keychain `session` slot. Independent of Pro entitlement — a signed-in
+/// free user reports signed_in=true, pro=false.
+pub fn signed_in() -> bool {
+    matches!(crate::keychain::get_key(SESSION_KEY), Ok(t) if !t.trim().is_empty())
+}
+
+/// UI-callable tier snapshot: `{ tier, pro, signed_in }`. Always Core here.
 #[tauri::command]
 pub fn pro_status() -> serde_json::Value {
-    serde_json::json!({ "tier": tier_label(), "pro": is_pro() })
+    serde_json::json!({ "tier": tier_label(), "pro": is_pro(), "signed_in": signed_in() })
 }
 
 /// UI-callable refresh. Core has no backend: always false, never blocks.

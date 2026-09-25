@@ -52,8 +52,8 @@ export function Settings({
   const [signCode, setSignCode] = useState("");
   const [signMsg, setSignMsg] = useState<string | null>(null);
   useEffect(() => {
-    invoke<{ tier: string; pro: boolean }>("pro_status")
-      .then((s) => { setTier(s.tier); setSignedIn(s.pro); })
+    invoke<{ tier: string; pro: boolean; signed_in: boolean }>("pro_status")
+      .then((s) => { setTier(s.tier); setSignedIn(s.signed_in); })
       .catch(() => {});
   }, []);
   async function openSignin() {
@@ -69,8 +69,8 @@ export function Settings({
     setSignMsg(null);
     try {
       await invoke("signin_complete", { code });
-      const s = await invoke<{ tier: string; pro: boolean }>("pro_status");
-      setTier(s.tier); setSignedIn(s.pro); setSignCode("");
+      const s = await invoke<{ tier: string; pro: boolean; signed_in: boolean }>("pro_status");
+      setTier(s.tier); setSignedIn(s.signed_in); setSignCode("");
       setSignMsg(s.pro ? "✓ signed in — Pro unlocked" : "✓ signed in");
     } catch (e) { setSignMsg("✗ " + String(e)); }
   }
