@@ -2,7 +2,6 @@ name: matrix (1.1.0)
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   workflow_dispatch:
 
 jobs:
