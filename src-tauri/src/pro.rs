@@ -44,7 +44,7 @@ pub const SESSION_KEY: &str = "session";
 /// Where the desktop sign-in code comes from (UI opens it in the browser).
 #[tauri::command]
 pub fn signin_start() -> serde_json::Value {
-    serde_json::json!({ "url": "https://masonlee.build/desktop-signin" })
+    serde_json::json!({ "url": "https://www.masonlee.build/desktop-signin" })
 }
 
 /// Complete sign-in with the one-time code from /desktop-signin. Exchanges it
@@ -57,7 +57,7 @@ pub async fn signin_complete(code: String) -> Result<serde_json::Value, String> 
         .build()
         .map_err(|e| format!("http: {e}"))?;
     let v: serde_json::Value = client
-        .post("https://masonlee.build/api/desktop-signin/exchange")
+        .post("https://www.masonlee.build/api/desktop-signin/exchange")
         .json(&serde_json::json!({ "code": code }))
         .send()
         .await
@@ -92,7 +92,7 @@ pub fn signout() -> Result<serde_json::Value, String> {
 /// Open a URL in the system browser (used by sign-in; WebView must not navigate away).
 #[tauri::command]
 pub fn open_url(url: String) -> Result<(), String> {
-    if !(url.starts_with("https://masonlee.build/") || url.starts_with("https://aygent.masonlee.build/")) {
+    if !(url.starts_with("https://masonlee.build/") || url.starts_with("https://www.masonlee.build/") || url.starts_with("https://aygent.masonlee.build/")) {
         return Err("refusing to open off-site URL".into());
     }
     #[cfg(target_os = "macos")]
