@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  OPTIONAL — DO NOT WIRE THIS IN UNLESS THE [DL] DIAGNOSTICS PROVE THE DOWNLOAD
+  FAILURE IS AN APP-SANDBOX / SANDBOX-EXTENSION ISSUE (Atlas, 2026-07-30).
+
+  Background: the recurring `sandbox_extension_issue_file failed for : 2` fires
+  in WebKit's networking XPC process. For `cargo tauri dev` the app is normally
+  ad-hoc signed and NOT app-sandboxed, so these entitlements are usually NOT
+  required. Adding App Sandbox where none existed can make things WORSE.
+
+  Only after the diagnostics confirm a sandbox extension failure even when our
+  own process can freely write the destination (i.e. `our_write_touch=OK` but
+  WebKit still errors), wire this file in by adding to tauri.conf.json:
+
+      "bundle": { "macOS": { "entitlements": "Entitlements.plist" } }
+
+  ...then do a FULL bundle build (`cargo tauri build`) or a signed dev run, not
+  just `cargo tauri dev` (dev may ignore bundle entitlements).
+-->
+<plist version="1.0">
+<dict>
+  <!-- Allow reading/writing the user's Downloads folder. -->
+  <key>com.apple.security.files.downloads.read-write</key>
+  <true/>
+  <!-- Allow read/write to user-selected files (context-menu save targets). -->
+  <key>com.apple.security.files.user-selected.read-write</key>
+  <true/>
+  <!-- Outgoing network (fetching the resource to download). -->
+  <key>com.apple.security.network.client</key>
+  <true/>
+</dict>
+</plist>

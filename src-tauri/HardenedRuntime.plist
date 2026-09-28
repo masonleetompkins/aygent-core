@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  HardenedRuntime.plist — entitlements for a Developer ID + NOTARIZED build.
+
+  This is NOT the App Sandbox file (Entitlements.plist). AYGENT is deliberately
+  NOT App-Sandboxed: it spawns a Node daemon, runs its OWN Seatbelt profile
+  (seatbelt/folder-mode.sb), and brokers process spawns. App Sandbox would break
+  all of that. What notarization DOES require is the HARDENED RUNTIME, and under
+  hardened runtime a few default-denied capabilities must be explicitly allowed
+  or the app crashes on launch / the daemon fails to spawn.
+
+  Wired into tauri.conf.json as:
+      "bundle": { "macOS": { "entitlements": "HardenedRuntime.plist" } }
+
+  Each key below is the MINIMUM AYGENT needs — nothing speculative:
+-->
+<plist version="1.0">
+<dict>
+  <!-- The WebView's JS engine needs JIT. Without this the UI process crashes
+       under hardened runtime. -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+
+  <!-- The JS engine + some native deps map writable+executable memory. Required
+       alongside allow-jit for WKWebView content to run hardened. -->
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+
+  <!-- ESSENTIAL for AYGENT: we bundle a portable Node runtime + native .node
+       modules that are NOT signed by our Developer ID. Library validation would
+       refuse to load them into our signed process, so the daemon would never
+       spawn. Disabling it lets our signed app load the bundled runtime. -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+
+  <!-- The privileged side sets env vars (broker port/token, PATH for the
+       provisioned node/uv) when spawning the daemon + Pro Mode processes.
+       Hardened runtime strips DYLD_* / injected env by default; allow it so the
+       daemon spawn's environment is honored. -->
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+  <true/>
+</dict>
+</plist>

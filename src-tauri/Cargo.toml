@@ -1,0 +1,146 @@
+[package]
+name = "aygent"
+version = "1.1.0"
+description = "The AI agent you actually own"
+authors = ["Mason Tompkins"]
+edition = "2021"
+rust-version = "1.77"
+# Two binaries exist now (aygent + the CEF helper aygent_helper). Tauri needs to
+# know which is THE app binary or `cargo tauri build` fails with 'failed to find
+# main binary'. The helper is a subprocess, never the app entry point.
+default-run = "aygent"
+
+[lib]
+name = "aygent_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# ENGINE-CEF (Phase 1): the CEF multi-process browser needs a SEPARATE helper
+# executable (the GPU/Renderer/Plugin subprocesses re-exec THIS binary path).
+# It re-execs into `execute_process` and does nothing else. Only built when the
+# `engine-cef` feature is on; a plain build never compiles it. bundle metadata
+# below tells `bundle-cef-app` its name.
+[[bin]]
+name = "aygent_runner"
+path = "src/bin/aygent_runner.rs"
+required-features = ["headless"]
+
+[[bin]]
+name = "aygent_helper"
+path = "src/bin/aygent_helper.rs"
+required-features = ["engine-cef"]
+
+# `bundle-cef-app` (from the cef crate's build-util) reads this to know which bin
+# is the CEF helper + where the mac resources live. Only used by the CEF bundle
+# step; inert for a normal build.
+[package.metadata.cef.bundle]
+helper_name = "aygent_helper"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "unstable"] }  # 'unstable' unlocks WebviewBuilder + Window::add_child — needed to EMBED a child webview inside the main window (the in-app browser). Pinned intentionally; Tauri gates multi-webview behind this flag on 2.x.
+tauri-plugin-dialog = "2"          # native folder picker (M0.2)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+rand = "0.8"                       # per-session WS token (Atlas C6)
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros"] }  # async command + broker WS
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }  # broker WS server (M0.2b) + AYGENT Remote outbound wss:// to Supabase Realtime
+crypto_box = { version = "0.9", features = ["chacha20"] }  # kept for examples/crypto_interop.rs (v1 asymmetric proof)
+chacha20poly1305 = "0.10"  # AYGENT REMOTE v2: XChaCha20-Poly1305 IETF AEAD with ONE account channel key (interop: libsodium crypto_aead_xchacha20poly1305_ietf) — any logged-in browser fetches the key over authed HTTPS
+futures-util = "0.3"
+# keyring moved to per-OS targets (1.1.0 M0)
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "multipart"], default-features = false }  # Anthropic HTTP (M0.3)
+git2 = { version = "0.19", default-features = false }  # checkpoints (C4): git object model compiled IN — no system git, zero user setup
+llama-cpp-2 = "0.1"                 # LOCAL MODELS: llama.cpp compiled IN — download + run GGUF models in-app, zero user setup (Metal on mac / CUDA on PC via features below)
+num_cpus = "1"                      # thread count for local inference / perf prediction
+sysinfo = "0.32"                    # hardware detection (CPU/RAM) for perf prediction on the RUNTIME machine
+genpdf = "0.2"                      # TOOLS: pure-Rust markdown/text -> PDF (compiled in, zero user setup)
+pulldown-cmark = { version = "0.12", default-features = false }  # real CommonMark parser -> proper inline styles, code blocks, blockquotes, HR, nested lists, tables
+once_cell = "1"                     # process-wide llama.cpp backend + model cache (local models)
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }  # M1.8 scheduler: DST-safe DailyAt/WeeklyAt timing math
+chrono-tz = "0.10"                  # M1.8 scheduler: IANA timezone db (compute local wall-clock -> UTC)
+rusqlite = { version = "0.32", features = ["bundled"] }  # M1.1 STATE SPINE: SQLite compiled IN (zero user setup, matches git2/llama.cpp philosophy). App state lives Rust-side (the daemon is Seatbelt-jailed w/ no ambient fs) behind a single-writer actor (Atlas C6). WAL + busy_timeout. Replaces the per-folder JSON stores.
+base64 = "0.22"                     # M1.4: decode context-doc uploads (UI reads file -> base64 -> Rust decodes + stores app-data-side, out of the jail)
+zip = { version = "2", default-features = false, features = ["deflate"] }
+miniz_oxide = "0.8"              # VIDEO: inflate FlateDecode streams for PDF style-guide text extraction  # BROWSER Slice 0: unzip the Chrome-for-Testing archive we fetch from Google's CDN into AYGENT's managed browser dir (install-nothing). deflate-only keeps it lean; CfT zips are standard deflate.
+sha2 = "0.10"
+jsonwebtoken = "9"                 # GOOGLE service accounts: sign the RS256 JWT assertion that is exchanged for an access token. Service-account auth avoids Google OAuth app verification entirely, but requires real crypto -> a dependency, not a descriptor.                      # BROWSER Slice 0: verify the downloaded Chrome-for-Testing zip against the per-file SHA-256 CfT publishes in its known-good JSON (integrity gate, honors the contract's "SHA-256 verify").
+urlencoding = "2"                   # (unused placeholder removed if not needed) — kept minimal
+dirs = "6"                          # BROWSER downloads: resolve the user's ~/Downloads (WebKit-download-friendly dir) for the on_download destination. Already in the tree via wry (v6.0.0 in Cargo.lock); declared direct so browser.rs uses dirs::download_dir()/home_dir() without lock churn.
+
+# ENGINE-CEF (Phase 1). OPTIONAL + off by default (see [features].engine-cef).
+# Pinned to the EXACT tag Phase-0's cef-spike proved on Mason's Mac
+# (export-cef-dir-v151.0.0+151.3.11 => CEF 151.3.11 / Chromium 151.x). Pulled
+# from crates.io by version; `build-util` gives us `bundle-cef-app` + the macOS
+# bundle layout logic (build_util::mac) our build script reuses. This is the
+# ONLY new heavy dep; it never compiles unless `--features engine-cef` is set.
+# NOTE: cef needs a recent toolchain (edition 2024 in its examples) but the
+# `cef` LIBRARY crate itself compiles on our edition 2021 workspace; only the
+# helper bin + bundler use its build-util. Cargo.lock will gain cef + its deps
+# the first time Mason builds WITH the feature (expected; commit that lock).
+cef = { version = "=151.0.0", features = ["build-util"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"                        # atomic openat/O_NOFOLLOW fd layer (M0.2c)
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "=3.2.1", features = ["apple-native"] }  # 1.1.0: mac Keychain
+# Direct AppKit access: the embedded browser webview is placed by setting its
+# NSView frame against the LIVE window contentView (ground truth), instead of
+# trusting wry's child-positioning math (titlebar/flip mismatches burned us).
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSView", "NSWindow", "NSResponder", "NSGraphics", "NSApplication", "NSEvent", "NSImage", "NSWorkspace"] }  # NSImage: dynamic Dock icon; NSWorkspace: persist it onto the .app bundle
+# NSValue -> NSNumber (setDrawsBackground KVC), NSString -> ns_string! macro:
+# both needed by cef_geometry's punchout (engine-cef). Harmless when unused.
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSValue", "NSString", "NSData"] }  # NSData: dynamic Dock icon (decode PNG bytes from the UI canvas)
+# CALayer for premium rounded corners on the WKWebView's own backing layer
+# (cornerRadius + masksToBounds). Already in the tree via tauri/wry; declare it
+# directly so NSView::layer()'s CALayer methods are in scope.
+objc2-quartz-core = { version = "0.3", features = ["CALayer", "objc2-core-foundation"] }
+# ENGINE-CEF external message pump: schedule do_message_loop_work() on the main
+# GCD queue (DispatchQueue::main().exec_async) from on_schedule_message_pump_work.
+# Already in the tree transitively via objc2/tao (0.3.1); declare it direct so
+# `use dispatch2::DispatchQueue` resolves. Harmless when engine-cef is off.
+dispatch2 = "0.3"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+# ENGINE-CEF (Phase 1 kill-switch). OFF by default so a plain `cargo tauri build`
+# still compiles the working WKWebView browser and never pulls the ~170MB CEF
+# framework. Mason builds WITH `--features engine-cef` to get the native
+# Chromium browser surface. When OFF, all `#[cfg(feature = "engine-cef")]` code
+# is excluded and the WKWebView path is used verbatim. This is the instant
+# revert: drop the feature flag and the old engine is back.
+engine-cef = ["dep:cef"]
+headless = []  # 1.1.0 M4: headless worker (no Tauri shell)
+# CEF macOS sandbox participation. cfg-checked in cef_engine.rs + the helper
+# bin; OFF today (matches shipped behavior: Settings.no_sandbox=1). Flip by
+# building with --features engine-cef,sandbox.
+sandbox = ["cef/sandbox"]
+# LOCAL-MODEL GPU acceleration. macOS builds turn on Metal; a CUDA PC build can
+# opt in. Kept as features so a headless/CI build can compile CPU-only.
+metal = ["llama-cpp-2/metal"]
+cuda = ["llama-cpp-2/cuda"]
+vulkan = ["llama-cpp-2/vulkan"]  # 1.1.0: Linux opt-in
+
+# On macOS, default to Metal so Mason's `cargo tauri dev` GPU-offloads out of the
+# box (this is where he builds/runs). Other targets stay CPU-only unless opted in.
+[target.'cfg(target_os = "macos")'.dependencies.llama-cpp-2]
+version = "0.1"
+features = ["metal"]
+
+# WORKAROUND (Aria 2026-08-01): release proc-macro dylibs fail dlopen with
+# "mis-aligned LINKEDIT string pool" — debug builds fine. Cargo strips debuginfo
+# in release by default; suspect strip pass mangles LINKEDIT under this
+# toolchain/dyld combo. Disable stripping to test/fix.
+[profile.release]
+strip = "none"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3" }  # 1.1.0: windows-native default (unsigned 1.1.0)
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }  # 1.1.0: Rule-7 link count (GetFileInformationByHandle)
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }  # 1.1.0: Secret Service gnome-keyring

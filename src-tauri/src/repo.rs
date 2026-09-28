@@ -1,0 +1,629 @@
+// AYGENT — Repository layer (M1.1).
+//
+// Typed CRUD over the SQLite spine. READS use a fresh reader connection (WAL =>
+// concurrent, never blocks the writer). WRITES funnel through the single-writer
+// actor (writer.rs). This module holds NO connection of its own — it borrows
+// `&Db` and picks the right path per operation.
+//
+// The row types mirror the existing JSON structs (agents.rs / conversations.rs /
+// settings.rs) so the UI-facing command shapes don't change: this is a storage
+// swap, not a contract change (CONTRACTS.md untouched).
+
+use crate::writer::Db;
+use rusqlite::{params, OptionalExtension};
+
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+// ── Agents ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentProfile {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub color: String,
+    #[serde(default)]
+    pub folder_path: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model_variant: String, // reasoning knob, e.g. Muse: minimal|low|medium|high|xhigh|max ("" = provider default)
+    #[serde(default = "default_context_mode")]
+    pub context_mode: String,
+    #[serde(default)]
+    pub system_prompt: String,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub sort_order: i64,
+    // Telegram per-agent bot (Fix 7): one bot per agent, token stored in keychain, chat allowlist in DB
+    #[serde(default)]
+    pub telegram_enabled: bool,
+    #[serde(default)]
+    pub telegram_bot_username: String,
+    #[serde(default)]
+    pub telegram_allowed_chats: String, // comma-separated chat_ids, empty = allow any that knows the bot
+}
+fn default_context_mode() -> String { "isolated".to_string() }
+
+/// App-generated id: time(ms, base36) + a PROCESS-MONOTONIC counter + small
+/// non-crypto random suffix. The counter (Atlas E) guarantees uniqueness even
+/// when two agents/conversations are created in the same millisecond under
+/// concurrent multi-agent + inter-agent spawning — the old stack-pointer⊕ms
+/// scheme could collide. Still sortable-ish (time-prefixed), no ULID crate.
+fn new_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let rand: u32 = {
+        let x = &ms as *const _ as usize as u64;
+        let mut h = x ^ (ms as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ seq.wrapping_mul(0xD6E8FEB86659FD93);
+        h ^= h >> 29; h = h.wrapping_mul(0xBF58476D1CE4E5B9); h ^= h >> 32;
+        (h & 0xFFFFFFFF) as u32
+    };
+    format!("a{}{}{:07x}", to_base36(ms as u64), to_base36(seq & 0xFFF), rand)
+}
+fn to_base36(mut n: u64) -> String {
+    const D: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if n == 0 { return "0".into(); }
+    let mut out = Vec::new();
+    while n > 0 { out.push(D[(n % 36) as usize]); n /= 36; }
+    out.reverse();
+    String::from_utf8(out).unwrap()
+}
+
+fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
+    Ok(AgentProfile {
+        id: r.get("id")?,
+        name: r.get("name")?,
+        icon: r.get("icon")?,
+        color: r.get("color")?,
+        folder_path: r.get("folder_path")?,
+        model: r.get("model")?,
+        provider: r.get("provider")?,
+        model_variant: r.get::<_, String>("model_variant").unwrap_or_default(),
+        context_mode: r.get("context_mode")?,
+        system_prompt: r.get("system_prompt")?,
+        created_at: r.get("created_at")?,
+        updated_at: r.get("updated_at")?,
+        archived: r.get::<_, i64>("archived")? != 0,
+        sort_order: r.get("sort_order").unwrap_or(0),
+        telegram_enabled: r.get::<_, i64>("telegram_enabled").unwrap_or(0) != 0,
+        telegram_bot_username: r.get::<_, String>("telegram_bot_username").unwrap_or_default(),
+        telegram_allowed_chats: r.get::<_, String>("telegram_allowed_chats").unwrap_or_default(),
+    })
+}
+
+pub fn list_agents(db: &Db) -> Result<Vec<AgentProfile>, String> {
+    let conn = db.reader()?;
+    let mut stmt = conn
+        .prepare("SELECT * FROM agent ORDER BY sort_order ASC, created_at ASC")
+        .map_err(|e| format!("prepare list_agents: {e}"))?;
+    let rows = stmt
+        .query_map([], row_to_agent)
+        .map_err(|e| format!("query list_agents: {e}"))?;
+    let mut out = Vec::new();
+    for a in rows { out.push(a.map_err(|e| format!("row: {e}"))?); }
+    Ok(out)
+}
+
+pub fn get_agent(db: &Db, id: &str) -> Result<Option<AgentProfile>, String> {
+    let conn = db.reader()?;
+    conn.query_row("SELECT * FROM agent WHERE id = ?1", params![id], row_to_agent)
+        .optional()
+        .map_err(|e| format!("get_agent: {e}"))
+}
+
+pub fn active_id(db: &Db) -> Result<String, String> {
+    let conn = db.reader()?;
+    conn.query_row("SELECT active_id FROM app_state WHERE id = 0", [], |r| r.get(0))
+        .map_err(|e| format!("active_id: {e}"))
+}
+
+/// M1.4 app-wide knobs: inter-agent budget (turns/chain) + max headless
+/// concurrency (agents running at once). Read together; clamped to sane bounds.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AppKnobs {
+    pub inter_agent_budget: i64,
+    pub max_concurrency: i64,
+}
+
+pub fn get_knobs(db: &Db) -> Result<AppKnobs, String> {
+    let conn = db.reader()?;
+    conn.query_row(
+        "SELECT inter_agent_budget, max_concurrency FROM app_state WHERE id = 0", [],
+        |r| Ok(AppKnobs { inter_agent_budget: r.get(0)?, max_concurrency: r.get(1)? }),
+    ).map_err(|e| format!("get_knobs: {e}"))
+}
+
+pub fn set_knobs(db: &Db, budget: i64, concurrency: i64) -> Result<(), String> {
+    // Clamp: budget 1..=50, concurrency 1..=12 (sane ceilings so a fat-finger
+    // can't unleash a runaway or a thundering herd of paid API calls).
+    let b = budget.clamp(1, 50);
+    let c = concurrency.clamp(1, 12);
+    db.write(move |conn| {
+        conn.execute("UPDATE app_state SET inter_agent_budget = ?1, max_concurrency = ?2 WHERE id = 0",
+            rusqlite::params![b, c]).map_err(|e| format!("set_knobs: {e}"))?;
+        Ok(())
+    })
+}
+
+pub fn get_active_agent(db: &Db) -> Result<Option<AgentProfile>, String> {
+    let id = active_id(db)?;
+    if id.is_empty() { return Ok(None); }
+    get_agent(db, &id)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_agent(
+    db: &Db,
+    name: &str, icon: &str, color: &str, folder_path: &str,
+    model: &str, provider: &str, model_variant: &str, context_mode: &str, system_prompt: &str,
+) -> Result<AgentProfile, String> {
+    let profile = AgentProfile {
+        id: new_id(),
+        name: if name.trim().is_empty() { "My Agent".into() } else { name.trim().to_string() },
+        icon: if icon.is_empty() { "🤖".into() } else { icon.to_string() },
+        color: if color.is_empty() { "#5b8cff".into() } else { color.to_string() },
+        folder_path: folder_path.to_string(),
+        model: model.to_string(),
+        provider: provider.to_string(),
+        model_variant: model_variant.to_string(),
+        context_mode: if context_mode.is_empty() { default_context_mode() } else { context_mode.to_string() },
+        system_prompt: system_prompt.to_string(),
+        created_at: now(),
+        updated_at: now(),
+        archived: false,
+        sort_order: 0,
+        telegram_enabled: false,
+        telegram_bot_username: String::new(),
+        telegram_allowed_chats: String::new(), // real value assigned in the txn (max+1)
+    };
+    let p = profile.clone();
+    db.write(move |c| {
+        let tx = c.transaction().map_err(|e| format!("txn: {e}"))?;
+        // Append to the end of the display order: sort_order = current max + 1.
+        let next_order: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM agent", [], |r| r.get(0),
+        ).unwrap_or(1);
+        tx.execute(
+            "INSERT INTO agent (id,name,icon,color,folder_path,model,provider,model_variant,context_mode,system_prompt,created_at,updated_at,archived,sort_order)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0,?13)",
+            params![p.id, p.name, p.icon, p.color, p.folder_path, p.model, p.provider, p.model_variant, p.context_mode, p.system_prompt, p.created_at, p.updated_at, next_order],
+        ).map_err(|e| format!("insert agent: {e}"))?;
+        // First agent becomes active; also seed its settings row.
+        tx.execute(
+            "UPDATE app_state SET active_id = ?1 WHERE id = 0 AND active_id = ''",
+            params![p.id],
+        ).map_err(|e| format!("seed active: {e}"))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO agent_settings (agent_id, model, provider) VALUES (?1, ?2, ?3)",
+            params![p.id, p.model, p.provider],
+        ).map_err(|e| format!("seed settings: {e}"))?;
+        tx.commit().map_err(|e| format!("commit: {e}"))?;
+        Ok(())
+    })?;
+    Ok(profile)
+}
+
+pub fn update_agent(db: &Db, mut profile: AgentProfile) -> Result<(), String> {
+    profile.updated_at = now();
+    db.write(move |c| {
+        let n = c.execute(
+            "UPDATE agent SET name=?2,icon=?3,color=?4,folder_path=?5,model=?6,provider=?7,model_variant=?8,context_mode=?9,system_prompt=?10,updated_at=?11,archived=?12,telegram_enabled=?13,telegram_bot_username=?14,telegram_allowed_chats=?15 WHERE id=?1",
+            params![profile.id, profile.name, profile.icon, profile.color, profile.folder_path, profile.model, profile.provider, profile.model_variant, profile.context_mode, profile.system_prompt, profile.updated_at, profile.archived as i64, profile.telegram_enabled as i64, profile.telegram_bot_username, profile.telegram_allowed_chats],
+        ).map_err(|e| format!("update agent: {e}"))?;
+        if n == 0 { return Err("agent not found".into()); }
+        Ok(())
+    })
+}
+
+/// Persist a new agent display order. `ids` is the full ordered list of agent
+/// ids (top-first). sort_order is rewritten to the index so the order is exactly
+/// what the UI showed. Runs in one txn so the rail + Agents tab never see a
+/// half-applied order.
+pub fn reorder_agents(db: &Db, ids: Vec<String>) -> Result<(), String> {
+    db.write(move |c| {
+        let tx = c.transaction().map_err(|e| format!("txn: {e}"))?;
+        for (i, id) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE agent SET sort_order = ?2 WHERE id = ?1",
+                params![id, i as i64],
+            ).map_err(|e| format!("reorder agent {id}: {e}"))?;
+        }
+        tx.commit().map_err(|e| format!("commit reorder: {e}"))?;
+        Ok(())
+    })
+}
+
+pub fn delete_agent(db: &Db, id: &str) -> Result<(), String> {
+    let id = id.to_string();
+    db.write(move |c| {
+        let tx = c.transaction().map_err(|e| format!("txn: {e}"))?;
+        // mem_chunk predates the agent FK (SQLite can't ALTER-ADD one), so scrub
+        // this agent's chunks explicitly in the same txn (Atlas E: else orphaned
+        // context survives a delete). conversation/agent_settings/mailbox/
+        // agent_context all cascade via their FKs.
+        tx.execute("DELETE FROM mem_chunk WHERE owner_kind = 'agent' AND owner_id = ?1", params![id])
+            .map_err(|e| format!("scrub mem_chunk: {e}"))?;
+        let n = tx.execute("DELETE FROM agent WHERE id = ?1", params![id])
+            .map_err(|e| format!("delete agent: {e}"))?;
+        if n == 0 { return Err("agent not found".into()); }
+        // If we deleted the active one, fall back to the earliest remaining.
+        let active: String = tx.query_row("SELECT active_id FROM app_state WHERE id = 0", [], |r| r.get(0))
+            .map_err(|e| format!("read active: {e}"))?;
+        if active == id {
+            let next: Option<String> = tx.query_row(
+                "SELECT id FROM agent ORDER BY created_at ASC LIMIT 1", [], |r| r.get(0),
+            ).optional().map_err(|e| format!("next active: {e}"))?;
+            tx.execute("UPDATE app_state SET active_id = ?1 WHERE id = 0",
+                params![next.unwrap_or_default()])
+                .map_err(|e| format!("set active: {e}"))?;
+        }
+        tx.commit().map_err(|e| format!("commit: {e}"))?;
+        Ok(())
+    })
+}
+
+pub fn set_active(db: &Db, id: &str) -> Result<(), String> {
+    let id = id.to_string();
+    db.write(move |c| {
+        let exists: bool = c.query_row("SELECT 1 FROM agent WHERE id = ?1", params![id], |_| Ok(true))
+            .optional().map_err(|e| format!("check: {e}"))?.unwrap_or(false);
+        if !exists { return Err("agent not found".into()); }
+        c.execute("UPDATE app_state SET active_id = ?1 WHERE id = 0", params![id])
+            .map_err(|e| format!("set active: {e}"))?;
+        Ok(())
+    })
+}
+
+/// Resolve an agentId to its jailed folder path (for the broker scope).
+pub fn folder_for(db: &Db, id: &str) -> Result<Option<String>, String> {
+    Ok(get_agent(db, id)?.map(|a| a.folder_path).filter(|p| !p.is_empty()))
+}
+
+/// M1.4 (Atlas #2): the OTHER non-archived agents that share `folder_path` with
+/// the given agent (empty `exclude_id` to just list everyone on that folder).
+/// Agents on the SAME folder share save point history + the folder write-lock
+/// (CONTRACTS §4) — the UI surfaces this so the user knows, and until the write
+/// lock lands (fast-follow) we WARN rather than silently allow torn writes.
+pub fn agents_sharing_folder(db: &Db, folder_path: &str, exclude_id: &str) -> Result<Vec<AgentProfile>, String> {
+    if folder_path.is_empty() { return Ok(vec![]); }
+    Ok(list_agents(db)?
+        .into_iter()
+        .filter(|a| !a.archived && a.id != exclude_id && a.folder_path == folder_path)
+        .collect())
+}
+
+// ── Shared context: read-only mounts ────────────────────────────────────────
+
+/// A folder an agent may READ but never write. The unit of "share your context
+/// with another agent without merging your homes".
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentMount {
+    pub id: i64,
+    pub agent_id: String,
+    pub path: String,
+    #[serde(default)]
+    pub label: String,
+    /// Set when this mount points at another AGENT's folder (vs a raw folder),
+    /// so the UI can label it and re-resolve if that agent's folder moves.
+    #[serde(default)]
+    pub source_agent_id: Option<String>,
+    #[serde(default)]
+    pub created_at: i64,
+}
+
+pub fn list_mounts(db: &Db, agent_id: &str) -> Result<Vec<AgentMount>, String> {
+    let conn = db.reader()?;
+    let mut st = conn
+        .prepare(
+            "SELECT id, agent_id, path, label, source_agent_id, created_at
+             FROM agent_mount WHERE agent_id = ?1 ORDER BY created_at ASC, id ASC",
+        )
+        .map_err(|e| format!("list_mounts prepare: {e}"))?;
+    let rows = st
+        .query_map(params![agent_id], |r| {
+            Ok(AgentMount {
+                id: r.get(0)?,
+                agent_id: r.get(1)?,
+                path: r.get(2)?,
+                label: r.get(3)?,
+                source_agent_id: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })
+        .map_err(|e| format!("list_mounts query: {e}"))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| format!("list_mounts row: {e}"))?);
+    }
+    Ok(out)
+}
+
+/// Add a read-only mount. Idempotent on (agent_id, path).
+pub fn add_mount(
+    db: &Db,
+    agent_id: &str,
+    path: &str,
+    label: &str,
+    source_agent_id: Option<String>,
+) -> Result<(), String> {
+    let (agent_id, path, label) = (agent_id.to_string(), path.to_string(), label.to_string());
+    let ts = now();
+    db.write(move |c| {
+        c.execute(
+            "INSERT INTO agent_mount (agent_id, path, label, source_agent_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(agent_id, path) DO UPDATE SET
+               label = excluded.label,
+               source_agent_id = excluded.source_agent_id",
+            params![agent_id, path, label, source_agent_id, ts],
+        )
+        .map_err(|e| format!("add_mount: {e}"))?;
+        Ok(())
+    })
+}
+
+pub fn remove_mount(db: &Db, id: i64) -> Result<(), String> {
+    db.write(move |c| {
+        c.execute("DELETE FROM agent_mount WHERE id = ?1", params![id])
+            .map_err(|e| format!("remove_mount: {e}"))?;
+        Ok(())
+    })
+}
+
+/// Every mount for every agent — used at boot to register broker mounts in one
+/// pass (mirrors register_all_agent_scopes).
+pub fn all_mounts(db: &Db) -> Result<Vec<AgentMount>, String> {
+    let conn = db.reader()?;
+    let mut st = conn
+        .prepare(
+            "SELECT id, agent_id, path, label, source_agent_id, created_at
+             FROM agent_mount ORDER BY agent_id, created_at ASC, id ASC",
+        )
+        .map_err(|e| format!("all_mounts prepare: {e}"))?;
+    let rows = st
+        .query_map([], |r| {
+            Ok(AgentMount {
+                id: r.get(0)?,
+                agent_id: r.get(1)?,
+                path: r.get(2)?,
+                label: r.get(3)?,
+                source_agent_id: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })
+        .map_err(|e| format!("all_mounts query: {e}"))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| format!("all_mounts row: {e}"))?);
+    }
+    Ok(out)
+}
+
+// ── Conversations ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Conversation {
+    pub id: String,
+    #[serde(default)]
+    pub agent_id: String,
+    pub title: String,
+    pub updated: i64,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub order: i64,
+    #[serde(default)]
+    pub msgs: serde_json::Value,
+    #[serde(default)]
+    pub history: serde_json::Value,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConvMeta {
+    pub id: String,
+    pub title: String,
+    pub updated: i64,
+    pub pinned: bool,
+    pub order: i64,
+}
+
+pub fn list_conversations(db: &Db, agent_id: &str) -> Result<Vec<ConvMeta>, String> {
+    let conn = db.reader()?;
+    // pinned first, then explicit order (0 = unset sorts last), then newest.
+    let mut stmt = conn.prepare(
+        "SELECT id,title,updated,pinned,ord FROM conversation WHERE agent_id = ?1
+         ORDER BY pinned DESC, (CASE WHEN ord = 0 THEN 1 ELSE 0 END) ASC, ord ASC, updated DESC",
+    ).map_err(|e| format!("prepare list_conv: {e}"))?;
+    let rows = stmt.query_map(params![agent_id], |r| {
+        Ok(ConvMeta {
+            id: r.get("id")?,
+            title: r.get("title")?,
+            updated: r.get("updated")?,
+            pinned: r.get::<_, i64>("pinned")? != 0,
+            order: r.get("ord")?,
+        })
+    }).map_err(|e| format!("query list_conv: {e}"))?;
+    let mut out = Vec::new();
+    for m in rows { out.push(m.map_err(|e| format!("row: {e}"))?); }
+    Ok(out)
+}
+
+pub fn load_conversation(db: &Db, id: &str) -> Result<Conversation, String> {
+    let conn = db.reader()?;
+    conn.query_row(
+        "SELECT id,agent_id,title,updated,pinned,ord,msgs,history FROM conversation WHERE id = ?1",
+        params![id],
+        |r| {
+            let msgs: String = r.get("msgs")?;
+            let history: String = r.get("history")?;
+            Ok(Conversation {
+                id: r.get("id")?,
+                agent_id: r.get("agent_id")?,
+                title: r.get("title")?,
+                updated: r.get("updated")?,
+                pinned: r.get::<_, i64>("pinned")? != 0,
+                order: r.get("ord")?,
+                msgs: serde_json::from_str(&msgs).unwrap_or(serde_json::json!([])),
+                history: serde_json::from_str(&history).unwrap_or(serde_json::json!([])),
+            })
+        },
+    ).map_err(|e| format!("load_conversation: {e}"))
+}
+
+/// Save (create or overwrite). Stamps `updated`; PRESERVES existing pinned/order
+/// if the incoming payload doesn't carry them (a turn-save must not clobber a
+/// pin/reorder) — same rule as conversations.rs::save.
+pub fn save_conversation(db: &Db, mut conv: Conversation) -> Result<(), String> {
+    conv.updated = now();
+    let msgs = serde_json::to_string(&conv.msgs).map_err(|e| format!("ser msgs: {e}"))?;
+    let history = serde_json::to_string(&conv.history).map_err(|e| format!("ser history: {e}"))?;
+    db.write(move |c| {
+        // Preserve prior pinned/order when the caller left them unset — and the
+        // TITLE whenever the row already exists (Mason 08-04: renames kept
+        // REVERTING because every turn-save re-derived the title from the
+        // first user message and clobbered the custom one). A title is set
+        // once on first save and only changes via rename_conversation().
+        let prev: Option<(i64, i64, String)> = c.query_row(
+            "SELECT pinned, ord, title FROM conversation WHERE id = ?1",
+            params![conv.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).optional().map_err(|e| format!("prev: {e}"))?;
+        let (pinned, ord, title) = match prev {
+            Some((p, o, t)) => (
+                if conv.pinned { 1 } else { p },
+                if conv.order == 0 { o } else { conv.order },
+                if t.is_empty() { conv.title.clone() } else { t },
+            ),
+            None => (conv.pinned as i64, conv.order, conv.title.clone()),
+        };
+        c.execute(
+            "INSERT INTO conversation (id,agent_id,title,updated,pinned,ord,msgs,history)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(id) DO UPDATE SET
+               agent_id=excluded.agent_id, title=excluded.title, updated=excluded.updated,
+               pinned=excluded.pinned, ord=excluded.ord, msgs=excluded.msgs, history=excluded.history",
+            params![conv.id, conv.agent_id, title, conv.updated, pinned, ord, msgs, history],
+        ).map_err(|e| format!("save conv: {e}"))?;
+        Ok(())
+    })
+}
+
+pub fn reorder_conversations(db: &Db, updates: Vec<(String, bool, i64)>) -> Result<(), String> {
+    db.write(move |c| {
+        let tx = c.transaction().map_err(|e| format!("txn: {e}"))?;
+        for (id, pinned, order) in &updates {
+            tx.execute(
+                "UPDATE conversation SET pinned = ?2, ord = ?3 WHERE id = ?1",
+                params![id, *pinned as i64, order],
+            ).map_err(|e| format!("reorder: {e}"))?;
+        }
+        tx.commit().map_err(|e| format!("commit: {e}"))?;
+        Ok(())
+    })
+}
+
+/// Rename ONLY — the single authorized way to change a title after creation
+/// (save_conversation preserves the stored title; see the note there). A
+/// targeted UPDATE so a rename can never race a turn-save into losing msgs.
+pub fn rename_conversation(db: &Db, id: &str, title: &str) -> Result<(), String> {
+    let id = id.to_string();
+    let title = title.to_string();
+    db.write(move |c| {
+        c.execute(
+            "UPDATE conversation SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        ).map_err(|e| format!("rename conv: {e}"))?;
+        Ok(())
+    })
+}
+
+pub fn delete_conversation(db: &Db, id: &str) -> Result<(), String> {
+    let id = id.to_string();
+    db.write(move |c| {
+        c.execute("DELETE FROM conversation WHERE id = ?1", params![id])
+            .map_err(|e| format!("delete conv: {e}"))?;
+        Ok(())
+    })
+}
+
+// ── Per-agent settings ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct AgentSettings {
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub provider: String,
+}
+
+pub fn load_settings(db: &Db, agent_id: &str) -> Result<AgentSettings, String> {
+    let conn = db.reader()?;
+    let s = conn.query_row(
+        "SELECT model, provider FROM agent_settings WHERE agent_id = ?1",
+        params![agent_id],
+        |r| Ok(AgentSettings { model: r.get(0)?, provider: r.get(1)? }),
+    ).optional().map_err(|e| format!("load_settings: {e}"))?;
+    Ok(s.unwrap_or_default())
+}
+
+pub fn save_settings(db: &Db, agent_id: &str, s: AgentSettings) -> Result<(), String> {
+    let agent_id = agent_id.to_string();
+    db.write(move |c| {
+        c.execute(
+            "INSERT INTO agent_settings (agent_id, model, provider) VALUES (?1, ?2, ?3)
+             ON CONFLICT(agent_id) DO UPDATE SET model = excluded.model, provider = excluded.provider",
+            params![agent_id, s.model, s.provider],
+        ).map_err(|e| format!("save_settings: {e}"))?;
+        Ok(())
+    })
+}
+
+/// Whether this agent auto-remembers durable facts from conversation (M1.7).
+/// Defaults ON when no row/column value exists (capture is conservative).
+pub fn get_auto_remember(db: &Db, agent_id: &str) -> bool {
+    let Ok(conn) = db.reader() else { return true };
+    conn.query_row(
+        "SELECT auto_remember FROM agent_settings WHERE agent_id = ?1",
+        params![agent_id],
+        |r| r.get::<_, i64>(0),
+    ).optional().ok().flatten().map(|v| v != 0).unwrap_or(true)
+}
+
+/// Set the per-agent auto-remember toggle (upserts the settings row).
+pub fn set_auto_remember(db: &Db, agent_id: &str, on: bool) -> Result<(), String> {
+    let agent_id = agent_id.to_string();
+    db.write(move |c| {
+        c.execute(
+            "INSERT INTO agent_settings (agent_id, model, provider, auto_remember) VALUES (?1, '', '', ?2)
+             ON CONFLICT(agent_id) DO UPDATE SET auto_remember = excluded.auto_remember",
+            params![agent_id, if on { 1 } else { 0 }],
+        ).map_err(|e| format!("set_auto_remember: {e}"))?;
+        Ok(())
+    })
+}

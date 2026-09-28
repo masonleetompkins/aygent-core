@@ -1,0 +1,106 @@
+// AYGENT sidebar nav (icon + label). SF-Symbol-style line glyphs (no emoji).
+import { useEffect, useState, type ReactNode } from "react";
+import { getVersion } from "@tauri-apps/api/app";
+import { Icon, type IconName } from "./Icon";
+
+export type ScreenId =
+  | "chat" | "browser" | "agents" | "tools" | "skills" | "mcp" | "settings" | "scheduler" | "connections" | "savepoints";
+
+export type NavGroup = "agent" | "global";
+export interface NavItem { id: ScreenId; label: string; icon: IconName; enabled: boolean; group: NavGroup; }
+
+// Phase-1 order. Only what's built is enabled; the rest show as "soon" so the
+// product shape is visible without pretending features exist.
+// Grouped so it's clear WHAT each item affects:
+//  • "This Agent"  — scoped to the agent(s) you're viewing (its folder/history)
+//  • "Global"      — app-wide (roster, connectors, app settings)
+export const NAV: NavItem[] = [
+  { id: "chat", label: "Chat", icon: "chat", enabled: true, group: "agent" },
+  { id: "browser", label: "Browser", icon: "globe", enabled: true, group: "agent" },
+  { id: "tools", label: "Tools", icon: "tools", enabled: true, group: "agent" },
+  { id: "skills", label: "Skills", icon: "sparkles", enabled: true, group: "agent" },
+  { id: "scheduler", label: "Scheduler", icon: "scheduler", enabled: true, group: "agent" },
+  { id: "savepoints", label: "Save Points", icon: "savepoints", enabled: true, group: "agent" },
+  { id: "agents", label: "Agents", icon: "agents", enabled: true, group: "global" },
+  { id: "connections", label: "Connections", icon: "connections", enabled: true, group: "global" },
+  { id: "mcp", label: "MCP", icon: "terminal", enabled: true, group: "global" },
+  { id: "settings", label: "Settings", icon: "settings", enabled: true, group: "global" },
+];
+
+export function Sidebar({ active, onSelect, showBrowser }: { active: ScreenId; onSelect: (id: ScreenId) => void; showBrowser: boolean }) {
+  // UI task #4 (Mason 08-01): the browser is a TOOL — no sidebar entry until
+  // it's actually enabled/installed (Tools tab owns the enable flow).
+  const nav = NAV.filter((i) => i.id !== "browser" || showBrowser);
+  return (
+    <nav style={{
+      width: 208, flexShrink: 0, height: "100vh", boxSizing: "border-box",
+      borderRight: "var(--border-width) solid var(--line)",
+      background: "var(--surface)", boxShadow: "var(--elevation)",
+      display: "flex", flexDirection: "column", padding: "12px 8px", gap: 1,
+    }}>
+      <div style={{ padding: "8px 10px 14px", fontWeight: 800, letterSpacing: "0.04em", fontSize: 22, color: "var(--text)" }}>
+        AYGENT
+      </div>
+      <SectionLabel>This Agent</SectionLabel>
+      {nav.filter((i) => i.group === "agent").map((item) => (
+        <NavButton key={item.id} item={item} active={active === item.id} onSelect={onSelect} />
+      ))}
+      <SectionLabel style={{ marginTop: 14 }}>Global</SectionLabel>
+      {nav.filter((i) => i.group === "global").map((item) => (
+        <NavButton key={item.id} item={item} active={active === item.id} onSelect={onSelect} />
+      ))}
+      <VersionTag />
+    </nav>
+  );
+}
+
+function SectionLabel({ children, style }: { children: ReactNode; style?: React.CSSProperties }) {
+  return (
+    <div style={{
+      padding: "10px 10px 4px", fontSize: 11, fontWeight: 700,
+      letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-faint)", ...style,
+    }}>{children}</div>
+  );
+}
+
+const SHORTCUTS: Partial<Record<ScreenId, string>> = { chat: "⌘1", agents: "⌘2", settings: "⌘," };
+
+function NavButton({ item, active, onSelect }: { item: NavItem; active: boolean; onSelect: (id: ScreenId) => void }): ReactNode {
+  const dim = !item.enabled;
+  return (
+    <button
+      onClick={() => item.enabled && onSelect(item.id)}
+      disabled={dim}
+      style={{
+        display: "flex", alignItems: "center", gap: 10, width: "100%",
+        padding: "6px 10px", borderRadius: "var(--radius-control)",
+        border: `var(--border-width) solid ${active ? "var(--line)" : "transparent"}`,
+        background: active ? "var(--bg)" : "transparent",
+        boxShadow: "none",
+        color: dim ? "var(--text-faint)" : "var(--text)",
+        cursor: dim ? "default" : "pointer",
+        fontSize: 13, fontWeight: active ? 600 : 400, textAlign: "left",
+        transition: "background 120ms ease, box-shadow 120ms ease",
+      }}
+    >
+      <span style={{ width: 18, display: "flex", justifyContent: "center" }}><Icon name={item.icon as IconName} size={17} /></span>
+      <span>{item.label}</span>
+      {SHORTCUTS[item.id] && !dim && (
+        <kbd className="pro-kbd" style={{ marginLeft: "auto" }}>{SHORTCUTS[item.id]}</kbd>
+      )}
+      {dim && <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--text-faint)" }}>soon</span>}
+    </button>
+  );
+}
+
+/** App version, read from the bundle (tauri.conf.json is the single source
+    of truth — the old hardcoded label drifted). */
+function VersionTag() {
+  const [v, setV] = useState("");
+  useEffect(() => { getVersion().then(setV).catch(() => {}); }, []);
+  return (
+    <div style={{ marginTop: "auto", padding: "10px", fontSize: 11, color: "var(--text-faint)" }}>
+      {v ? `AYGENT v${v}` : "AYGENT"}
+    </div>
+  );
+}

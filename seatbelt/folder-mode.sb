@@ -1,0 +1,78 @@
+;; AYGENT — Folder Mode Seatbelt profile (macOS sandbox-exec)
+;; This is THE jail. The Node daemon runs under this profile so it CANNOT
+;; open user files or spawn processes — it must route everything through the
+;; Rust broker over WS. This converts the broker from a convention into an
+;; OS-enforced boundary (Atlas C1).
+;;
+;; Applied in Phase 0. Pro Mode uses a RELAXED profile (folder-mode-pro.sb)
+;; that permits process-exec + wider fs when the agent holds shell.exec.
+;;
+;; NOTE: sandbox-exec is "deprecated" but fully functional on macOS 14/15 and
+;; is what Chromium et al. still rely on. Test the combination with the app's
+;; hardened-runtime signing early (Atlas N6).
+
+(version 1)
+(deny default)
+
+;; --- allow the daemon to run as a normal process (but NOT spawn children) ---
+(allow process-info*)
+(allow sysctl-read)
+(allow mach-lookup)                     ;; needed for basic runtime services
+(allow signal (target self))
+(allow system-socket)                   ;; node libuv / loopback sockets
+(allow iokit-open)                      ;; node runtime probes some iokit props
+
+;; --- HARD DENY: no arbitrary execution in Folder Mode (Atlas C3) ---
+(deny process-exec*)
+(deny process-fork)
+
+;; --- HARD DENY: no ambient filesystem access (Atlas C1) ---
+;; The daemon gets NOTHING under the user's disk. All file I/O crosses to the
+;; Rust broker, which is the only opener. No /Users, /tmp, /private, /var.
+(deny file-read* file-write*)
+
+;; --- allow ONLY what the Node runtime itself needs to boot ---
+;; (its own bundled runtime + our app resources — NEVER the agent folder)
+;; NOTE (2026-07-23): the FIRST attempt failed with
+;;   sandbox-exec: execvp() of 'node' failed: No such file or directory
+;; because the profile denied read/exec of the node binary + its dylibs. The
+;; jail must let node LAUNCH (read+exec its own runtime) while still denying the
+;; user's folders. In a bundle we ship node in Resources and allow that subpath;
+;; in dev we allow the system node locations. The AGENT FOLDER is never allowed
+;; here — that access comes only through the Rust broker.
+(allow process-exec (literal "<<NODE_BIN>>"))   ;; templated to the resolved node path
+(allow file-read*
+  (literal "<<NODE_BIN>>")
+  (subpath "/usr/lib")
+  (subpath "/usr/local")           ;; homebrew node dylibs (dev)
+  (subpath "/opt/homebrew")        ;; apple-silicon homebrew (dev)
+  (subpath "/usr/share")
+  (subpath "/System/Library")
+  (subpath "/System/Volumes/Preboot/Cryptexes")  ;; dyld shared cache (macOS 13+)
+  (literal "/")                    ;; stat the root (node startup)
+  (literal "/dev/null")
+  (literal "/dev/zero")
+  (literal "/dev/random")
+  (literal "/dev/urandom")
+  (literal "/dev/dtracehelper")
+  (subpath "/dev/fd"))
+;; node/libuv need read+write on some /dev + tty + pipe fds
+(allow file-write*
+  (literal "/dev/null")
+  (literal "/dev/dtracehelper")
+  (subpath "/dev/fd"))
+(allow file-read-metadata)          ;; stat() up ancestor chains during boot
+
+;; app bundle resources (daemon code, bundled node, pinned git binary path is
+;; NOT here — git is invoked by the Rust side, not the daemon)
+;; <<APP_BUNDLE_SUBPATH>> is templated in at launch by the Rust supervisor.
+(allow file-read*
+  (subpath "<<APP_BUNDLE_SUBPATH>>"))
+
+;; --- network: loopback only, for the WS link to the Rust broker/UI ---
+;; Outbound provider/API calls are ALSO made by the daemon (net.http capability)
+;; — kept broad here but the capability layer gates which tools may use net.
+(allow network-outbound)
+(allow network-inbound (local ip "localhost:*"))
+
+;; Everything else: denied by (deny default). The escape suite proves it.

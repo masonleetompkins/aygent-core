@@ -1,0 +1,9 @@
+﻿node_modules/
+target/
+dist/
+*.log
+.DS_Store
+.env
+*.dmg
+src-tauri/gen/
+.git-commit-msg.tmp
