@@ -1,9 +1,39 @@
-﻿node_modules/
+# deps / build
+node_modules/
 target/
 dist/
+src-tauri/gen/
+*.dmg
+
+# logs / os
 *.log
 .DS_Store
-.env
-*.dmg
-src-tauri/gen/
 .git-commit-msg.tmp
+
+# secrets / credentials — never commit
+.env*
+*.pem
+*.key
+*.p12
+*.pfx
+service-account*.json
+*service-account*.json
+secrets/
+.vault/
+credentials.json
+
+# aygent local state — user data, never commit
+.aygent/
+agents/
+memory/
+Memory/
+Daily/
+context/
+stores/
+backups/
+logs/
+aygent-root.json
+root.json
+*.db
+*.sqlite*
+*.sqlite-journal
