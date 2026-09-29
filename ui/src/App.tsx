@@ -6,7 +6,6 @@ import { type AgentProfile } from "./components/AgentSwitcher";
 import { Agents } from "./screens/Agents";
 import { Settings } from "./screens/Settings";
 import { Chat } from "./screens/Chat";
-import { Browser } from "./screens/Browser";
 import { SavePoints } from "./screens/SavePoints";
 import { Tools, Skills } from "./screens/Tools";
 import { McpConnections } from "./screens/McpConnections";
@@ -40,14 +39,6 @@ export function App() {
   // Roster order = the canonical ordering source (same list the rail renders).
   const [rosterOrder, setRosterOrder] = useState<string[]>([]);
   const [screen, setScreen] = useState<ScreenId>("chat");
-  // UI task #4: browser sidebar entry only when installed (Tools owns enabling).
-  const [browserInstalled, setBrowserInstalled] = useState(false);
-  useEffect(() => {
-    const check = () => { invoke<{ installed: boolean }>("browser_status").then((s) => setBrowserInstalled(!!s?.installed)).catch(() => {}); };
-    check();
-    window.addEventListener("aygent-browser-changed", check);
-    return () => window.removeEventListener("aygent-browser-changed", check);
-  }, []);
   const [mode, setMode] = useState<Mode>("light");
   const [accent, setAccent] = useState("");
   const [keySet, setKeySet] = useState(false);
@@ -253,7 +244,7 @@ export function App() {
         onManage={() => setScreen("agents")}
         refreshKey={rosterRefresh}
       />
-      <Sidebar active={screen} onSelect={setScreen} showBrowser={browserInstalled} />
+      <Sidebar active={screen} onSelect={setScreen} />
       <div style={{ flex: 1, height: "100vh", minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column" }}>
         {/* The persistent daemon-status strip was dev telemetry — removed. The
            connection state now lives as a quiet sanity-check in Settings.
@@ -261,8 +252,7 @@ export function App() {
            window and pin their footer to the bottom (no dead whitespace).
            minHeight:0 on BOTH this and the scroll parent is what lets flex
            children actually shrink below their content size — without it, a
-           child measures its frozen intrinsic size (the Browser pane was stuck
-           at its large-window rect because this chain couldn't shrink). */}
+           child measures its frozen intrinsic size (a stuck child keeps its large-window rect because this chain couldn't shrink). */}
         <div style={{ padding: "28px 32px", flex: 1, minHeight: 0, minWidth: 0, display: "flex", flexDirection: "column" }}>
           {screen === "chat" && (
             <Chat
@@ -298,7 +288,6 @@ export function App() {
           {screen === "tools" && <Tools folder={folder} agentId={activeAgent?.id ?? null} />}
           {screen === "skills" && <Skills folder={folder} agentId={activeAgent?.id ?? null} />}
           {screen === "mcp" && <McpConnections />}
-          {screen === "browser" && <Browser />}
         </div>
       </div>
       <CmdPalette onNavigate={(sc) => setScreen(sc)} />

@@ -11,7 +11,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Input, Pill } from "../components/ui";
-import { AygentBrowser } from "../components/AygentBrowser";
 import { AygentHyperFrames } from "../components/AygentHyperFrames";
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
@@ -30,7 +29,7 @@ type Skill = {
 };
 
 export function Tools({ folder, agentId }: { folder: string | null; agentId: string | null }) {
-  // TOOLS tab: the capability inventory + AYGENT-branded tools (the browser).
+  // TOOLS tab: the capability inventory.
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18, maxWidth: 760 }}>
       <ToolInventory folder={folder} agentId={agentId} />
@@ -185,9 +184,6 @@ function ToolInventory({ folder, agentId }: { folder: string | null; agentId: st
           });
         })()}
       </div>
-
-      {/* AYGENT-branded tools: the in-app browser (HyperFrames lives in Skills). */}
-      <AygentBrowser />
 
       {configuring && (
         <ToolConfig tool={configuring} folder={folder} agentId={agentId}

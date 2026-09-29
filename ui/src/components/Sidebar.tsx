@@ -4,7 +4,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { Icon, type IconName } from "./Icon";
 
 export type ScreenId =
-  | "chat" | "browser" | "agents" | "tools" | "skills" | "mcp" | "settings" | "scheduler" | "connections" | "savepoints";
+  | "chat" | "agents" | "tools" | "skills" | "mcp" | "settings" | "scheduler" | "connections" | "savepoints";
 
 export type NavGroup = "agent" | "global";
 export interface NavItem { id: ScreenId; label: string; icon: IconName; enabled: boolean; group: NavGroup; }
@@ -16,7 +16,6 @@ export interface NavItem { id: ScreenId; label: string; icon: IconName; enabled:
 //  • "Global"      — app-wide (roster, connectors, app settings)
 export const NAV: NavItem[] = [
   { id: "chat", label: "Chat", icon: "chat", enabled: true, group: "agent" },
-  { id: "browser", label: "Browser", icon: "globe", enabled: true, group: "agent" },
   { id: "tools", label: "Tools", icon: "tools", enabled: true, group: "agent" },
   { id: "skills", label: "Skills", icon: "sparkles", enabled: true, group: "agent" },
   { id: "scheduler", label: "Scheduler", icon: "scheduler", enabled: true, group: "agent" },
@@ -27,10 +26,8 @@ export const NAV: NavItem[] = [
   { id: "settings", label: "Settings", icon: "settings", enabled: true, group: "global" },
 ];
 
-export function Sidebar({ active, onSelect, showBrowser }: { active: ScreenId; onSelect: (id: ScreenId) => void; showBrowser: boolean }) {
-  // UI task #4 (Mason 08-01): the browser is a TOOL — no sidebar entry until
-  // it's actually enabled/installed (Tools tab owns the enable flow).
-  const nav = NAV.filter((i) => i.id !== "browser" || showBrowser);
+export function Sidebar({ active, onSelect }: { active: ScreenId; onSelect: (id: ScreenId) => void }) {
+  const nav = NAV;
   return (
     <nav style={{
       width: 208, flexShrink: 0, height: "100vh", boxSizing: "border-box",
@@ -100,7 +97,7 @@ function VersionTag() {
   useEffect(() => { getVersion().then(setV).catch(() => {}); }, []);
   return (
     <div style={{ marginTop: "auto", padding: "10px", fontSize: 11, color: "var(--text-faint)" }}>
-      {v ? `AYGENT v${v}` : "AYGENT"}
+      {v ? `AYGENT Core v${v}` : "AYGENT Core"}
     </div>
   );
 }

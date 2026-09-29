@@ -32,6 +32,7 @@
 // the terminal that each page he visits is captured.
 
 use std::path::PathBuf;
+use tauri::Manager;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -55,7 +56,9 @@ static HISTORY: Mutex<Option<Vec<HistEntry>>> = Mutex::new(None);
 
 /// <app_data>/browser/history.json — app state, NOT the user's folder.
 fn history_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    Ok(crate::browser::browser_dir(app)?.join("history.json"))
+    Ok(app.path().app_data_dir().map_err(|e| format!("app_data_dir: {e}"))?
+        .join("browser")
+        .join("history.json"))
 }
 
 fn now_secs() -> u64 {

@@ -7,7 +7,6 @@
 use rusqlite::params; // scheduler_list/scheduler_runs read-only queries
 
 mod agents;
-mod browser;
 mod cancel;
 // ENGINE-CEF (Phase 1): native Chromium visible-surface + punchout geometry.
 // Both are #![cfg(all(target_os = "macos", feature = "engine-cef"))] internally,
@@ -1941,8 +1940,7 @@ fn agents_set_active(
     Ok(profile)
 }
 
-/// Persist the active agent id to app-data so the browser can pick the right
-/// per-agent profile (Slice 6). Called by the UI alongside agents_set_active.
+/// Persist the active agent id to app-data. Called by the UI alongside agents_set_active.
 #[tauri::command]
 fn set_active_agent_marker(app: tauri::AppHandle, id: String) -> Result<(), String> {
     let ad = app_data(&app)?;
@@ -2824,766 +2822,10 @@ async fn anthropic_test(prompt: String) -> Result<String, String> {
     Ok(format!("[{model}]\n{answer}"))
 }
 
-/// M0.3 AGENT LOOP: the model gets a jailed file tool (read_file/write_file) and
-/// may call it; every call routes through the broker (jailed). This is where the
-/// brain (model) + the jail (broker) fuse into an actual agent. Returns a
-/// transcript string of what happened (tool calls + final answer).
-#[tauri::command]
-async fn agent_run(
-    app: tauri::AppHandle,
-    broker: tauri::State<'_, Arc<Broker>>,
-    browser_state: tauri::State<'_, browser::BrowserProc>,
-    db: tauri::State<'_, writer::Db>,
-    folder: Option<String>,
-    prompt: String,
-    // Per-call event channel the Browser panel listens on for the live CHECKLIST
-    // (browser:agent-plan / browser:agent-step / browser:agent-done). Optional so
-    // older callers still work; when absent we just skip the UI emits.
-    channel: Option<String>,
-) -> Result<String, String> {
-    use tauri::Emitter;
-    // Resolve the ACTIVE agent's actual provider + model (the rail selection).
-    // The Browser panel passes folder:null, so we resolve via the active agent id.
-    // Hardcoding Anthropic here meant Muse in the sidebar still ran Anthropic.
-    let resolved_agent_id = agent_for_folder(&db, folder.as_deref().unwrap_or("")).ok();
-    let (provider, configured_model): (String, Option<String>) = match resolved_agent_id.as_deref().and_then(|aid| repo::get_agent(&db, aid).ok()).flatten() {
-        Some(a) => (if a.provider.is_empty() { "anthropic".into() } else { a.provider.clone() }, if a.model.trim().is_empty() { None } else { Some(a.model.clone()) }),
-        None => ("anthropic".into(), None),
-    };
-    let provider = provider.as_str();
-    let (key, model): (String, String) = match provider {
-        "openai" | "openrouter" => {
-            let k = keychain::get_key(provider).map_err(|_| format!("no {provider} key set — add one in Settings"))?;
-            let m = match configured_model.clone() {
-                Some(m) if !m.trim().is_empty() => m,
-                _ => {
-                    // auto-pick: prefer a cheap/default model from live list
-                    let models = openai_provider::list_models(provider, &k).await.unwrap_or_default();
-                    models.first().cloned().unwrap_or_else(|| if provider=="openai" { "gpt-4o-mini".into() } else { "openai/gpt-4o-mini".into() })
-                }
-            };
-            (k, m)
-        },
-        "meta" => {
-            let k = keychain::get_key("meta").map_err(|_| "no meta key set — add one in Settings".to_string())?;
-            let m = configured_model.clone().filter(|m| !m.trim().is_empty()).unwrap_or_else(|| "muse-spark-1.2".into());
-            (k, m)
-        },
-        _ => {
-            // anthropic + default
-            let k = keychain::get_key("anthropic").map_err(|_| "no anthropic key set — add one first".to_string())?;
-            let models = provider::anthropic_list_models(&k).await?;
-            let m = match configured_model.clone() {
-                Some(m) if !m.trim().is_empty() => m,
-                _ => models.iter().find(|m| m.contains("sonnet")).or_else(|| models.iter().find(|m| !m.contains("haiku"))).cloned().or_else(|| models.first().cloned()).ok_or_else(|| "account returned no usable models".to_string())?,
-            };
-            (k, m)
-        }
-    };
-    eprintln!("[aygent][browser][AGENT] provider={provider} model={model} (resolved={:?})", resolved_agent_id);
-
-    // Helper: emit a checklist event to the FE if a channel was provided.
-    let emit_ev = |kind: &str, payload: serde_json::Value| {
-        if let Some(ch) = channel.as_deref() {
-            let mut p = payload;
-            if let Some(obj) = p.as_object_mut() { obj.insert("kind".into(), serde_json::json!(kind)); }
-            let _ = app.emit(ch, &p);
-        }
-    };
-
-    // M0.2b: capability model. In Folder Mode (the M0.3 default) the granted
-    // caps are {fs.read, fs.write, net.http, mcp.net}. The file tools below need
-    // only fs.read/fs.write, so they're allowed. shell.exec / mcp.local-exec /
-    // hooks.script are NOT granted here — they belong to Allow Shell Access. The OS
-    // Seatbelt jail is the authoritative backstop; this is the explicit early gate.
-    // (Full registry-driven gating + MCP transport split lands with the MCP
-    // client in Phase 1; the enum + rule are frozen now — see
-    // daemon/src/core/capabilities.ts and docs/CONTRACTS.md §3.)
-    let _mode = "folder"; // M1.4 makes this per-agent.
-
-    // Tool schemas the model can call. Handlers route through the broker (jailed).
-    // PLUS the browser tools (Slice 4/5) so the hand-off panel's agent can act in
-    // the VISIBLE tab — that's the whole point of this path being called from
-    // the Browser screen.
-    let mut tools = serde_json::json!([
-        {
-            "name": "read_file",
-            "description": "Read a UTF-8 text file inside the agent folder. Path is relative to the folder root.",
-            "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }
-        },
-        {
-            "name": "write_file",
-            "description": "Write a UTF-8 text file inside the agent folder. Path is relative to the folder root.",
-            "input_schema": { "type": "object", "properties": { "path": { "type": "string" }, "content": { "type": "string" } }, "required": ["path", "content"] }
-        },
-        {
-            "name": "list_files",
-            "description": "List entries in a directory inside the agent folder. Path is relative to the folder root; use '.' for the root.",
-            "input_schema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }
-        },
-        {
-            "name": "step_done",
-            "description": "Call this the INSTANT you finish one step of your plan. Pass the step's number (1-based). This checks the step off in the human's live checklist. Calling step_done for the FINAL step ENDS your turn. Advance the plan one step at a time — do not skip or repeat.",
-            "input_schema": { "type": "object", "properties": { "step": { "type": "integer", "description": "1-based number of the step you just completed" } }, "required": ["step"] }
-        },
-        {
-            "name": "task_complete",
-            "description": "Call this to STOP EARLY if the task is fully done before all plan steps are needed. Provide a one-sentence summary. Normally you finish by calling step_done on the last step instead.",
-            "input_schema": { "type": "object", "properties": { "summary": { "type": "string", "description": "one-sentence summary of what you did" } }, "required": ["summary"] }
-        }
-    ]);
-    if let Some(arr) = tools.as_array_mut() {
-        for schema in browser::agent_tool_schemas() { arr.push(schema); }
-    }
-
-    let system = "You are AYGENT, driving the in-app browser in the tab the human is watching. \
-        Use the browser tools to ACT in that page: browser_open (navigate to a URL), browser_read \
-        (see the current page's text), browser_click_text (click a link/button by its visible text), \
-        browser_type_text (type into a field, optionally submit), browser_click_first_result \
-        (click the FIRST organic search result — takes no arguments). You also have \
-        read_file/write_file/list_files for the user's folder.\n\n\
-        HOW TO WORK:\n\
-        - To search Google: the page is already google.com. Call browser_type_text with the query \
-        and submit:true. Then call browser_read ONCE to see the results.\n\
-        - To open the FIRST search result: call browser_click_first_result (NO arguments) — it \
-        deterministically clicks the first real result and skips ads. NEVER use browser_click_text \
-        with a guessed title for the first result.\n\
-        - To open a SPECIFIC named link: call browser_click_text with distinctive text from that \
-        link. The human approves each click.\n\
-        - After EACH tool call, the tool returns the current page title + URL. TRUST IT. If the URL \
-        changed to the destination you intended, the action SUCCEEDED.\n\n\
-        THE PLAN IS THE LAW (CRITICAL — do EXACTLY this, nothing else):\n\
-        - You were given an ordered PLAN. It is the ONLY authority for what to do. Execute it ONE STEP \
-        AT A TIME, strictly in order. Each turn you will be told the CURRENT step — do ONLY that step.\n\
-        - You MUST NOT take any action outside the current step. Do NOT explore, do NOT open extra \
-        pages, do NOT 'double-check' by re-searching. If it isn't the current step, don't do it.\n\
-        - The INSTANT the current step's goal is met, call `step_done` with that step's number. This \
-        checks it off in the human's live checklist. Only then move on.\n\
-        - Steps already checked off are FINISHED FOREVER. NEVER redo a completed step. In particular, \
-        once you have navigated OFF Google onto a destination, you may NOT go back to Google or \
-        re-open/re-search it — that step is done.\n\
-        - Reads are AUTHORITATIVE: after each tool call the result shows the current page title + URL. \
-        TRUST IT. If the URL is the destination you intended, that step SUCCEEDED — mark it done.\n\
-        - 'Click the first result' is DONE the instant the page navigates off the results page onto \
-        the destination. Mark it done and STOP touching Google.\n\
-        - If a step genuinely CANNOT be completed (element missing, page won't navigate, permission \
-        denied), say so plainly in text and call task_complete with a one-sentence reason — do NOT \
-        keep retrying or wander to a different approach.\n\
-        - Calling step_done on the LAST step ENDS your turn. That is how you finish. You do not need \
-        task_complete unless you're stopping early.\n\n\
-        Be concise. Prefer the FEWEST tool calls. Advance the checklist in order; never loop, never wander.";
-
-    // =====================================================================
-    // PLAN-FIRST (Problem 2 — the visible checklist Mason has asked for 4×).
-    // Before ANY action, make ONE model call that decomposes the task into an
-    // ordered list of concrete, checkable steps. We render it live in the Agent
-    // panel and check each off as it completes. The checklist STRUCTURALLY
-    // prevents the old re-search loop: if the plan is ["type query + submit",
-    // "click first result"] and step 2 is checked, there is no "search again"
-    // step to fall into — when every step is checked the turn ENDS.
-    // =====================================================================
-    let plan_system = "You are a browsing task planner. Decompose the user's task into the SHORTEST \
-        ordered list of concrete browser steps needed to finish it. Each step is one short imperative \
-        phrase (e.g. \"type 'claude' in the search box and submit\", \"click the first result\", \"read \
-        the page\"). For opening the top search hit, phrase the step as \"click the first result\" \
-        (the runner has a dedicated deterministic tool for it). Do NOT include steps for opening the \
-        browser (it's already open) or for reporting \
-        back. Prefer 1-4 steps. Reply with ONLY a JSON array of strings, nothing else.";
-    let plan_msgs = serde_json::json!([{ "role": "user", "content": prompt }]);
-    let no_tools = serde_json::json!([]);
-    let mut steps: Vec<String> = Vec::new();
-    // Planner uses the SAME provider/model as the agent (Muse in sidebar -> Muse planner).
-    let plan_resp: Result<serde_json::Value, String> = match provider {
-        "openai" | "openrouter" => {
-            let _msgs = serde_json::json!([{ "role": "user", "content": prompt }]);
-            // Use the provider's raw turn via openai_provider but we need a text-only call; use complete helper via a synthetic turn
-            // Instead do a minimal stream-equivalent: reuse anthropic planner prompt via openai complete
-            // For now, call openai_provider::openai_stream_turn with no tools and collect text
-            let _ = &key; // keeps borrow
-            // Fallback: try anthropic as planner even when browsing on another provider? No — use the right provider.
-            // Simplest: call openai's complete-style turn by using provider::anthropic_turn only as fallback? Let's dispatch properly:
-            // We will attempt to use the selected provider's turn; on error fall back to anthropic if available.
-            // To avoid async borrow issues, just call the provider's one-shot helper.
-            // For openai/openrouter: use openai_provider::complete with the plan prompt
-            match openai_provider::complete(&provider.to_string(), &key, &model, &format!("{plan_system}\n\nTask: {prompt}")).await {
-                Ok(text) => Ok(serde_json::json!({"content": [{"type":"text","text": text}]})),
-                Err(e) => Err(e),
-            }
-        },
-        "meta" => {
-            match meta_provider::complete(&key, &model, &format!("{plan_system}\n\nTask: {prompt}")).await {
-                Ok(text) => Ok(serde_json::json!({"content": [{"type":"text","text": text}]})),
-                Err(e) => Err(e),
-            }
-        },
-        _ => provider::anthropic_turn(&key, &model, plan_system, &plan_msgs, &no_tools).await,
-    };
-    if let Ok(resp) = plan_resp {
-        let text = resp.get("content").and_then(|c| c.as_array())
-            .map(|arr| arr.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join(""))
-            .unwrap_or_default();
-        steps = parse_plan_steps(&text);
-    }
-    if steps.is_empty() {
-        // Fallback plan so the checklist always renders + the loop still ends.
-        steps = vec!["Do the task on the current page".to_string(), "Confirm it's done".to_string()];
-    }
-    eprintln!("[aygent][browser][PLAN] {} steps: {:?}", steps.len(), steps);
-    emit_ev("plan", serde_json::json!({ "steps": steps.clone() }));
-
-    // Tell the model its own plan + that it must advance it explicitly.
-    let plan_note = {
-        let listed = steps.iter().enumerate()
-            .map(|(i, s)| format!("{}. {}", i + 1, s)).collect::<Vec<_>>().join("\n");
-        format!("Your plan (execute in order, one at a time):\n{listed}\n\nAfter you FINISH each step, \
-            call `step_done` with its number. When the LAST step is done, calling step_done for it \
-            ends the turn — you do NOT also need task_complete (but you may call task_complete to stop early).")
-    };
-
-    let mut messages = serde_json::json!([{ "role": "user", "content": format!("{prompt}\n\n{plan_note}") }]);
-    let mut transcript = String::new();
-    transcript.push_str(&format!("[{model}]\n"));
-
-    // Checklist progress. `next_step` is the 0-based index of the next unchecked
-    // step; when it reaches steps.len() every step is checked => DONE.
-    let mut next_step: usize = 0;
-    let mut browser_actions = 0u32;
-    // PER-STEP RETRY CAP (spec #3 — honest failure, no infinite loop). Count
-    // consecutive FAILED browser actions while the plan is parked on the same
-    // step. If a step can't complete after MAX_STEP_RETRIES attempts, surface a
-    // clear message to the user and STOP (don't loop forever). Resets whenever
-    // the checklist advances (next_step changes).
-    const MAX_STEP_RETRIES: u32 = 2;
-    let mut step_fail_streak: u32 = 0;
-    let mut streak_step: usize = 0;
-    // STEP-OVERRUN GUARD (Mason's Part-1 fix). Once a NAV-step's navigation
-    // actually lands on a real (non-search) destination, we record the step
-    // index here. While `satisfied_step == Some(next_step)`:
-    //   - the per-turn CURRENT-STATE tells the model the step's goal is MET and
-    //     to advance (step_done) or task_complete — NOT click/open/type again;
-    //   - a further browser_click_text/browser_open/browser_type_text on that
-    //     SAME step is REJECTED (never executed) with "this step is already
-    //     complete — advance", so a wandering second click can't happen.
-    // Keyed off the ACTUAL plan step + ACTUAL navigation, not hardcoded google
-    // logic. Cleared whenever the checklist advances (next_step changes).
-    let mut satisfied_step: Option<usize> = None;
-    // Iteration cap scales with plan size (each step may need a couple tool
-    // calls) but stays bounded so a misbehaving model can't spin forever.
-    let max_iters = (steps.len() * 4).clamp(8, 24);
-
-    // Agent loop: cap iterations so a misbehaving model can't spin forever.
-    for _ in 0..max_iters {
-        // CHECKLIST AUTHORITY (spec #1/#2): each turn, tell the model EXACTLY
-        // which step it is on and forbid anything else. This is the runtime
-        // enforcement of sequential execution — combined with the deterministic
-        // step_done -> next_step advance + the retry cap, the model cannot
-        // legitimately wander back to a finished step.
-        let cur_idx = next_step.min(steps.len().saturating_sub(1));
-        let done_list = if next_step == 0 {
-            "(none yet)".to_string()
-        } else {
-            steps.iter().take(next_step).enumerate()
-                .map(|(i, s)| format!("{}. {} ✓", i + 1, s)).collect::<Vec<_>>().join("; ")
-        };
-        // If the step's goal is ALREADY MET (a nav-step whose navigation landed
-        // on a real destination), the ONLY correct next move is to advance —
-        // NOT to click/open/type again. Inject that unambiguously so the model
-        // calls step_done (or task_complete on the last step) instead of taking
-        // another action and wandering (the exact double-click bug).
-        let goal_met = satisfied_step == Some(cur_idx);
-        let turn_system = if goal_met {
-            let is_last = cur_idx + 1 >= steps.len();
-            let cur_url = browser::current_agent_url();
-            format!(
-                "{system}\n\n── CURRENT STATE ──\n\
-                STEP {}/{} (\"{}\") is ALREADY COMPLETE — its goal is MET. The browser \
-                successfully navigated to the destination ({}).\n\
-                Already completed (do NOT redo): {}.\n\
-                Your ONLY valid next action is to {}. Do NOT click, open, type, or read \
-                again for this step — it is finished. Do NOT take ANY browser action now.",
-                cur_idx + 1, steps.len(),
-                steps.get(cur_idx).map(|s| s.as_str()).unwrap_or(""),
-                if cur_url.is_empty() { "the intended page".to_string() } else { cur_url },
-                done_list,
-                if is_last {
-                    format!("call step_done({}) to finish the turn (or task_complete with a one-line summary)", cur_idx + 1)
-                } else {
-                    format!("call step_done({}) so the checklist advances to the next step", cur_idx + 1)
-                },
-            )
-        } else {
-            format!(
-                "{system}\n\n── CURRENT STATE ──\n\
-                You are on STEP {}/{}: \"{}\".\n\
-                Already completed (do NOT redo): {}.\n\
-                Do ONLY step {} now. When its goal is met, call step_done({}) IMMEDIATELY — \
-                do NOT take a second action once the goal is achieved. \
-                Do NOT act outside this step. Do NOT re-open or re-search Google if it's already done.",
-                cur_idx + 1, steps.len(),
-                steps.get(cur_idx).map(|s| s.as_str()).unwrap_or(""),
-                done_list,
-                cur_idx + 1, cur_idx + 1,
-            )
-        };
-        // Dispatch the turn to the agent's actual provider (Muse etc.), not always Anthropic.
-        let resp: serde_json::Value = match provider {
-            "openai" | "openrouter" => {
-                let (assistant, _stop) = openai_provider::openai_stream_turn(&provider.to_string(), &key, &model, None, &turn_system, &messages, &tools, None, |_| {}).await?;
-                // Convert OpenAI assistant (tool_calls) -> Anthropic-like content for the loop below.
-                // For the browser loop we only need content as Anthropic blocks; synthesize them.
-                let mut blocks: Vec<serde_json::Value> = Vec::new();
-                if let Some(txt) = assistant.get("content").and_then(|c| c.as_str()) {
-                    if !txt.is_empty() { blocks.push(serde_json::json!({"type":"text","text": txt})); }
-                }
-                if let Some(tcs) = assistant.get("tool_calls").and_then(|t| t.as_array()) {
-                    for tc in tcs {
-                        let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
-                        let f = tc.get("function").cloned().unwrap_or(serde_json::json!({}));
-                        let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                        let args_str = f.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
-                        let input: serde_json::Value = serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
-                        blocks.push(serde_json::json!({"type":"tool_use","id": id, "name": name, "input": input}));
-                    }
-                }
-                let stop = if blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str())==Some("tool_use")) { "tool_use" } else { "end_turn" };
-                serde_json::json!({"content": blocks, "stop_reason": stop})
-            },
-            "meta" => {
-                let (assistant, _stop) = meta_provider::meta_stream_turn(&key, &model, None, &turn_system, &messages, &tools, None, |_| {}).await?;
-                let mut blocks: Vec<serde_json::Value> = Vec::new();
-                if let Some(txt) = assistant.get("content").and_then(|c| c.as_str()) {
-                    if !txt.is_empty() { blocks.push(serde_json::json!({"type":"text","text": txt})); }
-                }
-                if let Some(tcs) = assistant.get("tool_calls").and_then(|t| t.as_array()) {
-                    for tc in tcs {
-                        let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
-                        let f = tc.get("function").cloned().unwrap_or(serde_json::json!({}));
-                        let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                        let args_str = f.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
-                        let input: serde_json::Value = serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
-                        blocks.push(serde_json::json!({"type":"tool_use","id": id, "name": name, "input": input}));
-                    }
-                }
-                let stop = if blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str())==Some("tool_use")) { "tool_use" } else { "end_turn" };
-                serde_json::json!({"content": blocks, "stop_reason": stop})
-            },
-            _ => provider::anthropic_turn(&key, &model, &turn_system, &messages, &tools).await?,
-        };
-        let content = resp.get("content").and_then(|c| c.as_array()).cloned().unwrap_or_default();
-        let stop = resp.get("stop_reason").and_then(|s| s.as_str()).unwrap_or("");
-
-        // Append the assistant turn to history verbatim (needed for tool_result).
-        messages.as_array_mut().unwrap().push(serde_json::json!({
-            "role": "assistant", "content": content.clone()
-        }));
-
-        // Collect any text + any tool_use blocks.
-        let mut tool_results = Vec::new();
-        for blk in &content {
-            match blk.get("type").and_then(|t| t.as_str()) {
-                Some("text") => {
-                    if let Some(t) = blk.get("text").and_then(|t| t.as_str()) {
-                        transcript.push_str(t);
-                        transcript.push('\n');
-                    }
-                }
-                Some("tool_use") => {
-                    let name = blk.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    let id = blk.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
-                    let input = blk.get("input").cloned().unwrap_or(serde_json::json!({}));
-                    let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
-
-                    // STEP_DONE: the model checked a plan step off. Emit the
-                    // checkmark to the FE. When the LAST step is checked, END the
-                    // turn DETERMINISTICALLY — the checklist is what structurally
-                    // stops the old re-search loop (no unchecked step left => no
-                    // "search again" to fall into).
-                    if name == "step_done" {
-                        // Accept the number the model gave, but advance monotonically
-                        // so a repeated/skipped number can't stall or overshoot.
-                        let claimed = input.get("step").and_then(|s| s.as_i64()).unwrap_or(0);
-                        let idx = if claimed >= 1 { (claimed as usize).saturating_sub(1).max(next_step) } else { next_step };
-                        let idx = idx.min(steps.len().saturating_sub(1));
-                        next_step = idx + 1;
-                        // Advancing clears the step-overrun guard for the new step.
-                        satisfied_step = None;
-                        eprintln!("[aygent][browser][STEP] {}/{} done: {}", next_step, steps.len(),
-                            steps.get(idx).map(|s| s.as_str()).unwrap_or(""));
-                        emit_ev("step", serde_json::json!({ "index": idx, "done": next_step, "total": steps.len() }));
-                        transcript.push_str(&format!("  ✓ step {}/{}: {}\n", next_step, steps.len(),
-                            steps.get(idx).map(|s| s.as_str()).unwrap_or("")));
-                        if next_step >= steps.len() {
-                            // ALL steps checked => turn COMPLETE, deterministically.
-                            eprintln!("[aygent][browser][DONE] all {} steps complete", steps.len());
-                            emit_ev("done", serde_json::json!({ "total": steps.len() }));
-                            transcript.push_str("\n✓ all steps complete\n");
-                            return Ok(transcript);
-                        }
-                        // Not the last step — ack it and let the model continue.
-                        tool_results.push(serde_json::json!({
-                            "type": "tool_result", "tool_use_id": id,
-                            "content": format!("step {} checked off. Now do step {} of {}: {}",
-                                next_step, next_step + 1, steps.len(),
-                                steps.get(next_step).map(|s| s.as_str()).unwrap_or("")),
-                            "is_error": false
-                        }));
-                        continue;
-                    }
-                    // TASK_COMPLETE: the model signals it's done EARLY. End the
-                    // turn DETERMINISTICALLY. This is the explicit STOP event.
-                    if name == "task_complete" {
-                        let summary = input.get("summary").and_then(|s| s.as_str()).unwrap_or("done");
-                        transcript.push_str(&format!("\n✓ {summary}\n"));
-                        eprintln!("[aygent][browser][DONE] task_complete: {summary}");
-                        emit_ev("done", serde_json::json!({ "total": steps.len(), "summary": summary }));
-                        return Ok(transcript);
-                    }
-                    // FIRST-RESULT OVERRIDE (ITEM 1, belt+suspenders). If the
-                    // CURRENT plan step is a first-result step and the model
-                    // tried to click a specific TEXT (browser_click_text with a
-                    // model-guessed label like "Claude: Sign in"), FORCE the
-                    // deterministic browser_click_first_result path instead. This
-                    // removes any dependence on the model routing correctly: a
-                    // first-result step ALWAYS uses the anchor-required first-
-                    // organic-result selector, never the broad text-match that
-                    // clicked a <div>/tweet embed in the observed bug.
-                    // NOTE: we do NOT move the original `input` here (a later
-                    // borrow, `path`, still references it for the file tools).
-                    // We compute an OVERRIDE (name, input) only when firing the
-                    // first-result path, and select which to pass below.
-                    let first_result_override = name == "browser_click_text"
-                        && step_is_first_result(steps.get(next_step).map(|s| s.as_str()).unwrap_or(""));
-                    // IMAGE-INDEX OVERRIDE (Google Images): "click the 5th image" should use browser_click_image, not text match.
-                    // Detect ordinal + image hint in the CURRENT plan step, not the model-supplied text (which is a guessed caption).
-                    let step_text = steps.get(next_step).map(|s| s.as_str()).unwrap_or("");
-                    let is_image_step = step_text.to_ascii_lowercase().contains("image")
-                        && step_text.chars().any(|c| c.is_ascii_digit());
-                    let image_index_override = is_image_step && (name == "browser_click_text" || name == "browser_click_first_result");
-                    if first_result_override {
-                        eprintln!("[aygent][browser][STEP] OVERRIDE browser_click_text -> browser_click_first_result on first-result step {}/{} (ignoring model text {:?})",
-                            next_step + 1, steps.len(),
-                            input.get("text").and_then(|t| t.as_str()).unwrap_or(""));
-                    }
-                    if image_index_override {
-                        let idx = step_text.chars().filter(|c| c.is_ascii_digit()).collect::<String>().parse::<u64>().unwrap_or(1).max(1);
-                        eprintln!("[aygent][browser][STEP] OVERRIDE {} -> browser_click_image[{}] on image step {}/{}: {}", name, idx, next_step+1, steps.len(), step_text);
-                    }
-                    let (name, image_idx): (&str, Option<u64>) = if image_index_override {
-                        let idx = step_text.chars().filter(|c| c.is_ascii_digit()).collect::<String>().parse::<u64>().unwrap_or(1).max(1);
-                        ("browser_click_image", Some(idx))
-                    } else if first_result_override { ("browser_click_first_result", None) } else { (name, None) };
-                    let image_override_input = image_idx.map(|i| serde_json::json!({"index": i})).unwrap_or(serde_json::json!({}));
-                    let override_input = serde_json::json!({});
-                    let (input, _image_guard): (&serde_json::Value, bool) = if image_idx.is_some() { (&image_override_input, true) } else if first_result_override { (&override_input, false) } else { (&input, false) };
-                    // EXECUTE THROUGH THE BROKER (jailed) — or the browser tools
-                    // (act on the VISIBLE tab + per-agent domain policy + wheel).
-                    let (result_text, is_err) = if browser::is_agent_tool(name) {
-                        // STEP-OVERRUN GUARD (Part-1 fix): if THIS step's goal is
-                        // already met (a nav-step that already navigated to its
-                        // destination) and the model tries ANOTHER acting browser
-                        // tool on the SAME step, REJECT it — do NOT execute. This
-                        // is the code-level backstop that stops the second,
-                        // wandering click that landed on the wrong site. Reads are
-                        // harmless; only clicks/opens/types wander.
-                        let is_acting = matches!(name, "browser_click_text" | "browser_click_first_result" | "browser_click_image" | "browser_open" | "browser_type_text");
-                        if is_acting && satisfied_step == Some(next_step) {
-                            let cur = steps.get(next_step).map(|s| s.as_str()).unwrap_or("(current step)");
-                            eprintln!("[aygent][browser][STOP] rejected extra {name} on satisfied step {}/{}: {}",
-                                next_step + 1, steps.len(), cur);
-                            (format!(
-                                "this step is already complete — advance. Step {}/{} (\"{}\") is DONE: the page \
-                                 already navigated to its destination ({}). Do NOT {name} again. Call step_done({}) \
-                                 now (or task_complete if this was the last step).",
-                                next_step + 1, steps.len(), cur, browser::current_agent_url(), next_step + 1,
-                            ), true)
-                        } else {
-                        browser_actions += 1;
-                        // TRANSIENT CURRENT-ACTION line (Part-2 UX): emit a single
-                        // replaceable "→ doing X…" label the panel shows live and
-                        // OVERWRITES each action — NOT an accumulating log. The
-                        // meaningful persistent progress is the checklist.
-                        {
-                            let label = match name {
-                                "browser_open" => format!("opening {}", input.get("url").and_then(|u| u.as_str()).unwrap_or("page")),
-                                "browser_read" => "reading the page".to_string(),
-                                "browser_click_text" => format!("clicking “{}”", input.get("text").and_then(|t| t.as_str()).unwrap_or("")),
-                                "browser_click_first_result" => "clicking the first result".to_string(),
-                                "browser_type_text" => {
-                                    let submit = input.get("submit").and_then(|b| b.as_bool()).unwrap_or(false);
-                                    format!("typing “{}”{}", input.get("text").and_then(|t| t.as_str()).unwrap_or(""), if submit { " and submitting" } else { "" })
-                                }
-                                "browser_screenshot" => "capturing the page".to_string(),
-                                other => other.to_string(),
-                            };
-                            eprintln!("[aygent][browser][ACTION] step {}/{}: {label}", next_step + 1, steps.len());
-                            emit_ev("action", serde_json::json!({ "step": next_step + 1, "total": steps.len(), "label": label }));
-                        }
-                        // Hard backstop only: too many actions = force a stop.
-                        // Real termination is checking off the last plan step.
-                        if browser_actions > (steps.len() as u32 * 4).clamp(8, 20) {
-                            ("You've taken many actions without finishing your plan. Call step_done for the remaining steps, or task_complete with a summary.".to_string(), true)
-                        } else {
-                            // No configured allowlist — the human-in-the-loop
-                            // permission flow governs new hosts; current tab host
-                            // is pre-allowed. Pass empty.
-                            let domains: Vec<String> = Vec::new();
-                            let out = browser::agent_tool(&app, &browser_state, name, input, &domains).await;
-
-                            // ==========================================================
-                            // HARD STOP (Mason's spec #5): Deny / Take Control.
-                            // browser.rs signals these by returning a result whose
-                            // text STARTS WITH a sentinel token (__DENIED__ /
-                            // __TAKEOVER__). We NEVER feed that back to the model —
-                            // we END THE TURN right here so the agent cannot call
-                            // browser_open again or wander. The wheel was already
-                            // set (deny->idle, take->human) inside agent_tool.
-                            // ==========================================================
-                            if browser::is_hard_stop(&out.0) {
-                                let denied = out.0.starts_with(browser::STOP_DENIED);
-                                let tail = out.0
-                                    .trim_start_matches(browser::STOP_DENIED)
-                                    .trim_start_matches(browser::STOP_TAKEOVER)
-                                    .trim();
-                                let reason = if denied {
-                                    format!("stopped: user denied — {tail}")
-                                } else {
-                                    format!("stopped: user took control — {tail}")
-                                };
-                                eprintln!("[aygent][browser][STOP] hard stop ({}) at step {}/{}: {}",
-                                    if denied { "DENY" } else { "TAKEOVER" },
-                                    next_step + 1, steps.len(), tail);
-                                transcript.push_str(&format!("\n⛔ {reason}\n"));
-                                // Tell the FE the turn ended (spinner off, checklist
-                                // frozen where it is) + who's driving now.
-                                emit_ev("done", serde_json::json!({
-                                    "total": steps.len(),
-                                    "stopped": true,
-                                    "reason": if denied { "denied" } else { "takeover" },
-                                    "at_step": next_step + 1,
-                                    "summary": reason,
-                                }));
-                                return Ok(transcript);
-                            }
-                            out
-                        }
-                        } // end step-overrun-guard else (step not already satisfied)
-                    } else { match name {
-                        "read_file" => match broker.resolve_and_open(resolved_agent_id.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Read) {
-                            Ok(mut f) => {
-                                use std::io::Read;
-                                let mut s = String::new();
-                                match f.read_to_string(&mut s) {
-                                    // PAGED (2026-09-22): whole-file returns blew the context
-                                    // on large files and truncated mid-JSON in transit.
-                                    Ok(_) => paged_read(&s, input),
-                                    Err(e) => (format!("io error: {e}"), true),
-                                }
-                            }
-                            Err(e) => (format!("refused by jail: {e:?}"), true),
-                        },
-                        "write_file" => {
-                            let cnt = input.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                            if let Ok(real) = broker.resolve(resolved_agent_id.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Write) {
-                                if let Some(parent) = real.parent() { let _ = std::fs::create_dir_all(parent); }
-                            }
-                            match broker.resolve_and_open(resolved_agent_id.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Write) {
-                                Ok(mut f) => {
-                                    use std::io::Write as _;
-                                    match f.write_all(cnt.as_bytes()) {
-                                        Ok(_) => (format!("wrote {} bytes to {path}", cnt.len()), false),
-                                        Err(e) => (format!("io error: {e}"), true),
-                                    }
-                                }
-                                Err(e) => (format!("refused by jail: {e:?}"), true),
-                            }
-                        }
-                        "list_files" => match broker.resolve(resolved_agent_id.as_deref().filter(|a| broker.root_for(a).is_ok()).unwrap_or("default"), path, broker::Mode::Read) {
-                            Ok(real) => match std::fs::read_dir(&real) {
-                                Ok(rd) => {
-                                    let names: Vec<String> = rd.filter_map(|e| e.ok())
-                                        .map(|e| e.file_name().to_string_lossy().to_string()).collect();
-                                    (names.join("\n"), false)
-                                }
-                                Err(e) => (format!("io error: {e}"), true),
-                            },
-                            Err(e) => (format!("refused by jail: {e:?}"), true),
-                        },
-                        other => (format!("unknown tool: {other}"), true),
-                    } };
-
-                    // PER-STEP RETRY CAP (spec #3). Track consecutive FAILED
-                    // browser actions on the CURRENT step. A success resets the
-                    // streak; the checklist advancing (handled by step_done above)
-                    // also naturally moves us to a new streak_step. After
-                    // MAX_STEP_RETRIES failures on the same step, we surface an
-                    // honest "couldn't complete" message and STOP the turn rather
-                    // than let the model retry forever / wander.
-                    // A guard-rejection ("this step is already complete — advance")
-                    // is NOT a genuine action failure — it means the step already
-                    // SUCCEEDED. Do NOT let it count toward the retry cap (that
-                    // would falsely hard-stop a completed step). It's is_err only
-                    // so the model treats it as "don't do that; advance".
-                    let guard_reject = result_text.starts_with("this step is already complete");
-                    if browser::is_agent_tool(name) && !guard_reject {
-                        if streak_step != next_step { streak_step = next_step; step_fail_streak = 0; }
-                        if is_err {
-                            step_fail_streak += 1;
-                            eprintln!("[aygent][browser][STEP] fail {}/{} on step {}/{}: {}",
-                                step_fail_streak, MAX_STEP_RETRIES, next_step + 1, steps.len(),
-                                result_text.chars().take(160).collect::<String>());
-                            if step_fail_streak >= MAX_STEP_RETRIES {
-                                let cur = steps.get(next_step).map(|s| s.as_str()).unwrap_or("(current step)");
-                                let msg = format!(
-                                    "stopped: couldn't complete step {}/{} (\"{}\") after {} attempts — {}",
-                                    next_step + 1, steps.len(), cur, step_fail_streak,
-                                    result_text.chars().take(240).collect::<String>());
-                                eprintln!("[aygent][browser][STOP] step retry cap hit: {msg}");
-                                transcript.push_str(&format!("\n⛔ {msg}\n"));
-                                emit_ev("done", serde_json::json!({
-                                    "total": steps.len(),
-                                    "stopped": true,
-                                    "reason": "step_failed",
-                                    "at_step": next_step + 1,
-                                    "summary": msg,
-                                }));
-                                return Ok(transcript);
-                            }
-                        } else {
-                            step_fail_streak = 0;
-                        }
-                    }
-
-                    // ==========================================================
-                    // STEP-OVERRUN DETECTION (Part-1 fix — the core of the bug).
-                    // If the CURRENT step is a NAV-step ("click the first result",
-                    // "open the link", "go to X"…) and an ACTING browser tool just
-                    // SUCCEEDED and the page is now on a REAL non-search
-                    // destination, the step's GOAL IS MET. Mark it satisfied so
-                    // (a) next turn's CURRENT-STATE says "advance, don't act", and
-                    // (b) any further click/open/type on this same step is
-                    // rejected by the guard above. Keyed off the actual plan step
-                    // + actual navigation — NOT the old left_google turn-gate.
-                    // We ALSO amend the tool_result the model sees so it advances
-                    // instead of clicking again on this very turn.
-                    let mut satisfied_now = false;
-                    if browser::is_agent_tool(name)
-                        && !is_err
-                        && matches!(name, "browser_click_text" | "browser_click_first_result" | "browser_click_image" | "browser_open" | "browser_type_text")
-                        && satisfied_step != Some(next_step)
-                    {
-                        let cur_step_txt = steps.get(next_step).map(|s| s.as_str()).unwrap_or("");
-                        if step_is_nav(cur_step_txt) {
-                            let host = browser::current_agent_host();
-                            if !browser::is_search_host(&host) {
-                                satisfied_step = Some(next_step);
-                                satisfied_now = true;
-                                eprintln!("[aygent][browser][STEP] goal MET for step {}/{} (nav landed on {}): require step_done next",
-                                    next_step + 1, steps.len(), browser::current_agent_url());
-                            }
-                        }
-                    }
-
-                    transcript.push_str(&format!("  ⚙ {name}({path}) → {}\n",
-                        if is_err { format!("✗ {result_text}") } else { "✓".to_string() }));
-
-                    // When the nav-step just became satisfied, steer the model to
-                    // advance THIS turn: append an explicit instruction to the
-                    // tool_result so it calls step_done next instead of clicking
-                    // again (the exact wandering second click we're killing).
-                    let content_for_model = if satisfied_now {
-                        let is_last = next_step + 1 >= steps.len();
-                        format!(
-                            "{result_text}\n\n[STEP GOAL MET] Step {}/{} is now COMPLETE — the page navigated to its \
-                             destination. Do NOT click, open, or type again for this step. {}",
-                            next_step + 1, steps.len(),
-                            if is_last {
-                                format!("Call step_done({}) to finish (or task_complete with a one-line summary).", next_step + 1)
-                            } else {
-                                format!("Call step_done({}) so the checklist advances.", next_step + 1)
-                            },
-                        )
-                    } else {
-                        result_text.clone()
-                    };
-
-                    tool_results.push(serde_json::json!({
-                        "type": "tool_result",
-                        "tool_use_id": id,
-                        "content": content_for_model,
-                        "is_error": is_err
-                    }));
-                }
-                _ => {}
-            }
-        }
-
-        if stop == "tool_use" && !tool_results.is_empty() {
-            // Feed results back and loop for the model's next turn.
-            messages.as_array_mut().unwrap().push(serde_json::json!({
-                "role": "user", "content": tool_results
-            }));
-            continue;
-        }
-        break; // final answer reached
-    }
-
-    // Loop ended without an explicit step_done/task_complete (model gave a final
-    // answer, or the iteration cap hit). Emit a terminal `done` so the FE stops
-    // the "working" spinner + marks the checklist finished deterministically.
-    eprintln!("[aygent][browser][DONE] loop ended (steps {}/{})", next_step, steps.len());
-    emit_ev("done", serde_json::json!({ "total": steps.len(), "partial": next_step < steps.len() }));
-    Ok(transcript)
-}
-
-/// Parse the planner model's reply into an ordered list of step strings. The
-/// planner is told to return ONLY a JSON array of strings, but models sometimes
-/// wrap it in prose or a ```json fence — so we extract the first [...] slice and
-/// parse that, falling back to line-splitting if JSON parse fails. Steps are
-/// trimmed, de-numbered, and capped so a runaway plan can't blow the loop.
-fn parse_plan_steps(text: &str) -> Vec<String> {
-    let clean = |s: &str| -> String {
-        // Strip a leading list marker like "1. ", "- ", "* ".
-        let t = s.trim().trim_matches('"').trim();
-        let t = t.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')' || c == '-' || c == '*' || c == ' ');
-        t.trim().to_string()
-    };
-    // Prefer the JSON array slice.
-    if let (Some(a), Some(b)) = (text.find('['), text.rfind(']')) {
-        if b > a {
-            if let Ok(arr) = serde_json::from_str::<Vec<String>>(&text[a..=b]) {
-                let v: Vec<String> = arr.into_iter().map(|s| clean(&s)).filter(|s| !s.is_empty()).collect();
-                if !v.is_empty() { return v.into_iter().take(8).collect(); }
-            }
-        }
-    }
-    // Fallback: split lines that look like steps.
-    let v: Vec<String> = text.lines()
-        .map(clean)
-        .filter(|s| !s.is_empty() && s.len() > 2)
-        .collect();
-    v.into_iter().take(8).collect()
-}
-
-/// Does this plan step's GOAL consist of NAVIGATING to a destination — i.e. is
-/// it a "click the result", "open the link", "go to X", "visit", "navigate"
-/// step? Used by the STEP-OVERRUN GUARD in `agent_run`: for a nav-step, a
-/// successful navigation OFF the search page onto a real destination MEANS THE
-/// STEP IS DONE, so the loop must require step_done next instead of tolerating a
-/// second click. This keys off the ACTUAL plan step text (not hardcoded google
-/// logic) — the brittle `left_google` heuristic is NOT reintroduced.
-/// Is this plan step a "click the FIRST result / first link / top result" step?
-/// Used by the FIRST-RESULT OVERRIDE in `agent_run`: on such a step the model's
-/// browser_click_text (with a guessed label) is rewritten to the deterministic
-/// text-free `browser_click_first_result` tool, so we ALWAYS click the real
-/// first organic <a> instead of whatever text the model read off the page.
-fn step_is_first_result(step: &str) -> bool {
-    let s = step.to_ascii_lowercase();
-    (s.contains("first") && (s.contains("result") || s.contains("link") || s.contains("hit") || s.contains("listing")))
-        || s.contains("top result")
-        || s.contains("select the first")
-        || s.contains("open the first")
-        || s.contains("click the first")
-}
+// --- STREAMING agent loop (Phase 1) ----------------------------------------
+// Emits normalized StreamEvents to the UI via Tauri events as they arrive.
+// Tool calls still route through the broker (jailed). Falls back to turn-based
+// automatically if the provider can't stream (UI shows a thinking animation).
 
 fn is_placeholder_spin(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
@@ -3601,21 +2843,6 @@ fn is_placeholder_spin(text: &str) -> bool {
         || (t.contains("wiring") && t.contains("type-ahead"))
         || (t.contains("openrouter-style") && t.len() < 220)
 }
-
-fn step_is_nav(step: &str) -> bool {
-    let s = step.to_ascii_lowercase();
-    // Any verb that means "end up on a different page/destination".
-    (s.contains("click") && (s.contains("result") || s.contains("link") || s.contains("hit")
-        || s.contains("listing") || s.contains("title") || s.contains("first")))
-        || s.contains("open the") || s.starts_with("open ")
-        || s.contains("go to") || s.contains("navigate") || s.contains("visit")
-        || s.contains("follow the") || s.contains("select the first")
-}
-
-// --- STREAMING agent loop (Phase 1) ----------------------------------------
-// Emits normalized StreamEvents to the UI via Tauri events as they arrive.
-// Tool calls still route through the broker (jailed). Falls back to turn-based
-// automatically if the provider can't stream (UI shows a thinking animation).
 
 /// Execute one jailed tool call, returning (result_text, is_error). `agent_id`
 /// selects WHICH agent's broker scope (jail) the file op runs against — M1.4:
@@ -4222,25 +3449,6 @@ fn agent_tools_for_full(
         extra_instructions.push_str(&mcp_instr);
     }
 
-    // BROWSER TOOLS (Slice 4): if the in-app browser is installed AND this agent
-    // has at least one allowed browsing domain, expose the browser_* tools.
-    // Fails closed — no allowed domains => no agent browsing.
-    if browser::is_installed(app) {
-        if let Some(f) = eff_folder {
-            let domains = agent_browser_domains(app, f);
-            if !domains.is_empty() {
-                for schema in browser::agent_tool_schemas() { tools.push(schema); }
-                extra_instructions.push_str(&format!(
-                    "\n\nYou can browse the web in the SHARED in-app browser (the human watches live \
-                     and can take over). Allowed domains: {}. Use browser_open to visit a page, \
-                     browser_read to read it, browser_click_text / browser_type_text to interact. If \
-                     you hit a login, CAPTCHA, or paywall, say so — the human will take the wheel.",
-                    domains.join(", ")
-                ));
-            }
-        }
-    }
-
     // PRO MODE SHELL TOOLS (2026-07-31). Exposed ONLY when this folder's agent
     // has Allow Shell Access enabled (the scary-honest consent screen writes the flag).
     // Fails closed: no flag => no shell tools => Folder Mode (zero-shell). The
@@ -4357,22 +3565,6 @@ fn shell_tool_schemas() -> Vec<serde_json::Value> {
     ]
 }
 
-/// SLICE 4 — per-agent browser DOMAIN POLICY. The agent may only navigate to
-/// hosts on this allowlist (fails closed: empty => no agent browsing). Stored
-/// per-folder in app data (GUI-managed, no config files): 
-///   <app_data>/browser-policy/<folderkey>.json -> ["example.com", ...]
-/// The human tier is unrestricted (Slice 3) — this list ONLY gates the agent.
-fn agent_browser_domains(app: &tauri::AppHandle, folder: &str) -> Vec<String> {
-    let Ok(ad) = app_data(app) else { return vec![]; };
-    let dir = ad.join("browser-policy");
-    let key = folder_key_fnv(folder);
-    let path = dir.join(format!("{key}.json"));
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
-        .unwrap_or_default()
-}
-
 /// SHARED CONTEXT prompt block: tell the agent it has READ-ONLY access to other
 /// folders and EXACTLY how to reach them (the @shared namespace). Without this,
 /// an agent never knows a mount exists and never tries — which is why a
@@ -4399,27 +3591,6 @@ fn folder_key_fnv(folder: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in folder.as_bytes() { hash ^= *b as u64; hash = hash.wrapping_mul(0x100000001b3); }
     format!("{hash:016x}")
-}
-
-/// Read the agent's browser allowlist (GUI).
-#[tauri::command]
-fn browser_policy_get(app: tauri::AppHandle, folder: String) -> Result<Vec<String>, String> {
-    Ok(agent_browser_domains(&app, &folder))
-}
-
-/// Set the agent's browser allowlist (GUI).
-#[tauri::command]
-fn browser_policy_set(app: tauri::AppHandle, folder: String, domains: Vec<String>) -> Result<(), String> {
-    let ad = app_data(&app)?;
-    let dir = ad.join("browser-policy");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir browser-policy: {e}"))?;
-    let path = dir.join(format!("{}.json", folder_key_fnv(&folder)));
-    let clean: Vec<String> = domains.into_iter()
-        .map(|d| d.trim().trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_ascii_lowercase())
-        .filter(|d| !d.is_empty())
-        .collect();
-    let text = serde_json::to_string_pretty(&clean).map_err(|e| format!("serialize: {e}"))?;
-    std::fs::write(&path, text).map_err(|e| format!("write policy: {e}"))
 }
 
 /// The PDF tool's per-folder config ({} if unavailable). Passed into exec so the
@@ -4725,7 +3896,6 @@ async fn agent_stream(
     lanes: tauri::State<'_, lanes::Lanes>,
     db: tauri::State<'_, writer::Db>,
     drain: tauri::State<'_, drainer::DrainSignal>,
-    browser_state: tauri::State<'_, browser::BrowserProc>,
     cancel_reg: tauri::State<'_, cancel::CancelRegistry>,
     channel: String,
     prompt: String,
@@ -5397,13 +4567,6 @@ async fn agent_stream(
                     let (result_text, is_err) = if name == "whoami" {
                         // SELF-INTROSPECTION: read-only identity + model + capabilities.
                         (introspect::build_whoami(&app, &db, &scope_id, folder.as_deref()), false)
-                    } else if browser::is_agent_tool(&name) {
-                        // BROWSER TOOLS (Slice 4/5): async, driven through the CDP
-                        // session + per-agent domain policy + the shared-control
-                        // wheel. Policy keys off the FOLDER (same key as
-                        // agent_tools_for_full used to expose the tools).
-                        let domains = folder.as_deref().map(|f| agent_browser_domains(&app, f)).unwrap_or_default();
-                        browser::agent_tool(&app, &browser_state, &name, &input, &domains).await
                     } else if name == "task_continue" {
                         continue_gate::handle_task_continue(&app, &db, &scope_id, session_id.clone().unwrap_or_default(), &input).await
                     } else if name == "send_message" {
@@ -6166,13 +5329,6 @@ pub fn run() {
     let drain_signal = drainer::DrainSignal::new();
     let sched_signal = scheduler::SchedSignal::new();
 
-    // BROWSER (Slice 1): the long-lived headless Chromium handle. Launched on
-    // first navigate, reused across navigations, held here as managed state.
-    // NOTE: manage the PLAIN struct (it holds its own Mutex) so the managed type
-    // matches the commands' State<'_, BrowserProc> — an Arc<BrowserProc> would
-    // register a DIFFERENT type => 'state not managed'.
-    let browser_proc = browser::BrowserProc::new();
-
     // STOP BUTTON: the turn-cancellation registry (see cancel.rs). Managed as
     // state so both agent_stream (registers/checks the flag) and the new
     // agent_stop command (flips it from the UI's Stop click) share ONE map.
@@ -6199,7 +5355,6 @@ pub fn run() {
         .manage(lanes.clone())
         .manage(drain_signal.clone())
         .manage(sched_signal.clone())
-        .manage(browser_proc)
         .manage(cancel_registry)
         .manage(continue_gate::ContinueGate::default())
         .manage(remote_runtime)
@@ -6218,22 +5373,11 @@ pub fn run() {
             remote_cmds::theme_sync,
             provider_verify_key,
             daemon_info, pick_agent_folder, broker_probe,
-            set_provider_key, has_provider_key, anthropic_test, anthropic_models, agent_run,
+            set_provider_key, has_provider_key, anthropic_test, anthropic_models,
             agent_stream, reveal_in_finder, get_selected_model, set_selected_model,
             get_selection, set_selection, detect_hardware, local_catalog, local_search, local_lookup, local_downloaded,
             local_download, local_delete, local_tool_capability,
-            mlx::mlx_status, mlx::mlx_install_cmd, mlx::mlx_pull_cmd, mlx::mlx_stop_cmd, mlx::mlx_downloaded, mlx::mlx_delete_cmd, mlx::mlx_allow_code_cmd, mlx::mlx_code_status_cmd, restore_agent_folder,
-            browser::browser_status, browser::browser_install, browser::browser_launch_probe,
-            browser::browser_navigate, browser::browser_shutdown, browser::browser_uninstall, browser::browser_start_view, browser::browser_set_viewport,
-            browser::browser_click, browser::browser_scroll, browser::browser_type, browser::browser_key,
-            browser_policy_get, browser_policy_set,
-            browser::browser_control_status, browser::browser_take_wheel, browser::browser_release_wheel,
-            set_active_agent_marker,
-            browser::browser_history_nav, browser::browser_page_info, browser::browser_downloads_list,
-            browser::browser_history_list, browser::browser_history_clear,
-            browser::browser_download_url,
-                        browser::set_active_browser_tab, browser::browser_permission_answer,
-            browser::set_browser_hittest, browser::browser_engine_info,
+            mlx::mlx_status, mlx::mlx_install_cmd, mlx::mlx_pull_cmd, mlx::mlx_stop_cmd, mlx::mlx_downloaded, mlx::mlx_delete_cmd, mlx::mlx_allow_code_cmd, mlx::mlx_code_status_cmd, restore_agent_folder, set_active_agent_marker,
             openai_models, tools_list, tools_upsert, tools_delete, tools_set_enabled,
             tools_config, tools_set_config,
             hyperframes_status, hyperframes_provision, hyperframes_remove,
@@ -6367,31 +5511,6 @@ pub fn run() {
                     let lns = _app.state::<lanes::Lanes>().inner().clone();
                     scheduler::spawn(_app.handle().clone(), db, brk, lns, ssig, dsig);
                 }
-            }
-
-            // DOWNLOAD BRIDGE: the page-injected script emits `browser:save-request`
-            // { url, name } on a right-click image save / download-link click.
-            // wry's on_download never fires for context-menu saves, so THIS is
-            // how downloads actually happen: our process fetches the bytes and
-            // writes them to the agent folder (no WebKit, no sandbox).
-            {
-                use tauri::Listener;
-                let dl_handle = _app.handle().clone();
-                _app.listen_any("browser:save-request", move |ev| {
-                    #[derive(serde::Deserialize)]
-                    struct SaveReq { url: String, name: Option<String> }
-                    // Payload is a JSON string; parse it.
-                    if let Ok(req) = serde_json::from_str::<SaveReq>(ev.payload()) {
-                        eprintln!("[aygent][browser][DL] save-request url={} name={:?}", req.url, req.name);
-                        let h = dl_handle.clone();
-                        tauri::async_runtime::spawn(async move {
-                            match browser::browser_download_url(h, req.url.clone(), req.name).await {
-                                Ok(p) => eprintln!("[aygent][browser][DL] saved -> {p}"),
-                                Err(e) => eprintln!("[aygent][browser][DL] save failed: {e}"),
-                            }
-                        });
-                    }
-                });
             }
 
             let broker = broker.clone();

@@ -49,7 +49,7 @@ export function AgentSwitcher({
     if (a.id === activeId) return;
     try {
       const updated = await invoke<AgentProfile | null>("agents_set_active", { id: a.id });
-      // Slice 6: mark the active agent so the browser uses its per-agent profile.
+      // Persist the active-agent marker alongside the switch.
       invoke("set_active_agent_marker", { id: a.id }).catch(() => {});
       if (updated) onActiveChange(updated);
     } catch { /* ignore */ }
