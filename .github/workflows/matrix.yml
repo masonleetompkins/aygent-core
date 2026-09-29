@@ -81,6 +81,16 @@ jobs:
           TAG="${GITHUB_REF_NAME#v}"
           grep -q "$TAG" CHANGELOG.md || { echo "no $TAG entry in CHANGELOG.md"; exit 1; }
 
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   core-clean:
     runs-on: ubuntu-latest
     defaults:
