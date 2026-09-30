@@ -14,8 +14,8 @@
 // multi-threaded app.
 //
 // What the jail allows (mirroring the Seatbelt profile):
-//   - read + execute: the node binary and its install prefix (its libs, ICU)
-//   - read: the daemon's own code (dist/ + node_modules/), system libraries and
+//   - execute: only the node binary (and its ELF loader, which exec opens)
+//   - read: node's install prefix (its libs, ICU), the daemon's own code (dist/ + node_modules/), system libraries and
 //     config (/usr, /lib, /lib64, /etc, /opt), /proc and /sys (node's runtime
 //     probes)
 //   - read + write: /dev/null, /dev/zero, /dev/random, /dev/urandom, /dev/tty
@@ -105,18 +105,18 @@ fn restrict(daemon_dir: &Path, node_bin: &Path) -> Result<RulesetStatus, landloc
     let abi = ABI::V5;
     let all = AccessFs::from_all(abi);
     let read: BitFlags<AccessFs> = AccessFs::ReadFile | AccessFs::ReadDir;
-    let read_exec: BitFlags<AccessFs> = read | AccessFs::Execute;
     let dev: BitFlags<AccessFs> = AccessFs::ReadFile | AccessFs::WriteFile;
 
     let mut rules: Vec<(PathBuf, BitFlags<AccessFs>)> = Vec::new();
-    // The node runtime: the binary (and where its symlink points) plus the
-    // install prefix (…/bin/node -> …), for its shared libraries and data.
+    // The node runtime: the binary (and where its symlink points) may run;
+    // its install prefix (…/bin/node -> …) is readable for shared libraries
+    // and data, but nothing else in it may run (inside an AppImage the
+    // prefix also holds the app itself).
     for bin in [Some(node_bin.to_path_buf()), std::fs::canonicalize(node_bin).ok()].into_iter().flatten() {
         rules.push((bin.clone(), AccessFs::Execute | AccessFs::ReadFile));
         if let Some(prefix) = bin.parent().and_then(Path::parent) {
-            // Never widen to a system root like /usr (that is read-only below).
             if !matches!(prefix.to_str(), Some("/" | "/usr" | "/usr/local")) {
-                rules.push((prefix.to_path_buf(), read_exec));
+                rules.push((prefix.to_path_buf(), read));
             }
         }
     }

@@ -33,9 +33,17 @@ pub struct DaemonState {
 /// never spawned the daemon. We now probe the common absolute install locations
 /// directly (homebrew arm64/intel, /usr/local, /usr/bin, nvm) before falling back
 /// to `which`. AYGENT_NODE_BIN still overrides everything (dev/CI).
-fn resolve_node_bin() -> Option<String> {
+fn resolve_node_bin(app: &tauri::AppHandle) -> Option<String> {
     if let Ok(explicit) = std::env::var("AYGENT_NODE_BIN") {
         return Some(explicit);
+    }
+    // The runtime bundled with the app (Linux: scripts/fetch-node.mjs,
+    // tauri.linux.conf.json), so users need no Node install of their own.
+    if let Ok(res) = app.path().resource_dir() {
+        let bundled = res.join("node").join("bin").join(if cfg!(windows) { "node.exe" } else { "node" });
+        if bundled.exists() {
+            return Some(bundled.to_string_lossy().to_string());
+        }
     }
     // Probe concrete absolute paths first — works even with no PATH (Finder launch).
     let candidates = [
@@ -161,7 +169,7 @@ pub fn spawn_daemon(
     // LINUX: Landlock through this app binary as the launcher (linux_jail.rs).
     #[cfg(target_os = "linux")]
     let mut cmd = if jailed {
-        let node_bin = resolve_node_bin().ok_or("could not find node (install Node.js 24 or newer)")?;
+        let node_bin = resolve_node_bin(app).ok_or("could not find node (install Node.js 24 or newer)")?;
         let exe = std::env::current_exe()?;
         eprintln!("[aygent] jailed launch (Landlock): node={node_bin}");
         let mut c = Command::new(exe);
@@ -178,7 +186,7 @@ pub fn spawn_daemon(
     }
     #[cfg(not(target_os = "linux"))]
     let mut cmd = if jailed {
-        let node_bin = resolve_node_bin()
+        let node_bin = resolve_node_bin(app)
             .ok_or("could not resolve node binary for Seatbelt launch")?;
         let profile = materialize_profile(app, &node_bin, &daemon_dir)?;
         eprintln!("[aygent] jailed launch: node={node_bin} profile={}", profile.display());

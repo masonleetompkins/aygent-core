@@ -37,3 +37,6 @@ root.json
 *.db
 *.sqlite*
 *.sqlite-journal
+
+# Node runtime fetched for the Linux bundle (scripts/fetch-node.mjs)
+daemon/runtime/

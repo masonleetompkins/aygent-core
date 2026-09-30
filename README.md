@@ -106,6 +106,8 @@ cd aygent-core
 # UI + daemon bundles
 npm ci --prefix ui && npm run build --prefix ui
 npm ci --prefix daemon && npm run build --prefix daemon
+# (on Linux this also fetches the pinned Node runtime the AppImage bundles:
+#  scripts/fetch-node.mjs -> daemon/runtime/, checksum-verified)
 
 # Checks (what CI enforces)
 ./ui/node_modules/.bin/tsc --noEmit          # UI types
