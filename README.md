@@ -42,17 +42,27 @@ AYGENT Pro (paid, closed-source) adds hosted subscription credits with
 metered Intern/Workhorse/Expert tiers, a Wallet screen, and the Dashboard /
 Sparks / Video panels on top of this exact core: https://masonlee.build
 
-## Install (easy path — no building)
+## Download (no building)
 
-1. Download the latest release for your OS from
-   [Releases](https://github.com/masonleetompkins/aygent-core/releases):
-   `.dmg` (Mac), `.msi` (Windows), `.AppImage` (Linux).
-2. Install and open AYGENT. Pick an **agent folder** when asked — the agent
-   will only ever be able to touch files inside it.
-3. Add a brain in **Settings → Providers**: paste one provider key
+Get the latest release from
+[Releases](https://github.com/masonleetompkins/aygent-core/releases):
+
+| OS | File | Notes |
+|----|------|-------|
+| macOS (Apple Silicon) | `AYGENT-1.1.0-macOS-arm64.dmg` | Open, drag AYGENT to Applications. Unsigned dev build — on first launch, right-click → Open (once), then launch normally. |
+| Linux (x86_64) | `AYGENT-1.1.0-Linux.AppImage` | `chmod +x` the file, then run it. No install needed. |
+| Windows | — | No packaged build for 1.1.0 yet — build from source below (one command section). Check Releases for a newer version first. |
+
+Intel Macs: no prebuilt binary — build from source below (`cargo tauri build --bundles dmg`).
+
+First run (all platforms):
+
+1. Open AYGENT. Pick an **agent folder** when asked — the agent will only
+   ever be able to touch files inside it.
+2. Add a brain in **Settings → Providers**: paste one provider key
    (it goes straight to the OS keychain), or go to **Local Models** and
    download a free model to run fully offline.
-4. Open **Chat** and put it to work.
+3. Open **Chat** and put it to work.
 
 Updates are the same flow: download the new release, install over the old
 one. Your agents, memory, and settings live in your agent folders — updating
@@ -60,10 +70,39 @@ never touches them.
 
 ## Build from source
 
-Prereqs: Rust (`rustup`), Node 24+, per-OS webview deps (on Linux:
-`webkit2gtk` + friends — see `.github/workflows/matrix.yml`).
+Prereqs (all platforms): Rust via [rustup](https://rustup.rs) and Node 24+.
+
+**macOS**
 
 ```bash
+xcode-select --install   # command-line tools (compiler + SDK)
+```
+
+**Linux (Debian/Ubuntu)**
+
+```bash
+sudo apt-get update && sudo apt-get install -y \
+  libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+  librsvg2-dev patchelf
+```
+
+Other distros need the same WebKitGTK/GTK3 pieces under their own package
+names (`webkit2gtk`, `gtk3`, `libayatana-appindicator`, `librsvg`, `patchelf`).
+
+**Windows**
+
+- Install the MSVC Build Tools (via
+  [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/),
+  check "Desktop development with C++") and add the Rust MSVC target:
+  `rustup target add x86_64-pc-windows-msvc`.
+- WebView2 ships with Windows 10/11 — nothing to install.
+
+Build:
+
+```bash
+git clone https://github.com/masonleetompkins/aygent-core
+cd aygent-core
+
 # UI + daemon bundles
 npm ci --prefix ui && npm run build --prefix ui
 npm ci --prefix daemon && npm run build --prefix daemon
@@ -73,9 +112,20 @@ npm ci --prefix daemon && npm run build --prefix daemon
 cargo check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml --lib
 
-# App bundle (unsigned dev build)
+# App bundle (unsigned dev build) — lands in src-tauri/target/release/bundle/
 cargo tauri build
 ```
+
+One platform only? Scope the bundle and skip the rest:
+
+```bash
+cargo tauri build --bundles dmg        # macOS
+cargo tauri build --bundles appimage   # Linux (or: deb)
+cargo tauri build --bundles msi        # Windows
+```
+
+On Apple Silicon, append `--target aarch64-apple-darwin` to match the
+release DMG above.
 
 Project layout: `src-tauri/` (Rust shell: window, jail broker, providers,
 tools, memory) · `daemon/` (Node/TS engine: agent loop, scheduler) · `ui/`
