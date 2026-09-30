@@ -1,37 +1,67 @@
 # AYGENT Core
 
-_The AI agent you actually own._ A native desktop app: capable agents that work
-out of the box, touch only folders you choose, run on your own API keys or
-local models, and are configured entirely from a real UI — no terminal.
+_The AI agent you actually own._ A free, open-source, native desktop app
+(macOS · Windows · Linux) for working with AI agents that live in folders
+you choose, run on keys and models you control, and are configured entirely
+from a real UI — no terminal, no account, no subscription.
 
-- Stack: **Tauri v2 (Rust)** shell + **Node/TS** daemon + **React** UI
-- Platforms: **macOS · Windows · Linux** (one tree, CI-built for all three)
-- Keys: **BYOK** (Anthropic, OpenAI, OpenRouter, Muse) — stored in the OS
-  keychain, never leave Rust. Or run **local models** (GGUF, MLX) offline.
-- Safety: **Folder jail** per agent (OS-enforced; Seatbelt on macOS) with
-  per-agent **Allow Shell Access** for building and running code.
-- License: **Apache-2.0** (see `LICENSE`). Contributions welcome — see
-  `CONTRIBUTING.md`.
+## What it is
 
-AYGENT Pro (paid, closed-source) adds hosted credits, account sync, and the
-Dashboard / Sparks / Video panels on top of this exact core:
-https://masonlee.build
+AYGENT Core is a desktop harness for agentic AI work: create agents, point
+each one at a folder, talk to it in Chat, and let it read, write, organize,
+remember, and run on a schedule — inside boundaries the operating system
+enforces, not just promises.
 
-## Layout
+Out of the box: **Chat** · **Agents** (as many as you want) · **Tools** +
+**Skills** (extend what agents can do) · **Scheduler** (interval + cron jobs)
+· **Save Points** (rewind any change) · **Vault-native memory** (agents
+remember durable facts in markdown you keep) · **Connections** (GitHub,
+Notion, and more, per-agent on/off switches) · **MCP** servers · **Local
+models** (GGUF + Apple-silicon MLX, fully offline).
 
-```
-aygent-core/
-  src-tauri/     Rust shell: window, jail broker, providers, tools, memory
-  daemon/        Node/TS engine: agent loop, scheduler
-  ui/            React + Vite frontend (Tauri WebView)
-  seatbelt/      macOS sandbox profiles (deny file+exec by default)
-  scripts/       dev setup (mac-setup.sh), jail diagnostic (test-jail.sh)
-```
+## How it's different from other harnesses
+
+- **An app, not a CLI or SDK.** If you can use settings screens, you can use
+  AYGENT. Nothing to `pip install`, no API to wire, no YAML to write.
+- **You own the keys and the data.** Bring your own provider keys
+  (Anthropic, OpenAI, OpenRouter, Muse) — they're stored in the OS
+  keychain and injected per call on the Rust side, so the UI and the agent
+  never see them. Or skip the cloud entirely with downloaded local models.
+- **Jailed by the OS, not by convention.** Each agent can only touch its own
+  folder — enforced by Seatbelt on macOS and equivalent confinement
+  elsewhere. Shell access is a separate, per-agent, explicitly-granted
+  switch, not a default.
+- **Agents, plural, with memory.** Most harnesses give you one chat box.
+  AYGENT gives you a roster of agents with their own folders, memories,
+  schedules, and histories — plus Save Points, so every change is rewindable.
+- **Free and open (Apache-2.0).** No seat, no meter, no phone-home. Your
+  folder plus your keychain is your whole setup — moving machines means
+  moving a folder.
+
+AYGENT Pro (paid, closed-source) adds hosted subscription credits with
+metered Intern/Workhorse/Expert tiers, a Wallet screen, and the Dashboard /
+Sparks / Video panels on top of this exact core: https://masonlee.build
+
+## Install (easy path — no building)
+
+1. Download the latest release for your OS from
+   [Releases](https://github.com/masonleetompkins/aygent-core/releases):
+   `.dmg` (Mac), `.msi` (Windows), `.AppImage` (Linux).
+2. Install and open AYGENT. Pick an **agent folder** when asked — the agent
+   will only ever be able to touch files inside it.
+3. Add a brain in **Settings → Providers**: paste one provider key
+   (it goes straight to the OS keychain), or go to **Local Models** and
+   download a free model to run fully offline.
+4. Open **Chat** and put it to work.
+
+Updates are the same flow: download the new release, install over the old
+one. Your agents, memory, and settings live in your agent folders — updating
+never touches them.
 
 ## Build from source
 
-Prereqs: Rust (`rustup`), Node 20+, per-OS webview deps (CI installs them;
-on Linux: `webkit2gtk` + friends — see `.github/workflows/matrix.yml`).
+Prereqs: Rust (`rustup`), Node 24+, per-OS webview deps (on Linux:
+`webkit2gtk` + friends — see `.github/workflows/matrix.yml`).
 
 ```bash
 # UI + daemon bundles
@@ -47,8 +77,10 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 cargo tauri build
 ```
 
-First launch: pick an agent folder, add a provider key in Settings →
-Providers (or pull a local model in Settings → Local Models), open Chat.
+Project layout: `src-tauri/` (Rust shell: window, jail broker, providers,
+tools, memory) · `daemon/` (Node/TS engine: agent loop, scheduler) · `ui/`
+(React + Vite frontend) · `seatbelt/` (macOS sandbox profiles) · `scripts/`
+(dev setup, jail diagnostics).
 
 ## Security model
 
