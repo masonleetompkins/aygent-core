@@ -1,0 +1,5 @@
+# False positives reviewed 2026-09-30: a crate named crypto_secretbox in Cargo.lock
+# (twice) and code that looks up a key from the keychain (lib.rs). No secrets.
+15ec201578cc6f010c27ed38f10c6581b3b2005c:src-tauri/Cargo.lock:generic-api-key:889
+6e82d40d39aadbec8b44b635c71bd3b3c07e655c:src-tauri/Cargo.lock:generic-api-key:873
+48c31087d43095e0958dc415285ab830fc9f678e:src-tauri/src/lib.rs:generic-api-key:110
