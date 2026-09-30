@@ -1,0 +1,9 @@
+{
+  "name": "aygent",
+  "private": true,
+  "description": "Forwards the Tauri build hooks to the UI, so `cargo tauri build/dev` work from the repo root, src-tauri/ or ui/ alike (the CLI runs hooks where it finds a package.json).",
+  "scripts": {
+    "build": "npm run build --prefix ui",
+    "dev": "npm run dev --prefix ui"
+  }
+}

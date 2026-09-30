@@ -36,6 +36,11 @@ export class BrokerWsTransport implements BrokerTransport {
         // reject any in-flight requests so tools fail closed
         for (const [, cb] of this.pending) cb({ ok: false, error: "broker channel closed" });
         this.pending.clear();
+        // The broker lives in the app process: it closing means the app is gone
+        // (quit, crashed or killed). Nothing reconnects, so stop too rather than
+        // linger as an orphan holding the agents' state.
+        process.stderr.write("[aygent] broker channel closed: the app is gone, daemon exiting\n");
+        setTimeout(() => process.exit(0), 50);
       });
     });
   }

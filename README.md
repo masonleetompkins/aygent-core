@@ -28,8 +28,8 @@ models** (GGUF + Apple-silicon MLX, fully offline).
   keychain and injected per call on the Rust side, so the UI and the agent
   never see them. Or skip the cloud entirely with downloaded local models.
 - **Jailed by the OS, not by convention.** Each agent can only touch its own
-  folder — enforced by Seatbelt on macOS and equivalent confinement
-  elsewhere. Shell access is a separate, per-agent, explicitly-granted
+  folder — enforced by Seatbelt on macOS and Landlock on Linux (kernel
+  5.13+; on older kernels the app runs the engine unconfined and says so). Shell access is a separate, per-agent, explicitly-granted
   switch, not a default.
 - **Agents, plural, with memory.** Most harnesses give you one chat box.
   AYGENT gives you a roster of agents with their own folders, memories,
@@ -121,6 +121,9 @@ One platform only? Scope the bundle and skip the rest:
 ```bash
 cargo tauri build --bundles dmg        # macOS
 cargo tauri build --bundles appimage   # Linux (or: deb)
+# On a rolling distro (Arch and the like), linuxdeploy's bundled strip can't
+# read current libraries: NO_STRIP=true cargo tauri build --bundles appimage.
+# Release AppImages are built on Ubuntu 22.04 (CI) so they run on older glibc.
 cargo tauri build --bundles msi        # Windows
 ```
 

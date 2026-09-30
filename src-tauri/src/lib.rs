@@ -21,6 +21,10 @@ pub mod broker;
 mod dock_icon;
 mod broker_ws;
 pub mod exec;      // PRO MODE: the process-spawn broker (shell.exec). Only Rust spawns.
+#[cfg(target_os = "linux")]
+pub mod linux_jail;
+#[cfg(target_os = "linux")]
+mod linux_media; // LINUX: allow the UI's microphone (voice input). // LINUX: the daemon's Landlock jail (counterpart of the Seatbelt profile).
 pub mod paths;     // CONFIG RELOCATION: root-folder pointer + state-dir seam + onboarding paths.
 mod history;
 mod introspect; // Agent self-introspection: the read-only `whoami` tool.
@@ -103,7 +107,10 @@ fn mint_ws_token() -> String {
 #[tauri::command]
 fn daemon_info(state: tauri::State<Arc<DaemonState>>) -> serde_json::Value {
     let port = *state.ws_port.lock().unwrap();
-    serde_json::json!({ "port": port, "token": state.ws_token })
+    // How the daemon is confined: "seatbelt" (macOS), "landlock" (Linux),
+    // "none" (unconfined: the UI warns), or null (not known yet / dev launch).
+    let jail = state.jail.lock().unwrap().clone();
+    serde_json::json!({ "port": port, "token": state.ws_token, "jail": jail })
 }
 
 // ---------------------------------------------------------------------------
@@ -5348,6 +5355,18 @@ pub fn run() {
     exec::install_global(exec_broker.clone(), broker.clone());
 
     tauri::Builder::default()
+        // ONE instance: closing the window only hides AYGENT (the scheduler keeps
+        // running), and on Linux/Windows there is no Dock icon to bring it back,
+        // so launching it again must show the running app, not start a second
+        // one with its own daemon and scheduler (jobs would run twice). Must be
+        // the first plugin registered.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            for (_label, win) in app.webview_windows() {
+                let _ = win.show();
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .manage(broker.clone())
         .manage(exec_broker.clone())
@@ -5435,6 +5454,9 @@ pub fn run() {
         .register_uri_scheme_protocol(video_media::SCHEME, video_media::handle)
         .setup(move |_app| {
             video_tools::install_app(_app.handle().clone());
+            // LINUX: WebKitGTK leaves media permission to the app; allow the mic.
+            #[cfg(target_os = "linux")]
+            linux_media::install(_app.handle());
             // CACHE-BUST FIRST (Mason 08-08): if this is a new build, clear the
             // stale WKWebView frontend cache before the window loads, so the new
             // UI code actually runs. Must happen before any content load.

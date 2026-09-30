@@ -41,6 +41,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "unstable"] }  # 'unstable' unlocks WebviewBuilder + Window::add_child — needed to EMBED a child webview inside the main window (the in-app browser). Pinned intentionally; Tauri gates multi-webview behind this flag on 2.x.
 tauri-plugin-dialog = "2"          # native folder picker (M0.2)
+tauri-plugin-single-instance = "2" # a second launch shows the running app (Linux/Windows have no Dock to reopen it)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -144,3 +145,5 @@ windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service"] }  # 1.1.0: Secret Service gnome-keyring
+webkit2gtk = "2.0"  # the mic permission for voice input (linux_media.rs); the version wry uses
+landlock = "0.4"  # the daemon's Folder Mode jail on Linux (linux_jail.rs), like Seatbelt on macOS

@@ -253,7 +253,9 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
 
   // ---- Task #7: mic button -> record -> Whisper -> input ----
   const [rec, setRec] = useState<"idle" | "recording" | "transcribing">("idle");
-  const recRef = useRef<MediaRecorder | null>(null);
+  // The live recording: a MediaRecorder, or the WAV recorder below where the
+  // platform has none that works (Linux WebKitGTK without GStreamer encoders).
+  const recRef = useRef<{ stop(): void; mimeType: string } | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   // PUSH-TO-TALK (Mason 08-04): hold ` (or ~) to record, release to transcribe;
   // TAP it to send. Both the button and the key go through startRec/stopRec so
@@ -267,29 +269,41 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     if (rec !== "idle") return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mime = ["audio/webm", "audio/mp4", "audio/mpeg", ""].find((m) => !m || MediaRecorder.isTypeSupported(m)) ?? "";
-      const mr = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
-      chunksRef.current = [];
-      mr.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-      mr.onstop = async () => {
+      // Recorded audio -> Whisper -> the input box.
+      const finish = async (blob: Blob, ext: string) => {
         stream.getTracks().forEach((t) => t.stop());
         setRec("transcribing");
         try {
-          const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-          const buf = await blob.arrayBuffer();
-          const u8 = new Uint8Array(buf);
+          const u8 = new Uint8Array(await blob.arrayBuffer());
           let bin = "";
           for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode(...u8.subarray(i, i + 0x8000));
-          const ext = (recRef.current?.mimeType || "audio/webm").includes("mp4") ? "m4a"
-            : (recRef.current?.mimeType || "").includes("mpeg") ? "mp3" : "webm";
           const text = await invoke<string>("transcribe_audio_b64", { b64: btoa(bin), filename: `recording.${ext}` });
           setInput((prev) => (prev ? prev + " " : "") + text);
           taRef.current?.focus();
         } catch (err) { alert("Transcription failed: " + String(err)); }
         setRec("idle");
       };
-      mr.start();
-      recRef.current = mr;
+      // A MediaRecorder where one works; WebKitGTK may create one and only
+      // refuse at start(), so both are tried before falling back to WAV.
+      let recorder: MediaRecorder | null = null;
+      try {
+        const mime = ["audio/webm", "audio/mp4", "audio/mpeg", ""].find((m) => !m || MediaRecorder.isTypeSupported(m)) ?? "";
+        const mr = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+        const chunks: Blob[] = [];
+        mr.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+        mr.onstop = () => {
+          const type = mr.mimeType || "audio/webm";
+          const ext = type.includes("mp4") ? "m4a" : type.includes("mpeg") ? "mp3" : "webm";
+          void finish(new Blob(chunks, { type }), ext);
+        };
+        mr.start();
+        recorder = mr;
+      } catch { recorder = null; }
+      if (recorder) {
+        recRef.current = recorder;
+      } else {
+        recRef.current = recordWav(stream, (wav) => void finish(wav, "wav"));
+      }
       setRec("recording");
     } catch (err) {
       const e = err as DOMException;
@@ -1983,4 +1997,44 @@ function Thinking() {
       <style>{`@keyframes aygentPulse{0%,100%{opacity:.25}50%{opacity:1}}`}</style>
     </span>
   );
+}
+
+// Where the webview has no working MediaRecorder (Linux WebKitGTK without
+// GStreamer encoders), record raw samples with Web Audio and encode a WAV:
+// 16 kHz mono, 16-bit, which Whisper takes directly.
+function recordWav(stream: MediaStream, done: (wav: Blob) => void): { stop(): void; mimeType: string } {
+  const ctx = new AudioContext();
+  // Started outside the click (after the mic prompt), it may begin suspended.
+  void ctx.resume();
+  const source = ctx.createMediaStreamSource(stream);
+  const node = ctx.createScriptProcessor(4096, 1, 1);
+  const chunks: Float32Array[] = [];
+  node.onaudioprocess = (e) => chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  source.connect(node);
+  node.connect(ctx.destination);
+  return {
+    mimeType: "audio/wav",
+    stop() {
+      source.disconnect();
+      node.disconnect();
+      const rate = 16000;
+      const input = new Float32Array(chunks.reduce((n, c) => n + c.length, 0));
+      let at = 0;
+      for (const c of chunks) { input.set(c, at); at += c.length; }
+      const ratio = ctx.sampleRate / rate;
+      const samples = Math.floor(input.length / ratio);
+      const buf = new DataView(new ArrayBuffer(44 + samples * 2));
+      const str = (o: number, t: string) => { for (let i = 0; i < t.length; i++) buf.setUint8(o + i, t.charCodeAt(i)); };
+      str(0, "RIFF"); buf.setUint32(4, 36 + samples * 2, true); str(8, "WAVE");
+      str(12, "fmt "); buf.setUint32(16, 16, true); buf.setUint16(20, 1, true); buf.setUint16(22, 1, true);
+      buf.setUint32(24, rate, true); buf.setUint32(28, rate * 2, true); buf.setUint16(32, 2, true); buf.setUint16(34, 16, true);
+      str(36, "data"); buf.setUint32(40, samples * 2, true);
+      for (let i = 0; i < samples; i++) {
+        const v = Math.max(-1, Math.min(1, input[Math.floor(i * ratio)] ?? 0));
+        buf.setInt16(44 + i * 2, v < 0 ? v * 0x8000 : v * 0x7fff, true);
+      }
+      void ctx.close();
+      done(new Blob([buf], { type: "audio/wav" }));
+    },
+  };
 }

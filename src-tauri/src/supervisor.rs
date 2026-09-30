@@ -21,6 +21,8 @@ pub struct DaemonState {
     /// The live daemon process, so we can shut it down cleanly on quit.
     /// (Was `std::mem::forget(child)` — which orphaned Node on every exit.)
     pub child: Mutex<Option<std::process::Child>>,
+    /// How the daemon is confined ("seatbelt", "landlock", "none"), once known.
+    pub jail: Mutex<Option<String>>,
 }
 
 /// Find the absolute path to `node` (Seatbelt needs the concrete binary path;
@@ -156,6 +158,25 @@ pub fn spawn_daemon(
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "../daemon".to_string());
 
+    // LINUX: Landlock through this app binary as the launcher (linux_jail.rs).
+    #[cfg(target_os = "linux")]
+    let mut cmd = if jailed {
+        let node_bin = resolve_node_bin().ok_or("could not find node (install Node.js 24 or newer)")?;
+        let exe = std::env::current_exe()?;
+        eprintln!("[aygent] jailed launch (Landlock): node={node_bin}");
+        let mut c = Command::new(exe);
+        c.arg(crate::linux_jail::FLAG).arg(&daemon_dir).arg(&node_bin).arg(&daemon_entry);
+        c
+    } else {
+        let mut c = Command::new("node");
+        c.arg(&daemon_entry);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    if jailed {
+        *state.jail.lock().unwrap() = Some("seatbelt".into());
+    }
+    #[cfg(not(target_os = "linux"))]
     let mut cmd = if jailed {
         let node_bin = resolve_node_bin()
             .ok_or("could not resolve node binary for Seatbelt launch")?;
@@ -195,6 +216,11 @@ pub fn spawn_daemon(
         std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines().map_while(Result::ok) {
+                // The Linux jail launcher reports whether Landlock took hold.
+                if let Some(rest) = line.strip_prefix("AYGENT_JAIL=") {
+                    let kind = rest.split_whitespace().next().unwrap_or("none").to_string();
+                    *state.jail.lock().unwrap() = Some(kind);
+                }
                 if let Some(idx) = line.find("AYGENT_WS_PORT=") {
                     let rest = &line[idx + "AYGENT_WS_PORT=".len()..];
                     let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
