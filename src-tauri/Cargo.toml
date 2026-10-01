@@ -54,7 +54,7 @@ futures-util = "0.3"
 # keyring moved to per-OS targets (1.1.0 M0)
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "multipart"], default-features = false }  # Anthropic HTTP (M0.3)
 git2 = { version = "0.19", default-features = false }  # checkpoints (C4): git object model compiled IN — no system git, zero user setup
-llama-cpp-2 = "0.1"                 # LOCAL MODELS: llama.cpp compiled IN — download + run GGUF models in-app, zero user setup (Metal on mac / CUDA on PC via features below)
+llama-cpp-2 = { version = "0.1", default-features = false, features = ["common", "android-shared-stdcxx"] }  # LOCAL MODELS: llama.cpp compiled IN — download + run GGUF models in-app, zero user setup (Metal on mac / CUDA on PC via features below)
 num_cpus = "1"                      # thread count for local inference / perf prediction
 sysinfo = "0.32"                    # hardware detection (CPU/RAM) for perf prediction on the RUNTIME machine
 genpdf = "0.2"                      # TOOLS: pure-Rust markdown/text -> PDF (compiled in, zero user setup)
@@ -128,6 +128,13 @@ vulkan = ["llama-cpp-2/vulkan"]  # 1.1.0: Linux opt-in
 
 # On macOS, default to Metal so Mason's `cargo tauri dev` GPU-offloads out of the
 # box (this is where he builds/runs). Other targets stay CPU-only unless opted in.
+# OpenMP (a llama-cpp-2 default) everywhere but Windows: MSVC's OpenMP runtime
+# (VCOMP140.DLL) has no static build and isn't on a clean Windows, so the
+# Windows build uses ggml's own thread pool instead.
+[target.'cfg(not(windows))'.dependencies.llama-cpp-2]
+version = "0.1"
+features = ["openmp"]
+
 [target.'cfg(target_os = "macos")'.dependencies.llama-cpp-2]
 version = "0.1"
 features = ["metal"]
