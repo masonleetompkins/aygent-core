@@ -19,6 +19,8 @@
 // ffmpeg/ffprobe are the provisioned binaries (provision.rs); this module never
 // spawns anything the agent names.
 
+#[allow(unused_imports)]
+use crate::noconsole::NoConsole;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -250,7 +252,7 @@ fn parse_rate(s: &str) -> f64 {
 
 /// Probe a media file into the Asset fields (duration, streams, fps, size).
 pub fn probe_into(app: &tauri::AppHandle, abs: &Path, a: &mut Asset) -> Result<(), String> {
-    let out = Command::new(ffprobe(app)?)
+    let out = Command::new(ffprobe(app)?).no_console()
         .args(["-v", "error", "-print_format", "json", "-show_format", "-show_streams"])
         .arg(abs)
         .output().map_err(|e| format!("ffprobe: {e}"))?;
@@ -312,7 +314,7 @@ pub fn build_thumbs(app: &tauri::AppHandle, proj: &Path, abs: &Path, a: &Asset) 
             } else {
                 format!("fps=1/{step:.6},scale={fw}:{fh}:force_original_aspect_ratio=increase,crop={fw}:{fh},tile={frames}x1")
             };
-            let mut cmd = Command::new(&ff);
+            let mut cmd = Command::new(&ff).no_console();
             cmd.args(["-v", "error", "-y", "-i"]).arg(abs)
                 .args(["-vf", &vf, "-frames:v", "1", "-q:v", "6", "-an"]).arg(&strip);
             let out = cmd.output().map_err(|e| format!("ffmpeg strip: {e}"))?;
@@ -330,7 +332,7 @@ pub fn build_thumbs(app: &tauri::AppHandle, proj: &Path, abs: &Path, a: &Asset) 
         let wave = cache.join(format!("{}.wave.png", a.id));
         if !wave.is_file() {
             let fc = format!("[0:a]aformat=channel_layouts=mono,showwavespic=s={w}x64:colors=white:scale=sqrt[w]");
-            let out = Command::new(&ff)
+            let out = Command::new(&ff).no_console()
                 .args(["-v", "error", "-y", "-i"]).arg(abs)
                 .args(["-filter_complex", &fc, "-map", "[w]", "-frames:v", "1"]).arg(&wave)
                 .output().map_err(|e| format!("ffmpeg wave: {e}"))?;
@@ -924,7 +926,7 @@ pub fn video_reveal(broker: tauri::State<Arc<Broker>>, agent_id: String, project
     let p = match tail { Some(t) if !t.is_empty() && !t.contains("..") => proj.join(t), _ => proj };
     if !p.exists() { return Err("path does not exist".into()); }
     #[cfg(target_os = "macos")]
-    { Command::new("open").arg("-R").arg(&p).spawn().map_err(|e| e.to_string())?; }
+    { Command::new("open").no_console().arg("-R").arg(&p).spawn().map_err(|e| e.to_string())?; }
     #[cfg(not(target_os = "macos"))]
     { let _ = p; }
     Ok(())

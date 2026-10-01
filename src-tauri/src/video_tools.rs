@@ -21,6 +21,8 @@
 //   video_build_captions Hyperframes caption overlay → transparent T1 clip
 //   video_render_overlay one approved Hyperframes graphic → transparent V3 clip
 
+#[allow(unused_imports)]
+use crate::noconsole::NoConsole;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
@@ -740,7 +742,7 @@ pub fn transcribe(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, proje
     for i in 0..n {
         let off = i as f64 * CHUNK_SECS;
         let chunk = cache.join(format!("{}.tx{i}.mp3", a.id));
-        let o = Command::new(&ff).args(["-v", "error", "-y", "-ss", &format!("{off:.3}"), "-t", &format!("{CHUNK_SECS:.3}"), "-i"]).arg(&abs)
+        let o = Command::new(&ff).no_console().args(["-v", "error", "-y", "-ss", &format!("{off:.3}"), "-t", &format!("{CHUNK_SECS:.3}"), "-i"]).arg(&abs)
             .args(["-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k"]).arg(&chunk).output().map_err(|e| format!("ffmpeg: {e}"))?;
         if !o.status.success() { return Err(format!("audio extract failed: {}", String::from_utf8_lossy(&o.stderr).chars().take(300).collect::<String>())); }
         let bytes = std::fs::read(&chunk).map_err(|e| e.to_string())?;
@@ -788,7 +790,7 @@ fn sentences_from_words(words: &[Word]) -> Vec<Segment> {
 
 pub fn silences(app: &tauri::AppHandle, abs: &Path, threshold_db: f64, min_dur: f64) -> Result<Vec<(f64, f64)>, String> {
     let ff = video::ffmpeg(app)?;
-    let o = Command::new(&ff).args(["-hide_banner", "-nostats", "-i"]).arg(abs)
+    let o = Command::new(&ff).no_console().args(["-hide_banner", "-nostats", "-i"]).arg(abs)
         .args(["-vn", "-af", &format!("silencedetect=noise={threshold_db:.1}dB:d={:.3}", min_dur.max(0.05)), "-f", "null", "-"]).output().map_err(|e| format!("ffmpeg: {e}"))?;
     let err = String::from_utf8_lossy(&o.stderr);
     let mut out = vec![]; let mut start: Option<f64> = None;
@@ -1051,7 +1053,7 @@ fn voice_ensure_uv(app: &tauri::AppHandle, project: &str) -> Result<std::path::P
         })
     };
     dl()?;
-    let out = std::process::Command::new("tar")
+    let out = std::process::Command::new("tar").no_console()
         .arg("-xzf").arg(&tarball).arg("-C").arg(&dir)
         .output().map_err(|e| format!("tar uv: {e}"))?;
     if !out.status.success() {
@@ -1072,7 +1074,7 @@ fn voice_ensure_uv(app: &tauri::AppHandle, project: &str) -> Result<std::path::P
             let _ = std::fs::set_permissions(&to, perm);
         }
     }
-    let _ = std::process::Command::new("xattr").arg("-dr").arg("com.apple.quarantine").arg(&to).output();
+    let _ = std::process::Command::new("xattr").no_console().arg("-dr").arg("com.apple.quarantine").arg(&to).output();
     let _ = std::fs::remove_dir_all(dir.join(&stem));
     let _ = std::fs::remove_file(&tarball);
     voice_uv(app).ok_or_else(|| "uv binary missing after unpack".into())
@@ -1087,7 +1089,7 @@ pub fn voice_install(app: &tauri::AppHandle, _broker: &Broker, _agent_id: &str, 
     let script = dir.join("df_warmup.py");
     std::fs::write(&script, "from df.enhance import init_df\ninit_df()\nprint('voice-ready')\n").map_err(|e| e.to_string())?;
     let _ = tauri::Emitter::emit(app, "video-tool-progress", json!({ "project": project, "tool": "video_voice_install", "msg": "downloading voice model (~90MB, one time)…" }));
-    let mut cmd = Command::new(&uv);
+    let mut cmd = Command::new(&uv).no_console();
     cmd.args(["run", "--python", "3.11", "--with", "torch==2.5.1", "--with", "torchaudio==2.5.1", "--with", "deepfilternet", "--project"]).arg(&dir).arg(&script);
     for (k, v) in voice_env(app) { cmd.env(k, v); }
     cmd.env("PYTORCH_ENABLE_MPS_FALLBACK", "1");
@@ -1114,7 +1116,7 @@ fn df_isolate(app: &tauri::AppHandle, project: &str, wav: &Path, out: &Path) -> 
     let script = dir.join("df_run.py");
     if std::fs::write(&script, DF_SCRIPT).is_err() { return false; }
     let _ = tauri::Emitter::emit(app, "video-tool-progress", json!({ "project": project, "tool": "video_audio_enhance", "msg": "isolating voice (neural)…" }));
-    let mut cmd = Command::new(&uv);
+    let mut cmd = Command::new(&uv).no_console();
     cmd.args(["run", "--python", "3.11", "--with", "torch==2.5.1", "--with", "torchaudio==2.5.1", "--with", "deepfilternet", "--project"]).arg(&dir).arg(&script).arg(wav).arg(out);
     for (k, v) in voice_env(app) { cmd.env(k, v); }
     cmd.env("PYTORCH_ENABLE_MPS_FALLBACK", "1");
@@ -1125,7 +1127,7 @@ fn df_isolate(app: &tauri::AppHandle, project: &str, wav: &Path, out: &Path) -> 
 /// Returns None when unmeasurable (silence / parse failure) so the caller can
 /// skip the gain stage instead of guessing.
 fn measure_lufs(ff: &Path, wav: &Path) -> Option<f64> {
-    let o = Command::new(ff).args(["-hide_banner", "-nostats", "-i"]).arg(wav)
+    let o = Command::new(ff).no_console().args(["-hide_banner", "-nostats", "-i"]).arg(wav)
         .args(["-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json", "-f", "null", "-"]).output().ok()?;
     let err = String::from_utf8_lossy(&o.stderr);
     let start = err.rfind('{')?;
@@ -1149,7 +1151,7 @@ fn enhance_source(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, proje
     // 1) extract mono 48k WAV (neural stage wants mono; stereo re-created at mux)
     let wav = proj.join(".cache").join(format!("{}.src.wav", a.id));
     std::fs::create_dir_all(wav.parent().unwrap()).map_err(|e| e.to_string())?;
-    let o = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&abs).args(["-vn", "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&wav).output().map_err(|e| format!("ffmpeg: {e}"))?;
+    let o = Command::new(&ff).no_console().args(["-v", "error", "-y", "-i"]).arg(&abs).args(["-vn", "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&wav).output().map_err(|e| format!("ffmpeg: {e}"))?;
     if !o.status.success() { return Err(format!("extract failed: {}", String::from_utf8_lossy(&o.stderr).chars().take(300).collect::<String>())); }
     // 2) isolate: neural when installed, else a LIGHT static touch
     let neural = voice_ready(app);
@@ -1162,7 +1164,7 @@ fn enhance_source(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, proje
         // follows the take) + a SOFT 2:1 downward expander below -42 dBFS so room
         // tone between phrases drops another ~12 dB without gating consonants.
         // Measured on pink-noise-over-speech: head −48→−69 dB, speech untouched.
-        let o = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&wav)
+        let o = Command::new(&ff).no_console().args(["-v", "error", "-y", "-i"]).arg(&wav)
             .args(["-af", "highpass=f=70,afftdn=nr=12:nf=-40:tn=1,agate=threshold=0.008:ratio=2:attack=8:release=250:knee=4", "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&iso)
             .output().map_err(|e| format!("ffmpeg: {e}"))?;
         if !o.status.success() { return Err(format!("fallback isolate failed: {}", String::from_utf8_lossy(&o.stderr).chars().take(300).collect::<String>())); }
@@ -1174,7 +1176,7 @@ fn enhance_source(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, proje
     let eq = "highpass=f=80,lowpass=f=12000,treble=g=-4:f=3000";
     let comp_fx = "acompressor=threshold=-24dB:ratio=2:attack=15:release=250:knee=6:makeup=1";
     let shaped = proj.join(".cache").join(format!("{}.eq.wav", a.id));
-    let o = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&iso)
+    let o = Command::new(&ff).no_console().args(["-v", "error", "-y", "-i"]).arg(&iso)
         .args(["-af", &format!("{eq},{comp_fx}"), "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&shaped)
         .output().map_err(|e| format!("ffmpeg: {e}"))?;
     let _ = std::fs::remove_file(&iso);
@@ -1183,7 +1185,7 @@ fn enhance_source(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, proje
     // take — no gain riding, so pauses/room tone stay exactly as quiet relative
     // to the voice as the isolation left them) + true-peak limiter at -1.5 dBTP.
     let gain_db = measure_lufs(&ff, &shaped).map(|i| (-16.0 - i).clamp(-20.0, 30.0)).unwrap_or(0.0);
-    let o = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&shaped)
+    let o = Command::new(&ff).no_console().args(["-v", "error", "-y", "-i"]).arg(&shaped)
         .args(["-af", &format!("volume={gain_db:.2}dB,alimiter=limit=-1.5dB:attack=5:release=50:level=false"), "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&out)
         .output().map_err(|e| format!("ffmpeg: {e}"))?;
     let _ = std::fs::remove_file(&shaped);
@@ -1197,9 +1199,9 @@ fn enhance_source(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, proje
         let padded = proj.join(".cache").join(format!("{}.pad.wav", a.id));
         let apad = format!("apad=whole_dur={:.3}", dur_full);
         let mov = media.join(format!("{stem}.cleaned.mov"));
-        let pad_ok = Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&out).args(["-af", apad.as_str(), "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&padded).output().map(|o| o.status.success()).unwrap_or(false);
+        let pad_ok = Command::new(&ff).no_console().args(["-v", "error", "-y", "-i"]).arg(&out).args(["-af", apad.as_str(), "-ar", "48000", "-c:a", "pcm_s16le"]).arg(&padded).output().map(|o| o.status.success()).unwrap_or(false);
         let mux_ok = if pad_ok {
-            Command::new(&ff).args(["-v", "error", "-y", "-i"]).arg(&abs).args(["-i"]).arg(&padded)
+            Command::new(&ff).no_console().args(["-v", "error", "-y", "-i"]).arg(&abs).args(["-i"]).arg(&padded)
                 .args(["-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
                        "-movflags", "+faststart", "-t", &format!("{:.3}", dur_full)]).arg(&mov)
                 .output().map(|o| o.status.success() && mov.is_file()).unwrap_or(false)
@@ -1325,7 +1327,7 @@ pub fn matte(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &
     let stem: String = Path::new(&a.name).file_stem().and_then(|s| s.to_str()).unwrap_or("clip").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
     let out = proj.join("media").join(format!("{stem}.alpha.mp4"));
     let _ = tauri::Emitter::emit(app, "video-tool-progress", json!({ "project": project, "tool": "video_matte", "msg": "running RobustVideoMatting (first run downloads torch + weights)" }));
-    let mut cmd = Command::new(&uv);
+    let mut cmd = Command::new(&uv).no_console();
     cmd.args(["run", "--python", "3.11", "--with", "torch", "--with", "torchvision", "--with", "av", "--with", "numpy"]).arg(&script).arg(&abs).arg(&out);
     for (k, v) in crate::provision::uv_env(app) { cmd.env(k, v); }
     cmd.env("PYTORCH_ENABLE_MPS_FALLBACK", "1");

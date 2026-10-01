@@ -13,6 +13,8 @@
 // and split it back on dispatch. Underscores in <key> are avoided (keys are
 // slugs). The double-underscore delimiter keeps the original tool name intact.
 
+#[allow(unused_imports)]
+use crate::noconsole::NoConsole;
 use std::path::PathBuf;
 use tauri::AppHandle;
 
@@ -395,14 +397,14 @@ pub async fn run_plan(app: &AppHandle, channel: &str, plan: &[(String, String, V
         let _ = app.emit(channel, &serde_json::json!({ "phase": "step", "note": label }));
         eprintln!("[aygent][mcp] {label}: {program} {}", args.join(" "));
         let mut cmd = if program == "npm" {
-            let mut c = std::process::Command::new(&node);
+            let mut c = std::process::Command::new(&node).no_console();
             c.arg(&npm).args(args);
             c
         } else {
             // A global bin the previous step installed (resolve under node prefix/bin).
             let bin = node_prefix.join("bin").join(program);
             let prog = if bin.is_file() { bin } else { std::path::PathBuf::from(program) };
-            let mut c = std::process::Command::new(prog);
+            let mut c = std::process::Command::new(prog).no_console();
             c.args(args);
             c
         };

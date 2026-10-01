@@ -4,6 +4,8 @@
 // Seatbelt profile that denies file+exec — Atlas C1). Also mints the
 // per-session WS token (C6) and hands it + the daemon port to the UI.
 
+#[allow(unused_imports)]
+use crate::noconsole::NoConsole;
 use rusqlite::params; // scheduler_list/scheduler_runs read-only queries
 
 mod agents;
@@ -25,6 +27,7 @@ pub mod exec;      // PRO MODE: the process-spawn broker (shell.exec). Only Rust
 pub mod linux_jail;
 #[cfg(target_os = "linux")]
 mod linux_media; // LINUX: allow the UI's microphone (voice input). // LINUX: the daemon's Landlock jail (counterpart of the Seatbelt profile).
+mod noconsole; // WINDOWS: no console window for the programs the app starts.
 pub mod paths;     // CONFIG RELOCATION: root-folder pointer + state-dir seam + onboarding paths.
 mod history;
 mod introspect; // Agent self-introspection: the read-only `whoami` tool.
@@ -110,7 +113,8 @@ fn daemon_info(state: tauri::State<Arc<DaemonState>>) -> serde_json::Value {
     // How the daemon is confined: "seatbelt" (macOS), "landlock" (Linux),
     // "none" (unconfined: the UI warns), or null (not known yet / dev launch).
     let jail = state.jail.lock().unwrap().clone();
-    serde_json::json!({ "port": port, "token": state.ws_token, "jail": jail })
+    let jail_reason = state.jail_reason.lock().unwrap().clone();
+    serde_json::json!({ "port": port, "token": state.ws_token, "jail": jail, "jail_reason": jail_reason })
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +355,7 @@ async fn github_git_auth(
     let (token, login) = connections::resolve_github_push_token(&db, agent_id.as_deref())?;
 
     // 1. Set the credential helper globally to osxkeychain (idempotent).
-    let set = std::process::Command::new("git")
+    let set = std::process::Command::new("git").no_console()
         .args(["config", "--global", "credential.helper", "osxkeychain"])
         .output()
         .map_err(|e| format!("git config: {e}"))?;
@@ -362,7 +366,7 @@ async fn github_git_auth(
     // 2. Feed the credential to the osxkeychain helper's `store` on stdin. The
     //    protocol is a blank-line-terminated key=value block.
     use std::io::Write as _;
-    let mut child = std::process::Command::new("git")
+    let mut child = std::process::Command::new("git").no_console()
         .args(["credential-osxkeychain", "store"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -647,14 +651,14 @@ fn reveal_in_finder(
     let real_os = real.as_os_str();
 
     #[cfg(target_os = "macos")]
-    let mut cmd = { let mut c = std::process::Command::new("open"); c.arg("-R").arg(real_os); c };
+    let mut cmd = { let mut c = std::process::Command::new("open").no_console(); c.arg("-R").arg(real_os); c };
     #[cfg(target_os = "windows")]
-    let mut cmd = { let mut c = std::process::Command::new("explorer"); c.arg(format!("/select,{}", real.display())); c };
+    let mut cmd = { let mut c = std::process::Command::new("explorer").no_console(); c.arg(format!("/select,{}", real.display())); c };
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut cmd = {
         // No universal "select" on Linux file managers; open the parent dir.
         let dir = real.parent().unwrap_or(&real);
-        let mut c = std::process::Command::new("xdg-open"); c.arg(dir); c
+        let mut c = std::process::Command::new("xdg-open").no_console(); c.arg(dir); c
     };
 
     cmd.spawn().map_err(|e| format!("could not open file manager: {e}"))?;

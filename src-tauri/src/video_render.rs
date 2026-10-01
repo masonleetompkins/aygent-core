@@ -14,6 +14,8 @@
 // layers flagged behindSubject are composited BETWEEN the a-roll and its
 // alpha-merged foreground so overlays sit behind Mason.
 
+#[allow(unused_imports)]
+use crate::noconsole::NoConsole;
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -737,7 +739,7 @@ fn filter_file_args(app: &tauri::AppHandle, script: &Path) -> Vec<String> {
     static MODERN: OnceLock<bool> = OnceLock::new();
     let modern = *MODERN.get_or_init(|| {
         let Ok(ff) = video::ffmpeg(app) else { return true };
-        let out = Command::new(ff).arg("-version").output().ok();
+        let out = Command::new(ff).no_console().arg("-version").output().ok();
         let text = out.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
         let major: u32 = text.split_whitespace().nth(2).and_then(|v| v.split(['.', '-']).next()).and_then(|m| m.trim_start_matches('n').parse().ok()).unwrap_or(9);
         major >= 8 || (major == 7 && !text.contains("7.0"))
@@ -762,7 +764,7 @@ pub fn cancel(key: &str) -> bool {
         }
         // Windows: no libc signals — taskkill is the equivalent hammer.
         #[cfg(windows)]
-        Some(p) => std::process::Command::new("taskkill")
+        Some(p) => std::process::Command::new("taskkill").no_console()
             .args(["/PID", &p.to_string(), "/F"])
             .output()
             .map(|o| o.status.success())
@@ -842,7 +844,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 fn run_ffmpeg_progress(app: &tauri::AppHandle, key: &str, args: &[String], dur: f64, project: &str) -> Result<(), String> {
     let ff = video::ffmpeg(app)?;
-    let mut child = Command::new(&ff).args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null()).spawn().map_err(|e| format!("spawn ffmpeg: {e}"))?;
+    let mut child = Command::new(&ff).no_console().args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null()).spawn().map_err(|e| format!("spawn ffmpeg: {e}"))?;
     let pid = child.id();
     if let Ok(mut m) = running().lock() { m.insert(key.to_string(), pid); }
     let stdout = child.stdout.take();
@@ -892,7 +894,7 @@ pub fn frame(app: &tauri::AppHandle, broker: &Broker, agent_id: &str, project: &
     let t = t.clamp(0.0, (plan.dur - 0.001).max(0.0));
     args.extend(["-ss".into(), format!("{t:.4}"), "-frames:v".into(), "1".into(), "-q:v".into(), "3".into(), "-y".into(), out.to_string_lossy().to_string()]);
     let ff = video::ffmpeg(app)?;
-    let o = Command::new(&ff).arg("-hide_banner").args(&args).output().map_err(|e| format!("ffmpeg: {e}"))?;
+    let o = Command::new(&ff).no_console().arg("-hide_banner").args(&args).output().map_err(|e| format!("ffmpeg: {e}"))?;
     if !o.status.success() {
         let e = String::from_utf8_lossy(&o.stderr);
         let tail: String = e.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");

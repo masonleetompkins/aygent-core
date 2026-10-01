@@ -11,6 +11,8 @@
 //! Turns run chat-only (same honest fallback as GGUF chat-only models).
 //! No manual setup: the engine auto-installs on first pull/chat.
 
+#[allow(unused_imports)]
+use crate::noconsole::NoConsole;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -71,7 +73,7 @@ pub fn mlx_installed(app: &AppHandle) -> bool {
     if !py.is_file() {
         return false;
     }
-    std::process::Command::new(&py)
+    std::process::Command::new(&py).no_console()
         .args(["-c", "import mlx_lm"])
         .output()
         .map(|o| o.status.success())
@@ -96,7 +98,7 @@ pub async fn ensure_mlx(app: &AppHandle, channel: &str) -> Result<PathBuf, Strin
     let venv_dir = home.join("venv");
     if !py.is_file() {
         emit(app, channel, "mlx: creating Python 3.11 venv…");
-        let out = std::process::Command::new(&uv)
+        let out = std::process::Command::new(&uv).no_console()
             .args(["venv", "--python", "3.11"])
             .arg(&venv_dir)
             .output()
@@ -107,13 +109,13 @@ pub async fn ensure_mlx(app: &AppHandle, channel: &str) -> Result<PathBuf, Strin
                 String::from_utf8_lossy(&out.stderr).chars().take(500).collect::<String>()
             ));
         }
-        let _ = std::process::Command::new("xattr")
+        let _ = std::process::Command::new("xattr").no_console()
             .args(["-dr", "com.apple.quarantine"])
             .arg(&venv_dir)
             .output();
     }
     emit(app, channel, "mlx: installing mlx-lm (one-time, a few minutes)…");
-    let out = std::process::Command::new(&uv)
+    let out = std::process::Command::new(&uv).no_console()
         .args(["pip", "install", "--python"])
         .arg(&py)
         .arg("mlx-lm")
@@ -204,7 +206,7 @@ pub async fn ensure_server(
     let log = std::fs::File::create(&log_path).map_err(|e| format!("server log: {e}"))?;
     let err_log = log.try_clone().map_err(|e| format!("server log: {e}"))?;
     emit(app, channel, &format!("mlx: starting {repo} (first boot downloads weights)…"));
-    let mut cmd = std::process::Command::new(&py);
+    let mut cmd = std::process::Command::new(&py).no_console();
     if is_pack {
         let dir = local_dir.clone().unwrap_or_else(|| local_repo_dir(app, &repo).unwrap());
         ensure_pack_deps(app, channel, &dir).await?;
@@ -606,7 +608,7 @@ async fn ensure_pack_deps(app: &AppHandle, channel: &str, pack_dir: &std::path::
 ")).map_err(|e| format!("write requirements: {e}"))?;
     emit(app, channel, "mlx: installing pack loader deps (one-time)...");
     let uv = ensure_uv(app, channel).await?;
-    let out = std::process::Command::new(&uv)
+    let out = std::process::Command::new(&uv).no_console()
         .args(["pip", "install", "--python"])
         .arg(&py)
         .args(["-r"])
@@ -619,7 +621,7 @@ async fn ensure_pack_deps(app: &AppHandle, channel: &str, pack_dir: &std::path::
     // Prove the loader imports against the installed versions.
     let rt = pack_dir.join("runtime");
     let prog = format!("import sys; sys.path.insert(0, {:?}); import artifact; print('loader ok')", rt.to_string_lossy());
-    let probe = std::process::Command::new(&py)
+    let probe = std::process::Command::new(&py).no_console()
         .args(["-c", &prog])
         .output()
         .map_err(|e| format!("probe spawn: {e}"))?;

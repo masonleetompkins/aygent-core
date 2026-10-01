@@ -9,6 +9,8 @@
 // a progress event on a channel so the UI narrates EXACTLY what's being
 // installed + where (Mason's requirement: the user always knows what's happening).
 
+#[allow(unused_imports)]
+use crate::noconsole::NoConsole;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -165,7 +167,7 @@ pub async fn ensure_node(app: &AppHandle, channel: &str) -> Result<PathBuf, Stri
     // Extract into rt, then rename the versioned dir to runtime/node.
     #[cfg(target_os = "macos")]
     {
-        let out = std::process::Command::new("tar")
+        let out = std::process::Command::new("tar").no_console()
             .arg("-xzf").arg(&archive).arg("-C").arg(&rt)
             .output().map_err(|e| format!("tar node: {e}"))?;
         if !out.status.success() {
@@ -174,7 +176,7 @@ pub async fn ensure_node(app: &AppHandle, channel: &str) -> Result<PathBuf, Stri
     }
     #[cfg(target_os = "linux")]
     {
-        let out = std::process::Command::new("tar")
+        let out = std::process::Command::new("tar").no_console()
             .arg("-xJf").arg(&archive).arg("-C").arg(&rt)
             .output().map_err(|e| format!("tar node: {e}"))?;
         if !out.status.success() {
@@ -212,7 +214,7 @@ pub async fn ensure_ffmpeg(app: &AppHandle, channel: &str) -> Result<PathBuf, St
             download_to(app, channel, "ffmpeg", &format!("{name} (macOS {a})"), &url, &dir.join(format!("{name}.zip"))).await?;
             emit(app, channel, "ffmpeg", &format!("Unpacking {name}…"), None);
             let zip = dir.join(format!("{name}.zip"));
-            let out = std::process::Command::new("unzip")
+            let out = std::process::Command::new("unzip").no_console()
                 .arg("-o").arg(&zip).arg("-d").arg(&dir)
                 .output().map_err(|e| format!("unzip {name}: {e}"))?;
             if !out.status.success() {
@@ -220,7 +222,7 @@ pub async fn ensure_ffmpeg(app: &AppHandle, channel: &str) -> Result<PathBuf, St
             }
             if !bin.is_file() { return Err(format!("{name} binary missing after unpack")); }
             chmod_x(&bin, name)?;
-            let _ = std::process::Command::new("xattr").arg("-dr").arg("com.apple.quarantine").arg(&bin).output();
+            let _ = std::process::Command::new("xattr").no_console().arg("-dr").arg("com.apple.quarantine").arg(&bin).output();
             let _ = std::fs::remove_file(&zip);
         }
     }
@@ -231,7 +233,7 @@ pub async fn ensure_ffmpeg(app: &AppHandle, channel: &str) -> Result<PathBuf, St
         let tarball = dir.join("ffmpeg-static.tar.xz");
         download_to(app, channel, "ffmpeg", "ffmpeg static (Linux)", &url, &tarball).await?;
         emit(app, channel, "ffmpeg", "Unpacking ffmpeg…", None);
-        let out = std::process::Command::new("tar")
+        let out = std::process::Command::new("tar").no_console()
             .arg("-xJf").arg(&tarball).arg("-C").arg(&dir)
             .output().map_err(|e| format!("tar ffmpeg: {e}"))?;
         if !out.status.success() {
@@ -297,14 +299,14 @@ fn chmod_x(path: &Path, name: &str) -> Result<(), String> {
 /// the caller is async; the work itself is a blocking child process.
 #[cfg(target_os = "windows")]
 async fn expand_archive(zip: &Path, dest: &Path) -> Result<(), String> {
-    let ps = std::process::Command::new("powershell")
+    let ps = std::process::Command::new("powershell").no_console()
         .args(["-NoProfile", "-Command",
             &format!("Expand-Archive -Force '{}' '{}'", zip.display(), dest.display())])
         .output();
     if let Ok(out) = ps {
         if out.status.success() { return Ok(()); }
     }
-    let out = std::process::Command::new("tar")
+    let out = std::process::Command::new("tar").no_console()
         .arg("-xf").arg(zip).arg("-C").arg(dest)
         .output().map_err(|e| format!("expand archive: {e}"))?;
     if !out.status.success() {
@@ -349,7 +351,7 @@ async fn run_npm(app: &AppHandle, channel: &str, cwd: &Path, args: &[&str]) -> R
     let node = node_bin(app).ok_or("node not provisioned")?;
     let npm = npm_cli(app).ok_or("npm not provisioned")?;
     emit(app, channel, "npm", &format!("Running npm {}…", args.join(" ")), None);
-    let mut cmd = std::process::Command::new(&node);
+    let mut cmd = std::process::Command::new(&node).no_console();
     cmd.arg(&npm).args(args).current_dir(cwd);
     cmd.env("PATH", provisioned_path(app));
     // Keep npm from trying to use a global prefix outside our tree.
@@ -498,7 +500,7 @@ pub async fn ensure_uv(app: &AppHandle, channel: &str) -> Result<PathBuf, String
     expand_archive(&archive, &rt).await?;
     #[cfg(not(target_os = "windows"))]
     {
-        let out = std::process::Command::new("tar")
+        let out = std::process::Command::new("tar").no_console()
             .arg("-xzf").arg(&archive).arg("-C").arg(&rt)
             .output().map_err(|e| format!("tar uv: {e}"))?;
         if !out.status.success() {
@@ -524,7 +526,7 @@ pub async fn ensure_uv(app: &AppHandle, channel: &str) -> Result<PathBuf, String
                 }
             }
             // Strip quarantine so it launches without a Gatekeeper prompt.
-            let _ = std::process::Command::new("xattr").arg("-dr").arg("com.apple.quarantine").arg(&to).output();
+            let _ = std::process::Command::new("xattr").no_console().arg("-dr").arg("com.apple.quarantine").arg(&to).output();
         }
     }
     let _ = std::fs::remove_dir_all(&extracted);

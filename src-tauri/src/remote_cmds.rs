@@ -4,6 +4,8 @@
 // status (paired? connected? SAS?), unpair. Thin over remote/remote_runtime —
 // no protocol logic lives here.
 
+#[allow(unused_imports)]
+use crate::noconsole::NoConsole;
 use tauri::Manager;
 
 /// Everything the Settings card renders, in one call.
@@ -127,7 +129,7 @@ pub async fn remote_connect(app: tauri::AppHandle) -> Result<bool, String> {
 }
 
 fn hostname_or_default() -> String {
-    std::process::Command::new("scutil")
+    std::process::Command::new("scutil").no_console()
         .args(["--get", "ComputerName"])
         .output()
         .ok()

@@ -15,6 +15,8 @@
 // binary (include_str!), with {{SLOTS}} the agent's style text never touches as
 // code — it is JSON-embedded into the page body + HTML-comment annotation.
 
+#[allow(unused_imports)]
+use crate::noconsole::NoConsole;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -52,7 +54,7 @@ fn hf_run(path_env: &str, hf_bin: &Path, args: &[&str], workdir: &Path) -> Resul
         hf_bin.to_string_lossy().replace('\'', "'\\''"),
         args.iter().map(|a| format!("'{a}'")).collect::<Vec<_>>().join(" ")
     );
-    let o = Command::new("bash").arg("-lc").arg(&sh).current_dir(workdir)
+    let o = Command::new("bash").no_console().arg("-lc").arg(&sh).current_dir(workdir)
         .env("PATH", format!("{path_env}:/usr/bin:/bin"))
         .env("HYPERFRAMES_SKIP_SKILLS", "1")
         .output().map_err(|e| format!("hyperframes spawn: {e}"))?;

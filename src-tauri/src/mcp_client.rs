@@ -13,6 +13,8 @@
 // Transport: MCP over stdio = newline-delimited JSON-RPC 2.0 on stdin/stdout;
 // servers may log to stderr (we drain + log it).
 
+#[allow(unused_imports)]
+use crate::noconsole::NoConsole;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -128,7 +130,7 @@ pub fn start(
 ) -> Result<Arc<McpServer>, String> {
     if let Some(s) = get(key) { return Ok(s); }
 
-    let mut cmd = Command::new(program);
+    let mut cmd = Command::new(program).no_console();
     cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     for (k, v) in env { cmd.env(k, v); }
     if let Some(d) = cwd { cmd.current_dir(d); }

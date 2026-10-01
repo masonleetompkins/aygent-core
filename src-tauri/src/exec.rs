@@ -20,6 +20,8 @@
 //   5. Handles are OPAQUE. The daemon never gets a raw PID it can signal; kills
 //      go through the broker (mirror of the file broker's handles-not-paths).
 
+#[allow(unused_imports)]
+use crate::noconsole::NoConsole;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -344,7 +346,7 @@ impl ExecBroker {
         let _ = std::fs::create_dir_all(&log_dir);
         let log_path = log_dir.join(format!("{handle}.log"));
 
-        let mut cmd = Command::new(program);
+        let mut cmd = Command::new(program).no_console();
         cmd.args(args)
             .current_dir(root) // INVARIANT 1: cwd pinned to the jail root
             .stdin(Stdio::piped())

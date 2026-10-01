@@ -31,6 +31,7 @@ export function App() {
   const [status, setStatus] = useState<Status>({ kind: "booting" });
   // How the OS confines the agent engine ("none" = unconfined: warn).
   const [jail, setJail] = useState<string | null>(null);
+  const [jailReason, setJailReason] = useState<string | null>(null);
   const [folder, setFolder] = useState<string | null>(null);
   const [activeAgent, setActiveAgent] = useState<AgentProfile | null>(null);
   // Multi-agent: which agents have an OPEN chat pane (side by side). Stored as a
@@ -146,12 +147,13 @@ export function App() {
     let socket: WebSocket | null = null;
     let cancelled = false;
     async function connect() {
-      let info: { port: number | null; token: string; jail?: string | null };
+      let info: { port: number | null; token: string; jail?: string | null; jail_reason?: string | null };
       try { info = await invoke("daemon_info"); }
       catch (e) { setStatus({ kind: "error", msg: `daemon_info failed: ${String(e)}` }); return; }
       if (cancelled) return;
       if (!info.port) { setStatus({ kind: "no-daemon" }); setTimeout(connect, 600); return; }
       setJail(info.jail ?? null);
+      setJailReason(info.jail_reason ?? null);
       setStatus({ kind: "connecting", port: info.port });
       socket = new WebSocket(`ws://127.0.0.1:${info.port}`);
       let sentAt = 0;
@@ -251,7 +253,7 @@ export function App() {
       <div style={{ flex: 1, height: "100vh", minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column" }}>
         {jail === "none" && (
           <div role="alert" style={{ padding: "8px 14px", background: "rgba(255, 170, 0, 0.12)", borderBottom: "1px solid rgba(255, 170, 0, 0.4)", color: "var(--text)", fontSize: 13 }}>
-            ⚠ This system can't sandbox the agent engine (the Linux kernel has no Landlock), so it runs unconfined.
+            ⚠ This system can't sandbox the agent engine{jailReason ? ` (${jailReason})` : ""}, so it runs unconfined.
             Agents still only reach their own folder through the app, but the operating system is not enforcing it.
           </div>
         )}

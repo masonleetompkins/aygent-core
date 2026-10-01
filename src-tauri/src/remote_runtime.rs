@@ -19,6 +19,8 @@
 // unless the user enables "Allow shell from remote" in Settings (device-local
 // gate, same one-gate discipline as connections).
 
+#[allow(unused_imports)]
+use crate::noconsole::NoConsole;
 use std::sync::Arc;
 use tauri::{Emitter, Listener, Manager};
 
@@ -214,7 +216,7 @@ async fn send_hello(
 }
 
 fn hostname() -> String {
-    std::process::Command::new("scutil")
+    std::process::Command::new("scutil").no_console()
         .args(["--get", "ComputerName"])
         .output()
         .ok()

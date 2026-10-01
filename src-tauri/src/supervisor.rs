@@ -9,6 +9,8 @@
 // prevents the `execvp of node failed` gotcha (the profile must allow reading
 // + exec of the node binary while still denying the user's folders).
 
+#[allow(unused_imports)]
+use crate::noconsole::NoConsole;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -23,6 +25,8 @@ pub struct DaemonState {
     pub child: Mutex<Option<std::process::Child>>,
     /// How the daemon is confined ("seatbelt", "landlock", "none"), once known.
     pub jail: Mutex<Option<String>>,
+    /// Why it is unconfined, when jail is "none" (shown in the app).
+    pub jail_reason: Mutex<Option<String>>,
 }
 
 /// Find the absolute path to `node` (Seatbelt needs the concrete binary path;
@@ -69,7 +73,7 @@ fn resolve_node_bin(app: &tauri::AppHandle) -> Option<String> {
         }
     }
     // Last resort: `which node` (works in dev / a shell-launched app).
-    let out = Command::new("/usr/bin/which").arg("node").output().ok()?;
+    let out = Command::new("/usr/bin/which").no_console().arg("node").output().ok()?;
     if out.status.success() {
         let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !p.is_empty() {
@@ -172,11 +176,11 @@ pub fn spawn_daemon(
         let node_bin = resolve_node_bin(app).ok_or("could not find node (install Node.js 24 or newer)")?;
         let exe = std::env::current_exe()?;
         eprintln!("[aygent] jailed launch (Landlock): node={node_bin}");
-        let mut c = Command::new(exe);
+        let mut c = Command::new(exe).no_console();
         c.arg(crate::linux_jail::FLAG).arg(&daemon_dir).arg(&node_bin).arg(&daemon_entry);
         c
     } else {
-        let mut c = Command::new("node");
+        let mut c = Command::new("node").no_console();
         c.arg(&daemon_entry);
         c
     };
@@ -184,17 +188,31 @@ pub fn spawn_daemon(
     if jailed {
         *state.jail.lock().unwrap() = Some("seatbelt".into());
     }
-    #[cfg(not(target_os = "linux"))]
+    // WINDOWS: no OS sandbox for the daemon yet. It runs unconfined (the
+    // broker still holds agents to their folders) and the app says so.
+    #[cfg(windows)]
+    let mut cmd = {
+        let node_bin = resolve_node_bin(app).ok_or("could not find node.exe (install Node.js 24 or newer)")?;
+        if jailed {
+            eprintln!("[aygent] NOTE: no OS sandbox on Windows yet; the daemon runs unconfined");
+            *state.jail.lock().unwrap() = Some("none".into());
+            *state.jail_reason.lock().unwrap() = Some("the Windows build has no OS sandbox yet".into());
+        }
+        let mut c = Command::new(&node_bin).no_console();
+        c.arg(&daemon_entry);
+        c
+    };
+    #[cfg(not(any(target_os = "linux", windows)))]
     let mut cmd = if jailed {
         let node_bin = resolve_node_bin(app)
             .ok_or("could not resolve node binary for Seatbelt launch")?;
         let profile = materialize_profile(app, &node_bin, &daemon_dir)?;
         eprintln!("[aygent] jailed launch: node={node_bin} profile={}", profile.display());
-        let mut c = Command::new("sandbox-exec");
+        let mut c = Command::new("sandbox-exec").no_console();
         c.arg("-f").arg(&profile).arg(&node_bin).arg(&daemon_entry);
         c
     } else {
-        let mut c = Command::new("node");
+        let mut c = Command::new("node").no_console();
         c.arg(&daemon_entry);
         c
     };
@@ -227,6 +245,9 @@ pub fn spawn_daemon(
                 // The Linux jail launcher reports whether Landlock took hold.
                 if let Some(rest) = line.strip_prefix("AYGENT_JAIL=") {
                     let kind = rest.split_whitespace().next().unwrap_or("none").to_string();
+                    if kind == "none" {
+                        *state.jail_reason.lock().unwrap() = Some("this Linux kernel has no Landlock".into());
+                    }
                     *state.jail.lock().unwrap() = Some(kind);
                 }
                 if let Some(idx) = line.find("AYGENT_WS_PORT=") {
