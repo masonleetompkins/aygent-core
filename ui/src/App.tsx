@@ -27,11 +27,31 @@ type Status =
   | { kind: "connected"; port: number; latency?: number }
   | { kind: "error"; msg: string };
 
+const JAIL_DISMISSED_KEY = "aygent.unconfinedWarningDismissed";
+
 export function App() {
   const [status, setStatus] = useState<Status>({ kind: "booting" });
   // How the OS confines the agent engine ("none" = unconfined: warn).
   const [jail, setJail] = useState<string | null>(null);
   const [jailReason, setJailReason] = useState<string | null>(null);
+  // The unconfined warning, once dismissed, stays hidden for that same reason
+  // (a different reason, e.g. a sandbox that later fails, shows it again).
+  const [jailDismissed, setJailDismissed] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(JAIL_DISMISSED_KEY);
+    } catch {
+      return null;
+    }
+  });
+  const dismissJail = () => {
+    const reason = jailReason ?? "";
+    setJailDismissed(reason);
+    try {
+      localStorage.setItem(JAIL_DISMISSED_KEY, reason);
+    } catch {
+      /* not remembered: hidden until the next launch */
+    }
+  };
   const [folder, setFolder] = useState<string | null>(null);
   const [activeAgent, setActiveAgent] = useState<AgentProfile | null>(null);
   // Multi-agent: which agents have an OPEN chat pane (side by side). Stored as a
@@ -251,10 +271,21 @@ export function App() {
       />
       <Sidebar active={screen} onSelect={setScreen} />
       <div style={{ flex: 1, height: "100vh", minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column" }}>
-        {jail === "none" && (
-          <div role="alert" style={{ padding: "8px 14px", background: "rgba(255, 170, 0, 0.12)", borderBottom: "1px solid rgba(255, 170, 0, 0.4)", color: "var(--text)", fontSize: 13 }}>
-            ⚠ This system can't sandbox the agent engine{jailReason ? ` (${jailReason})` : ""}, so it runs unconfined.
-            Agents still only reach their own folder through the app, but the operating system is not enforcing it.
+        {jail === "none" && jailDismissed !== (jailReason ?? "") && (
+          <div role="alert" style={{ display: "flex", alignItems: "flex-start", gap: 12, padding: "8px 14px", background: "rgba(255, 170, 0, 0.12)", borderBottom: "1px solid rgba(255, 170, 0, 0.4)", color: "var(--text)", fontSize: 13 }}>
+            <div style={{ flex: 1 }}>
+              ⚠ This system can't sandbox the agent engine{jailReason ? ` (${jailReason})` : ""}, so it runs unconfined.
+              Agents still only reach their own folder through the app, but the operating system is not enforcing it.
+            </div>
+            <button
+              type="button"
+              onClick={dismissJail}
+              aria-label="Dismiss this warning"
+              title="Dismiss"
+              style={{ flex: "none", background: "none", border: "none", color: "var(--text)", fontSize: 16, lineHeight: 1, padding: "0 2px", cursor: "pointer", opacity: 0.7 }}
+            >
+              ×
+            </button>
           </div>
         )}
         {/* The persistent daemon-status strip was dev telemetry — removed. The

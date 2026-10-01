@@ -1,25 +1,37 @@
 name: matrix (1.1.0)
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Which app to build
+        type: choice
+        options: [all, windows, macos, linux]
+        default: all
 
 jobs:
+  # The build matrix, narrowed to the platform asked for.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          PLATFORM: ${{ inputs.platform || 'all' }}
+        run: |
+          all='[
+            {"platform":"macos","os":"macos-14","target":"aarch64-apple-darwin","bundle":"dmg","bundles":"dmg"},
+            {"platform":"windows","os":"windows-2022","target":"x86_64-pc-windows-msvc","bundle":"msi","bundles":"msi"},
+            {"platform":"linux","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","bundle":"appimage","bundles":"appimage"}
+          ]'
+          echo "matrix=$(jq -c --arg p "$PLATFORM" 'map(select($p == "all" or .platform == $p))' <<<"$all")" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos-14
-            target: aarch64-apple-darwin
-            bundle: dmg
-            bundles: dmg
-          - os: windows-2022
-            target: x86_64-pc-windows-msvc
-            bundle: msi
-            bundles: msi
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            bundle: appimage
-            bundles: appimage
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     defaults:
       run:
