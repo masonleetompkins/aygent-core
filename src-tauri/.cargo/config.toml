@@ -1,0 +1,9 @@
+# Windows: link the C/C++ runtime statically, so the app runs on a clean
+# Windows without the Visual C++ Redistributable (MSVCP140.dll and friends).
+# Rust and cc-built C code follow +crt-static; llama.cpp (CMake) needs
+# LLAMA_STATIC_CRT. CI checks the built exe (scripts/check-win-imports.mjs).
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+LLAMA_STATIC_CRT = "1"
