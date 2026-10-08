@@ -167,6 +167,94 @@ fn store_tokens(id: &str, access: &str, refresh: &str, expires_at_ms: i64) -> Re
     .expired())
 }
 
+/// What login material exists on this machine per seat kind (no secrets —
+/// bools only). The Settings UI calls this on mount to offer one-click
+/// connect instead of label-first manual setup.
+#[tauri::command]
+pub fn sub_detect() -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "claude-code": crate::subscription::detect_source("claude-code"),
+        "codex": crate::subscription::detect_source("codex"),
+    }))
+}
+
+// Human errors for a missing CLI login — never a raw OS path error in the UI
+// (that red `read /Users/…/.credentials.json: No such file` line was the
+// whole complaint, Mason 10-08).
+fn no_login_hint(kind: &str) -> String {
+    match kind {
+        "claude-code" => "No Claude credentials file to import — Claude keeps its login in its own keychain, so there is nothing to read. Run `claude setup-token` in your terminal and paste the result below.".to_string(),
+        _ => "No Codex login found — run `codex login` in your terminal, then Connect again.".to_string(),
+    }
+}
+
+fn actionable_import_err(kind: &str, e: String) -> String {
+    let l = e.to_lowercase();
+    if l.contains("no such file") || l.contains("not found") || l.contains("enoent") {
+        no_login_hint(kind)
+    } else {
+        e
+    }
+}
+
+/// First tokenless profile of a kind, else a fresh Personal-style profile.
+/// Label numbering skips taken names so Connect never collides.
+fn ensure_profile(kind: &str) -> Result<SubProfile, String> {
+    let map = load_profiles();
+    if let Some(p) = map.values().filter(|p| p.kind == kind).find(|p| {
+        crate::keychain::get_key(&crate::subscription::key_slot(&p.id))
+            .map(|s| s.is_empty())
+            .unwrap_or(true)
+    }) {
+        return Ok(p.clone());
+    }
+    let taken: Vec<String> = map
+        .values()
+        .filter(|p| p.kind == kind)
+        .map(|p| p.label.clone())
+        .collect();
+    let mut label = "Personal".to_string();
+    let mut n = 2;
+    while taken.iter().any(|l| l == &label) {
+        label = format!("Personal {n}");
+        n += 1;
+    }
+    let p = SubProfile { id: new_id(), kind: kind.to_string(), label, updated_at: now_ms() };
+    let mut map = map;
+    map.insert(p.id.clone(), p.clone());
+    save_profiles(&map)?;
+    Ok(p)
+}
+
+/// One-click connect (Mason 10-08): no label typing. Ensures a profile, then
+/// imports the detected CLI login. Claude without a credentials file returns
+/// `{connected:false, next:"paste"}` so the UI opens the setup-token paste
+/// box for the ensured profile instead of erroring.
+#[tauri::command]
+pub fn sub_connect(kind: String) -> Result<serde_json::Value, String> {
+    if !valid_kind(&kind) {
+        return Err(format!("unknown kind: {kind} (want claude-code|codex)"));
+    }
+    let det = crate::subscription::detect_source(&kind);
+    let has_token = det.get("has_token").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !has_token {
+        if kind == "claude-code" {
+            let p = ensure_profile(&kind)?;
+            return Ok(serde_json::json!({
+                "ok": true, "connected": false, "next": "paste",
+                "id": p.id, "label": p.label,
+                "hint": no_login_hint(&kind),
+            }));
+        }
+        return Err(no_login_hint(&kind));
+    }
+    let p = ensure_profile(&kind)?;
+    let toks =
+        crate::subscription::import_cli(&kind).map_err(|e| actionable_import_err(&kind, e))?;
+    let expired = store_tokens(&p.id, &toks.access_token, &toks.refresh_token, toks.expires_at_ms)?;
+    Ok(serde_json::json!({ "ok": true, "connected": true, "id": p.id, "label": p.label, "expired": expired }))
+}
+
 /// Import OAuth tokens from the official CLI login into this profile.
 /// v1 = read ~/.claude/.credentials.json | ~/.codex/auth.json (user runs
 /// `claude login` / `codex login` in terminal first). Native OAuth later.
@@ -174,7 +262,7 @@ fn store_tokens(id: &str, access: &str, refresh: &str, expires_at_ms: i64) -> Re
 pub fn sub_profile_import_cli(id: String) -> Result<serde_json::Value, String> {
     let map = load_profiles();
     let p = map.get(&id).ok_or("unknown subscription profile")?;
-    let toks = crate::subscription::import_cli(&p.kind)?;
+    let toks = crate::subscription::import_cli(&p.kind).map_err(|e| actionable_import_err(&p.kind, e))?;
     let expired = store_tokens(&id, &toks.access_token, &toks.refresh_token, toks.expires_at_ms)?;
     Ok(serde_json::json!({ "ok": true, "expired": expired }))
 }

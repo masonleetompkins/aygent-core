@@ -1,15 +1,17 @@
-// SubProfiles — Claude Code + Codex subscription profiles (slice 3, UNWIRED).
+// SubProfiles — Claude Code + Codex subscription seats (Mason 10-08).
 //
-// Drop-in section for Settings → Providers. Calls the sub_* commands from
-// sub_cmds.rs (register them in lib.rs first — see docs/subscription-providers.md).
-// v1 auth = run `claude login` / `codex login` in terminal, then Import.
-// Profiles are multi (Personal/Work), tokens in Keychain, usage polled cached 90s.
+// One-click connect: the backend auto-detects CLI logins on this machine, so
+// there is no label-first step. Claude (Keychain-held, no importable file)
+// resolves to the `claude setup-token` paste flow; Codex imports directly.
+// Manual multi-profile (Personal/Work) lives under "Add another profile".
+
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Input, Pill } from "../components/ui";
 
 type Profile = { id: string; kind: string; label: string; has_token: boolean };
 type Usage = { pct_5h: number | null; reset_at_ms: number | null; weekly_pct: number | null; error?: string };
+type Detected = { file_found: boolean; has_token: boolean; cli_found: boolean };
 
 function fmtReset(ms: number | null): string {
   if (!ms) return "";
@@ -35,12 +37,15 @@ function UsageBar({ u }: { u: Usage | undefined }) {
   );
 }
 
-function KindSection({ kind, title, loginHint }: { kind: string; title: string; loginHint: string }) {
+function KindSection({ kind, title, blurb }: { kind: string; title: string; blurb: string }) {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [label, setLabel] = useState("");
   const [msg, setMsg] = useState<string | null>(null);
   const [usage, setUsage] = useState<Record<string, Usage>>({});
   const [busy, setBusy] = useState<string | null>(null);
+  const [detected, setDetected] = useState<Detected | null>(null);
+  const [pasteFor, setPasteFor] = useState<string | null>(null);
+  const [pasteHint, setPasteHint] = useState<string | null>(null);
 
   async function refresh() {
     try {
@@ -60,8 +65,34 @@ function KindSection({ kind, title, loginHint }: { kind: string; title: string; 
       }
     } catch (e) { setMsg("✗ " + String(e)); }
   }
-  useEffect(() => { void refresh(); /* eslint-disable-next-line */ }, [kind]);
+  async function detect() {
+    try {
+      const d = await invoke<any>("sub_detect");
+      setDetected(d?.[kind] ?? null);
+    } catch { /* detect never blocks the list */ }
+  }
+  useEffect(() => { void refresh(); void detect(); /* eslint-disable-next-line */ }, [kind]);
 
+  const connected = profiles.filter((p) => p.has_token);
+
+  async function connect() {
+    setBusy("connect"); setMsg(null);
+    try {
+      const r = await invoke<any>("sub_connect", { kind });
+      if (r.connected) {
+        setPasteFor(null); setPasteHint(null);
+        setMsg(r.expired
+          ? `✓ ${r.label} connected — but the token looks expired. Refresh the login, then Re-import.`
+          : `✓ ${r.label} connected`);
+      } else {
+        // Claude without an importable file: open the setup-token paste box.
+        setPasteFor(r.id); setPasteHint(r.hint ?? null);
+        setMsg(null);
+      }
+      await refresh();
+    } catch (e) { setMsg("✗ " + String(e)); }
+    finally { setBusy(null); }
+  }
   async function create() {
     if (!label.trim()) return;
     setBusy("create"); setMsg(null);
@@ -73,7 +104,7 @@ function KindSection({ kind, title, loginHint }: { kind: string; title: string; 
     setBusy(p.id); setMsg(null);
     try {
       const r = await invoke<any>("sub_profile_import_cli", { id: p.id });
-      setMsg(r.expired ? "Imported — token looks expired, re-run login then import again." : `✓ ${p.label} connected`);
+      setMsg(r.expired ? "Imported — token looks expired, refresh the login then import again." : `✓ ${p.label} connected`);
       await refresh();
     } catch (e) { setMsg("✗ " + String(e)); }
     finally { setBusy(null); }
@@ -88,13 +119,23 @@ function KindSection({ kind, title, loginHint }: { kind: string; title: string; 
     <div style={{ display: "flex", flexDirection: "column", gap: 8, paddingTop: 8 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
         <span style={{ fontSize: 14, fontWeight: 700, width: 100 }}>{title}</span>
-        {profiles.length === 0
-          ? <Pill tone="muted">no profiles</Pill>
-          : <Pill tone="ok">{profiles.length} profile{profiles.length === 1 ? "" : "s"}</Pill>}
+        {connected.length > 0
+          ? <Pill tone="ok">{connected.length} connected ✓</Pill>
+          : <Pill tone="muted">not connected</Pill>}
       </div>
-      <p style={{ color: "var(--text-muted)", fontSize: 12, margin: 0 }}>
-        {loginHint} Tokens stay in Keychain — the UI only sees labels + usage %.
-      </p>
+      <p style={{ color: "var(--text-muted)", fontSize: 12, margin: 0 }}>{blurb}</p>
+      {connected.length === 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", padding: "10px 12px", borderRadius: "var(--radius-control)", border: "var(--border-width) solid var(--accent)", background: "color-mix(in srgb, var(--accent) 8%, transparent)" }}>
+          <span style={{ fontSize: 13 }}>
+            {detected?.has_token
+              ? `Found your ${title} login on this Mac.`
+              : kind === "claude-code"
+                ? `${title} keeps its login private — one click, then paste a setup token.`
+                : `No ${title} login found yet.`}
+          </span>
+          <Button onClick={connect} disabled={busy === "connect"}>{busy === "connect" ? "…" : detected?.has_token ? "Connect" : kind === "claude-code" ? "Connect with setup-token" : "Connect"}</Button>
+        </div>
+      )}
       {profiles.map((p) => (
         <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
           <b style={{ fontSize: 13, minWidth: 90 }}>{p.label}</b>
@@ -108,21 +149,26 @@ function KindSection({ kind, title, loginHint }: { kind: string; title: string; 
           </span>
         </div>
       ))}
-      <div style={{ display: "flex", gap: 8 }}>
-        <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="New profile label — Personal, Work…" />
-        <Button onClick={create} disabled={busy === "create" || !label.trim()}>Add</Button>
-      </div>
-      <PasteToken profiles={profiles} onDone={refresh} />
+      {(pasteFor || pasteHint) && <PasteToken profiles={profiles} forcePid={pasteFor} hint={pasteHint} open onDone={() => { setPasteFor(null); setPasteHint(null); void refresh(); }} />}
+      <details style={{ fontSize: 12, color: "var(--text-muted)" }}>
+        <summary style={{ cursor: "pointer" }}>Add another profile (Personal, Work…)</summary>
+        <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+          <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Profile label…" />
+          <Button variant="secondary" onClick={create} disabled={busy === "create" || !label.trim()}>Add</Button>
+        </div>
+        <PasteToken profiles={profiles} onDone={refresh} />
+      </details>
       {msg && <Pill tone={msg.startsWith("✗") ? "danger" : "ok"}>{msg}</Pill>}
     </div>
   );
 }
 
-function PasteToken({ profiles, onDone }: { profiles: Profile[]; onDone: () => void }) {
-  const [pid, setPid] = useState(profiles.find((p) => !p.has_token)?.id ?? "");
+function PasteToken({ profiles, onDone, forcePid, hint, open }: { profiles: Profile[]; onDone: () => void; forcePid?: string | null; hint?: string | null; open?: boolean }) {
+  const [pid, setPid] = useState(forcePid ?? profiles.find((p) => !p.has_token)?.id ?? "");
   const [tok, setTok] = useState("");
   const [msg, setMsg] = useState<string | null>(null);
   useEffect(() => {
+    if (forcePid) { setPid(forcePid); return; }
     if (!pid && profiles.length > 0) setPid(profiles.find((p) => !p.has_token)?.id ?? profiles[0].id);
   }, [profiles]);
   async function save() {
@@ -135,10 +181,9 @@ function PasteToken({ profiles, onDone }: { profiles: Profile[]; onDone: () => v
       onDone();
     } catch (e) { setMsg("✗ " + String(e)); }
   }
-  if (profiles.length === 0) return null;
-  return (
-    <details style={{ fontSize: 12, color: "var(--text-muted)" }}>
-      <summary style={{ cursor: "pointer" }}>Paste a token manually (no CLI needed)</summary>
+  if (profiles.length === 0 && !forcePid) return null;
+  const body = (
+    <>
       <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
         <select value={pid} onChange={(e) => setPid(e.target.value)} style={{ padding: "8px 10px", borderRadius: "var(--radius-control)", border: "var(--border-width) solid var(--line)", background: "var(--bg)", color: "var(--text)" }}>
           {profiles.map((p) => <option key={p.id} value={p.id}>{p.label}{p.has_token ? " (replace)" : ""}</option>)}
@@ -146,21 +191,52 @@ function PasteToken({ profiles, onDone }: { profiles: Profile[]; onDone: () => v
         <Input type="password" value={tok} onChange={(e) => setTok(e.target.value)} placeholder="paste token…" />
         <Button variant="secondary" onClick={save} disabled={!pid || !tok.trim()}>Save</Button>
       </div>
-      <p style={{ margin: "4px 0 0" }}>Claude: run <code>claude setup-token</code> in terminal, paste the result. Codex: paste the access token from <code>~/.codex/auth.json → tokens.access_token</code>.</p>
+      <p style={{ margin: "4px 0 0" }}>{hint ?? <>Claude: run <code>claude setup-token</code> in terminal, paste the result. Codex: paste the access token from <code>~/.codex/auth.json → tokens.access_token</code>.</>}</p>
       {msg && <Pill tone={msg.startsWith("✗") ? "danger" : "ok"}>{msg}</Pill>}
+    </>
+  );
+  if (open) return <div style={{ fontSize: 12, color: "var(--text-muted)" }}>{body}</div>;
+  return (
+    <details style={{ fontSize: 12, color: "var(--text-muted)" }}>
+      <summary style={{ cursor: "pointer" }}>Paste a token manually (no CLI needed)</summary>
+      {body}
     </details>
+  );
+}
+
+function KeychainBanner() {
+  const [state, setState] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  async function check() {
+    setBusy(true);
+    try {
+      const s = await invoke<any>("keychain_status");
+      setState(s?.state ?? null);
+    } catch { setState(null); }
+    finally { setBusy(false); }
+  }
+  useEffect(() => { void check(); }, []);
+  if (state !== "locked") return null;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", padding: "10px 12px", borderRadius: "var(--radius-control)", border: "var(--border-width) solid var(--danger)", background: "color-mix(in srgb, var(--danger) 8%, transparent)", fontSize: 13 }}>
+      <span>AYGENT can't read its Keychain vault in this build — macOS treats every unsigned rebuild as a new app. Allow the prompt once and all keys return.</span>
+      <Button variant="secondary" onClick={() => void check()} disabled={busy}>{busy ? "…" : "Re-authorize"}</Button>
+    </div>
   );
 }
 
 export function SubProfiles() {
   return (
     <Card title="Subscriptions">
-      <p style={{ color: "var(--text-muted)", fontSize: 14, margin: 0 }}>
-        Use Claude / ChatGPT subscriptions instead of API keys. $0 billed — tokens
-        + API-equivalent value still tracked per turn.
-      </p>
-      <KindSection kind="claude-code" title="Claude Code" loginHint="Run `claude login` in terminal, then Import." />
-      <KindSection kind="codex" title="Codex" loginHint="Run `codex login` in terminal, then Import." />
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <p style={{ color: "var(--text-muted)", fontSize: 14, margin: 0 }}>
+          Use Claude / ChatGPT subscriptions instead of API keys. $0 billed — tokens
+          + API-equivalent value still tracked per turn.
+        </p>
+        <KeychainBanner />
+        <KindSection kind="claude-code" title="Claude Code" blurb="Tokens stay in Keychain — the UI only sees labels + usage %." />
+        <KindSection kind="codex" title="Codex" blurb="Tokens stay in Keychain — the UI only sees labels + usage %." />
+      </div>
     </Card>
   );
 }

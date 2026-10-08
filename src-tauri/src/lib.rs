@@ -5616,7 +5616,7 @@ pub fn run() {
             remote_cmds::theme_sync,
             provider_verify_key,
             daemon_info, pick_agent_folder, broker_probe,
-            set_provider_key, has_provider_key, anthropic_test, anthropic_models,
+            keychain::keychain_status, set_provider_key, has_provider_key, anthropic_test, anthropic_models,
             agent_stream, reveal_in_finder, get_selected_model, set_selected_model,
             get_selection, set_selection, detect_hardware, local_catalog, local_search, local_lookup, local_downloaded,
             local_download, local_delete, local_tool_capability,
@@ -5674,7 +5674,7 @@ pub fn run() {
             telegram_status, telegram_set_token, telegram_test_token,
             onboarding_status, onboarding_pick_root, onboarding_set_root,
             onboarding_make_agent_home, onboarding_finish, import_memory,
-            sub_cmds::sub_profiles_list, sub_cmds::sub_profile_create, sub_cmds::sub_profile_delete, sub_cmds::sub_profile_import_cli, sub_cmds::sub_profile_save_token, sub_cmds::sub_profile_pin, sub_cmds::sub_models, sub_cmds::sub_usage, sub_cmds::sub_probe, sub_cmds::sub_active, sub_cmds::sub_log_turn, sub_cmds::sub_pinned
+            sub_cmds::sub_profiles_list, sub_cmds::sub_profile_create, sub_cmds::sub_profile_delete, sub_cmds::sub_detect, sub_cmds::sub_connect, sub_cmds::sub_profile_import_cli, sub_cmds::sub_profile_save_token, sub_cmds::sub_profile_pin, sub_cmds::sub_models, sub_cmds::sub_usage, sub_cmds::sub_probe, sub_cmds::sub_active, sub_cmds::sub_log_turn, sub_cmds::sub_pinned
         ])
         .register_uri_scheme_protocol(video_media::SCHEME, video_media::handle)
         .setup(move |_app| {

@@ -129,6 +129,60 @@ pub fn import_codex_cli() -> Result<SubTokens, String> {
     })
 }
 
+// --- Auto-detect (Mason 10-08): what login material exists on this machine? ---
+// No secrets — bools only. Drives the one-click connect UI so nobody types a
+// label before connecting. Note Claude usually has NO file (its CLI keeps
+// OAuth in its own Keychain, unreadable to us) — that case resolves to the
+// `claude setup-token` paste flow, not Import.
+
+fn cli_file(kind: &str) -> Option<std::path::PathBuf> {
+    let home = home_dir()?;
+    match kind {
+        "claude-code" => Some(home.join(".claude/.credentials.json")),
+        "codex" => Some(home.join(".codex/auth.json")),
+        _ => None,
+    }
+}
+
+fn cli_binary(kind: &str) -> &'static str {
+    match kind {
+        "claude-code" => "claude",
+        "codex" => "codex",
+        _ => "",
+    }
+}
+
+/// Is `bin` executable somewhere visible (PATH + the usual Homebrew/local bins
+/// GUI apps inherit a thin PATH, so check the common homes explicitly).
+fn binary_found(bin: &str) -> bool {
+    if bin.is_empty() {
+        return false;
+    }
+    let mut dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    if let Some(home) = home_dir() {
+        dirs.push(home.join(".local/bin"));
+    }
+    dirs.push("/opt/homebrew/bin".into());
+    dirs.push("/usr/local/bin".into());
+    dirs.iter().any(|d| d.join(bin).is_file())
+}
+
+/// What login material exists for a seat kind. Bools only — never secrets.
+/// `has_token` reuses the real import parsers, so detect agrees with import.
+pub fn detect_source(kind: &str) -> serde_json::Value {
+    let file_found = cli_file(kind).map(|p| p.is_file()).unwrap_or(false);
+    let has_token = import_cli(kind)
+        .map(|t| !t.access_token.is_empty())
+        .unwrap_or(false);
+    serde_json::json!({
+        "file_found": file_found,
+        "has_token": has_token,
+        "cli_found": binary_found(cli_binary(kind)),
+    })
+}
+
 pub fn import_cli(kind: &str) -> Result<SubTokens, String> {
     match kind {
         "claude-code" => import_claude_cli(),

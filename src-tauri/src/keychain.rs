@@ -85,6 +85,33 @@ pub fn get_key(provider: &str) -> Result<String, String> {
     }
 }
 
+/// UI-visible vault state (Mason 10-08): "ready" (readable, N secrets),
+/// "empty" (readable, nothing stored yet), or "locked" (macOS denied THIS
+/// build access — every unsigned rebuild is a new app identity until we sign
+/// with a stable Developer ID; allowing the OS prompt once heals it). The
+/// read itself triggers the OS prompt when needed, so a "Try again" button
+/// that re-invokes this is the whole fix. Fresh read, bypasses the cache.
+#[tauri::command]
+pub fn keychain_status() -> serde_json::Value {
+    match vault_entry() {
+        Err(e) => serde_json::json!({ "state": "locked", "error": e }),
+        Ok(entry) => match entry.get_password() {
+            Err(keyring::Error::NoEntry) => serde_json::json!({ "state": "empty", "items": 0 }),
+            Err(e) => serde_json::json!({ "state": "locked", "error": e.to_string() }),
+            Ok(json) => {
+                let n = serde_json::from_str::<HashMap<String, String>>(&json)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if n == 0 {
+                    serde_json::json!({ "state": "empty", "items": 0 })
+                } else {
+                    serde_json::json!({ "state": "ready", "items": n })
+                }
+            }
+        },
+    }
+}
+
 /// Whether a key exists (safe for the UI — returns bool, never the secret).
 pub fn has_key(provider: &str) -> bool {
     get_key(provider).is_ok()
