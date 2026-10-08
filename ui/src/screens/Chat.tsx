@@ -14,6 +14,7 @@ import { notifyThread } from "../lib/notify";
 import type { TurnItem, TurnUsage } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
 import { DiffView, DiffCounts, countDiff, isDiffable } from "../components/DiffView";
+import { modelRank, modelLabel } from "../lib/models";
 import { SubscriptionBadge } from "../components/SubscriptionBadge";
 
 type SubTag = { kind: string; label: string; apiEquivCents: number; tokens: number };
@@ -1586,7 +1587,22 @@ function HistoryItem({
 
 // Inline-editable chat name shown under the "Chat" header. Click to edit; Enter
 // or blur commits, Escape cancels. Empty renders a muted "Untitled" prompt.
-const THREAD_PROVIDERS = ["anthropic", "openai", "openrouter", "meta", "local", "mlx"];
+// Per-thread model override seats. Same providers the Agents form offers, so
+// a thread can borrow any seat — including subscription seats.
+const THREAD_PROVIDERS: Array<{ id: string; label: string }> = [
+  { id: "anthropic", label: "Anthropic" },
+  { id: "openai", label: "OpenAI" },
+  { id: "openrouter", label: "OpenRouter" },
+  { id: "meta", label: "Muse (Meta)" },
+  { id: "claude-code", label: "Claude Code (sub)" },
+  { id: "codex", label: "Codex (sub)" },
+  { id: "local", label: "Local (GGUF)" },
+  { id: "mlx", label: "Local (MLX)" },
+];
+
+// COMMAND PRO per-thread model override (B1): pick from what is ACTUALLY
+// available for the provider (same live sources the Agents form uses) — no
+// typing model ids. Unknown/offline still offers a type-the-id fallback.
 function ThreadModelPicker({ agentDefault, value, onChange }: {
   agentDefault: { provider: string; model: string };
   value: { provider: string; model: string } | null;
@@ -1595,26 +1611,78 @@ function ThreadModelPicker({ agentDefault, value, onChange }: {
   const [editing, setEditing] = useState(false);
   const [prov, setProv] = useState(value?.provider || agentDefault.provider);
   const [mod, setMod] = useState(value?.model || agentDefault.model);
-  useEffect(() => { setProv(value?.provider || agentDefault.provider); setMod(value?.model || agentDefault.model); }, [value?.provider, value?.model, agentDefault.provider, agentDefault.model]);
+  const [models, setModels] = useState<string[]>([]);
+  const [localOpts, setLocalOpts] = useState<Array<{ value: string; label: string }>>([]);
+  const [loading, setLoading] = useState(false);
+  const [loadErr, setLoadErr] = useState<string | null>(null);
+  const [typing, setTyping] = useState(false);
+  useEffect(() => { setProv(value?.provider || agentDefault.provider); setMod(value?.model || agentDefault.model); setTyping(false); }, [value?.provider, value?.model, agentDefault.provider, agentDefault.model]);
+  async function loadFor(p: string): Promise<void> {
+    setModels([]); setLocalOpts([]); setLoadErr(null); setLoading(true);
+    try {
+      if (p === "local") {
+        const list = await invoke<Array<{ filename: string; path: string }>>("local_downloaded");
+        setLocalOpts((list || []).map((m) => ({ value: m.path, label: m.filename })));
+        if ((list || []).length === 0) setLoadErr("No local models downloaded yet.");
+      } else if (p === "mlx") {
+        const list = await invoke<Array<{ repo: string }>>("mlx_downloaded");
+        setLocalOpts((list || []).map((m) => ({ value: m.repo, label: m.repo })));
+        if ((list || []).length === 0) setLoadErr("No MLX models pulled yet.");
+      } else {
+        const list = p === "anthropic"
+          ? await invoke<string[]>("anthropic_models")
+          : (p === "claude-code" || p === "codex")
+            ? await invoke<string[]>("sub_models", { kind: p })
+            : await invoke<string[]>("openai_models", { provider: p });
+        setModels([...(list || [])].sort((a, b) => modelRank(b) - modelRank(a)));
+        if ((list || []).length === 0) setLoadErr("Model list came back empty.");
+      }
+    } catch (e) { setLoadErr(String(e)); }
+    finally { setLoading(false); }
+  }
+  function openEditor() {
+    const p = value?.provider || agentDefault.provider;
+    setProv(p); setMod(value?.model || agentDefault.model); setTyping(false);
+    setEditing(true);
+    void loadFor(p);
+  }
+  function pickProvider(p: string) { setProv(p); setMod(""); setTyping(false); void loadFor(p); }
   if (!editing) {
     const label = value ? (value.model || value.provider) + " (thread)" : (agentDefault.model || agentDefault.provider) + " (agent)";
     return (
-      <button onClick={() => setEditing(true)} title="Override model for this thread only — other threads keep the agent default"
+      <button onClick={openEditor} title="Override model for this thread only — other threads keep the agent default"
         style={{ display: "inline-flex", alignItems: "center", gap: 6, background: "transparent", border: "1px solid var(--line)", borderRadius: 999, cursor: "pointer", flexShrink: 0, padding: "3px 10px", color: "var(--text-muted)", fontSize: 12, fontFamily: "ui-monospace, monospace", maxWidth: 360 }}>
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span>
         <span style={{ opacity: 0.6 }}>▾</span>
       </button>
     );
   }
+  const opts = prov === "local" || prov === "mlx"
+    ? localOpts
+    : models.map((m) => ({ value: m, label: modelLabel(m) }));
+  const inList = opts.some((o) => o.value === mod);
+  const showInput = typing || (mod !== "" && !inList);
+  const selStyle = { background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, color: "var(--text)", padding: "3px 6px", fontSize: 12, maxWidth: 220 } as const;
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "wrap", flexShrink: 0 }}>
-      <select value={prov} onChange={(e) => setProv(e.target.value)}
-        style={{ background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, color: "var(--text)", padding: "3px 6px", fontSize: 12 }}>
-        {THREAD_PROVIDERS.map((x) => <option key={x} value={x}>{x}</option>)}
+      <select value={prov} onChange={(e) => pickProvider(e.target.value)} style={selStyle}>
+        {THREAD_PROVIDERS.map((x) => <option key={x.id} value={x.id}>{x.label}</option>)}
       </select>
-<input value={mod} onChange={(e) => setMod(e.target.value)} placeholder="model id (blank = auto)"
-        spellCheck={false}
-        style={{ background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, color: "var(--text)", padding: "3px 8px", fontSize: 12, fontFamily: "ui-monospace, monospace", width: 200 }} />
+      <select
+        value={showInput ? "__custom__" : mod}
+        disabled={loading}
+        onChange={(e) => { const v = e.target.value; if (v === "__custom__") { setTyping(true); } else { setTyping(false); setMod(v); } }}
+        style={selStyle}>
+        <option value="">{loading ? "loading models…" : "Auto" + (prov === "local" || prov === "mlx" ? "" : " (recommended)")}</option>
+        {mod !== "" && !inList && <option value={mod}>{mod} (current)</option>}
+        {opts.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+        <option value="__custom__">Type an id…</option>
+      </select>
+      {showInput && (
+        <input value={typing && mod === "" ? "" : mod} onChange={(e) => setMod(e.target.value)} placeholder="model id" spellCheck={false}
+          style={{ background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, color: "var(--text)", padding: "3px 8px", fontSize: 12, fontFamily: "ui-monospace, monospace", width: 200 }} />
+      )}
+      {loadErr && <span title={loadErr} style={{ fontSize: 12, color: "var(--text-faint)", cursor: "help" }}>⚠</span>}
       <button onClick={() => { onChange(mod.trim() || prov !== agentDefault.provider ? { provider: prov, model: mod.trim() } : null); setEditing(false); }}
         style={{ background: "var(--accent)", color: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, padding: "3px 10px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Set</button>
       {value && <button onClick={() => { onChange(null); setEditing(false); }} title="Back to agent default"
