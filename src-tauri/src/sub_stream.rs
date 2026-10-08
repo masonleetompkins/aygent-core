@@ -147,3 +147,50 @@ pub async fn sub_probe(id: String, prompt: String) -> Result<serde_json::Value, 
     };
     Ok(serde_json::json!({ "ok": true, "kind": kind, "text": text }))
 }
+
+/// Resolve the serving seat for a subscription kind + agent: pinned profile
+/// first, else first healthy in label order (skips spent windows via cached
+/// usage). Returns (native_provider, oauth_token, profile_id, label).
+pub async fn resolve_seat(kind: &str, agent_id: &str) -> Result<(String, String, String, String), String> {
+    let mut order = crate::sub_cmds::profile_order(kind);
+    if order.is_empty() {
+        return Err(format!("no {kind} profiles yet — add one in Settings → Subscriptions"));
+    }
+    if let Some(pinned) = crate::sub_cmds::pinned_profile(agent_id) {
+        if crate::sub_cmds::get_profile(&pinned).map(|p| p.kind == kind).unwrap_or(false) {
+            order.retain(|(id, _)| id != &pinned);
+            if let Some(p) = crate::sub_cmds::get_profile(&pinned) {
+                order.insert(0, (p.id, p.label));
+            }
+        }
+    }
+    let mut last_err = String::from("no stored token — Import or paste one per profile");
+    for (id, label) in &order {
+        let access = match profile_token(id) {
+            Ok((k, a)) if k == kind && !a.is_empty() => a,
+            _ => continue,
+        };
+        match crate::subscription::usage_cached(id, kind, &access).await {
+            Ok(u) if crate::sub_loop::usage_exhausted(u.pct_5h) => {
+                last_err = format!(
+                    "{label} window spent{}",
+                    u.reset_at_ms.map(|ms| format!(" — resets {ms}")).unwrap_or_default()
+                );
+                continue;
+            }
+            _ => {}
+        }
+        let native = if kind == "claude-code" { "anthropic" } else { "openai" }.to_string();
+        return Ok((native, access, id.clone(), label.clone()));
+    }
+    Err(format!("no usable {kind} seat right now — {last_err}"))
+}
+
+/// Default model when the agent leaves model blank on a seat.
+pub fn default_model(kind: &str) -> &'static str {
+    if kind == "claude-code" {
+        "claude-sonnet-4-5"
+    } else {
+        "gpt-5.2"
+    }
+}

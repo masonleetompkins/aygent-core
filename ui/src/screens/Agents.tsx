@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Input, Pill } from "../components/ui";
 import type { AgentProfile } from "../components/AgentSwitcher";
 import { Icon, AGENT_ICONS, type IconName } from "../components/Icon";
+import { SubProfilePicker } from "../components/SubProfilePicker";
 
 // Agents management screen (§10.2): list all agent profiles, create/edit/delete,
 // and pick each agent's jailed folder + model/provider. The switcher rail is the
@@ -296,6 +297,16 @@ export function AgentForm({
   const [model, setModel] = useState(initial?.model ?? "");
   const [variant, setVariant] = useState(initial?.model_variant ?? "");
   const [provider, setProvider] = useState(initial?.provider ?? "anthropic");
+  // SUBSCRIPTION SEAT pin ("" = auto/failover). Persisted on save; loaded for edits.
+  const [subPin, setSubPin] = useState("");
+  useEffect(() => {
+    if ((provider === "claude-code" || provider === "codex") && initial?.id) {
+      invoke<string>("sub_pinned", { agentId: initial.id }).then(setSubPin).catch(() => {});
+    } else if (provider !== "claude-code" && provider !== "codex") {
+      setSubPin("");
+    }
+    // eslint-disable-next-line
+  }, [provider]);
   const [contextMode, setContextMode] = useState(initial?.context_mode ?? "isolated");
   const [systemPrompt, setSystemPrompt] = useState(initial?.system_prompt ?? "");
   const [saving, setSaving] = useState(false);
@@ -529,7 +540,9 @@ export function AgentForm({
     const attempt = () =>
       prov === "anthropic"
         ? invoke<string[]>("anthropic_models")
-        : invoke<string[]>("openai_models", { provider: prov });
+        : (prov === "claude-code" || prov === "codex")
+          ? invoke<string[]>("sub_models", { kind: prov })
+          : invoke<string[]>("openai_models", { provider: prov });
     let lastErr: unknown = null;
     // Cold-mount: the daemon/keychain handshake can lag a beat, so the first few
     // calls may throw spuriously. Retry with a longer, wider backoff before we
@@ -569,12 +582,14 @@ export function AgentForm({
           folder_path: folder, model, provider, model_variant: variant, context_mode: contextMode, system_prompt: systemPrompt,
         };
         await invoke("agents_update", { profile: updated });
+        try { await invoke("sub_profile_pin", { agentId: updated.id, profileId: (provider === "claude-code" || provider === "codex") ? subPin : "" }); } catch { /* pin is advisory */ }
         onDone(updated);
       } else {
         const created = await invoke<AgentProfile>("agents_create", {
           name: name.trim(), icon, color, folderPath: folder, model, provider,
           modelVariant: variant, contextMode, systemPrompt,
         });
+        try { await invoke("sub_profile_pin", { agentId: created.id, profileId: (provider === "claude-code" || provider === "codex") ? subPin : "" }); } catch { /* pin is advisory */ }
         onDone(created);
       }
     } catch { onDone(null); }
@@ -630,6 +645,8 @@ export function AgentForm({
               <option value="openai">OpenAI</option>
               <option value="openrouter">OpenRouter</option>
               <option value="meta">Muse (Meta)</option>
+              <option value="claude-code">Claude Code (subscription)</option>
+              <option value="codex">Codex (subscription)</option>
               <option value="local">Local (GGUF)</option>
               <option value="mlx">Local (MLX)</option>
             </select>
@@ -735,6 +752,10 @@ export function AgentForm({
             </label>
           )}
         </div>
+
+        {(provider === "claude-code" || provider === "codex") && (
+          <SubProfilePicker provider={provider} value={subPin} onChange={setSubPin} />
+        )}
 
         {/* CONTEXT MODE (2026-08-03): how much conversation context this agent
            carries between chats. Wired end-to-end now (was a dead column). */}

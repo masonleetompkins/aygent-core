@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Card, Button, Input, Pill } from "../components/ui";
 import { saveTheme, type Mode } from "../lib/theme";
+import { SubProfiles } from "../components/SubProfiles";
 
 const ACCENT_SWATCHES = ["#4169e1", "#00cafc", "#2dd4bf", "#a78bfa", "#22c55e", "#e0533d"]; // default royal blue + 5 (Mason cleanup)
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
@@ -128,6 +129,9 @@ export function Settings({
         <ProviderRow provider="openrouter" label="OpenRouter" placeholder="sk-or-…" />
         <ProviderRow provider="meta" label="Muse (Meta)" placeholder="your Muse API key" />
       </Card>
+
+      {/* SUBSCRIPTIONS — Claude / ChatGPT seats instead of API keys ($0 billed). */}
+      <SubProfiles />
 
       {/* MODEL card removed (Mason cleanup #3) — model choice lives per-agent in
           the Agents tab. */}

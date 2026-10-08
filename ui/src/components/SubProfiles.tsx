@@ -112,8 +112,43 @@ function KindSection({ kind, title, loginHint }: { kind: string; title: string; 
         <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="New profile label — Personal, Work…" />
         <Button onClick={create} disabled={busy === "create" || !label.trim()}>Add</Button>
       </div>
+      <PasteToken profiles={profiles} onDone={refresh} />
       {msg && <Pill tone={msg.startsWith("✗") ? "danger" : "ok"}>{msg}</Pill>}
     </div>
+  );
+}
+
+function PasteToken({ profiles, onDone }: { profiles: Profile[]; onDone: () => void }) {
+  const [pid, setPid] = useState(profiles.find((p) => !p.has_token)?.id ?? "");
+  const [tok, setTok] = useState("");
+  const [msg, setMsg] = useState<string | null>(null);
+  useEffect(() => {
+    if (!pid && profiles.length > 0) setPid(profiles.find((p) => !p.has_token)?.id ?? profiles[0].id);
+  }, [profiles]);
+  async function save() {
+    if (!pid || !tok.trim()) return;
+    setMsg(null);
+    try {
+      await invoke("sub_profile_save_token", { id: pid, access_token: tok.trim() });
+      setTok("");
+      setMsg("✓ token saved to Keychain");
+      onDone();
+    } catch (e) { setMsg("✗ " + String(e)); }
+  }
+  if (profiles.length === 0) return null;
+  return (
+    <details style={{ fontSize: 12, color: "var(--text-muted)" }}>
+      <summary style={{ cursor: "pointer" }}>Paste a token manually (no CLI needed)</summary>
+      <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
+        <select value={pid} onChange={(e) => setPid(e.target.value)} style={{ padding: "8px 10px", borderRadius: "var(--radius-control)", border: "var(--border-width) solid var(--line)", background: "var(--bg)", color: "var(--text)" }}>
+          {profiles.map((p) => <option key={p.id} value={p.id}>{p.label}{p.has_token ? " (replace)" : ""}</option>)}
+        </select>
+        <Input type="password" value={tok} onChange={(e) => setTok(e.target.value)} placeholder="paste token…" />
+        <Button variant="secondary" onClick={save} disabled={!pid || !tok.trim()}>Save</Button>
+      </div>
+      <p style={{ margin: "4px 0 0" }}>Claude: run <code>claude setup-token</code> in terminal, paste the result. Codex: paste the access token from <code>~/.codex/auth.json → tokens.access_token</code>.</p>
+      {msg && <Pill tone={msg.startsWith("✗") ? "danger" : "ok"}>{msg}</Pill>}
+    </details>
   );
 }
 

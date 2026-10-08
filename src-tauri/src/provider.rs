@@ -278,6 +278,7 @@ fn find_double_newline(buf: &[u8]) -> Option<usize> {
 /// ToolUse event. Returns the assistant `content` array (for history) + stop.
 pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
     api_key: &str,
+    oauth: bool,
     model: &str,
     system: &str,
     messages: &serde_json::Value,
@@ -301,9 +302,13 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
     });
 
     let client = reqwest::Client::new();
-    let resp = client
-        .post(ANTHROPIC_URL)
-        .header("x-api-key", api_key)
+    // SUBSCRIPTION SEATS: OAuth bearer + oauth beta instead of x-api-key.
+    let authed = if oauth {
+        client.post(ANTHROPIC_URL).bearer_auth(api_key).header("anthropic-beta", "oauth-2025-04-20")
+    } else {
+        client.post(ANTHROPIC_URL).header("x-api-key", api_key)
+    };
+    let resp = authed
         .header("anthropic-version", API_VERSION)
         .header("content-type", "application/json")
         .json(&body)

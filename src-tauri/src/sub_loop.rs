@@ -45,15 +45,6 @@ pub fn pick_failover(order: &[String], tried: &[String], exhausted: &dyn Fn(&str
     order.iter().find(|id| !tried.contains(id)).cloned()
 }
 
-/// Display default models per subscription kind (v1: provider default).
-/// Kept as a function so the Agents picker can show honest labels later.
-pub fn default_model_label(kind: &str) -> &'static str {
-    match kind {
-        "claude-code" => "Auto (subscription default)",
-        "codex" => "Auto (subscription default)",
-        _ => "Auto",
-    }
-}
 
 #[cfg(test)]
 mod tests {

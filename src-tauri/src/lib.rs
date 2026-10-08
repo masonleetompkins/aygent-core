@@ -1518,6 +1518,18 @@ async fn openai_models(provider: String) -> Result<Vec<String>, String> {
 async fn provider_verify_key(provider: String) -> Result<(), String> {
     let key = keychain::get_key(&provider)?;
     if key.trim().is_empty() { return Err("stored key is empty".into()); }
+    if crate::subscription::is_subscription_provider(&provider) {
+        // A seat verifies by holding a token (any profile of this kind).
+        return if crate::sub_cmds::profile_order(&provider).iter().any(|(id, _)| {
+            crate::sub_stream::profile_token(id)
+                .map(|(k, a)| k == provider && !a.is_empty())
+                .unwrap_or(false)
+        }) {
+            Ok(())
+        } else {
+            Err(format!("no {provider} seat connected — add one in Settings → Subscriptions"))
+        };
+    }
     if provider == "anthropic" { return anthropic_models().await.map(|_| ()); }
     if provider == "meta" { return meta_provider::verify_key(&key).await; }
     openai_provider::verify_key(&provider, &key).await
@@ -1593,11 +1605,43 @@ async fn chat_model_info(provider: Option<String>, model: String) -> serde_json:
     let (mut p_in, mut p_out) = (table.price.input, table.price.output);
     let (mut p_cr, mut p_cw, mut p_cw5, mut p_cw1) = (table.price.cache_read, table.price.cache_write, table.price.cache_write_5m, table.price.cache_write_1h);
     let mut display_name = model.clone();
+    let mut sub_info: Option<serde_json::Value> = None;
 
     // DYNAMIC window (the fix): fetch the REAL context window from the provider
     // instead of a hardcoded substring guess. Falls back to the table on any
     // error (offline, older account, unknown model).
     match provider.as_str() {
+        "claude-code" | "codex" => {
+            // SUBSCRIPTION SEAT: window from the native counterpart's table,
+            // price ZERO ($0 billed — usage tracked instead), plus live window
+            // state when a seat holds a token. Never fails the meter.
+            let native = if provider == "claude-code" { "claude-sonnet-4-5" } else { "gpt-5.2" };
+            let t = pricing::lookup(if model.trim().is_empty() { native } else { model.as_str() });
+            context_tokens = t.context_tokens;
+            known = t.known;
+            display_name = if model.trim().is_empty() {
+                format!("{provider} · auto")
+            } else {
+                model.clone()
+            };
+            p_in = 0.0; p_out = 0.0; p_cr = 0.0; p_cw = 0.0; p_cw5 = 0.0; p_cw1 = 0.0;
+            for (id, label) in crate::sub_cmds::profile_order(&provider) {
+                let access = match crate::sub_stream::profile_token(&id) {
+                    Ok((k, a)) if k == provider && !a.is_empty() => a,
+                    _ => continue,
+                };
+                if let Ok(u) = crate::subscription::usage_cached(&id, &provider, &access).await {
+                    sub_info = Some(serde_json::json!({
+                        "billing": "subscription", "kind": provider, "label": label,
+                        "pct_5h": u.pct_5h, "reset_at_ms": u.reset_at_ms, "weekly_pct": u.weekly_pct,
+                    }));
+                    break;
+                }
+            }
+            if sub_info.is_none() {
+                sub_info = Some(serde_json::json!({ "billing": "subscription", "kind": provider }));
+            }
+        }
         "anthropic" | "" => {
             if let Ok(key) = keychain::get_key("anthropic") {
                 if let Ok((ctx, _max_out, name)) = provider::anthropic_model_info(&key, &model).await {
@@ -1635,7 +1679,8 @@ async fn chat_model_info(provider: Option<String>, model: String) -> serde_json:
         "context_tokens": context_tokens,
         "known": known,
         "display_name": display_name,
-        "price": { "input": p_in, "output": p_out, "cache_read": p_cr, "cache_write": p_cw, "cache_write_5m": p_cw5, "cache_write_1h": p_cw1 }
+        "price": { "input": p_in, "output": p_out, "cache_read": p_cr, "cache_write": p_cw, "cache_write_5m": p_cw5, "cache_write_1h": p_cw1 },
+        "subscription": sub_info
     });
     if let Ok(mut cache) = MODEL_INFO_CACHE.lock() {
         cache.insert(cache_key, (std::time::Instant::now(), val.clone()));
@@ -1729,6 +1774,14 @@ async fn compact_history(db: &writer::Db, agent_id: &str, history: Vec<serde_jso
             let cleaned = local_tools::strip_think(&raw).trim().to_string();
             if cleaned.is_empty() { return Err("local model produced an empty summary — try again".into()); }
             cleaned
+        }
+        "claude-code" | "codex" => {
+            let (_, token, _, _) = crate::sub_stream::resolve_seat(&provider, agent_id).await?;
+            if provider == "claude-code" {
+                crate::sub_stream::claude_oauth_complete(&token, &agent.model, &ask).await?
+            } else {
+                crate::sub_stream::codex_oauth_complete(&token, &agent.model, &ask).await?
+            }
         }
         _ => return Err("compaction needs a cloud provider (Anthropic/OpenAI/OpenRouter) or a local model".into()),
     };
@@ -2268,6 +2321,14 @@ async fn agent_generate_soul(
             if model.trim().is_empty() { return Err("pick a model for this agent first".into()); }
             if provider == "meta" { meta_provider::complete(&key, &model, &meta).await? }
             else { openai_provider::complete(&provider, &key, &model, &meta).await? }
+        }
+        "claude-code" | "codex" => {
+            let (_, token, _, _) = crate::sub_stream::resolve_seat(&provider, &agent_id).await?;
+            if provider == "claude-code" {
+                crate::sub_stream::claude_oauth_complete(&token, &agent.model, &meta).await?
+            } else {
+                crate::sub_stream::codex_oauth_complete(&token, &agent.model, &meta).await?
+            }
         }
         _ => return Err("Soul generation needs a cloud provider (Anthropic/OpenAI/OpenRouter) \
                          — set one for this agent.".into()),
@@ -3924,7 +3985,9 @@ async fn agent_stream(
 ) -> Result<serde_json::Value, String> {
     use tauri::Emitter;
     let broker = broker.inner().clone();
-    let provider_kind = provider.unwrap_or_default();
+    let mut provider_kind = provider.unwrap_or_default();
+    let mut model = model;
+    let mut sub_oauth: Option<String> = None;
 
     // STOP BUTTON: register this turn's cancel flag under its event channel.
     // The guard's Drop removes the entry on ANY exit path (this fn has many:
@@ -3958,6 +4021,28 @@ async fn agent_stream(
             repo::active_id(&db).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "default".to_string())
         }
     };
+
+    // ---- SUBSCRIPTION SEATS (Claude Code / Codex) ---------------------------
+    // A seat spends the user's chat subscription ($0 billed), not an API key.
+    // Resolve the profile now (agent-pinned, else first healthy in label
+    // order), then ride the NATIVE wire below: claude-code -> Anthropic
+    // Messages, codex -> OpenAI Chat Completions, with the OAuth bearer as
+    // `key`. Cost stays $0: chat_model_info reports price zero for these
+    // providers and the UI logs the turn via sub_log_turn (it holds the sums).
+    if crate::subscription::is_subscription_provider(&provider_kind) {
+        let kind = provider_kind.clone();
+        let (native, token, pid, plabel) =
+            crate::sub_stream::resolve_seat(&kind, &scope_id).await?;
+        if model.as_ref().map(|m| m.trim().is_empty()).unwrap_or(true) {
+            model = Some(crate::sub_stream::default_model(&kind).to_string());
+        }
+        provider_kind = native;
+        crate::sub_cmds::note_active(&channel, &pid, &kind, &plabel);
+        sub_oauth = Some(token);
+        let _ = app.emit(&channel, &provider::StreamEvent::Info {
+            text: format!("subscription · {kind} · {plabel} · $0 billed (usage tracked)"),
+        });
+    }
     // If the agent has a folder but its scope isn't registered yet (e.g. created
     // this session), register it now so the jail is live for this turn.
     if let Ok(Some(fp)) = repo::folder_for(&db, &scope_id) {
@@ -4223,8 +4308,11 @@ async fn agent_stream(
     // Shared Chat Completions wire format; one impl, two base URLs. Full tool-
     // use: same jailed exec_tool + broker + SAVE POINTs as every other provider.
     if provider_kind == "openai" || provider_kind == "openrouter" || provider_kind == "meta" {
-        let key = keychain::get_key(&provider_kind)
-            .map_err(|_| format!("no {provider_kind} key set — add one in Settings"))?;
+        let key = match sub_oauth.clone() {
+            Some(t) => t,
+            None => keychain::get_key(&provider_kind)
+                .map_err(|_| format!("no {provider_kind} key set — add one in Settings"))?,
+        };
         let model = model.filter(|m| !m.trim().is_empty())
             .ok_or_else(|| format!("no {provider_kind} model selected — pick one in Settings"))?;
         // MODEL VARIANT: the agent's reasoning knob (Muse Spark effort etc.).
@@ -4473,8 +4561,11 @@ async fn agent_stream(
     }
 
     // ---- ANTHROPIC PATH (default) ------------------------------------------
-    let key = keychain::get_key("anthropic")
-        .map_err(|_| "no anthropic key set — add one in Settings".to_string())?;
+    let key = match sub_oauth.clone() {
+        Some(t) => t,
+        None => keychain::get_key("anthropic")
+            .map_err(|_| "no anthropic key set — add one in Settings".to_string())?,
+    };
     // Model choice: explicit (from the per-folder Settings picker) wins; empty/
     // missing = auto (prefer haiku — cheap/fast — else first available).
     let model = match model.filter(|m| !m.trim().is_empty()) {
@@ -4548,7 +4639,7 @@ async fn agent_stream(
             break;
         }
         let stream_result = provider::anthropic_stream_turn(
-            &key, &model, &anthropic_sys, &messages, &tools, Some(&cancel_flag),
+            &key, sub_oauth.is_some(), &model, &anthropic_sys, &messages, &tools, Some(&cancel_flag),
             |ev| { let _ = app.emit(&channel, &ev); },
         ).await;
         if let Err(e) = &stream_result {
@@ -4842,7 +4933,7 @@ pub async fn run_headless_turn(
     msg: &mailbox::Message,
 ) -> Result<(), String> {
     use tauri::Emitter;
-    let agent = repo::get_agent(db, agent_id)?.ok_or("recipient agent gone")?;
+    let mut agent = repo::get_agent(db, agent_id)?.ok_or("recipient agent gone")?;
 
     // Register the recipient's jail scope (it may not be active in the UI).
     if !agent.folder_path.is_empty() {
@@ -5003,7 +5094,23 @@ pub async fn run_headless_turn(
     };
     let mounts_block = mounts_prompt_block(broker, agent_id);
     // Resolve provider/model (recipient's own; fallback anthropic auto/haiku).
-    let provider_kind = if agent.provider.is_empty() { "anthropic".to_string() } else { agent.provider.clone() };
+    let mut provider_kind = if agent.provider.is_empty() { "anthropic".to_string() } else { agent.provider.clone() };
+    // ---- SUBSCRIPTION SEATS (headless): same seat resolution as the human
+    // path, attributed to the recipient's inbox channel.
+    let mut sub_oauth_hl: Option<String> = None;
+    if crate::subscription::is_subscription_provider(&provider_kind) {
+        let kind = provider_kind.clone();
+        let (native, token, pid, plabel) = crate::sub_stream::resolve_seat(&kind, agent_id).await?;
+        if agent.model.trim().is_empty() {
+            agent.model = crate::sub_stream::default_model(&kind).to_string();
+        }
+        provider_kind = native;
+        crate::sub_cmds::note_active(&stream_channel, &pid, &kind, &plabel);
+        sub_oauth_hl = Some(token);
+        let _ = app.emit(&stream_channel, &provider::StreamEvent::Info {
+            text: format!("subscription · {kind} · {plabel} · $0 billed (usage tracked)"),
+        });
+    }
     let muse_quiet = if provider_kind == "meta" { MUSE_QUIET_TOOLS } else { "" };
 
     // Tools: the FULL registry (file tools, connectors, MCP, video, dashboard,
@@ -5065,7 +5172,10 @@ pub async fn run_headless_turn(
     // slower + the human path is where they're exercised). Non-cloud recipients
     // get a note instead of silently doing nothing.
     if provider_kind == "anthropic" {
-        let key = keychain::get_key("anthropic").map_err(|_| "recipient has no anthropic key".to_string())?;
+        let key = match sub_oauth_hl.clone() {
+            Some(t) => t,
+            None => keychain::get_key("anthropic").map_err(|_| "recipient has no anthropic key".to_string())?,
+        };
         let model = if agent.model.trim().is_empty() {
             let models = provider::anthropic_list_models(&key).await?;
             models.iter().find(|m| m.contains("haiku")).cloned().or_else(|| models.first().cloned()).ok_or("no model")?
@@ -5077,7 +5187,7 @@ pub async fn run_headless_turn(
             // tool cards), not just a rail spinner.
             let model_msgs = with_prior(&messages);
             let (content, stop) = provider::anthropic_stream_turn(
-                &key, &model, &system, &model_msgs, &tools, Some(&hl_cancel_flag),
+                &key, false, &model, &system, &model_msgs, &tools, Some(&hl_cancel_flag),
                 |ev| { let _ = app.emit(&stream_channel, &ev); },
             ).await?;
             messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": content.clone() }));
@@ -5152,7 +5262,10 @@ pub async fn run_headless_turn(
             break;
         }
     } else if provider_kind == "openai" || provider_kind == "openrouter" || provider_kind == "meta" {
-        let key = keychain::get_key(&provider_kind).map_err(|_| format!("recipient has no {provider_kind} key"))?;
+        let key = match sub_oauth_hl.clone() {
+            Some(t) => t,
+            None => keychain::get_key(&provider_kind).map_err(|_| format!("recipient has no {provider_kind} key"))?,
+        };
         if agent.model.trim().is_empty() { return Err("recipient has no model set".into()); }
         // TOOL LOOP (Mason 09-04): this branch used to be a single no-tools text
         // turn, so a task_continue wake-up on Muse/OpenAI could only TALK — it could
@@ -5458,7 +5571,7 @@ pub fn run() {
             telegram_status, telegram_set_token, telegram_test_token,
             onboarding_status, onboarding_pick_root, onboarding_set_root,
             onboarding_make_agent_home, onboarding_finish, import_memory,
-            sub_cmds::sub_profiles_list, sub_cmds::sub_profile_create, sub_cmds::sub_profile_delete, sub_cmds::sub_profile_import_cli, sub_cmds::sub_usage, sub_cmds::sub_probe
+            sub_cmds::sub_profiles_list, sub_cmds::sub_profile_create, sub_cmds::sub_profile_delete, sub_cmds::sub_profile_import_cli, sub_cmds::sub_profile_save_token, sub_cmds::sub_profile_pin, sub_cmds::sub_models, sub_cmds::sub_usage, sub_cmds::sub_probe, sub_cmds::sub_active, sub_cmds::sub_log_turn, sub_cmds::sub_pinned
         ])
         .register_uri_scheme_protocol(video_media::SCHEME, video_media::handle)
         .setup(move |_app| {

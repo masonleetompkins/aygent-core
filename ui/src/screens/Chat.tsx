@@ -14,14 +14,17 @@ import { notifyThread } from "../lib/notify";
 import type { TurnItem, TurnUsage } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
 import { DiffView, DiffCounts, countDiff, isDiffable } from "../components/DiffView";
+import { SubscriptionBadge } from "../components/SubscriptionBadge";
 
+type SubTag = { kind: string; label: string; apiEquivCents: number; tokens: number };
+type SubInfo = { billing: string; kind: string; label?: string | null; pct_5h?: number | null; reset_at_ms?: number | null; weekly_pct?: number | null };
 type ToolLine = { name: string; path: string; ok?: boolean; detail?: string; summary?: string; body?: string; running?: boolean; spark?: { slug: string; title: string; html: string }; before?: { exists: boolean; content: string; truncated: boolean; binary: boolean } | null };
 type Msg =
   // `at` = epoch ms. For a USER message it's when they hit send; for an
   // ASSISTANT message it's when the turn COMPLETED (set at finalize, not at
   // first token), which is what the timestamp in the margin claims to mean.
   | { role: "user"; text: string; memory?: string; at?: number }
-  | { role: "assistant"; text: string; tools: ToolLine[]; streaming?: boolean; at?: number; timeline?: TurnItem[]; usage?: TurnUsage };
+  | { role: "assistant"; text: string; tools: ToolLine[]; streaming?: boolean; at?: number; timeline?: TurnItem[]; usage?: TurnUsage; sub?: SubTag };
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 
@@ -88,6 +91,8 @@ function providerLabel(p: string | null | undefined): string {
     case "openai": return "an OpenAI";
     case "openrouter": return "an OpenRouter";
     case "meta": return "a Muse (Meta)";
+    case "claude-code": return "a Claude subscription seat";
+    case "codex": return "a Codex (ChatGPT) subscription seat";
     case "anthropic": case "": case null: case undefined: return "an Anthropic";
     default: return `a ${p}`;
   }
@@ -673,7 +678,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       const done = getAgentTurnSnapshot(mySlot);
       const finalMsgs: Msg[] = [
         ...msgsRef.current,
-        { role: "assistant", text: done.liveText || "(continued — no written reply this round)", tools: done.liveTools as ToolLine[], timeline: done.timeline, streaming: false, at: Date.now(), usage: done.usage },
+        { role: "assistant", text: done.liveText || "(continued — no written reply this round)", tools: done.liveTools as ToolLine[], timeline: done.timeline, streaming: false, at: Date.now(), usage: done.usage, sub: await logSubTurn(channel, myAgent, providerRef.current, done.usage) },
       ];
       if (agentId === myAgent && convIdRef.current === myConvId) {
         msgsRef.current = finalMsgs; setMsgs(finalMsgs);
@@ -775,6 +780,23 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     } catch { /* non-fatal: chat still works even if save fails */ }
   }
 
+  // SUBSCRIPTION TURNS: attribute the seat that served the turn + log tokens
+  // to sub.db (best-effort; a logging failure never breaks the chat).
+  async function logSubTurn(channel: string, aId: string | null, prov: string, usage?: TurnUsage): Promise<SubTag | undefined> {
+    try {
+      if ((prov !== "claude-code" && prov !== "codex") || !usage || !aId) return undefined;
+      const seat = await invoke<{ profile_id: string; kind: string; label: string } | null>("sub_active", { channel });
+      if (!seat) return undefined;
+      const r = await invoke<{ ok: boolean; api_equiv_cents: number }>("sub_log_turn", {
+        agentId: aId, profileId: seat.profile_id, kind: seat.kind,
+        input: Math.round(usage.input || 0), output: Math.round(usage.output || 0),
+        cacheRead: Math.round(usage.cacheRead || 0),
+      });
+      const ctxIn = (usage.contextInput ?? 0) || (usage.input + usage.cacheRead + usage.cacheWrite);
+      return { kind: seat.kind, label: seat.label, apiEquivCents: r.api_equiv_cents ?? 0, tokens: ctxIn + usage.output };
+    } catch { return undefined; }
+  }
+
   async function send() {
     let prompt = input.trim();
     // Task #8: #tool tags become an explicit instruction the model honors.
@@ -859,7 +881,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
         : "(no reply text came back from the model this turn — try asking a follow-up)";
       const finalMsgs: Msg[] = [
         ...withUserMem,
-        { role: "assistant", text: done.liveText || emptyReplyText, tools: done.liveTools as ToolLine[], timeline: done.timeline, streaming: false, at: Date.now(), usage: done.usage },
+        { role: "assistant", text: done.liveText || emptyReplyText, tools: done.liveTools as ToolLine[], timeline: done.timeline, streaming: false, at: Date.now(), usage: done.usage, sub: await logSubTurn(channel, myAgent, providerRef.current, done.usage) },
       ];
       // Only overwrite the visible pane if we're STILL viewing this agent+conv.
       if (agentId === myAgent && convIdRef.current === myConvId) {
@@ -967,7 +989,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // ---- CONTEXT METER + $ COST (Mason, this session) -----------------------
   // The model's context window + price, fetched Rust-side (pricing.rs). Refetch
   // when the selected model changes so the % + cost track the real model.
-  type ModelInfo = { context_tokens: number; known: boolean; price: ModelPrice };
+  type ModelInfo = { context_tokens: number; known: boolean; price: ModelPrice; subscription?: SubInfo | null };
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
   useEffect(() => {
     let cancelled = false;
@@ -1147,6 +1169,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
                   <span title="Running cost of this chat, based on the model's price" style={{ fontSize: 12, color: "var(--text-muted)", fontVariantNumeric: "tabular-nums" }}>
                     · {fmtCost(convUsage.cost)}
                   </span>
+                )}
+                {modelInfo?.subscription && (
+                  <SubscriptionBadge
+                    kind={modelInfo.subscription.kind}
+                    label={modelInfo.subscription.label ?? modelInfo.subscription.kind}
+                    pct5h={modelInfo.subscription.pct_5h ?? null}
+                    resetAtMs={modelInfo.subscription.reset_at_ms ?? null}
+                  />
                 )}
                 <button
                   onClick={() => void compactContext()}
@@ -1627,7 +1657,7 @@ function fmtClock(ms?: number): string {
 
 /** One-line meta stamp UNDER the message: clock · tokens · cost. Renders
  *  nothing when there is nothing to show, so rows never shift. */
-function MetaStamp({ at, usage, price, align }: { at?: number; usage?: TurnUsage; price?: ModelPrice; align: "left" | "right" }) {
+function MetaStamp({ at, usage, price, sub, align }: { at?: number; usage?: TurnUsage; price?: ModelPrice; sub?: SubTag; align: "left" | "right" }) {
   const cost = usage ? turnCost(usage, price) : 0;
   const ctxIn = usage ? ((usage.contextInput ?? 0) || (usage.input + usage.cacheRead + usage.cacheWrite)) : 0;
   const toks = usage ? ctxIn + usage.output : 0;
@@ -1635,7 +1665,10 @@ function MetaStamp({ at, usage, price, align }: { at?: number; usage?: TurnUsage
   const clock = fmtClock(at);
   if (clock) parts.push(clock);
   if (usage && toks > 0) parts.push(fmtTokens(toks) + " tok");
-  if (cost > 0) parts.push(fmtCost(cost));
+  if (sub) {
+    if (sub.apiEquivCents > 0) parts.push(`~$${(sub.apiEquivCents / 100).toFixed(2)} API value`);
+    else parts.push("subscription · $0");
+  } else if (cost > 0) parts.push(fmtCost(cost));
   if (parts.length === 0) return null;
   return (
     <span
@@ -1720,7 +1753,7 @@ function BubbleBody({ m, isUser, memory, agentId, local, price }: { m: Msg; isUs
         )}
         {!isUser && m.role === "assistant" && m.streaming && !m.text && <Thinking />}
       </div>
-      <MetaStamp at={m.at} usage={usage} price={price} align={isUser ? "right" : "left"} />
+      <MetaStamp at={m.at} usage={usage} price={price} sub={m.role === "assistant" ? m.sub : undefined} align={isUser ? "right" : "left"} />
       {memory && (
         <span style={{ marginTop: 3, alignSelf: isUser ? "flex-end" : "flex-start", fontSize: 12, color: "#3fa46a" }}>{memory}</span>
       )}

@@ -1,14 +1,9 @@
-// AYGENT — Subscription Tauri commands (slice 2+4, UNWIRED).
+// AYGENT — Subscription Tauri commands (profiles, tokens, usage, turn log).
 //
-// NOT YET COMPILED IN: add to lib.rs `mod sub_cmds;` + `mod subscription;`
-// + `mod sub_loop;` + `mod sub_stream;` and register these fns in
-// invoke_handler. Landing the file first keeps the slice reviewable without
-// rewriting 300KB lib.rs over the API.
-//
-// v1 stores profile METADATA in the Keychain vault too (slot "sub:profiles"
-// as a JSON map) so slice 2 needs NO db migration. Secrets per profile live
-// under subscription::key_slot(id). The v16 tables (subscription_turn history)
-// land when agent_stream wiring happens.
+// Profile METADATA lives in the Keychain vault (slot "sub:profiles" as a JSON
+// map) so no DB migration was needed to ship profiles. Secrets per profile live
+// under subscription::key_slot(id). Turn history lives in its own tiny SQLite
+// (sub.db in app-data) — low volume, no writer-actor contention with aygent.db.
 
 use std::collections::HashMap;
 
@@ -53,6 +48,58 @@ fn new_id() -> String {
 
 fn valid_kind(kind: &str) -> bool {
     matches!(kind, "claude-code" | "codex")
+}
+
+/// Metadata for one profile (no secrets). Used by agent_stream resolution.
+pub(crate) fn get_profile(id: &str) -> Option<SubProfile> {
+    load_profiles().get(id).cloned()
+}
+
+/// (id, label) of every profile of a kind, label-sorted = failover order.
+pub(crate) fn profile_order(kind: &str) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = load_profiles()
+        .values()
+        .filter(|p| p.kind == kind)
+        .map(|p| (p.id.clone(), p.label.clone()))
+        .collect();
+    v.sort_by(|a, b| a.1.cmp(&b.1));
+    v
+}
+
+// --- Per-agent pinning ("Work agent always uses my Work seat") ----------------
+// Stored in the vault (no DB migration): slot "sub:pinned:{agent_id}".
+
+fn pin_slot(agent_id: &str) -> String {
+    format!("sub:pinned:{agent_id}")
+}
+
+/// Pinned profile id for an agent, if it still exists.
+pub(crate) fn pinned_profile(agent_id: &str) -> Option<String> {
+    let id = crate::keychain::get_key(&pin_slot(agent_id)).ok()?;
+    if id.trim().is_empty() {
+        return None;
+    }
+    get_profile(id.trim()).map(|p| p.id)
+}
+
+/// The pinned profile id for an agent ("" = auto). Used by the Agents picker.
+#[tauri::command]
+pub fn sub_pinned(agent_id: String) -> Result<String, String> {
+    Ok(pinned_profile(&agent_id).unwrap_or_default())
+}
+
+/// Pin (or unpin with an empty id) an agent to a profile. Kind mismatch is
+/// refused so the Agents picker can't strand an agent on the wrong seat.
+/// Keychain slot "sub:pinned:{agent_id}".
+#[tauri::command]
+pub fn sub_profile_pin(agent_id: String, profile_id: String) -> Result<(), String> {
+    let profile_id = profile_id.trim().to_string();
+    if profile_id.is_empty() {
+        return crate::keychain::set_key(&pin_slot(&agent_id), "");
+    }
+    let p = get_profile(&profile_id).ok_or("unknown subscription profile")?;
+    let _ = p; // existence checked; kind is enforced by the picker + turn
+    crate::keychain::set_key(&pin_slot(&agent_id), &profile_id)
 }
 
 #[tauri::command]
@@ -101,6 +148,25 @@ pub fn sub_profile_delete(id: String) -> Result<(), String> {
     Ok(())
 }
 
+fn store_tokens(id: &str, access: &str, refresh: &str, expires_at_ms: i64) -> Result<bool, String> {
+    if access.trim().is_empty() {
+        return Err("empty token — nothing stored".into());
+    }
+    let json = serde_json::to_string(&serde_json::json!({
+        "access_token": access.trim(),
+        "refresh_token": refresh.trim(),
+        "expires_at_ms": expires_at_ms,
+    }))
+    .map_err(|e| format!("encode tokens: {e}"))?;
+    crate::keychain::set_key(&crate::subscription::key_slot(id), &json)?;
+    Ok(crate::subscription::SubTokens {
+        access_token: access.to_string(),
+        refresh_token: refresh.to_string(),
+        expires_at_ms,
+    }
+    .expired())
+}
+
 /// Import OAuth tokens from the official CLI login into this profile.
 /// v1 = read ~/.claude/.credentials.json | ~/.codex/auth.json (user runs
 /// `claude login` / `codex login` in terminal first). Native OAuth later.
@@ -109,14 +175,40 @@ pub fn sub_profile_import_cli(id: String) -> Result<serde_json::Value, String> {
     let map = load_profiles();
     let p = map.get(&id).ok_or("unknown subscription profile")?;
     let toks = crate::subscription::import_cli(&p.kind)?;
-    let json = serde_json::to_string(&serde_json::json!({
-        "access_token": toks.access_token,
-        "refresh_token": toks.refresh_token,
-        "expires_at_ms": toks.expires_at_ms,
-    }))
-    .map_err(|e| format!("encode tokens: {e}"))?;
-    crate::keychain::set_key(&crate::subscription::key_slot(&id), &json)?;
-    Ok(serde_json::json!({ "ok": true, "expired": toks.expired() }))
+    let expired = store_tokens(&id, &toks.access_token, &toks.refresh_token, toks.expires_at_ms)?;
+    Ok(serde_json::json!({ "ok": true, "expired": expired }))
+}
+
+/// Paste-token flow (the PRIMARY Claude path on machines where the CLI keeps
+/// OAuth in the Keychain: run `claude setup-token` in terminal, paste here).
+/// Also covers any manual token case for either kind. Tokens go straight to
+/// the vault — the UI never keeps them.
+#[tauri::command]
+pub fn sub_profile_save_token(
+    id: String,
+    access_token: String,
+    refresh_token: Option<String>,
+) -> Result<serde_json::Value, String> {
+    if get_profile(&id).is_none() {
+        return Err("unknown subscription profile".into());
+    }
+    let expired = store_tokens(&id, &access_token, refresh_token.as_deref().unwrap_or(""), 0)?;
+    Ok(serde_json::json!({ "ok": true, "expired": expired }))
+}
+
+/// Curated model suggestions per seat (the OAuth APIs accept standard ids;
+/// the list keeps the picker honest without a network round-trip).
+#[tauri::command]
+pub fn sub_models(kind: String) -> Result<Vec<String>, String> {
+    match kind.as_str() {
+        "claude-code" => Ok(vec![
+            "claude-sonnet-4-5".to_string(),
+            "claude-opus-4-1".to_string(),
+            "claude-haiku-4-5".to_string(),
+        ]),
+        "codex" => Ok(vec!["gpt-5.2".to_string(), "gpt-5.1-codex-mini".to_string()]),
+        _ => Err(format!("unknown subscription kind: {kind}")),
+    }
 }
 
 /// Cached 5h-window usage for a profile (90s TTL — the endpoints 429 when hammered).
@@ -147,4 +239,95 @@ pub async fn sub_usage(id: String) -> Result<serde_json::Value, String> {
 #[tauri::command]
 pub async fn sub_probe(id: String, prompt: String) -> Result<serde_json::Value, String> {
     crate::sub_stream::sub_probe(id, prompt).await
+}
+
+// --- Active seat per channel -------------------------------------------------
+// agent_stream records which profile actually served each turn's channel; the
+// UI reads it at turn end to attribute the turn log (auto-pick means the UI
+// can't know the seat any other way). Process-local: restarts clear it, and a
+// missing entry just means "attribute to provider, not seat".
+
+#[derive(Debug, Clone)]
+struct ActiveSeat {
+    profile_id: String,
+    kind: String,
+    label: String,
+}
+
+static ACTIVE_SEAT: std::sync::Mutex<Option<HashMap<String, ActiveSeat>>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) fn note_active(channel: &str, profile_id: &str, kind: &str, label: &str) {
+    if let Ok(mut g) = ACTIVE_SEAT.lock() {
+        let m = g.get_or_insert_with(HashMap::new);
+        m.insert(
+            channel.to_string(),
+            ActiveSeat { profile_id: profile_id.to_string(), kind: kind.to_string(), label: label.to_string() },
+        );
+    }
+}
+
+/// Which seat served this channel's latest subscription turn (if any).
+#[tauri::command]
+pub fn sub_active(channel: String) -> Option<serde_json::Value> {
+    ACTIVE_SEAT
+        .lock()
+        .ok()?
+        .as_ref()?
+        .get(&channel)
+        .map(|s| serde_json::json!({ "profile_id": s.profile_id, "kind": s.kind, "label": s.label }))
+}
+
+// --- Turn log ($0 billed, tokens + api-equiv kept) ----------------------------
+
+fn sub_db(app: &tauri::AppHandle) -> Result<rusqlite::Connection, String> {
+    use tauri::Manager;
+    let dir = app.path().app_data_dir().map_err(|e| format!("app data dir: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir app data: {e}"))?;
+    let conn =
+        rusqlite::Connection::open(dir.join("sub.db")).map_err(|e| format!("open sub.db: {e}"))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS subscription_turn (
+           id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL,
+           profile_id TEXT NOT NULL, kind TEXT NOT NULL,
+           input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+           cache_read_tokens INTEGER NOT NULL DEFAULT 0, api_equiv_cents INTEGER NOT NULL DEFAULT 0,
+           created_at INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE INDEX IF NOT EXISTS idx_sub_turn_agent ON subscription_turn(agent_id, created_at DESC);",
+    )
+    .map_err(|e| format!("migrate sub.db: {e}"))?;
+    Ok(conn)
+}
+
+/// Log one finished subscription turn (called by the UI, which holds the summed
+/// Usage). Returns the API-equivalent cents for display.
+#[tauri::command]
+pub fn sub_log_turn(
+    app: tauri::AppHandle,
+    agent_id: String,
+    profile_id: String,
+    kind: String,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+) -> Result<serde_json::Value, String> {
+    if !valid_kind(&kind) {
+        return Err(format!("unknown subscription kind: {kind}"));
+    }
+    let equiv = crate::subscription::api_equivalent_cents(
+        &kind,
+        input.max(0) as u64,
+        output.max(0) as u64,
+        cache_read.max(0) as u64,
+    );
+    let conn = sub_db(&app)?;
+    conn.execute(
+        "INSERT INTO subscription_turn
+           (agent_id, profile_id, kind, input_tokens, output_tokens, cache_read_tokens, api_equiv_cents, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![agent_id, profile_id, kind, input, output, cache_read, equiv, now_ms()],
+    )
+    .map_err(|e| format!("log turn: {e}"))?;
+    Ok(serde_json::json!({ "ok": true, "api_equiv_cents": equiv }))
 }
