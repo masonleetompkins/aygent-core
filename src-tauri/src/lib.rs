@@ -4721,8 +4721,15 @@ async fn agent_stream(
                 finished_naturally = true;
                 break;
             }
-            if tool_calls_total > 0 {
-                let warn = format!("⚠️ turn interrupted after {tool_calls_total} tool calls ({e}). Work so far is saved — reply to continue.");
+            // 429 (rate-limited seat) degrades even with no work yet: an instant
+            // retry will not help, and a persisted note beats a bare error.
+            let rate_limited = e.contains("429");
+            if tool_calls_total > 0 || rate_limited {
+                let warn = if rate_limited {
+                    "⚠️ provider is rate-limiting this seat right now (429). Work so far is saved — reply to continue.".to_string()
+                } else {
+                format!("⚠️ turn interrupted after {tool_calls_total} tool calls ({e}). Work so far is saved — reply to continue.")
+                };
                 let _ = app.emit(&channel, &provider::StreamEvent::Info { text: warn.clone() });
                 messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": [{ "type": "text", "text": warn }] }));
                 finished_naturally = true;

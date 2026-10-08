@@ -55,6 +55,7 @@ pub async fn claude_oauth_complete(access_token: &str, model: &str, user_msg: &s
         .bearer_auth(access_token)
         .header("anthropic-version", "2023-06-01")
         .header("anthropic-beta", "oauth-2025-04-20")
+        .header("User-Agent", "claude-code/2.1.295")
         .header("content-type", "application/json")
         .json(&body)
         .send()

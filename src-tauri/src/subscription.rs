@@ -276,7 +276,7 @@ pub async fn fetch_usage(kind: &str, access_token: &str) -> Result<WindowUsage, 
                 .get("https://api.anthropic.com/api/oauth/usage")
                 .bearer_auth(access_token)
                 .header("anthropic-beta", "oauth-2025-04-20")
-                .header("User-Agent", "claude-code/2.1.198")
+                .header("User-Agent", "claude-code/2.1.295")
                 .send()
                 .await
                 .map_err(|e| format!("claude usage: {e}"))?;
