@@ -290,11 +290,11 @@ pub fn sub_profile_save_token(
 pub fn sub_models(kind: String) -> Result<Vec<String>, String> {
     match kind.as_str() {
         "claude-code" => Ok(vec![
+            "claude-opus-5-5".to_string(),
             "claude-sonnet-4-5".to_string(),
-            "claude-opus-4-1".to_string(),
             "claude-haiku-4-5".to_string(),
         ]),
-        "codex" => Ok(vec!["gpt-5.2".to_string(), "gpt-5.1-codex-mini".to_string()]),
+        "codex" => Ok(vec!["gpt-6.1-sol".to_string(), "gpt-6-sol".to_string()]),
         _ => Err(format!("unknown subscription kind: {kind}")),
     }
 }

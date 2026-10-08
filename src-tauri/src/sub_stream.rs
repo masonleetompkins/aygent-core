@@ -40,10 +40,11 @@ pub fn profile_token(id: &str) -> Result<(String, String), String> {
 /// Minimal Claude Messages call over the subscription OAuth.
 /// Returns assistant text; any 401/403 means re-login + re-import.
 pub async fn claude_oauth_complete(access_token: &str, model: &str, user_msg: &str) -> Result<String, String> {
-    let model = if model.is_empty() { "claude-sonnet-4-5" } else { model };
+    let model = if model.is_empty() { "claude-opus-5-5" } else { model };
     let body = json!({
         "model": model,
         "max_tokens": 512,
+        "system": [{ "type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude." }],
         "messages": [{ "role": "user", "content": user_msg }],
     });
     let client = reqwest::Client::builder()
@@ -109,20 +110,20 @@ pub async fn claude_oauth_complete(access_token: &str, model: &str, user_msg: &s
 
 /// Minimal OpenAI chat call over the ChatGPT (Codex) OAuth.
 pub async fn codex_oauth_complete(access_token: &str, model: &str, user_msg: &str) -> Result<String, String> {
-    let model = if model.is_empty() { "gpt-5.1-codex-mini" } else { model };
+    let model = if model.is_empty() { "gpt-6.1-sol" } else { model };
     let body = json!({
         "model": model,
-        "messages": [{ "role": "user", "content": user_msg }],
-        "stream": false,
+        "input": user_msg,
     });
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| format!("http: {e}"))?;
     let resp = client
-        .post("https://api.openai.com/v1/chat/completions")
+        .post("https://api.openai.com/v1/responses")
         .bearer_auth(access_token)
         .header("content-type", "application/json")
+        .header("originator", "codex_cli_rs")
         .json(&body)
         .send()
         .await
@@ -142,15 +143,23 @@ pub async fn codex_oauth_complete(access_token: &str, model: &str, user_msg: &st
         return Err(format!("codex oauth {status}: {text}"));
     }
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("bad json: {e}"))?;
-    let out = v
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .and_then(|a| a.first())
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string();
+    let mut out = String::new();
+    if let Some(items) = v.get("output").and_then(|o| o.as_array()) {
+        for item in items {
+            if item.get("type").and_then(|t| t.as_str()) != Some("message") {
+                continue;
+            }
+            if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
+                for part in parts {
+                    if part.get("type").and_then(|t| t.as_str()) == Some("output_text") {
+                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                            out.push_str(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
     if out.is_empty() {
         return Err(format!("empty completion; raw: {text}"));
     }
@@ -215,8 +224,8 @@ pub async fn resolve_seat(kind: &str, agent_id: &str) -> Result<(String, String,
 /// Default model when the agent leaves model blank on a seat.
 pub fn default_model(kind: &str) -> &'static str {
     if kind == "claude-code" {
-        "claude-sonnet-4-5"
+        "claude-opus-5-5"
     } else {
-        "gpt-5.2"
+        "gpt-6.1-sol"
     }
 }
