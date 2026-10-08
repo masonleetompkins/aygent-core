@@ -3961,6 +3961,27 @@ const AGENT_SYSTEM_LOCAL: &str = "You are AYGENT, a helpful AI assistant running
 /// slower and can loop unproductively, so we cap at 4 (Mason's call).
 const LOCAL_TOOL_TURN_CAP: usize = 4;
 
+/// TRANSIENT provider errors worth retrying within a turn (Mason 10-08):
+/// gateway 504s ("response stream did not start before the server timeout"),
+/// 502/503/529, transport cuts. Retried per-round; prior rounds' tool work is
+/// already in `messages`, so a retry re-sends the same history (no side-effect
+/// replay — tools already ran, results already recorded).
+fn is_transient_stream_err(e: &str) -> bool {
+    let l = e.to_lowercase();
+    l.contains("gatewaytimeout")
+        || l.contains("gateway timeout")
+        || l.contains("did not start before")
+        || l.contains("504")
+        || l.contains("502")
+        || l.contains("503")
+        || l.contains("529")
+        || l.contains("overloaded")
+        || l.contains("request failed")
+        || l.contains("stream error")
+        || l.contains("timeout")
+        || l.contains("temporarily")
+}
+
 /// STREAMING chat turn. `history` is the running conversation (array of
 /// {role, content}); we append the new user prompt, run the agent loop with
 /// streaming, emit events to the UI, and return the FULL updated history so the
@@ -4378,7 +4399,7 @@ async fn agent_stream(
             }
             let mut round_calls: usize = 0;
             let mut round_errs: usize = 0;
-            let stream_result = if provider_kind == "meta" {
+            let mut stream_result = if provider_kind == "meta" {
                 meta_provider::meta_stream_turn(
                     &key, &model, variant_opt, &sys, &messages, &tools, Some(&cancel_flag),
                     |ev| { let _ = app.emit(&channel, &ev); },
@@ -4389,11 +4410,46 @@ async fn agent_stream(
                     |ev| { let _ = app.emit(&channel, &ev); },
                 ).await
             };
+            // RETRY transient gateway/stream errors in-round (Mason 10-08: Muse 504
+            // "response stream did not start" mid-turn). Prior rounds already ran,
+            // so retrying the same history is safe (no tool re-execution).
+            if let Err(e) = &stream_result {
+                if e != "__CANCELLED__" && is_transient_stream_err(e) {
+                    let mut attempt: u64 = 1;
+                    while attempt < 3 && matches!(&stream_result, Err(ee) if is_transient_stream_err(ee)) {
+                        attempt += 1;
+                        let last = stream_result.as_ref().err().cloned().unwrap_or_default();
+                        let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("retrying after {last} (attempt {attempt}/3)…") });
+                        tokio::time::sleep(std::time::Duration::from_millis(800 * attempt)).await;
+                        stream_result = if provider_kind == "meta" {
+                            meta_provider::meta_stream_turn(
+                                &key, &model, variant_opt, &sys, &messages, &tools, Some(&cancel_flag),
+                                |ev| { let _ = app.emit(&channel, &ev); },
+                            ).await
+                        } else {
+                            openai_provider::openai_stream_turn(
+                                &provider_kind, &key, &model, variant_opt, &sys, &messages, &tools, Some(&cancel_flag),
+                                |ev| { let _ = app.emit(&channel, &ev); },
+                            ).await
+                        };
+                    }
+                }
+            }
             if let Err(e) = &stream_result {
                 if e == "__CANCELLED__" {
                     messages.as_array_mut().unwrap().push(serde_json::json!({
                         "role": "assistant", "content": "⏹️ stopped by user"
                     }));
+                    finished_naturally = true;
+                    break;
+                }
+                // KEEP THE STREAM (Mason 10-08): work already done this turn must
+                // survive a late-round provider error. Persist it + note, return
+                // Ok history, so the UI keeps every tool card + Reply continues.
+                if tool_calls_total > 0 || rounds > 1 {
+                    let warn = format!("⚠️ turn interrupted after {tool_calls_total} tool calls ({e}). Work so far is saved — reply to continue.");
+                    let _ = app.emit(&channel, &provider::StreamEvent::Info { text: warn.clone() });
+                    messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": warn }));
                     finished_naturally = true;
                     break;
                 }
@@ -4638,15 +4694,37 @@ async fn agent_stream(
             finished_naturally = true;
             break;
         }
-        let stream_result = provider::anthropic_stream_turn(
+        let mut stream_result = provider::anthropic_stream_turn(
             &key, sub_oauth.is_some(), &model, &anthropic_sys, &messages, &tools, Some(&cancel_flag),
             |ev| { let _ = app.emit(&channel, &ev); },
         ).await;
+        if let Err(e) = &stream_result {
+            if e != "__CANCELLED__" && is_transient_stream_err(e) {
+                let mut attempt: u64 = 1;
+                while attempt < 3 && matches!(&stream_result, Err(ee) if is_transient_stream_err(ee)) {
+                    attempt += 1;
+                    let last = stream_result.as_ref().err().cloned().unwrap_or_default();
+                    let _ = app.emit(&channel, &provider::StreamEvent::Info { text: format!("retrying after {last} (attempt {attempt}/3)…") });
+                    tokio::time::sleep(std::time::Duration::from_millis(800 * attempt)).await;
+                    stream_result = provider::anthropic_stream_turn(
+                        &key, sub_oauth.is_some(), &model, &anthropic_sys, &messages, &tools, Some(&cancel_flag),
+                        |ev| { let _ = app.emit(&channel, &ev); },
+                    ).await;
+                }
+            }
+        }
         if let Err(e) = &stream_result {
             if e == "__CANCELLED__" {
                 messages.as_array_mut().unwrap().push(serde_json::json!({
                     "role": "assistant", "content": [{ "type": "text", "text": "⏹️ stopped by user" }]
                 }));
+                finished_naturally = true;
+                break;
+            }
+            if tool_calls_total > 0 {
+                let warn = format!("⚠️ turn interrupted after {tool_calls_total} tool calls ({e}). Work so far is saved — reply to continue.");
+                let _ = app.emit(&channel, &provider::StreamEvent::Info { text: warn.clone() });
+                messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": [{ "type": "text", "text": warn }] }));
                 finished_naturally = true;
                 break;
             }
@@ -5041,11 +5119,17 @@ pub async fn run_headless_turn(
         }
     };
 
-    // 1) DISPATCH-TIME VISIBILITY: show the inbound message in the recipient's
-    //    inbox thread IMMEDIATELY (before any work), so "📨 from Atlas: …" appears
-    //    the instant it's sent. We persist it now + emit a stream event so an
-    //    open pane renders it live.
-    {
+    // 1) DISPATCH-TIME VISIBILITY (Mason 10-08): peer/remote/scheduler messages
+    //    show inbound immediately ("📨 from Atlas: …"). Continuations do NOT:
+    //    a wake-up is the model resuming its OWN work, so it streams as a new
+    //    assistant response — no blue user bubble, no InboundMessage. The turn's
+    //    assistant reply (persisted at end-of-turn) is the visible record.
+    //    (Before: every poll wrote "⏰ resumed: proc-…" as the user, which
+    //    read like the human nagging the model.)
+    if is_continue {
+        let _ = app.emit(&stream_channel, &provider::StreamEvent::Info { text: "continuing…".into() });
+    }
+    if !is_continue {
         let conv_id = if is_telegram { format!("telegram-{agent_id}") } else { continue_conv.clone().unwrap_or_else(|| format!("inbox-{agent_id}")) };
         let existing = repo::load_conversation(db, &conv_id).ok();
         let mut ui_msgs = existing.as_ref().and_then(|c| c.msgs.as_array().cloned()).unwrap_or_default();
@@ -5186,10 +5270,29 @@ pub async fn run_headless_turn(
             // human path emits — so an open pane WATCHES the work happen (tokens +
             // tool cards), not just a rail spinner.
             let model_msgs = with_prior(&messages);
-            let (content, stop) = provider::anthropic_stream_turn(
+            let mut hl_result = provider::anthropic_stream_turn(
                 &key, false, &model, &system, &model_msgs, &tools, Some(&hl_cancel_flag),
                 |ev| { let _ = app.emit(&stream_channel, &ev); },
-            ).await?;
+            ).await;
+            if let Err(e) = &hl_result {
+                if e != "__CANCELLED__" && is_transient_stream_err(e) {
+                    let mut attempt: u64 = 1;
+                    while attempt < 3 && matches!(&hl_result, Err(ee) if is_transient_stream_err(ee)) {
+                        attempt += 1;
+                        let last = hl_result.as_ref().err().cloned().unwrap_or_default();
+                        let _ = app.emit(&stream_channel, &provider::StreamEvent::Info { text: format!("retrying after {last} (attempt {attempt}/3)…") });
+                        tokio::time::sleep(std::time::Duration::from_millis(800 * attempt)).await;
+                        hl_result = provider::anthropic_stream_turn(
+                            &key, false, &model, &system, &model_msgs, &tools, Some(&hl_cancel_flag),
+                            |ev| { let _ = app.emit(&stream_channel, &ev); },
+                        ).await;
+                    }
+                }
+            }
+            let (content, stop) = match hl_result {
+                Ok(v) => v,
+                Err(e) => { reply_text = format!("(couldn't complete the reply: {e}) — work so far is kept; it will resume on the next wake-up."); break; }
+            };
             messages.as_array_mut().unwrap().push(serde_json::json!({ "role": "assistant", "content": content.clone() }));
             let mut tool_results = Vec::new();
             // Dedupe identical send_message calls WITHIN one turn: the model

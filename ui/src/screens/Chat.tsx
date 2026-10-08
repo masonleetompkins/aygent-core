@@ -686,7 +686,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       void persistFor(myConvId, finalMsgs, historyRef.current);
       setContinueNote(null);
     } catch (err) {
-      const errMsgs: Msg[] = [...msgsRef.current, { role: "assistant", text: `✗ ${String(err)}`, tools: [], streaming: false, at: Date.now() }];
+      // KEEP THE STREAM (Mason 10-08): a late provider error must not wipe
+      // the tool cards + text that already streamed this turn.
+      const snap = getAgentTurnSnapshot(mySlot);
+      const keptText = (snap.liveText || "").trim();
+      const keptTools = (snap.liveTools || []) as ToolLine[];
+      const errText = String(err);
+      const text = keptText ? `${keptText}\n\n✗ ${errText} — work above is kept; reply to continue.` : `✗ ${errText}`;
+      const errMsgs: Msg[] = [...msgsRef.current, { role: "assistant", text, tools: keptTools, timeline: snap.timeline, streaming: false, at: Date.now(), usage: snap.usage }];
       if (agentId === myAgent && convIdRef.current === myConvId) { msgsRef.current = errMsgs; setMsgs(errMsgs); }
       void persistFor(myConvId, errMsgs, historyRef.current);
     }
@@ -890,7 +897,12 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       void persistFor(myConvId, finalMsgs, historyRef.current);
       runningChannelRef.current = null;
     } catch (err) {
-      const errMsgs: Msg[] = [...withUser, { role: "assistant", text: `✗ ${String(err)}`, tools: [], streaming: false, at: Date.now() }];
+      const snap2 = getAgentTurnSnapshot(mySlot);
+      const keptText2 = (snap2.liveText || "").trim();
+      const keptTools2 = (snap2.liveTools || []) as ToolLine[];
+      const errText2 = String(err);
+      const text2 = keptText2 ? `${keptText2}\n\n✗ ${errText2} — work above is kept; reply to continue.` : `✗ ${errText2}`;
+      const errMsgs: Msg[] = [...withUser, { role: "assistant", text: text2, tools: keptTools2, timeline: snap2.timeline, streaming: false, at: Date.now(), usage: snap2.usage }];
       if (agentId === myAgent && convIdRef.current === myConvId) { msgsRef.current = errMsgs; setMsgs(errMsgs); }
       void persistFor(myConvId, errMsgs, historyRef.current);
       runningChannelRef.current = null;
