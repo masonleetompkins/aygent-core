@@ -109,6 +109,16 @@ function KindSection({ kind, title, blurb }: { kind: string; title: string; blur
     } catch (e) { setMsg("✗ " + String(e)); }
     finally { setBusy(null); }
   }
+  async function test(p: Profile) {
+    setBusy("test:" + p.id); setMsg(null);
+    try {
+      const r = await invoke<any>("sub_probe", { id: p.id, prompt: "Reply with exactly: OK" });
+      const text = String(r?.text ?? "").trim().slice(0, 200);
+      setMsg(text.toUpperCase().includes("OK") ? `✓ ${p.label} chats fine` : `✓ ${p.label} replied: ${text || "(empty)"}`);
+      await refresh();
+    } catch (e) { setMsg("✗ test turn failed: " + String(e).slice(0, 300)); }
+    finally { setBusy(null); }
+  }
   async function remove(p: Profile) {
     if (!window.confirm(`Remove subscription profile "${p.label}"? (Tokens forgotten.)`)) return;
     try { await invoke("sub_profile_delete", { id: p.id }); await refresh(); }
@@ -145,6 +155,11 @@ function KindSection({ kind, title, blurb }: { kind: string; title: string; blur
             <Button variant="secondary" onClick={() => void importCli(p)} disabled={busy === p.id}>
               {busy === p.id ? "…" : p.has_token ? "Re-import" : "Import from CLI"}
             </Button>
+            {p.has_token && (
+              <Button variant="secondary" onClick={() => void test(p)} disabled={busy === "test:" + p.id}>
+                {busy === "test:" + p.id ? "…" : "Test"}
+              </Button>
+            )}
             <Button variant="secondary" onClick={() => void remove(p)}>Remove</Button>
           </span>
         </div>

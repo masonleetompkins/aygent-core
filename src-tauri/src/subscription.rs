@@ -286,7 +286,11 @@ pub async fn fetch_usage(kind: &str, access_token: &str) -> Result<WindowUsage, 
                 return Err("claude usage rate-limited (endpoint throttles — retry in 60s)".into());
             }
             if !status.is_success() {
-                return Err(format!("claude usage {status}: {text}"));
+                if status.as_u16() == 403 && text.contains("oauth_scope_insufficient") {
+                    return Err("usage meter needs a full CLI login — this token can still chat (use Test)".into());
+                }
+                let short: String = text.chars().take(200).collect();
+                return Err(format!("claude usage {status}: {short}"));
             }
             let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("claude usage parse: {e}"))?;
             Ok(parse_claude_usage(&v))
