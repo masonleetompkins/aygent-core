@@ -1,8 +1,9 @@
-// AYGENT — Subscription Tauri commands (slice 2, UNWIRED).
+// AYGENT — Subscription Tauri commands (slice 2+4, UNWIRED).
 //
 // NOT YET COMPILED IN: add to lib.rs `mod sub_cmds;` + `mod subscription;`
-// and register these fns in invoke_handler. Landing the file first keeps the
-// slice reviewable without rewriting 300KB lib.rs over the API.
+// + `mod sub_loop;` + `mod sub_stream;` and register these fns in
+// invoke_handler. Landing the file first keeps the slice reviewable without
+// rewriting 300KB lib.rs over the API.
 //
 // v1 stores profile METADATA in the Keychain vault too (slot "sub:profiles"
 // as a JSON map) so slice 2 needs NO db migration. Secrets per profile live
@@ -139,4 +140,11 @@ pub async fn sub_usage(id: String) -> Result<serde_json::Value, String> {
         })),
         Err(e) => Ok(serde_json::json!({ "ok": false, "error": e })),
     }
+}
+
+/// Live probe: one minimal completion over the profile's subscription OAuth.
+/// Proves the token-loop spends SUB credits before we wire streaming + tools.
+#[tauri::command]
+pub async fn sub_probe(id: String, prompt: String) -> Result<serde_json::Value, String> {
+    crate::sub_stream::sub_probe(id, prompt).await
 }
