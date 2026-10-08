@@ -175,7 +175,7 @@ function PasteToken({ profiles, onDone, forcePid, hint, open }: { profiles: Prof
     if (!pid || !tok.trim()) return;
     setMsg(null);
     try {
-      await invoke("sub_profile_save_token", { id: pid, access_token: tok.trim() });
+      await invoke("sub_profile_save_token", { id: pid, accessToken: tok.trim() });
       setTok("");
       setMsg("✓ token saved to Keychain");
       onDone();
