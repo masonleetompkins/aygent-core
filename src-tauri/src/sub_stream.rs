@@ -111,9 +111,11 @@ pub async fn claude_oauth_complete(access_token: &str, model: &str, user_msg: &s
 /// Minimal OpenAI chat call over the ChatGPT (Codex) OAuth.
 pub async fn codex_oauth_complete(access_token: &str, account_id: &str, model: &str, user_msg: &str) -> Result<String, String> {
     let model = if model.is_empty() { "gpt-6.1-sol" } else { model };
+    // NOTE: this backend rejects a bare-string input (400 "Input must be a
+    // list") — always send the message-object form.
     let body = json!({
         "model": model,
-        "input": user_msg,
+        "input": [{ "role": "user", "content": [{ "type": "input_text", "text": user_msg }] }],
         "store": false,
     });
     let client = reqwest::Client::builder()
