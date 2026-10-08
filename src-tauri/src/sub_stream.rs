@@ -61,6 +61,12 @@ pub async fn claude_oauth_complete(access_token: &str, model: &str, user_msg: &s
         .await
         .map_err(|e| format!("claude oauth: {e}"))?;
     let status = resp.status();
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let text = resp.text().await.unwrap_or_default();
     if status.as_u16() == 401 || status.as_u16() == 403 {
         return Err(format!("claude oauth rejected ({status}) — re-run `claude login` then Re-import: {text}"));
@@ -68,7 +74,17 @@ pub async fn claude_oauth_complete(access_token: &str, model: &str, user_msg: &s
     if !status.is_success() {
         // Surface exhausted distinctly so the loop can failover.
         if crate::sub_loop::is_exhausted_error(&format!("{status} {text}")) {
-            return Err(format!("__EXHAUSTED__ claude {status}: {text}"));
+            // 429 on a seat usually means the subscription window is full right
+            // now — say when to retry instead of dumping the raw body.
+            if status.as_u16() == 429 {
+                let when = if retry_after.is_empty() {
+                    "wait a bit".to_string()
+                } else {
+                    format!("retry in {retry_after}s")
+                };
+                return Err(format!("Claude says rate-limited (429) — {when}, then Test again"));
+            }
+            return Err(format!("claude {status}: {}", text.chars().take(200).collect::<String>()));
         }
         return Err(format!("claude oauth {status}: {text}"));
     }
@@ -116,7 +132,10 @@ pub async fn codex_oauth_complete(access_token: &str, model: &str, user_msg: &st
     }
     if !status.is_success() {
         if crate::sub_loop::is_exhausted_error(&format!("{status} {text}")) {
-            return Err(format!("__EXHAUSTED__ codex {status}: {text}"));
+            if status.as_u16() == 429 {
+                return Err("ChatGPT says rate-limited (429) — wait a bit, then Test again".into());
+            }
+            return Err(format!("codex {status}: {}", text.chars().take(200).collect::<String>()));
         }
         return Err(format!("codex oauth {status}: {text}"));
     }
@@ -138,12 +157,17 @@ pub async fn codex_oauth_complete(access_token: &str, model: &str, user_msg: &st
 
 /// Probe a profile end-to-end: resolve token, run the right complete().
 /// Returns (kind, assistant_text). Live-verify entry point.
+fn user_facing(e: String) -> String {
+    // Test results are human-readable by contract: bounded text only.
+    e.chars().take(300).collect()
+}
+
 pub async fn sub_probe(id: String, prompt: String) -> Result<serde_json::Value, String> {
-    let (kind, access) = profile_token(&id)?;
+    let (kind, access) = profile_token(&id).map_err(user_facing)?;
     let text = match kind.as_str() {
-        "claude-code" => claude_oauth_complete(&access, "", &prompt).await?,
-        "codex" => codex_oauth_complete(&access, "", &prompt).await?,
-        k => return Err(format!("unknown kind: {k}")),
+        "claude-code" => claude_oauth_complete(&access, "", &prompt).await.map_err(user_facing)?,
+        "codex" => codex_oauth_complete(&access, "", &prompt).await.map_err(user_facing)?,
+        k => return Err(user_facing(format!("unknown kind: {k}"))),
     };
     Ok(serde_json::json!({ "ok": true, "kind": kind, "text": text }))
 }
