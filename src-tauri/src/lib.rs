@@ -82,6 +82,10 @@ mod video_media; // VIDEO v0.3: aygent-media:// jailed range-capable media servi
 mod video_tools; // VIDEO v0.3: video_* agent tools (frame-accurate edit helpers).
 mod video_hyperframes; // VIDEO: Hyperframes transparent overlays — graphics + captions (T1/V3 clips).
 mod continue_gate; // task_continue v2 (Mason 09-22): poll-every-30s or wait-for-Continue, no timer picker.
+mod subscription;
+mod sub_cmds;
+mod sub_loop;
+mod sub_stream;
 
 use std::sync::Arc;
 use rand::Rng;
@@ -5453,7 +5457,8 @@ pub fn run() {
             github_git_auth,
             telegram_status, telegram_set_token, telegram_test_token,
             onboarding_status, onboarding_pick_root, onboarding_set_root,
-            onboarding_make_agent_home, onboarding_finish, import_memory
+            onboarding_make_agent_home, onboarding_finish, import_memory,
+            sub_cmds::sub_profiles_list, sub_cmds::sub_profile_create, sub_cmds::sub_profile_delete, sub_cmds::sub_profile_import_cli, sub_cmds::sub_usage, sub_cmds::sub_probe
         ])
         .register_uri_scheme_protocol(video_media::SCHEME, video_media::handle)
         .setup(move |_app| {
