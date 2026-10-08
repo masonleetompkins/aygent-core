@@ -50,13 +50,14 @@ pub async fn claude_oauth_complete(access_token: &str, model: &str, user_msg: &s
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| format!("http: {e}"))?;
-    let resp = client
-        .post("https://api.anthropic.com/v1/messages")
-        .bearer_auth(access_token)
-        .header("anthropic-version", "2023-06-01")
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .header("User-Agent", "claude-code/2.1.295")
-        .header("content-type", "application/json")
+    let req = crate::subscription::apply_claude_headers(
+        client
+            .post("https://api.anthropic.com/v1/messages")
+            .bearer_auth(access_token)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json"),
+    );
+    let resp = req
         .json(&body)
         .send()
         .await

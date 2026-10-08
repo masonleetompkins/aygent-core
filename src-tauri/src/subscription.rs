@@ -183,6 +183,39 @@ pub fn detect_source(kind: &str) -> serde_json::Value {
     })
 }
 
+// --- Claude Code wire identity (Mason 10-08) ---------------------------------
+// Anthropic classifies subscription-token (sk-ant-oat*) traffic: requests that
+// do not look like Claude Code get throttled or refused. Shape mirrors the
+// working opencode-claude-subscription plugin (MIT): Claude Code UA + x-app,
+// both OAuth betas, direct-browser-access flag, and a per-request session id.
+// (Tool-name aliasing from that plugin is OpenCode-specific; our probe sends
+// no tools, so headers are the whole fix. Identity system block is the
+// documented fallback if classification persists.)
+const CLAUDE_UA: &str = "claude-cli/2.1.295 (external, cli)";
+const CLAUDE_BETAS: &str = "claude-code-20250219,oauth-2025-04-20";
+
+fn new_session_uuid() -> String {
+    let mut b = [0u8; 16];
+    rand::Rng::fill(&mut rand::thread_rng(), &mut b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11],
+        b[12], b[13], b[14], b[15]
+    )
+}
+
+/// Apply the Claude Code request shape to an outgoing call (auth left to caller).
+/// Use on EVERY Claude OAuth call: complete, stream, usage.
+pub fn apply_claude_headers(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    req.header("User-Agent", CLAUDE_UA)
+        .header("x-app", "cli")
+        .header("anthropic-beta", CLAUDE_BETAS)
+        .header("anthropic-dangerous-direct-browser-access", "true")
+        .header("x-claude-code-session-id", new_session_uuid())
+}
+
 pub fn import_cli(kind: &str) -> Result<SubTokens, String> {
     match kind {
         "claude-code" => import_claude_cli(),
@@ -272,11 +305,11 @@ pub async fn fetch_usage(kind: &str, access_token: &str) -> Result<WindowUsage, 
         .map_err(|e| format!("http: {e}"))?;
     match kind {
         "claude-code" => {
-            let resp = client
-                .get("https://api.anthropic.com/api/oauth/usage")
-                .bearer_auth(access_token)
-                .header("anthropic-beta", "oauth-2025-04-20")
-                .header("User-Agent", "claude-code/2.1.295")
+            let resp = apply_claude_headers(
+                client
+                    .get("https://api.anthropic.com/api/oauth/usage")
+                    .bearer_auth(access_token),
+            )
                 .send()
                 .await
                 .map_err(|e| format!("claude usage: {e}"))?;

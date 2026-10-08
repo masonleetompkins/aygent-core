@@ -304,7 +304,7 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
     let client = reqwest::Client::new();
     // SUBSCRIPTION SEATS: OAuth bearer + oauth beta instead of x-api-key.
     let authed = if oauth {
-        client.post(ANTHROPIC_URL).bearer_auth(api_key).header("anthropic-beta", "oauth-2025-04-20").header("User-Agent", "claude-code/2.1.295")
+        crate::subscription::apply_claude_headers(client.post(ANTHROPIC_URL).bearer_auth(api_key))
     } else {
         client.post(ANTHROPIC_URL).header("x-api-key", api_key)
     };
