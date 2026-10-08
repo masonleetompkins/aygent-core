@@ -117,6 +117,8 @@ pub async fn codex_oauth_complete(access_token: &str, account_id: &str, model: &
         "model": model,
         "input": [{ "role": "user", "content": [{ "type": "input_text", "text": user_msg }] }],
         "store": false,
+        // This backend REQUIRES streaming (400 otherwise).
+        "stream": true,
     });
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
@@ -139,39 +141,65 @@ pub async fn codex_oauth_complete(access_token: &str, account_id: &str, model: &
         .await
         .map_err(|e| format!("codex oauth: {e}"))?;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
+    // NOTE: the success path streams (body consumed below), so error
+    // branches read the body themselves.
     if status.as_u16() == 401 || status.as_u16() == 403 {
+        let text = resp.text().await.unwrap_or_default();
         return Err(format!("codex oauth rejected ({status}) — re-run `codex login` then Re-import: {}", text.chars().take(200).collect::<String>()));
     }
     if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
         if crate::sub_loop::is_exhausted_error(&format!("{status} {text}")) {
             if status.as_u16() == 429 {
                 return Err("ChatGPT says rate-limited (429) — wait a bit, then Test again".into());
             }
             return Err(format!("codex {status}: {}", text.chars().take(200).collect::<String>()));
         }
-        return Err(format!("codex oauth {status}: {text}"));
+        return Err(format!("codex oauth {status}: {}", text.chars().take(200).collect::<String>()));
     }
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("bad json: {e}"))?;
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
     let mut out = String::new();
-    if let Some(items) = v.get("output").and_then(|o| o.as_array()) {
-        for item in items {
-            if item.get("type").and_then(|t| t.as_str()) != Some("message") {
+    let mut last_type = String::new();
+    let mut done = false;
+    while !done {
+        let Some(chunk) = stream.next().await else { break };
+        let bytes = chunk.map_err(|e| format!("codex stream: {e}"))?;
+        buf.extend_from_slice(&bytes);
+        while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+            let frame = String::from_utf8_lossy(&buf[..pos]).into_owned();
+            buf.drain(..pos + 2);
+            let mut data = String::new();
+            for line in frame.lines() {
+                let line = line.trim_start();
+                if let Some(d) = line.strip_prefix("data:") {
+                    data.push_str(d.trim());
+                }
+            }
+            if data.is_empty() || data == "[DONE]" {
                 continue;
             }
-            if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
-                for part in parts {
-                    if part.get("type").and_then(|t| t.as_str()) == Some("output_text") {
-                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                            out.push_str(t);
-                        }
-                    }
+            let ev: serde_json::Value = match serde_json::from_str(&data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let t = ev.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            if !t.is_empty() {
+                last_type = t.clone();
+            }
+            if t == "response.output_text.delta" {
+                if let Some(d) = ev.get("delta").and_then(|d| d.as_str()) {
+                    out.push_str(d);
                 }
+            } else if t == "response.completed" || t == "response.failed" || t == "response.incomplete" {
+                done = true;
+                break;
             }
         }
     }
     if out.is_empty() {
-        return Err(format!("empty completion; raw: {text}"));
+        return Err(format!("empty completion (last event: {})", if last_type.is_empty() { "none" } else { &last_type }));
     }
     Ok(out)
 }
