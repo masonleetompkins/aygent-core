@@ -148,7 +148,7 @@ pub fn sub_profile_delete(id: String) -> Result<(), String> {
     Ok(())
 }
 
-fn store_tokens(id: &str, access: &str, refresh: &str, expires_at_ms: i64) -> Result<bool, String> {
+fn store_tokens(id: &str, access: &str, refresh: &str, expires_at_ms: i64, account_id: &str) -> Result<bool, String> {
     if access.trim().is_empty() {
         return Err("empty token — nothing stored".into());
     }
@@ -156,6 +156,7 @@ fn store_tokens(id: &str, access: &str, refresh: &str, expires_at_ms: i64) -> Re
         "access_token": access.trim(),
         "refresh_token": refresh.trim(),
         "expires_at_ms": expires_at_ms,
+        "account_id": account_id.trim(),
     }))
     .map_err(|e| format!("encode tokens: {e}"))?;
     crate::keychain::set_key(&crate::subscription::key_slot(id), &json)?;
@@ -163,6 +164,7 @@ fn store_tokens(id: &str, access: &str, refresh: &str, expires_at_ms: i64) -> Re
         access_token: access.to_string(),
         refresh_token: refresh.to_string(),
         expires_at_ms,
+        account_id: account_id.to_string(),
     }
     .expired())
 }
@@ -251,7 +253,7 @@ pub fn sub_connect(kind: String) -> Result<serde_json::Value, String> {
     let p = ensure_profile(&kind)?;
     let toks =
         crate::subscription::import_cli(&kind).map_err(|e| actionable_import_err(&kind, e))?;
-    let expired = store_tokens(&p.id, &toks.access_token, &toks.refresh_token, toks.expires_at_ms)?;
+    let expired = store_tokens(&p.id, &toks.access_token, &toks.refresh_token, toks.expires_at_ms, &toks.account_id)?;
     Ok(serde_json::json!({ "ok": true, "connected": true, "id": p.id, "label": p.label, "expired": expired }))
 }
 
@@ -263,7 +265,7 @@ pub fn sub_profile_import_cli(id: String) -> Result<serde_json::Value, String> {
     let map = load_profiles();
     let p = map.get(&id).ok_or("unknown subscription profile")?;
     let toks = crate::subscription::import_cli(&p.kind).map_err(|e| actionable_import_err(&p.kind, e))?;
-    let expired = store_tokens(&id, &toks.access_token, &toks.refresh_token, toks.expires_at_ms)?;
+    let expired = store_tokens(&id, &toks.access_token, &toks.refresh_token, toks.expires_at_ms, &toks.account_id)?;
     Ok(serde_json::json!({ "ok": true, "expired": expired }))
 }
 
@@ -280,7 +282,7 @@ pub fn sub_profile_save_token(
     if get_profile(&id).is_none() {
         return Err("unknown subscription profile".into());
     }
-    let expired = store_tokens(&id, &access_token, refresh_token.as_deref().unwrap_or(""), 0)?;
+    let expired = store_tokens(&id, &access_token, refresh_token.as_deref().unwrap_or(""), 0, "")?;
     Ok(serde_json::json!({ "ok": true, "expired": expired }))
 }
 

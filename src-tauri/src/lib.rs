@@ -1776,11 +1776,11 @@ async fn compact_history(db: &writer::Db, agent_id: &str, history: Vec<serde_jso
             cleaned
         }
         "claude-code" | "codex" => {
-            let (_, token, _, _) = crate::sub_stream::resolve_seat(&provider, agent_id).await?;
+            let (_, token, pid, _) = crate::sub_stream::resolve_seat(&provider, agent_id).await?;
             if provider == "claude-code" {
                 crate::sub_stream::claude_oauth_complete(&token, &agent.model, &ask).await?
             } else {
-                crate::sub_stream::codex_oauth_complete(&token, &agent.model, &ask).await?
+                crate::sub_stream::codex_oauth_complete(&token, &crate::sub_stream::profile_account(&pid), &agent.model, &ask).await?
             }
         }
         _ => return Err("compaction needs a cloud provider (Anthropic/OpenAI/OpenRouter) or a local model".into()),
@@ -2323,11 +2323,11 @@ async fn agent_generate_soul(
             else { openai_provider::complete(&provider, &key, &model, &meta).await? }
         }
         "claude-code" | "codex" => {
-            let (_, token, _, _) = crate::sub_stream::resolve_seat(&provider, &agent_id).await?;
+            let (_, token, pid, _) = crate::sub_stream::resolve_seat(&provider, &agent_id).await?;
             if provider == "claude-code" {
                 crate::sub_stream::claude_oauth_complete(&token, &agent.model, &meta).await?
             } else {
-                crate::sub_stream::codex_oauth_complete(&token, &agent.model, &meta).await?
+                crate::sub_stream::codex_oauth_complete(&token, &crate::sub_stream::profile_account(&pid), &agent.model, &meta).await?
             }
         }
         _ => return Err("Soul generation needs a cloud provider (Anthropic/OpenAI/OpenRouter) \

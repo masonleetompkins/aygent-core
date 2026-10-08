@@ -37,6 +37,7 @@ pub struct SubTokens {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at_ms: i64,
+    pub account_id: String,
 }
 
 impl SubTokens {
@@ -106,6 +107,7 @@ pub fn import_claude_cli() -> Result<SubTokens, String> {
             access_token: access,
             refresh_token: s(c, &["refreshToken", "refresh_token"]),
             expires_at_ms: i64_at(c, &["expiresAt", "expires_at", "expiresAtMs"]),
+            account_id: String::new(),
         });
     }
     Err(format!("no OAuth token in {}", p.display()))
@@ -126,6 +128,10 @@ pub fn import_codex_cli() -> Result<SubTokens, String> {
         access_token: access,
         refresh_token: s(&t, &["refresh_token", "refreshToken"]),
         expires_at_ms: i64_at(&t, &["expires_at", "expiresAt"]),
+        account_id: {
+            let a = s(&t, &["account_id"]);
+            if a.is_empty() { s(&v, &["account_id"]) } else { a }
+        },
     })
 }
 

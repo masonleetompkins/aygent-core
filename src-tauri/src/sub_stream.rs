@@ -109,21 +109,29 @@ pub async fn claude_oauth_complete(access_token: &str, model: &str, user_msg: &s
 }
 
 /// Minimal OpenAI chat call over the ChatGPT (Codex) OAuth.
-pub async fn codex_oauth_complete(access_token: &str, model: &str, user_msg: &str) -> Result<String, String> {
+pub async fn codex_oauth_complete(access_token: &str, account_id: &str, model: &str, user_msg: &str) -> Result<String, String> {
     let model = if model.is_empty() { "gpt-6.1-sol" } else { model };
     let body = json!({
         "model": model,
         "input": user_msg,
+        "store": false,
     });
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| format!("http: {e}"))?;
-    let resp = client
-        .post("https://api.openai.com/v1/responses")
+    // The Codex backend lives behind ChatGPT, not the platform API: account
+    // routing rides on chatgpt-account-id (Mason 10-08, verified against the
+    // CLI + codex-rs tests + langchain's codex wrapper).
+    let mut req = client
+        .post("https://chatgpt.com/backend-api/codex/responses")
         .bearer_auth(access_token)
         .header("content-type", "application/json")
-        .header("originator", "codex_cli_rs")
+        .header("originator", "codex_cli_rs");
+    if !account_id.trim().is_empty() {
+        req = req.header("chatgpt-account-id", account_id.trim());
+    }
+    let resp = req
         .json(&body)
         .send()
         .await
@@ -131,7 +139,7 @@ pub async fn codex_oauth_complete(access_token: &str, model: &str, user_msg: &st
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if status.as_u16() == 401 || status.as_u16() == 403 {
-        return Err(format!("codex oauth rejected ({status}) — re-run `codex login` then Re-import: {text}"));
+        return Err(format!("codex oauth rejected ({status}) — re-run `codex login` then Re-import: {}", text.chars().take(200).collect::<String>()));
     }
     if !status.is_success() {
         if crate::sub_loop::is_exhausted_error(&format!("{status} {text}")) {
@@ -166,6 +174,19 @@ pub async fn codex_oauth_complete(access_token: &str, model: &str, user_msg: &st
     Ok(out)
 }
 
+/// Stored ChatGPT account id for a profile ("" when imported before it was
+/// captured). Sent as chatgpt-account-id: the Codex backend routes on it.
+pub fn profile_account(id: &str) -> String {
+    let raw = match crate::keychain::get_key(&crate::subscription::key_slot(id)) {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("account_id").and_then(|a| a.as_str()).map(String::from))
+        .unwrap_or_default()
+}
+
 /// Probe a profile end-to-end: resolve token, run the right complete().
 /// Returns (kind, assistant_text). Live-verify entry point.
 fn user_facing(e: String) -> String {
@@ -177,7 +198,19 @@ pub async fn sub_probe(id: String, prompt: String) -> Result<serde_json::Value, 
     let (kind, access) = profile_token(&id).map_err(user_facing)?;
     let text = match kind.as_str() {
         "claude-code" => claude_oauth_complete(&access, "", &prompt).await.map_err(user_facing)?,
-        "codex" => codex_oauth_complete(&access, "", &prompt).await.map_err(user_facing)?,
+        "codex" => {
+                // Account id may predate stored profiles: fall back to a live
+                // file read (the CLI rotates these files; never refresh here —
+                // refresh tokens are single-use and refreshing would log the
+                // CLI out). Stale ACCESS tokens still need Re-import.
+                let mut acct = profile_account(&id);
+                if acct.is_empty() {
+                    if let Ok(t) = crate::subscription::import_cli("codex") {
+                        acct = t.account_id;
+                    }
+                }
+                codex_oauth_complete(&access, &acct, "", &prompt).await.map_err(user_facing)?
+            }
         k => return Err(user_facing(format!("unknown kind: {k}"))),
     };
     Ok(serde_json::json!({ "ok": true, "kind": kind, "text": text }))
