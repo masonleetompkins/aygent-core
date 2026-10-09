@@ -21,7 +21,3 @@ Settings Providers card: import SubProfiles + render <SubProfiles />.
    62pct resets 14:20 12.4k tok (~$1.23 API value).
 4. Live verify (both CLIs logged in): token-loop spends sub credits, usage
    endpoints parse, 429 fails over.
-
-## Pro
-usage_events.source=subscription, wallet untouched, bypass tier_lock + $25/d.
-Proxy never sees these turns. Entitlement unchanged — Core AND Pro.
