@@ -295,7 +295,18 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
         // emitted, tool_results stays empty, and the loop breaks: a silent death
         // exactly at "generation". 8192 gives tool calls real room.
         "max_tokens": 64000,
-        "system": cacheable_system(system),
+        "system": if oauth {
+            // Subscription seats ride the full Claude Code wire shape: the
+            // identity line leads as its own system block (Mason 10-08).
+            let mut blocks = vec![serde_json::json!({ "type": "text", "text": crate::subscription::CLAUDE_IDENTITY })];
+            match cacheable_system(system) {
+                serde_json::Value::Array(mut arr) => blocks.append(&mut arr),
+                other => blocks.push(other),
+            }
+            serde_json::Value::Array(blocks)
+        } else {
+            cacheable_system(system)
+        },
         "tools": cacheable_tools(tools),
         "messages": cacheable_messages(messages),
         "stream": true,

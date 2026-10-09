@@ -4009,6 +4009,7 @@ async fn agent_stream(
     let mut provider_kind = provider.unwrap_or_default();
     let mut model = model;
     let mut sub_oauth: Option<String> = None;
+    let mut sub_pid: Option<String> = None;
 
     // STOP BUTTON: register this turn's cancel flag under its event channel.
     // The guard's Drop removes the entry on ANY exit path (this fn has many:
@@ -4060,10 +4061,26 @@ async fn agent_stream(
         provider_kind = native;
         crate::sub_cmds::note_active(&channel, &pid, &kind, &plabel);
         sub_oauth = Some(token);
+        sub_pid = Some(pid);
         let _ = app.emit(&channel, &provider::StreamEvent::Info {
             text: format!("subscription · {kind} · {plabel} · $0 billed (usage tracked)"),
         });
     }
+    // Account routing for Codex seats (chatgpt-account-id header). Stored at
+    // import; falls back to a live CLI file read for older profiles.
+    let seat_account = || -> String {
+        let mut acct = sub_pid
+            .as_deref()
+            .map(crate::sub_stream::profile_account)
+            .unwrap_or_default();
+        if acct.is_empty() {
+            if let Ok(t) = crate::subscription::import_cli("codex") {
+                acct = t.account_id;
+            }
+        }
+        acct
+    };
+
     // If the agent has a folder but its scope isn't registered yet (e.g. created
     // this session), register it now so the jail is live for this turn.
     if let Ok(Some(fp)) = repo::folder_for(&db, &scope_id) {
@@ -4404,6 +4421,14 @@ async fn agent_stream(
                     &key, &model, variant_opt, &sys, &messages, &tools, Some(&cancel_flag),
                     |ev| { let _ = app.emit(&channel, &ev); },
                 ).await
+            } else if provider_kind == "openai" && sub_oauth.is_some() {
+                // CODEX SEAT: platform Chat Completions rejects ChatGPT OAuth
+                // (401 missing_scope) — ride the ChatGPT backend instead. Same
+                // OpenAI-shape result, so the loop below is untouched.
+                crate::sub_stream::codex_stream_turn(
+                    &key, &seat_account(), &model, variant_opt, &sys, &messages, &tools, Some(&cancel_flag),
+                    |ev| { let _ = app.emit(&channel, &ev); },
+                ).await
             } else {
                 openai_provider::openai_stream_turn(
                     &provider_kind, &key, &model, variant_opt, &sys, &messages, &tools, Some(&cancel_flag),
@@ -4424,6 +4449,11 @@ async fn agent_stream(
                         stream_result = if provider_kind == "meta" {
                             meta_provider::meta_stream_turn(
                                 &key, &model, variant_opt, &sys, &messages, &tools, Some(&cancel_flag),
+                                |ev| { let _ = app.emit(&channel, &ev); },
+                            ).await
+                        } else if provider_kind == "openai" && sub_oauth.is_some() {
+                            crate::sub_stream::codex_stream_turn(
+                                &key, &seat_account(), &model, variant_opt, &sys, &messages, &tools, Some(&cancel_flag),
                                 |ev| { let _ = app.emit(&channel, &ev); },
                             ).await
                         } else {
@@ -5189,6 +5219,7 @@ pub async fn run_headless_turn(
     // ---- SUBSCRIPTION SEATS (headless): same seat resolution as the human
     // path, attributed to the recipient's inbox channel.
     let mut sub_oauth_hl: Option<String> = None;
+    let mut sub_pid_hl: Option<String> = None;
     if crate::subscription::is_subscription_provider(&provider_kind) {
         let kind = provider_kind.clone();
         let (native, token, pid, plabel) = crate::sub_stream::resolve_seat(&kind, agent_id).await?;
@@ -5198,6 +5229,7 @@ pub async fn run_headless_turn(
         provider_kind = native;
         crate::sub_cmds::note_active(&stream_channel, &pid, &kind, &plabel);
         sub_oauth_hl = Some(token);
+        sub_pid_hl = Some(pid);
         let _ = app.emit(&stream_channel, &provider::StreamEvent::Info {
             text: format!("subscription · {kind} · {plabel} · $0 billed (usage tracked)"),
         });
@@ -5391,6 +5423,21 @@ pub async fn run_headless_turn(
             let mut round_text = String::new();
             let hl_stream = if provider_kind == "meta" {
                 meta_provider::meta_stream_turn(&key, &agent.model, variant_hl_opt, &system, &model_msgs, &tools, Some(&hl_cancel_flag),
+                    |ev| { if let provider::StreamEvent::TextDelta { text } = &ev { round_text.push_str(text); } let _ = app.emit(&stream_channel, &ev); }).await
+            } else if provider_kind == "openai" && sub_oauth_hl.is_some() {
+                // CODEX SEAT headless: same ChatGPT backend as human turns.
+                // pid is the serving profile (pinned or auto-picked at 5194).
+                let mut acct = sub_pid_hl
+            .as_deref()
+            .map(crate::sub_stream::profile_account)
+            .unwrap_or_default();
+                if acct.is_empty() {
+                    if let Ok(t) = crate::subscription::import_cli("codex") {
+                        acct = t.account_id;
+                    }
+                }
+                crate::sub_stream::codex_stream_turn(
+                    &key, &acct, &agent.model, variant_hl_opt, &system, &model_msgs, &tools, Some(&hl_cancel_flag),
                     |ev| { if let provider::StreamEvent::TextDelta { text } = &ev { round_text.push_str(text); } let _ = app.emit(&stream_channel, &ev); }).await
             } else {
                 openai_provider::openai_stream_turn(&provider_kind, &key, &agent.model, variant_hl_opt, &system, &model_msgs, &tools, Some(&hl_cancel_flag),

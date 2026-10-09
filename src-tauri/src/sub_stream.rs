@@ -204,6 +204,312 @@ pub async fn codex_oauth_complete(access_token: &str, account_id: &str, model: &
     Ok(out)
 }
 
+/// Codex seat TURN over the ChatGPT backend (Responses SSE), Mason 10-08.
+///
+/// The platform Chat Completions endpoint rejects ChatGPT OAuth tokens (401
+/// missing_scope), so seats ride the wire the CLI itself speaks:
+/// chatgpt.com/backend-api/codex/responses + account routing. Returns the
+/// OpenAI-native assistant shape ({role, content, tool_calls}) so the
+/// agent_stream openai loop runs UNCHANGED on top.
+/// `messages`/`tools` arrive in the same shapes the openai branch holds.
+pub async fn codex_stream_turn<F: FnMut(crate::provider::StreamEvent)>(
+    access_token: &str,
+    account_id: &str,
+    model: &str,
+    effort: Option<&str>,
+    instructions: &str,
+    messages: &serde_json::Value,
+    tools: &serde_json::Value,
+    cancel: Option<&crate::cancel::CancelFlag>,
+    mut on_event: F,
+) -> Result<(serde_json::Value, String), String> {
+    let mut body = serde_json::json!({
+        "model": model,
+        "instructions": instructions,
+        "input": codex_input(messages),
+        "tools": codex_tools(tools),
+        "store": false,
+        "stream": true,
+    });
+    // Sol reasoning effort: only known-good values ride along.
+    if let Some(e) = effort.map(str::trim).filter(|e| !e.is_empty()) {
+        if ["none", "low", "medium", "high", "xhigh", "max"].contains(&e) {
+            body["reasoning"] = serde_json::json!({ "effort": e });
+        }
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("http: {e}"))?;
+    let mut req = client
+        .post("https://chatgpt.com/backend-api/codex/responses")
+        .bearer_auth(access_token)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .header("originator", "codex_cli_rs");
+    if !account_id.trim().is_empty() {
+        req = req.header("chatgpt-account-id", account_id.trim());
+    }
+    let resp = req
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("codex stream request: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let short: String = text.chars().take(200).collect();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Err(format!("codex rejected ({status}) — re-run `codex login` then Re-import: {short}"));
+        }
+        return Err(format!("codex {status}: {short}"));
+    }
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut answer = String::new();
+    let mut calls: Vec<(String, String, String)> = Vec::new();
+    let mut arg_acc: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut item_to_call: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
+    let mut saw_done = false;
+    while let Some(chunk) = stream.next().await {
+        if cancel
+            .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(false)
+        {
+            on_event(crate::provider::StreamEvent::Done { stop_reason: "cancelled".into() });
+            return Err("__CANCELLED__".into());
+        }
+        let bytes = chunk.map_err(|e| format!("codex stream: {e}"))?;
+        buf.extend_from_slice(&bytes);
+        while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+            let frame = String::from_utf8_lossy(&buf[..pos]).into_owned();
+            buf.drain(..pos + 2);
+            let mut data = String::new();
+            for line in frame.lines() {
+                let line = line.trim_start();
+                if let Some(d) = line.strip_prefix("data:") {
+                    data.push_str(d.trim());
+                }
+            }
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let ev: serde_json::Value = match serde_json::from_str(&data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            match ev.get("type").and_then(|t| t.as_str()) {
+                Some("response.output_text.delta") => {
+                    if let Some(d) = ev.get("delta").and_then(|d| d.as_str()) {
+                        if !d.is_empty() {
+                            answer.push_str(d);
+                            on_event(crate::provider::StreamEvent::TextDelta { text: d.to_string() });
+                        }
+                    }
+                }
+                Some("response.output_item.added") => {
+                    if let Some(item) = ev.get("item") {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                            let iid = item.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                            let cid = item
+                                .get("call_id")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or(&iid)
+                                .to_string();
+                            let name = item.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                            if !iid.is_empty() {
+                                item_to_call.insert(iid.clone(), (cid, name));
+                            }
+                            arg_acc.entry(iid).or_default();
+                        }
+                    }
+                }
+                Some("response.function_call_arguments.delta") => {
+                    if let (Some(iid), Some(d)) = (
+                        ev.get("item_id").and_then(|x| x.as_str()),
+                        ev.get("delta").and_then(|x| x.as_str()),
+                    ) {
+                        arg_acc.entry(iid.to_string()).or_default().push_str(d);
+                    }
+                }
+                Some("response.output_item.done") => {
+                    if let Some(item) = ev.get("item") {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                            let iid = item.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                            let (cid, name) = item_to_call.remove(&iid).unwrap_or_else(|| {
+                                let c = item
+                                    .get("call_id")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or(&iid)
+                                    .to_string();
+                                let n = item.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                (c, n)
+                            });
+                            let mut args = arg_acc.remove(&iid).unwrap_or_default();
+                            if args.is_empty() {
+                                args = item
+                                    .get("arguments")
+                                    .and_then(|a| a.as_str())
+                                    .unwrap_or("{}")
+                                    .to_string();
+                            }
+                            let input: serde_json::Value =
+                                serde_json::from_str(&args).unwrap_or(serde_json::json!({}));
+                            on_event(crate::provider::StreamEvent::ToolUse { id: cid.clone(), name: name.clone(), input });
+                            calls.push((cid, name, args));
+                        }
+                    }
+                }
+                Some("response.completed") => {
+                    if let Some(u) = ev
+                        .get("response")
+                        .and_then(|r| r.get("usage"))
+                        .or_else(|| ev.get("usage"))
+                    {
+                        on_event(crate::provider::StreamEvent::Usage {
+                            input: u.get("input_tokens").and_then(|n| n.as_u64()).unwrap_or(0),
+                            output: u.get("output_tokens").and_then(|n| n.as_u64()).unwrap_or(0),
+                            cache_read: 0,
+                            cache_write: 0,
+                            cache_write_5m: 0,
+                            cache_write_1h: 0,
+                            context_window: 0,
+                        });
+                    }
+                    on_event(crate::provider::StreamEvent::Done { stop_reason: "completed".into() });
+                    saw_done = true;
+                }
+                Some("response.failed") | Some("response.error") | Some("error") => {
+                    let msg = ev
+                        .get("response")
+                        .and_then(|r| r.get("error"))
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .or_else(|| ev.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()))
+                        .or_else(|| ev.get("message").and_then(|m| m.as_str()))
+                        .unwrap_or("codex stream error");
+                    on_event(crate::provider::StreamEvent::Error { text: msg.to_string() });
+                    return Err(msg.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+    if !saw_done {
+        on_event(crate::provider::StreamEvent::Done { stop_reason: "completed".into() });
+    }
+    let mut tool_calls_json = Vec::new();
+    for (id, name, args) in &calls {
+        tool_calls_json.push(
+            serde_json::json!({ "id": id, "type": "function", "function": { "name": name, "arguments": args } }),
+        );
+    }
+    let mut assistant = serde_json::json!({ "role": "assistant", "content": answer });
+    let mut stop = String::from("completed");
+    if !tool_calls_json.is_empty() {
+        assistant["tool_calls"] = serde_json::json!(tool_calls_json);
+        stop = "tool_use".into();
+    }
+    Ok((assistant, stop))
+}
+
+/// OpenAI-native history (what the agent loop holds) -> Responses input items.
+/// Text passes through; tool_result blocks become function_call_output;
+/// assistant tool_calls become function_call items for replay.
+fn codex_input(messages: &serde_json::Value) -> serde_json::Value {
+    fn text_of(v: &serde_json::Value) -> String {
+        match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Null => String::new(),
+            _ => v.to_string(),
+        }
+    }
+    let mut out = Vec::new();
+    for m in messages.as_array().cloned().unwrap_or_default() {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user").to_string();
+        let content = m.get("content").cloned().unwrap_or(serde_json::Value::Null);
+        if role == "assistant" {
+            if let Some(tcs) = m.get("tool_calls").and_then(|t| t.as_array()) {
+                if !tcs.is_empty() {
+                    let txt = text_of(&content);
+                    if !txt.trim().is_empty() {
+                        out.push(serde_json::json!({ "role": "assistant", "content": [{ "type": "output_text", "text": txt }] }));
+                    }
+                    for tc in tcs {
+                        let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                        let f = tc.get("function").cloned().unwrap_or(serde_json::json!({}));
+                        let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                        let args = f.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}").to_string();
+                        out.push(serde_json::json!({ "type": "function_call", "call_id": id, "name": name, "arguments": args }));
+                    }
+                    continue;
+                }
+            }
+            let txt = text_of(&content);
+            if txt.trim().is_empty() {
+                continue;
+            }
+            out.push(serde_json::json!({ "role": "assistant", "content": [{ "type": "output_text", "text": txt }] }));
+            continue;
+        }
+        // user (and system-ish) turns
+        match &content {
+            serde_json::Value::String(s) if !s.trim().is_empty() => {
+                out.push(serde_json::json!({ "role": role, "content": [{ "type": "input_text", "text": s }] }));
+            }
+            serde_json::Value::Array(blocks) => {
+                let mut texts = Vec::new();
+                for b in blocks {
+                    let t = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    if t == "tool_result" {
+                        let cid = b.get("tool_use_id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                        out.push(serde_json::json!({ "type": "function_call_output", "call_id": cid, "output": text_of(b.get("content").unwrap_or(&serde_json::Value::Null)) }));
+                    } else if t == "text" || t == "input_text" {
+                        if let Some(s) = b.get("text").and_then(|s| s.as_str()) {
+                            texts.push(s.to_string());
+                        }
+                    } else if t == "image_url" {
+                        let url = b
+                            .get("image_url")
+                            .and_then(|u| u.get("url"))
+                            .and_then(|u| u.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !url.is_empty() {
+                            out.push(serde_json::json!({ "role": role, "content": [{ "type": "input_image", "image_url": url }] }));
+                        }
+                    }
+                }
+                let joined = texts.join("
+");
+                if !joined.trim().is_empty() {
+                    out.push(serde_json::json!({ "role": role, "content": [{ "type": "input_text", "text": joined }] }));
+                }
+            }
+            _ => {}
+        }
+    }
+    serde_json::Value::Array(out)
+}
+
+/// Registry tools ({name, description, input_schema}) -> Responses function tools.
+fn codex_tools(tools: &serde_json::Value) -> serde_json::Value {
+    let arr = tools.as_array().cloned().unwrap_or_default();
+    let out: Vec<serde_json::Value> = arr
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "type": "function",
+                "name": t.get("name").cloned().unwrap_or(serde_json::json!("")),
+                "description": t.get("description").cloned().unwrap_or(serde_json::json!("")),
+                "parameters": t.get("input_schema").cloned().unwrap_or(serde_json::json!({"type":"object"})),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(out)
+}
+
 /// Stored ChatGPT account id for a profile ("" when imported before it was
 /// captured). Sent as chatgpt-account-id: the Codex backend routes on it.
 pub fn profile_account(id: &str) -> String {

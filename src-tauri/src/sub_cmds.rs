@@ -286,18 +286,76 @@ pub fn sub_profile_save_token(
     Ok(serde_json::json!({ "ok": true, "expired": expired }))
 }
 
-/// Curated model suggestions per seat (the OAuth APIs accept standard ids;
-/// the list keeps the picker honest without a network round-trip).
+/// Model list per seat: live from the provider when a connected profile
+/// exists, curated fallback otherwise (Mason 10-08: curated-only hid models).
+/// Live Claude list = Models API over the seat token in full Claude Code
+/// shape; anything but 200 with parseable ids falls back silently.
 #[tauri::command]
-pub fn sub_models(kind: String) -> Result<Vec<String>, String> {
-    match kind.as_str() {
-        "claude-code" => Ok(vec![
-            "claude-opus-5-5".to_string(),
-            "claude-sonnet-4-5".to_string(),
-            "claude-haiku-4-5".to_string(),
-        ]),
-        "codex" => Ok(vec!["gpt-6.1-sol".to_string(), "gpt-6-sol".to_string()]),
-        _ => Err(format!("unknown subscription kind: {kind}")),
+pub async fn sub_models(kind: String) -> Result<Vec<String>, String> {
+    fn curated(kind: &str) -> Result<Vec<String>, String> {
+        match kind {
+            "claude-code" => Ok(vec![
+                "claude-opus-5-5".to_string(),
+                "claude-sonnet-4-5".to_string(),
+                "claude-haiku-4-5".to_string(),
+            ]),
+            "codex" => Ok(vec![
+                "gpt-6.1-sol".to_string(),
+                "gpt-6-sol".to_string(),
+                "gpt-6-luna".to_string(),
+                "gpt-6-astra".to_string(),
+            ]),
+            _ => Err(format!("unknown subscription kind: {kind}")),
+        }
+    }
+    if kind != "claude-code" {
+        return curated(&kind);
+    }
+    // First connected profile funds the attempt; never fails the picker.
+    let token: Option<String> = load_profiles()
+        .values()
+        .filter(|p| p.kind == "claude-code")
+        .find_map(|p| {
+            crate::keychain::get_key(&crate::subscription::key_slot(&p.id))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|v| v.get("access_token").and_then(|a| a.as_str()).map(String::from))
+                .filter(|a| !a.is_empty())
+        });
+    let Some(token) = token else {
+        return curated(&kind);
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return curated(&kind),
+    };
+    let req = crate::subscription::apply_claude_headers(
+        client
+            .get("https://api.anthropic.com/v1/models")
+            .bearer_auth(&token),
+    );
+    let live: Vec<String> = match req.send().await {
+        Ok(resp) if resp.status().is_success() => resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("data").and_then(|d| d.as_array()).cloned())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
+                    .filter(|id| !id.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    if live.is_empty() {
+        curated(&kind)
+    } else {
+        Ok(live)
     }
 }
 

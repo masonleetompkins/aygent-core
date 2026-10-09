@@ -200,6 +200,10 @@ pub fn detect_source(kind: &str) -> serde_json::Value {
 const CLAUDE_UA: &str = "claude-cli/2.1.295 (external, cli)";
 const CLAUDE_BETAS: &str = "claude-code-20250219,oauth-2025-04-20";
 
+/// First system block on subscription-shaped Claude calls (matches the
+/// working third-party recipe: the endpoint classifies on it).
+pub const CLAUDE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
 fn new_session_uuid() -> String {
     let mut b = [0u8; 16];
     rand::Rng::fill(&mut rand::thread_rng(), &mut b);
