@@ -278,6 +278,7 @@ fn find_double_newline(buf: &[u8]) -> Option<usize> {
 /// ToolUse event. Returns the assistant `content` array (for history) + stop.
 pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
     api_key: &str,
+    oauth: bool,
     model: &str,
     system: &str,
     messages: &serde_json::Value,
@@ -294,16 +295,31 @@ pub async fn anthropic_stream_turn<F: FnMut(StreamEvent)>(
         // emitted, tool_results stays empty, and the loop breaks: a silent death
         // exactly at "generation". 8192 gives tool calls real room.
         "max_tokens": 64000,
-        "system": cacheable_system(system),
+        "system": if oauth {
+            // Subscription seats ride the full Claude Code wire shape: the
+            // identity line leads as its own system block (Mason 10-08).
+            let mut blocks = vec![serde_json::json!({ "type": "text", "text": crate::subscription::CLAUDE_IDENTITY })];
+            match cacheable_system(system) {
+                serde_json::Value::Array(mut arr) => blocks.append(&mut arr),
+                other => blocks.push(other),
+            }
+            serde_json::Value::Array(blocks)
+        } else {
+            cacheable_system(system)
+        },
         "tools": cacheable_tools(tools),
         "messages": cacheable_messages(messages),
         "stream": true,
     });
 
     let client = reqwest::Client::new();
-    let resp = client
-        .post(ANTHROPIC_URL)
-        .header("x-api-key", api_key)
+    // SUBSCRIPTION SEATS: OAuth bearer + oauth beta instead of x-api-key.
+    let authed = if oauth {
+        crate::subscription::apply_claude_headers(client.post(ANTHROPIC_URL).bearer_auth(api_key))
+    } else {
+        client.post(ANTHROPIC_URL).header("x-api-key", api_key)
+    };
+    let resp = authed
         .header("anthropic-version", API_VERSION)
         .header("content-type", "application/json")
         .json(&body)

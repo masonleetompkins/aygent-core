@@ -1,11 +1,11 @@
 {
   "name": "aygent-ui",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "node scripts/check-grid.mjs && tsc && vite build",
+    "build": "node scripts/check-invoke-case.mjs && node scripts/check-grid.mjs && tsc && vite build",
     "preview": "vite preview",
     "check:grid": "node scripts/check-grid.mjs"
   },

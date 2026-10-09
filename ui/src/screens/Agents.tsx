@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { Card, Button, Input, Pill } from "../components/ui";
 import type { AgentProfile } from "../components/AgentSwitcher";
 import { Icon, AGENT_ICONS, type IconName } from "../components/Icon";
+import { SubProfilePicker } from "../components/SubProfilePicker";
+import { modelRank, modelLabel } from "../lib/models";
 
 // Agents management screen (§10.2): list all agent profiles, create/edit/delete,
 // and pick each agent's jailed folder + model/provider. The switcher rail is the
@@ -12,38 +14,6 @@ const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 // Agent icons are SF-Symbol-style glyphs (see Icon.tsx); rendered in the
 // accent color (flat, no glow) — no per-agent background color anymore (Mason's call).
 const ICONS = AGENT_ICONS;
-
-// Rank a model id most-powerful-first. Higher score = more capable = higher in
-// the dropdown. Family tier dominates; version bumps break ties (opus-5 > opus-4-8).
-// Provider-agnostic heuristic; unknown ids fall to the bottom but stay listed.
-function modelRank(id: string): number {
-  const s = id.toLowerCase();
-  let base = 0;
-  if (s.includes("fable") || s.includes("mythos")) base = 900;      // next-gen top tier
-  else if (s.includes("opus")) base = 800;
-  else if (s.includes("gpt-5") || s.includes("o3") || s.includes("o1")) base = 780; // OpenAI reasoning/top
-  else if (s.includes("sonnet")) base = 700;
-  else if (s.includes("gpt-4")) base = 680;
-  else if (s.includes("haiku")) base = 500;
-  else if (s.includes("mini") || s.includes("small")) base = 400;
-  else base = 300;
-  // version nudge: pull a trailing version like "-5", "-4-8", "4.6" out of the id.
-  const m = s.match(/(\d+)(?:[.-](\d+))?/g);
-  let ver = 0;
-  if (m) { const last = m[m.length - 1].replace(/[.-]/g, "."); const parts = last.split("."); ver = (parseInt(parts[0] || "0") * 10) + parseInt(parts[1] || "0"); }
-  return base + ver;
-}
-
-// A short, human label for a model id (family + version), so the dropdown reads
-// nicely instead of showing raw ids.
-function modelLabel(id: string): string {
-  const s = id.toLowerCase();
-  const fam =
-    s.includes("fable") ? "Fable" : s.includes("mythos") ? "Mythos" :
-    s.includes("opus") ? "Opus" : s.includes("sonnet") ? "Sonnet" : s.includes("haiku") ? "Haiku" :
-    null;
-  return fam ? `${fam} — ${id}` : id;
-}
 
 export function Agents({
   activeId,
@@ -296,6 +266,16 @@ export function AgentForm({
   const [model, setModel] = useState(initial?.model ?? "");
   const [variant, setVariant] = useState(initial?.model_variant ?? "");
   const [provider, setProvider] = useState(initial?.provider ?? "anthropic");
+  // SUBSCRIPTION SEAT pin ("" = auto/failover). Persisted on save; loaded for edits.
+  const [subPin, setSubPin] = useState("");
+  useEffect(() => {
+    if ((provider === "claude-code" || provider === "codex") && initial?.id) {
+      invoke<string>("sub_pinned", { agentId: initial.id }).then(setSubPin).catch(() => {});
+    } else if (provider !== "claude-code" && provider !== "codex") {
+      setSubPin("");
+    }
+    // eslint-disable-next-line
+  }, [provider]);
   const [contextMode, setContextMode] = useState(initial?.context_mode ?? "isolated");
   const [systemPrompt, setSystemPrompt] = useState(initial?.system_prompt ?? "");
   const [saving, setSaving] = useState(false);
@@ -529,7 +509,9 @@ export function AgentForm({
     const attempt = () =>
       prov === "anthropic"
         ? invoke<string[]>("anthropic_models")
-        : invoke<string[]>("openai_models", { provider: prov });
+        : (prov === "claude-code" || prov === "codex")
+          ? invoke<string[]>("sub_models", { kind: prov })
+          : invoke<string[]>("openai_models", { provider: prov });
     let lastErr: unknown = null;
     // Cold-mount: the daemon/keychain handshake can lag a beat, so the first few
     // calls may throw spuriously. Retry with a longer, wider backoff before we
@@ -569,12 +551,14 @@ export function AgentForm({
           folder_path: folder, model, provider, model_variant: variant, context_mode: contextMode, system_prompt: systemPrompt,
         };
         await invoke("agents_update", { profile: updated });
+        try { await invoke("sub_profile_pin", { agentId: updated.id, profileId: (provider === "claude-code" || provider === "codex") ? subPin : "" }); } catch { /* pin is advisory */ }
         onDone(updated);
       } else {
         const created = await invoke<AgentProfile>("agents_create", {
           name: name.trim(), icon, color, folderPath: folder, model, provider,
           modelVariant: variant, contextMode, systemPrompt,
         });
+        try { await invoke("sub_profile_pin", { agentId: created.id, profileId: (provider === "claude-code" || provider === "codex") ? subPin : "" }); } catch { /* pin is advisory */ }
         onDone(created);
       }
     } catch { onDone(null); }
@@ -630,6 +614,8 @@ export function AgentForm({
               <option value="openai">OpenAI</option>
               <option value="openrouter">OpenRouter</option>
               <option value="meta">Muse (Meta)</option>
+              <option value="claude-code">Claude Code (subscription)</option>
+              <option value="codex">Codex (subscription)</option>
               <option value="local">Local (GGUF)</option>
               <option value="mlx">Local (MLX)</option>
             </select>
@@ -735,6 +721,10 @@ export function AgentForm({
             </label>
           )}
         </div>
+
+        {(provider === "claude-code" || provider === "codex") && (
+          <SubProfilePicker provider={provider} value={subPin} onChange={setSubPin} />
+        )}
 
         {/* CONTEXT MODE (2026-08-03): how much conversation context this agent
            carries between chats. Wired end-to-end now (was a dead column). */}

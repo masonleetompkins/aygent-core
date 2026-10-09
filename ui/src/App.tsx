@@ -137,6 +137,13 @@ export function App() {
   useEffect(() => {
     const p = activeAgent?.provider || "anthropic";
     if (p === "local" || p === "mlx") { setKeySet(true); return; }
+    // SUBSCRIPTION SEATS hold OAuth in sub:* vault slots, not provider keys —
+    // the gate is "any connected seat of this kind".
+    if (p === "claude-code" || p === "codex") {
+      invoke<Array<{ has_token: boolean }>>("sub_profiles_list", { kind: p })
+        .then((l) => setKeySet((l || []).some((x) => x.has_token))).catch(() => {});
+      return;
+    }
     invoke<boolean>("has_provider_key", { provider: p }).then(setKeySet).catch(() => {});
   }, [screen, activeAgent?.id, activeAgent?.provider]);
   // Settings can change the active agent's provider/model (set_selection) without
