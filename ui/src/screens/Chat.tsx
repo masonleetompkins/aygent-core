@@ -14,14 +14,18 @@ import { notifyThread } from "../lib/notify";
 import type { TurnItem, TurnUsage } from "../lib/turns";
 import type { AgentProfile } from "../components/AgentSwitcher";
 import { DiffView, DiffCounts, countDiff, isDiffable } from "../components/DiffView";
+import { modelRank, modelLabel } from "../lib/models";
+import { SubscriptionBadge } from "../components/SubscriptionBadge";
 
+type SubTag = { kind: string; label: string; apiEquivCents: number; tokens: number };
+type SubInfo = { billing: string; kind: string; label?: string | null; pct_5h?: number | null; reset_at_ms?: number | null; weekly_pct?: number | null };
 type ToolLine = { name: string; path: string; ok?: boolean; detail?: string; summary?: string; body?: string; running?: boolean; spark?: { slug: string; title: string; html: string }; before?: { exists: boolean; content: string; truncated: boolean; binary: boolean } | null };
 type Msg =
   // `at` = epoch ms. For a USER message it's when they hit send; for an
   // ASSISTANT message it's when the turn COMPLETED (set at finalize, not at
   // first token), which is what the timestamp in the margin claims to mean.
   | { role: "user"; text: string; memory?: string; at?: number }
-  | { role: "assistant"; text: string; tools: ToolLine[]; streaming?: boolean; at?: number; timeline?: TurnItem[]; usage?: TurnUsage };
+  | { role: "assistant"; text: string; tools: ToolLine[]; streaming?: boolean; at?: number; timeline?: TurnItem[]; usage?: TurnUsage; sub?: SubTag };
 
 const hint = { color: "var(--text-muted)", fontSize: 14, margin: 0 } as const;
 
@@ -88,6 +92,8 @@ function providerLabel(p: string | null | undefined): string {
     case "openai": return "an OpenAI";
     case "openrouter": return "an OpenRouter";
     case "meta": return "a Muse (Meta)";
+    case "claude-code": return "a Claude subscription seat";
+    case "codex": return "a Codex (ChatGPT) subscription seat";
     case "anthropic": case "": case null: case undefined: return "an Anthropic";
     default: return `a ${p}`;
   }
@@ -673,7 +679,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       const done = getAgentTurnSnapshot(mySlot);
       const finalMsgs: Msg[] = [
         ...msgsRef.current,
-        { role: "assistant", text: done.liveText || "(continued — no written reply this round)", tools: done.liveTools as ToolLine[], timeline: done.timeline, streaming: false, at: Date.now(), usage: done.usage },
+        { role: "assistant", text: done.liveText || "(continued — no written reply this round)", tools: done.liveTools as ToolLine[], timeline: done.timeline, streaming: false, at: Date.now(), usage: done.usage, sub: await logSubTurn(channel, myAgent, providerRef.current, done.usage) },
       ];
       if (agentId === myAgent && convIdRef.current === myConvId) {
         msgsRef.current = finalMsgs; setMsgs(finalMsgs);
@@ -681,7 +687,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       void persistFor(myConvId, finalMsgs, historyRef.current);
       setContinueNote(null);
     } catch (err) {
-      const errMsgs: Msg[] = [...msgsRef.current, { role: "assistant", text: `✗ ${String(err)}`, tools: [], streaming: false, at: Date.now() }];
+      // KEEP THE STREAM (Mason 10-08): a late provider error must not wipe
+      // the tool cards + text that already streamed this turn.
+      const snap = getAgentTurnSnapshot(mySlot);
+      const keptText = (snap.liveText || "").trim();
+      const keptTools = (snap.liveTools || []) as ToolLine[];
+      const errText = String(err);
+      const text = keptText ? `${keptText}\n\n✗ ${errText} — work above is kept; reply to continue.` : `✗ ${errText}`;
+      const errMsgs: Msg[] = [...msgsRef.current, { role: "assistant", text, tools: keptTools, timeline: snap.timeline, streaming: false, at: Date.now(), usage: snap.usage }];
       if (agentId === myAgent && convIdRef.current === myConvId) { msgsRef.current = errMsgs; setMsgs(errMsgs); }
       void persistFor(myConvId, errMsgs, historyRef.current);
     }
@@ -775,6 +788,23 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
     } catch { /* non-fatal: chat still works even if save fails */ }
   }
 
+  // SUBSCRIPTION TURNS: attribute the seat that served the turn + log tokens
+  // to sub.db (best-effort; a logging failure never breaks the chat).
+  async function logSubTurn(channel: string, aId: string | null, prov: string, usage?: TurnUsage): Promise<SubTag | undefined> {
+    try {
+      if ((prov !== "claude-code" && prov !== "codex") || !usage || !aId) return undefined;
+      const seat = await invoke<{ profile_id: string; kind: string; label: string } | null>("sub_active", { channel });
+      if (!seat) return undefined;
+      const r = await invoke<{ ok: boolean; api_equiv_cents: number }>("sub_log_turn", {
+        agentId: aId, profileId: seat.profile_id, kind: seat.kind,
+        input: Math.round(usage.input || 0), output: Math.round(usage.output || 0),
+        cacheRead: Math.round(usage.cacheRead || 0),
+      });
+      const ctxIn = (usage.contextInput ?? 0) || (usage.input + usage.cacheRead + usage.cacheWrite);
+      return { kind: seat.kind, label: seat.label, apiEquivCents: r.api_equiv_cents ?? 0, tokens: ctxIn + usage.output };
+    } catch { return undefined; }
+  }
+
   async function send() {
     let prompt = input.trim();
     // Task #8: #tool tags become an explicit instruction the model honors.
@@ -859,7 +889,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
         : "(no reply text came back from the model this turn — try asking a follow-up)";
       const finalMsgs: Msg[] = [
         ...withUserMem,
-        { role: "assistant", text: done.liveText || emptyReplyText, tools: done.liveTools as ToolLine[], timeline: done.timeline, streaming: false, at: Date.now(), usage: done.usage },
+        { role: "assistant", text: done.liveText || emptyReplyText, tools: done.liveTools as ToolLine[], timeline: done.timeline, streaming: false, at: Date.now(), usage: done.usage, sub: await logSubTurn(channel, myAgent, providerRef.current, done.usage) },
       ];
       // Only overwrite the visible pane if we're STILL viewing this agent+conv.
       if (agentId === myAgent && convIdRef.current === myConvId) {
@@ -868,7 +898,12 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
       void persistFor(myConvId, finalMsgs, historyRef.current);
       runningChannelRef.current = null;
     } catch (err) {
-      const errMsgs: Msg[] = [...withUser, { role: "assistant", text: `✗ ${String(err)}`, tools: [], streaming: false, at: Date.now() }];
+      const snap2 = getAgentTurnSnapshot(mySlot);
+      const keptText2 = (snap2.liveText || "").trim();
+      const keptTools2 = (snap2.liveTools || []) as ToolLine[];
+      const errText2 = String(err);
+      const text2 = keptText2 ? `${keptText2}\n\n✗ ${errText2} — work above is kept; reply to continue.` : `✗ ${errText2}`;
+      const errMsgs: Msg[] = [...withUser, { role: "assistant", text: text2, tools: keptTools2, timeline: snap2.timeline, streaming: false, at: Date.now(), usage: snap2.usage }];
       if (agentId === myAgent && convIdRef.current === myConvId) { msgsRef.current = errMsgs; setMsgs(errMsgs); }
       void persistFor(myConvId, errMsgs, historyRef.current);
       runningChannelRef.current = null;
@@ -967,7 +1002,7 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
   // ---- CONTEXT METER + $ COST (Mason, this session) -----------------------
   // The model's context window + price, fetched Rust-side (pricing.rs). Refetch
   // when the selected model changes so the % + cost track the real model.
-  type ModelInfo = { context_tokens: number; known: boolean; price: ModelPrice };
+  type ModelInfo = { context_tokens: number; known: boolean; price: ModelPrice; subscription?: SubInfo | null };
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
   useEffect(() => {
     let cancelled = false;
@@ -1147,6 +1182,14 @@ function ChatPane({ agent, folder, keySet, agentId, multi, closable, onClose }: 
                   <span title="Running cost of this chat, based on the model's price" style={{ fontSize: 12, color: "var(--text-muted)", fontVariantNumeric: "tabular-nums" }}>
                     · {fmtCost(convUsage.cost)}
                   </span>
+                )}
+                {modelInfo?.subscription && (
+                  <SubscriptionBadge
+                    kind={modelInfo.subscription.kind}
+                    label={modelInfo.subscription.label ?? modelInfo.subscription.kind}
+                    pct5h={modelInfo.subscription.pct_5h ?? null}
+                    resetAtMs={modelInfo.subscription.reset_at_ms ?? null}
+                  />
                 )}
                 <button
                   onClick={() => void compactContext()}
@@ -1544,7 +1587,22 @@ function HistoryItem({
 
 // Inline-editable chat name shown under the "Chat" header. Click to edit; Enter
 // or blur commits, Escape cancels. Empty renders a muted "Untitled" prompt.
-const THREAD_PROVIDERS = ["anthropic", "openai", "openrouter", "meta", "local", "mlx"];
+// Per-thread model override seats. Same providers the Agents form offers, so
+// a thread can borrow any seat — including subscription seats.
+const THREAD_PROVIDERS: Array<{ id: string; label: string }> = [
+  { id: "anthropic", label: "Anthropic" },
+  { id: "openai", label: "OpenAI" },
+  { id: "openrouter", label: "OpenRouter" },
+  { id: "meta", label: "Muse (Meta)" },
+  { id: "claude-code", label: "Claude Code (sub)" },
+  { id: "codex", label: "Codex (sub)" },
+  { id: "local", label: "Local (GGUF)" },
+  { id: "mlx", label: "Local (MLX)" },
+];
+
+// COMMAND PRO per-thread model override (B1): pick from what is ACTUALLY
+// available for the provider (same live sources the Agents form uses) — no
+// typing model ids. Unknown/offline still offers a type-the-id fallback.
 function ThreadModelPicker({ agentDefault, value, onChange }: {
   agentDefault: { provider: string; model: string };
   value: { provider: string; model: string } | null;
@@ -1553,26 +1611,78 @@ function ThreadModelPicker({ agentDefault, value, onChange }: {
   const [editing, setEditing] = useState(false);
   const [prov, setProv] = useState(value?.provider || agentDefault.provider);
   const [mod, setMod] = useState(value?.model || agentDefault.model);
-  useEffect(() => { setProv(value?.provider || agentDefault.provider); setMod(value?.model || agentDefault.model); }, [value?.provider, value?.model, agentDefault.provider, agentDefault.model]);
+  const [models, setModels] = useState<string[]>([]);
+  const [localOpts, setLocalOpts] = useState<Array<{ value: string; label: string }>>([]);
+  const [loading, setLoading] = useState(false);
+  const [loadErr, setLoadErr] = useState<string | null>(null);
+  const [typing, setTyping] = useState(false);
+  useEffect(() => { setProv(value?.provider || agentDefault.provider); setMod(value?.model || agentDefault.model); setTyping(false); }, [value?.provider, value?.model, agentDefault.provider, agentDefault.model]);
+  async function loadFor(p: string): Promise<void> {
+    setModels([]); setLocalOpts([]); setLoadErr(null); setLoading(true);
+    try {
+      if (p === "local") {
+        const list = await invoke<Array<{ filename: string; path: string }>>("local_downloaded");
+        setLocalOpts((list || []).map((m) => ({ value: m.path, label: m.filename })));
+        if ((list || []).length === 0) setLoadErr("No local models downloaded yet.");
+      } else if (p === "mlx") {
+        const list = await invoke<Array<{ repo: string }>>("mlx_downloaded");
+        setLocalOpts((list || []).map((m) => ({ value: m.repo, label: m.repo })));
+        if ((list || []).length === 0) setLoadErr("No MLX models pulled yet.");
+      } else {
+        const list = p === "anthropic"
+          ? await invoke<string[]>("anthropic_models")
+          : (p === "claude-code" || p === "codex")
+            ? await invoke<string[]>("sub_models", { kind: p })
+            : await invoke<string[]>("openai_models", { provider: p });
+        setModels([...(list || [])].sort((a, b) => modelRank(b) - modelRank(a)));
+        if ((list || []).length === 0) setLoadErr("Model list came back empty.");
+      }
+    } catch (e) { setLoadErr(String(e)); }
+    finally { setLoading(false); }
+  }
+  function openEditor() {
+    const p = value?.provider || agentDefault.provider;
+    setProv(p); setMod(value?.model || agentDefault.model); setTyping(false);
+    setEditing(true);
+    void loadFor(p);
+  }
+  function pickProvider(p: string) { setProv(p); setMod(""); setTyping(false); void loadFor(p); }
   if (!editing) {
     const label = value ? (value.model || value.provider) + " (thread)" : (agentDefault.model || agentDefault.provider) + " (agent)";
     return (
-      <button onClick={() => setEditing(true)} title="Override model for this thread only — other threads keep the agent default"
+      <button onClick={openEditor} title="Override model for this thread only — other threads keep the agent default"
         style={{ display: "inline-flex", alignItems: "center", gap: 6, background: "transparent", border: "1px solid var(--line)", borderRadius: 999, cursor: "pointer", flexShrink: 0, padding: "3px 10px", color: "var(--text-muted)", fontSize: 12, fontFamily: "ui-monospace, monospace", maxWidth: 360 }}>
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span>
         <span style={{ opacity: 0.6 }}>▾</span>
       </button>
     );
   }
+  const opts = prov === "local" || prov === "mlx"
+    ? localOpts
+    : models.map((m) => ({ value: m, label: modelLabel(m) }));
+  const inList = opts.some((o) => o.value === mod);
+  const showInput = typing || (mod !== "" && !inList);
+  const selStyle = { background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, color: "var(--text)", padding: "3px 6px", fontSize: 12, maxWidth: 220 } as const;
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "wrap", flexShrink: 0 }}>
-      <select value={prov} onChange={(e) => setProv(e.target.value)}
-        style={{ background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, color: "var(--text)", padding: "3px 6px", fontSize: 12 }}>
-        {THREAD_PROVIDERS.map((x) => <option key={x} value={x}>{x}</option>)}
+      <select value={prov} onChange={(e) => pickProvider(e.target.value)} style={selStyle}>
+        {THREAD_PROVIDERS.map((x) => <option key={x.id} value={x.id}>{x.label}</option>)}
       </select>
-<input value={mod} onChange={(e) => setMod(e.target.value)} placeholder="model id (blank = auto)"
-        spellCheck={false}
-        style={{ background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, color: "var(--text)", padding: "3px 8px", fontSize: 12, fontFamily: "ui-monospace, monospace", width: 200 }} />
+      <select
+        value={showInput ? "__custom__" : mod}
+        disabled={loading}
+        onChange={(e) => { const v = e.target.value; if (v === "__custom__") { setTyping(true); } else { setTyping(false); setMod(v); } }}
+        style={selStyle}>
+        <option value="">{loading ? "loading models…" : "Auto" + (prov === "local" || prov === "mlx" ? "" : " (recommended)")}</option>
+        {mod !== "" && !inList && <option value={mod}>{mod} (current)</option>}
+        {opts.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+        <option value="__custom__">Type an id…</option>
+      </select>
+      {showInput && (
+        <input value={typing && mod === "" ? "" : mod} onChange={(e) => setMod(e.target.value)} placeholder="model id" spellCheck={false}
+          style={{ background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, color: "var(--text)", padding: "3px 8px", fontSize: 12, fontFamily: "ui-monospace, monospace", width: 200 }} />
+      )}
+      {loadErr && <span title={loadErr} style={{ fontSize: 12, color: "var(--text-faint)", cursor: "help" }}>⚠</span>}
       <button onClick={() => { onChange(mod.trim() || prov !== agentDefault.provider ? { provider: prov, model: mod.trim() } : null); setEditing(false); }}
         style={{ background: "var(--accent)", color: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, padding: "3px 10px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Set</button>
       {value && <button onClick={() => { onChange(null); setEditing(false); }} title="Back to agent default"
@@ -1627,7 +1737,7 @@ function fmtClock(ms?: number): string {
 
 /** One-line meta stamp UNDER the message: clock · tokens · cost. Renders
  *  nothing when there is nothing to show, so rows never shift. */
-function MetaStamp({ at, usage, price, align }: { at?: number; usage?: TurnUsage; price?: ModelPrice; align: "left" | "right" }) {
+function MetaStamp({ at, usage, price, sub, align }: { at?: number; usage?: TurnUsage; price?: ModelPrice; sub?: SubTag; align: "left" | "right" }) {
   const cost = usage ? turnCost(usage, price) : 0;
   const ctxIn = usage ? ((usage.contextInput ?? 0) || (usage.input + usage.cacheRead + usage.cacheWrite)) : 0;
   const toks = usage ? ctxIn + usage.output : 0;
@@ -1635,7 +1745,10 @@ function MetaStamp({ at, usage, price, align }: { at?: number; usage?: TurnUsage
   const clock = fmtClock(at);
   if (clock) parts.push(clock);
   if (usage && toks > 0) parts.push(fmtTokens(toks) + " tok");
-  if (cost > 0) parts.push(fmtCost(cost));
+  if (sub) {
+    if (sub.apiEquivCents > 0) parts.push(`~$${(sub.apiEquivCents / 100).toFixed(2)} API value`);
+    else parts.push("subscription · $0");
+  } else if (cost > 0) parts.push(fmtCost(cost));
   if (parts.length === 0) return null;
   return (
     <span
@@ -1720,7 +1833,7 @@ function BubbleBody({ m, isUser, memory, agentId, local, price }: { m: Msg; isUs
         )}
         {!isUser && m.role === "assistant" && m.streaming && !m.text && <Thinking />}
       </div>
-      <MetaStamp at={m.at} usage={usage} price={price} align={isUser ? "right" : "left"} />
+      <MetaStamp at={m.at} usage={usage} price={price} sub={m.role === "assistant" ? m.sub : undefined} align={isUser ? "right" : "left"} />
       {memory && (
         <span style={{ marginTop: 3, alignSelf: isUser ? "flex-end" : "flex-start", fontSize: 12, color: "#3fa46a" }}>{memory}</span>
       )}
