@@ -5,8 +5,10 @@
 // UI build on any snake_case invoke key. Run: node scripts/check-invoke-case.mjs
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const ROOT = new URL("../src", import.meta.url).pathname;
+// fileURLToPath, not URL.pathname: on Windows that's "/D:/…" (→ "D:\D:\…").
+const ROOT = fileURLToPath(new URL("../src", import.meta.url));
 const KEY_RE = /[{,]\s*([A-Za-z_$][\w$]*)\s*:/g;
 
 function files(dir) {
