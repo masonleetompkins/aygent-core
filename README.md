@@ -49,9 +49,9 @@ Get the latest release from
 
 | OS | File | Notes |
 |----|------|-------|
-| macOS (Apple Silicon) | `AYGENT-1.1.0-macOS-arm64.dmg` | Signed and notarized by Mason Tompkins — open, drag AYGENT to Applications, double-click to launch. |
-| Linux (x86_64) | `AYGENT-1.1.0-Linux.AppImage` | `chmod +x` the file, then run it. No install needed. |
-| Windows | — | No packaged build for 1.1.0 yet — build from source below (one command section). Check Releases for a newer version first. |
+| macOS (Apple Silicon) | `AYGENT-1.1.1-macOS-arm64.dmg` | Signed and notarized by Mason Tompkins — open, drag AYGENT to Applications, double-click to launch. |
+| Linux (x86_64) | `AYGENT-1.1.1-Linux.AppImage` | `chmod +x` the file, then run it. No install needed. |
+| Windows (x64) | `AYGENT-1.1.1-Windows-x64.msi` | Not code-signed yet: if SmartScreen says "Windows protected your PC", choose More info → Run anyway. Nothing else to install. The agent engine isn't OS-sandboxed on Windows yet (the app shows a dismissible warning). |
 
 Intel Macs: no prebuilt binary — build from source below (`cargo tauri build --bundles dmg`).
 

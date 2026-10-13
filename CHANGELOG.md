@@ -5,6 +5,14 @@
 - Settings → Subscriptions: auto-detects CLI logins on this Mac and connects in one click (no label-first form). Claude routes to `claude setup-token` paste automatically; missing-login errors say what to do instead of raw paths.
 - Mid-turn provider timeouts (Muse 504s) retry in-round and never discard streamed work; task_continue wake-ups stream as the model's own response, not a user bubble.
 
+## 1.1.1 — Windows MSI
+- Windows: first packaged build (`AYGENT-1.1.1-Windows-x64.msi`). It needs nothing installed: Node.js (v24.21.0, checksum-pinned) is bundled, and the C/C++ runtime is linked in, so there's no Visual C++ Redistributable (MSVCP140/VCRUNTIME140/VCOMP140) to fetch. CI fails the build if the app ever needs those DLLs again.
+- Windows: API keys and subscription logins are kept. They used to live only in memory (the keychain library had no Windows store enabled) and vanished on restart; the vault is now a DPAPI-encrypted file in `%APPDATA%\build.masonlee.aygent` that only your Windows account can open (Credential Manager's 2.5 KB item limit is too small for subscription tokens).
+- Windows: Settings → Subscriptions finds Claude Code / Codex logins (Windows has no `HOME`; the profile folder is used) and their `.exe`/`.cmd` installs.
+- Windows: no console windows flash up when the app starts the engine or tools.
+- The engine isn't OS-sandboxed on Windows yet, and the app says so in a warning bar that can now be dismissed (it comes back only if the reason changes).
+- Build: `gh workflow run matrix.yml -f platform=windows` builds one platform.
+
 ## 1.1.0 — Linux fixes (AppImage rebuilt)
 - Linux: the agent engine now starts. It was launched through macOS's `sandbox-exec`, which Linux doesn't have; it now runs in a Landlock jail (kernel 5.13+) matching the macOS Seatbelt profile: no access to your files, `/tmp` or other programs, only its own code and the Node runtime. On a kernel without Landlock it still runs, unconfined, and the app says so.
 - Linux: the window no longer draws blank on some GPUs (WebKitGTK's DMA-BUF renderer is turned off by default).

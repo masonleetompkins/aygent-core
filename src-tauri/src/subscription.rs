@@ -54,7 +54,9 @@ impl SubTokens {
 }
 
 fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
+    // HOME first (what the CLIs themselves honor on macOS/Linux); Windows
+    // has no HOME, so fall back to the profile folder (%USERPROFILE%).
+    std::env::var_os("HOME").map(std::path::PathBuf::from).or_else(dirs::home_dir)
 }
 
 fn read_json(path: &std::path::Path) -> Result<serde_json::Value, String> {
@@ -170,9 +172,23 @@ fn binary_found(bin: &str) -> bool {
     if let Some(home) = home_dir() {
         dirs.push(home.join(".local/bin"));
     }
-    dirs.push("/opt/homebrew/bin".into());
-    dirs.push("/usr/local/bin".into());
-    dirs.iter().any(|d| d.join(bin).is_file())
+    #[cfg(not(windows))]
+    {
+        dirs.push("/opt/homebrew/bin".into());
+        dirs.push("/usr/local/bin".into());
+    }
+    // Windows: the native installer's claude.exe is in ~/.local/bin (above);
+    // npm installs codex.cmd / claude.cmd under %APPDATA%\npm.
+    #[cfg(windows)]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        dirs.push(std::path::PathBuf::from(appdata).join("npm"));
+    }
+    let names: Vec<String> = if cfg!(windows) {
+        ["exe", "cmd", "bat", "ps1"].iter().map(|ext| format!("{bin}.{ext}")).collect()
+    } else {
+        vec![bin.to_string()]
+    };
+    dirs.iter().any(|d| names.iter().any(|n| d.join(n).is_file()))
 }
 
 /// What login material exists for a seat kind. Bools only — never secrets.
